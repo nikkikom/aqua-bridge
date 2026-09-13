@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly randomized Hypothesis run (PR runs are derandomized).
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  # Cancel superseded PR runs; never cancel runs on main or the nightly.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      # Keep in sync with the ruff pin in pyproject.toml [dev].
+      - name: Install ruff
+        run: pip install "ruff==0.16.7"
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format --check
+        run: ruff format --check .
+
+  test:
+    if: github.event_name != 'schedule'
+    name: test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HYPOTHESIS_PROFILE: ci
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: latest
+            python-version: "3.14"
+            pi-parity: false
+          - name: pi-parity
+            python-version: "3.13"
+            pi-parity: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # pi-parity: the exact versions apt ships on the Raspberry Pi
+      # (Raspberry Pi OS Trixie), installed before the project so the run
+      # matches what the daemon uses there. --no-deps keeps the pins.
+      - name: Install pinned pi-parity dependencies
+        if: matrix.pi-parity
+        run: |
+          pip install \
+            numpy==2.2.4 \
+            pyyaml==6.0.2 \
+            pytest==8.3.5 \
+            hypothesis==6.130.5 \
+            aiohttp==3.11.16 \
+            paho-mqtt==2.1.0
+          pip install -e . --no-deps
+
+      - name: Install latest dependencies
+        if: ${{ !matrix.pi-parity }}
+        run: pip install -e ".[dev,http,mqtt]"
+
+      - name: shellcheck version
+        run: shellcheck --version | head -2
+
+      - name: pytest
+        run: pytest -m "not hardware" --durations=15
+
+  nightly-fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    name: nightly-fuzz (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      HYPOTHESIS_PROFILE: nightly
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: latest
+            python-version: "3.14"
+            pi-parity: false
+          - name: pi-parity
+            python-version: "3.13"
+            pi-parity: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install pinned pi-parity dependencies
+        if: matrix.pi-parity
+        run: |
+          pip install \
+            numpy==2.2.4 \
+            pyyaml==6.0.2 \
+            pytest==8.3.5 \
+            hypothesis==6.130.5 \
+            aiohttp==3.11.16 \
+            paho-mqtt==2.1.0
+          pip install -e . --no-deps
+      - name: Install latest dependencies
+        if: ${{ !matrix.pi-parity }}
+        run: pip install -e ".[dev,http,mqtt]"
+      # Randomized search; a failure prints a @reproduce_failure blob in the log.
+      - name: pytest (randomized Hypothesis)
+        run: pytest -m "not hardware" --durations=15

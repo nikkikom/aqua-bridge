@@ -8,3 +8,4 @@ config.yaml
 .DS_Store
 private.md
 secrets/
+.hypothesis/

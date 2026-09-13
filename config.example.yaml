@@ -1,6 +1,7 @@
 # Copy to config.yaml on the Pi. Channel names are logical, not hwmon pwmN.
 
 mqtt:
+  enabled: false         # MQTT Discovery for Home Assistant (section 7); LWT on {node_id}/status
   host: mqtt.local
   port: 1883
   username: ""
@@ -12,28 +13,56 @@ host:
   interval_s: 5
 
 mpc:
-  dt: 2.0
-  horizon: 8
-  setpoints:
+  solver: pi             # "pi" (first cut) or "mpc" (small linear MPC, numpy)
+  dt: 2.0                # seconds per tick
+  horizon: 8             # MPC prediction horizon, ticks (>= 1); ignored by "pi"
+  temps:                 # plant temperatures the gate checks; setpoints keys must be listed here
+    - coolant
+    - air
+  setpoints:             # target °C per controlled temperature; every key must be in temps
     coolant: 35.0
+  channel_temps:         # fan channel -> temperatures it controls (each must have a setpoint).
+    radiator: [coolant]  # Omit or leave {} to let every channel control every setpoint temp.
+    intake: [coolant]    # Error per channel = max over its temps of (T - setpoint).
+  weights:               # MPC tracking weight per temperature; missing temp -> 1.0
+    coolant: 1.0
+  weight_pwm: 0.0        # MPC penalty on PWM effort, per PWM^2 (>= 0); > 0 trades a steady-state offset
+  weight_dpwm: 60.0      # MPC penalty on PWM moves, per PWM^2 per tick (>= 0; "mpc" needs one of the two > 0)
+  mpc_tau_s: 120.0       # MPC model: time constant of the controlled temperatures, seconds (> 0)
+  mpc_gain_c_per_pwm: 8.0  # MPC model: steady-state °C drop of a temperature per +1.0 PWM on one of its channels
+  mpc_estimator_gain: 0.1  # MPC offset-free disturbance estimator, per-tick gain in (0, 1]
+  pi_kp: 0.05            # PI proportional gain, PWM per °C of error (> 0)
+  pi_ki: 0.002           # PI integral gain, PWM per (°C * s) (>= 0)
   pwm_min: 0.15
   pwm_max: 1.0
-  d_pwm_max: 0.1
-  fallback_hold_s: 10
-  confirm_ticks: 3
-  dT_max: 5.0
-  fallback_pwm:
+  d_pwm_max: 0.1         # max |Δpwm| per tick, also honoured while ramping to fallback
+  fallback_pwm:          # HIGH cooling on fault; keys exactly channels, each in (pwm_min, pwm_max]
     radiator: 0.8
     intake: 0.8
+  fallback_hold_s: 10    # hold last good command this long, then ramp toward fallback_pwm
+  confirm_s: 6           # consecutive trusted seconds before auto; >= 2*dt and <= fallback_hold_s
+  dT_max_c_per_s: 2.0    # gate slew limit, °C/s; per-tick limit = this * dt
+  temp_min_c: -20.0      # gate absolute valid range, °C
+  temp_max_c: 120.0
+  median3: false         # pre-filter: median of last 3 raw samples per temperature
+  stuck_s: 180           # window, seconds; several plant time constants, not a debounce
+  stuck_eps_c: 0.02      # "unchanged" band; aquaero reports 0.01 °C
+  stuck_pwm_net: 0.15    # net PWM move over the window that must show up in T
+  stuck_sibling_dT_c: 1.0
+  solver_max_iter: 50    # MPC iteration cap; hitting it is a solver fault (fallback)
   channels:
     - radiator
     - intake
 
 xt6:
   prefer: hwmon
-  map:
+  hwmon_name: aquaero    # /sys/class/hwmon/*/name to look for
+  map:                   # fan channel -> hwmon pwmN
     radiator: pwm1
     intake: pwm2
+  temp_map:              # logical temperature -> hwmon tempN
+    coolant: temp1
+    air: temp2
 
 http:
   bind: 0.0.0.0
