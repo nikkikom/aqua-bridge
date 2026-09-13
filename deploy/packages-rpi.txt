@@ -37,3 +37,7 @@ python3-yaml
 python3-paho-mqtt
 python3-aiohttp
 liquidctl
+
+# Tests on the Pi (pytest -m hardware, HYPOTHESIS_PROFILE=pi)
+python3-pytest
+python3-hypothesis

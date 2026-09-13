@@ -1,0 +1,425 @@
+"""Control supervisor: modes, manual overrides, setpoints, presets (sections 5, 6, 7).
+
+The :class:`Supervisor` is the :class:`~aqua_bridge.control.intents.ControlSurface`
+that HTTP, MQTT and the Digole UI talk to. It owns everything a human can
+change at runtime and turns the solver's :class:`~aqua_bridge.model.MpcCommand`
+into the command that actually goes to the fans (:meth:`Supervisor.compose`).
+It never writes PWM itself: the loop calls ``sink.apply`` with what
+``compose`` returns, so ``pwm_min``/``pwm_max`` and ``d_pwm_max`` are
+enforced on one path for solver and human alike.
+
+Rules (section 6 "Control", section 4.8, section 5 "Modes")
+-----------------------------------------------------------
+* ``SetPwm`` while the mode is ``auto`` -> :class:`IntentConflict` (HTTP 409).
+  The client must ``SetMode(manual|mixed)`` first; a raw PWM never
+  silently flips the mode away from auto.
+* ``SetPwm`` for an unknown channel, or a PWM outside
+  ``[cfg.pwm_min, cfg.pwm_max]`` -> :class:`IntentInvalid` (4xx).
+* ``SetSetpoint`` only for a temperature that already has a setpoint in the
+  config (``cfg.setpoints``). A temperature in ``cfg.temps`` without a
+  setpoint is monitored by the gate but not regulated; giving it a target at
+  runtime would change which temperatures the fans chase (``channel_temps``
+  defaults to "every setpoint"), so it is rejected as invalid. The value
+  must lie strictly inside ``(temp_min_c, temp_max_c)`` (model rule).
+* ``SetMode(auto)`` clears every override. ``SetMode(manual)`` gives every
+  channel without an override one, seeded from the last applied PWM (or
+  ``fallback_pwm`` before anything was applied) so entering manual does
+  not move a fan. ``SetMode(mixed)`` keeps the overrides as they are.
+* ``ClearOverride(ch)`` removes one override; ``ClearOverride()`` removes
+  all. When no override remains the mode becomes ``auto``; when some remain
+  in ``manual`` the mode becomes ``mixed``.
+* Released channels are handed to the loop once (``TickPlan.released``) so
+  it can drop their integrator entries and the solver re-initialises
+  bumplessly (its first output equals the override that was on the fan).
+
+``compose`` (section 6 "Do not bypass ``d_pwm_max``")
+-----------------------------------------------------
+* ``mpc_cmd.mode == fallback`` -> the solver command is returned unchanged.
+  A fault (untrusted sensors, broken solver) must never reduce cooling, and
+  a manual override that pins a fan low would do exactly that while the
+  controller is blind. Overrides are kept and resume when the fault clears.
+* Otherwise every overridden channel is replaced by its override, rate
+  limited to ``|delta| <= d_pwm_max`` against the last *applied* PWM and
+  clamped into ``[pwm_min, pwm_max]``; other channels keep the solver's
+  value. The mode of the composed command is the solver's mode (there is
+  no ``manual`` mode in :class:`~aqua_bridge.model.Mode`); the control mode
+  and the overrides are recorded in ``diagnostics["supervisor"]``.
+
+Presets (section 6 ``POST /api/preset``, "MPC aggressiveness")
+--------------------------------------------------------------
+A preset is a documented transform of the base config, applied by
+:meth:`Supervisor.effective_config` before every ``step``; it never edits
+the config on disk. See :data:`PRESETS`:
+
+* ``quiet``  -- setpoints ``+2 C``, PI gains ``x0.5``, MPC move penalty ``x2``
+* ``normal`` -- the config as written
+* ``cool``   -- setpoints ``-2 C``, PI gains ``x2``, MPC move penalty ``x0.5``
+
+The offset applies on top of the user's setpoint; ``snapshot().setpoints``
+reports the user's values and ``extra["effective_setpoints"]`` the
+offset ones. A preset or setpoint whose effective config fails validation
+is rejected as :class:`IntentInvalid` at submit time, so the loop never sees
+an invalid config.
+
+Thread safety: every public method takes one re-entrant lock; ``snapshot``
+copies, so an HTTP thread and the loop thread may interleave freely.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import threading
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from typing import Any
+
+from aqua_bridge.control.intents import (
+    ClearOverride,
+    ControlMode,
+    ControlSnapshot,
+    Intent,
+    IntentConflict,
+    IntentInvalid,
+    Preset,
+    SetMode,
+    SetPreset,
+    SetPwm,
+    SetSetpoint,
+)
+from aqua_bridge.model import (
+    ConfigError,
+    Mode,
+    MpcCommand,
+    MpcConfig,
+    MpcState,
+    PlantObservation,
+)
+
+__all__ = ["PRESETS", "PresetEffect", "Supervisor", "TickPlan", "apply_preset"]
+
+_EPS = 1e-12
+
+
+@dataclass(frozen=True)
+class PresetEffect:
+    """What a preset does to the base :class:`MpcConfig` (module docstring)."""
+
+    setpoint_offset_c: float = 0.0  # added to every setpoint
+    gain_scale: float = 1.0  # multiplies pi_kp and pi_ki
+    move_penalty_scale: float = 1.0  # multiplies weight_dpwm (MPC solver)
+
+
+PRESETS: dict[Preset, PresetEffect] = {
+    Preset.QUIET: PresetEffect(setpoint_offset_c=2.0, gain_scale=0.5, move_penalty_scale=2.0),
+    Preset.NORMAL: PresetEffect(),
+    Preset.COOL: PresetEffect(setpoint_offset_c=-2.0, gain_scale=2.0, move_penalty_scale=0.5),
+}
+
+
+def apply_preset(cfg: MpcConfig, setpoints: Mapping[str, float], preset: Preset) -> MpcConfig:
+    """``cfg`` with ``setpoints`` and the preset transform applied.
+
+    Raises :class:`~aqua_bridge.model.ConfigError` when the result is not a
+    valid config (setpoint outside the gate's absolute range, for instance).
+    """
+    effect = PRESETS[Preset(preset)]
+    return dataclasses.replace(
+        cfg,
+        setpoints={name: float(v) + effect.setpoint_offset_c for name, v in setpoints.items()},
+        pi_kp=cfg.pi_kp * effect.gain_scale,
+        pi_ki=cfg.pi_ki * effect.gain_scale,
+        weight_dpwm=cfg.weight_dpwm * effect.move_penalty_scale,
+    )
+
+
+@dataclass(frozen=True)
+class TickPlan:
+    """Consistent view of the supervisor for one loop tick (taken under the lock).
+
+    The loop runs ``step`` with ``cfg`` and composes with ``overrides``;
+    ``released`` names channels whose override was cleared since the last
+    plan (drop their integrator entry for a bumpless return to the solver).
+    """
+
+    cfg: MpcConfig
+    control_mode: ControlMode
+    overrides: dict[str, float] = field(default_factory=dict)
+    released: frozenset[str] = frozenset()
+    preset: Preset = Preset.NORMAL
+
+
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return lo if value < lo else hi if value > hi else value
+
+
+class Supervisor:
+    """ControlSurface implementation shared by the loop and the publishers."""
+
+    def __init__(
+        self,
+        cfg: MpcConfig,
+        *,
+        clock: Callable[[], float] | None = None,
+        version: str = "",
+        preset: Preset = Preset.NORMAL,
+    ) -> None:
+        if not isinstance(cfg, MpcConfig):
+            raise TypeError(f"cfg must be an MpcConfig, got {type(cfg).__name__}")
+        self._lock = threading.RLock()
+        self._base_cfg = cfg
+        self._clock = clock if clock is not None else time.monotonic
+        self._version = version
+        self._started_at = self._clock()
+
+        self._control_mode = ControlMode.AUTO
+        self._overrides: dict[str, float] = {}
+        self._setpoints: dict[str, float] = dict(cfg.setpoints)
+        self._preset = Preset(preset)
+        self._effective = apply_preset(cfg, self._setpoints, self._preset)
+        self._released: set[str] = set()
+
+        # Loop-reported facts.
+        self._obs: PlantObservation | None = None
+        self._last_cmd: MpcCommand | None = None
+        self._mpc_cmd: MpcCommand | None = None
+        self._state: MpcState | None = None
+        self._applied_pwm: dict[str, float] | None = None
+        self._usb_present = False
+        self._mqtt_connected: bool | None = None
+        self._extra: dict[str, Any] = {}
+
+    # -- read side --------------------------------------------------------
+
+    @property
+    def base_config(self) -> MpcConfig:
+        return self._base_cfg
+
+    @property
+    def control_mode(self) -> ControlMode:
+        with self._lock:
+            return self._control_mode
+
+    @property
+    def preset(self) -> Preset:
+        with self._lock:
+            return self._preset
+
+    @property
+    def overrides(self) -> dict[str, float]:
+        with self._lock:
+            return dict(self._overrides)
+
+    @property
+    def setpoints(self) -> dict[str, float]:
+        with self._lock:
+            return dict(self._setpoints)
+
+    def effective_config(self) -> MpcConfig:
+        """The config ``step`` must run with right now (setpoints + preset)."""
+        with self._lock:
+            return self._effective
+
+    def snapshot(self) -> ControlSnapshot:
+        with self._lock:
+            state = self._state
+            extra = dict(self._extra)
+            extra["effective_setpoints"] = dict(self._effective.setpoints)
+            extra["applied_pwm"] = None if self._applied_pwm is None else dict(self._applied_pwm)
+            extra["mpc_mode"] = None if self._mpc_cmd is None else self._mpc_cmd.mode.value
+            return ControlSnapshot(
+                obs=self._obs,
+                last_cmd=self._last_cmd,
+                control_mode=self._control_mode,
+                setpoints=dict(self._setpoints),
+                overrides=dict(self._overrides),
+                preset=self._preset,
+                channels=tuple(self._base_cfg.channels),
+                temps=tuple(self._base_cfg.temps),
+                pwm_min=self._base_cfg.pwm_min,
+                pwm_max=self._base_cfg.pwm_max,
+                solver_status=ControlSnapshot.solver_status_for(self._mpc_cmd),
+                fault_reason=None if state is None else state.fault_reason,
+                fault_since_ts=None if state is None else state.fault_since_ts,
+                usb_present=self._usb_present,
+                mqtt_connected=self._mqtt_connected,
+                uptime_s=max(0.0, self._clock() - self._started_at),
+                version=self._version,
+                extra=extra,
+            )
+
+    # -- intents ----------------------------------------------------------
+
+    def submit(self, intent: Intent) -> None:
+        with self._lock:
+            if isinstance(intent, SetMode):
+                self._set_mode(intent.mode)
+            elif isinstance(intent, SetPwm):
+                self._set_pwm(intent.channel, intent.pwm)
+            elif isinstance(intent, SetSetpoint):
+                self._set_setpoint(intent.channel, intent.celsius)
+            elif isinstance(intent, SetPreset):
+                self._set_preset(intent.name)
+            elif isinstance(intent, ClearOverride):
+                self._clear_override(intent.channel)
+            else:
+                raise IntentInvalid(f"unsupported intent {type(intent).__name__}")
+
+    def _seed_pwm(self, channel: str) -> float:
+        """Override value that does not move the fan when entering manual."""
+        if self._applied_pwm is not None and channel in self._applied_pwm:
+            value = self._applied_pwm[channel]
+        else:
+            value = self._base_cfg.fallback_pwm[channel]
+        return _clamp(float(value), self._base_cfg.pwm_min, self._base_cfg.pwm_max)
+
+    def _set_mode(self, mode: ControlMode) -> None:
+        mode = ControlMode(mode)
+        if mode is ControlMode.AUTO:
+            self._released.update(self._overrides)
+            self._overrides.clear()
+        elif mode is ControlMode.MANUAL:
+            for ch in self._base_cfg.channels:
+                self._overrides.setdefault(ch, self._seed_pwm(ch))
+        self._control_mode = mode
+
+    def _set_pwm(self, channel: str, pwm: float) -> None:
+        cfg = self._base_cfg
+        if channel not in cfg.channels:
+            raise IntentInvalid(f"unknown channel {channel!r}; channels are {list(cfg.channels)}")
+        if not cfg.pwm_min <= pwm <= cfg.pwm_max:
+            raise IntentInvalid(f"pwm {pwm} outside [pwm_min={cfg.pwm_min}, pwm_max={cfg.pwm_max}]")
+        if self._control_mode is ControlMode.AUTO:
+            raise IntentConflict("raw PWM is rejected while mode is auto; POST /api/mode first")
+        self._overrides[channel] = float(pwm)
+        self._released.discard(channel)
+
+    def _set_setpoint(self, temp: str, celsius: float) -> None:
+        cfg = self._base_cfg
+        if temp not in cfg.temps:
+            raise IntentInvalid(f"unknown temperature {temp!r}; temps are {list(cfg.temps)}")
+        if temp not in cfg.setpoints:
+            raise IntentInvalid(
+                f"temperature {temp!r} has no setpoint in the config and cannot be regulated"
+            )
+        candidate = dict(self._setpoints)
+        candidate[temp] = float(celsius)
+        self._effective = self._validated(candidate, self._preset)
+        self._setpoints = candidate
+
+    def _set_preset(self, name: Preset) -> None:
+        preset = Preset(name)
+        self._effective = self._validated(self._setpoints, preset)
+        self._preset = preset
+
+    def _validated(self, setpoints: Mapping[str, float], preset: Preset) -> MpcConfig:
+        try:
+            return apply_preset(self._base_cfg, setpoints, preset)
+        except ConfigError as exc:
+            raise IntentInvalid(f"rejected: {exc}") from exc
+
+    def _clear_override(self, channel: str | None) -> None:
+        if channel is None:
+            self._released.update(self._overrides)
+            self._overrides.clear()
+        else:
+            if channel not in self._base_cfg.channels:
+                raise IntentInvalid(f"unknown channel {channel!r}")
+            if self._overrides.pop(channel, None) is not None:
+                self._released.add(channel)
+        if not self._overrides:
+            self._control_mode = ControlMode.AUTO
+        elif self._control_mode is ControlMode.MANUAL:
+            self._control_mode = ControlMode.MIXED
+
+    # -- loop side --------------------------------------------------------
+
+    def plan_tick(self) -> TickPlan:
+        """Atomic view for one tick; consumes the pending ``released`` set."""
+        with self._lock:
+            released = frozenset(self._released)
+            self._released.clear()
+            return TickPlan(
+                cfg=self._effective,
+                control_mode=self._control_mode,
+                overrides=dict(self._overrides),
+                released=released,
+                preset=self._preset,
+            )
+
+    def compose(
+        self,
+        mpc_cmd: MpcCommand,
+        plan: TickPlan,
+        prev_pwm: Mapping[str, float],
+    ) -> MpcCommand:
+        """Final command for the sink (module docstring, *compose*).
+
+        ``prev_pwm`` is what the last applied command put on the fans (the
+        loop resolves it exactly as ``step`` does for its own rate limit).
+        Pure: depends only on its arguments.
+        """
+        cfg = plan.cfg
+        supervisor_diag: dict[str, Any] = {
+            "control_mode": plan.control_mode.value,
+            "preset": plan.preset.value,
+            "overrides": dict(plan.overrides),
+            "overrides_applied": False,
+        }
+        diagnostics = dict(mpc_cmd.diagnostics)
+        if mpc_cmd.mode is Mode.FALLBACK or not plan.overrides:
+            # Fallback wins over manual: the controller is blind and must not
+            # let a human-pinned low duty reduce cooling. No override -> solver.
+            diagnostics["supervisor"] = supervisor_diag
+            return MpcCommand(pwm=dict(mpc_cmd.pwm), mode=mpc_cmd.mode, diagnostics=diagnostics)
+
+        pwm: dict[str, float] = {}
+        limited: dict[str, bool] = {}
+        for ch in cfg.channels:
+            if ch in plan.overrides:
+                want = float(plan.overrides[ch])
+                prev = float(prev_pwm[ch])
+                moved = _clamp(want, prev - cfg.d_pwm_max, prev + cfg.d_pwm_max)
+                limited[ch] = abs(moved - want) > _EPS
+                pwm[ch] = _clamp(moved, cfg.pwm_min, cfg.pwm_max)
+            else:
+                pwm[ch] = float(mpc_cmd.pwm[ch])
+        supervisor_diag["overrides_applied"] = True
+        supervisor_diag["override_rate_limited"] = limited
+        diagnostics["supervisor"] = supervisor_diag
+        return MpcCommand(pwm=pwm, mode=mpc_cmd.mode, diagnostics=diagnostics)
+
+    def record_tick(
+        self,
+        *,
+        obs: PlantObservation | None,
+        mpc_cmd: MpcCommand | None,
+        cmd: MpcCommand | None,
+        state: MpcState | None,
+        applied: bool,
+        usb_present: bool,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
+        """The loop reports what happened this tick (for ``snapshot``)."""
+        with self._lock:
+            if obs is not None:
+                self._obs = obs
+            if mpc_cmd is not None:
+                self._mpc_cmd = mpc_cmd
+            if cmd is not None:
+                self._last_cmd = cmd
+                if applied:
+                    self._applied_pwm = dict(cmd.pwm)
+            if state is not None:
+                self._state = state
+            self._usb_present = bool(usb_present)
+            if extra:
+                self._extra.update(extra)
+
+    def set_mqtt_connected(self, connected: bool | None) -> None:
+        with self._lock:
+            self._mqtt_connected = connected
+
+    def set_usb_present(self, present: bool) -> None:
+        with self._lock:
+            self._usb_present = bool(present)

@@ -1,0 +1,41 @@
+[Unit]
+Description=aqua-bridge MPC fan controller (aquaero 6 XT + Quadro)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+# User= below is a placeholder; deploy/install-pi.sh substitutes the real
+# service account name at install time (site-specific names stay out of git).
+User=aqua
+# plugdev: the udev rule in deploy/99-aquacomputer.rules gives that group
+# write access to the aquaero's hwmon pwmK / pwmK_enable attributes (the
+# kernel creates them root:root 0644; without the rule every apply() fails
+# with EACCES and the unit loops on the start timeout). dialout: HID path.
+SupplementaryGroups=dialout plugdev
+# NotifyAccess=main + no shell wrapper: ExecStart= must be the venv
+# interpreter running -m aqua_bridge directly, so the main PID is the
+# process that calls sd_notify (see PROJECT.md §9).
+ExecStart=/opt/aqua-bridge/.venv/bin/python -m aqua_bridge --config /etc/aqua-bridge/config.yaml
+Restart=always
+WatchdogSec=30
+# READY=1 is sent after the first tick whose command reached the device, so
+# a device that is absent at boot (USB not yet enumerated, hwmon permissions
+# wrong) shows up as a start timeout followed by Restart=always -- the
+# visible "device absent" state. Long enough for a slow USB enumeration on
+# the Zero W, short enough that the journal shows the problem quickly.
+TimeoutStartSec=120
+# No ExecStop=: systemd would run it while the main process is still
+# alive (then send SIGTERM), giving two writers to hwmon at once. The
+# daemon's own SIGTERM handler writes fallback_pwm and exits; that is
+# the only stop path.
+#
+# Deploy side effect (accepted, PROJECT.md §9): `systemctl restart` is a
+# clean stop, so on every restart the fans jump to fallback_pwm (0.8 in
+# config.example.yaml) and then ramp back down at d_pwm_max per tick —
+# on the order of ten seconds with the example config. Do not mistake a
+# restart for a thermal event.
+
+[Install]
+WantedBy=multi-user.target

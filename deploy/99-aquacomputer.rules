@@ -1,0 +1,16 @@
+# Aqua Computer devices (USB VID 0c70): aquaero 6 XT (+ Quadro over aquabus).
+#
+# Raw USB / hidraw nodes -- the HID path (liquidctl, the USB spike, tests).
+SUBSYSTEM=="usb", ATTR{idVendor}=="0c70", MODE="0660", GROUP="plugdev"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c70", MODE="0660", GROUP="plugdev"
+#
+# hwmon path (aquacomputer_d5next driver) -- the path the daemon actually
+# writes (aqua_bridge.hw.xt6 -> /sys/class/hwmon/hwmonN/pwmK). The kernel
+# creates pwmK and pwmK_enable as root:root 0644, so the non-root service
+# user (SupplementaryGroups=plugdev in aqua-bridge.service) could not write
+# them and every apply() would fail with EACCES: no READY=1, start timeout,
+# restart loop, fans never controlled. Hand the pwm attributes to plugdev
+# with group write. tempK_input / fanK_input are world-readable already.
+# %p is the device path under /sys; the attributes exist when the add
+# event fires (they are created before the device is announced).
+ACTION=="add", SUBSYSTEM=="hwmon", ATTRS{idVendor}=="0c70", RUN+="/bin/sh -c 'for f in /sys%p/pwm*; do [ -e $f ] && chgrp plugdev $f && chmod g+w $f; done'"

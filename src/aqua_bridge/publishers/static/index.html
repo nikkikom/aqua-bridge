@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>aqua-bridge</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 0; padding: 12px 16px; background: #111; color: #ddd; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  section { border: 1px solid #333; border-radius: 6px; padding: 8px 12px; margin-bottom: 10px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: #999; margin: 0 0 6px; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 2px 4px; }
+  td.k { color: #999; }
+  td.v { text-align: right; font-variant-numeric: tabular-nums; }
+  #fault { display: none; background: #a33; color: #fff; padding: 8px 12px; border-radius: 6px; margin-bottom: 10px; font-weight: bold; }
+  #fault.show { display: block; }
+</style>
+</head>
+<body>
+<h1>aqua-bridge</h1>
+<div id="fault">FAULT</div>
+
+<section id="overview"><h2>Overview</h2><table></table></section>
+<section id="temps"><h2>Temps</h2><table></table></section>
+<section id="fans"><h2>Fans</h2><table></table></section>
+<section id="mpc"><h2>MPC</h2><table></table></section>
+<section id="host"><h2>Host</h2><table></table></section>
+
+<script>
+function row(k, v) {
+  return "<tr><td class=k>" + k + "</td><td class=v>" + v + "</td></tr>";
+}
+function fmt(v, digits) {
+  if (v === null || v === undefined) return "-";
+  if (typeof v === "number") return v.toFixed(digits === undefined ? 2 : digits);
+  return String(v);
+}
+function table(id, rows) {
+  document.querySelector("#" + id + " table").innerHTML = rows.join("");
+}
+
+async function poll() {
+  try {
+    const [stateRes, healthRes] = await Promise.all([
+      fetch("/api/state"), fetch("/api/health"),
+    ]);
+    const state = await stateRes.json();
+    const health = await healthRes.json();
+
+    document.getElementById("fault").className = health.solver === "fault" || health.solver === "fallback" ? "show" : "";
+
+    const obs = state.obs || {};
+    const cmd = state.cmd || {};
+
+    table("overview", [
+      row("Mode", fmt(state.mode)),
+      row("Preset", fmt(state.preset)),
+      row("Solver", fmt(health.solver)),
+      row("Fault reason", fmt(health.fault_reason)),
+      row("Uptime (s)", fmt(health.uptime_s, 0)),
+      row("Version", fmt(health.version)),
+    ]);
+
+    const tempRows = (state.temps || []).map(t =>
+      row(t + " (set " + fmt(state.setpoints[t]) + ")", fmt((obs.temps || {})[t]) + " C"));
+    table("temps", tempRows);
+
+    const fanRows = [];
+    for (const ch of (state.channels || [])) {
+      const override = ch in (state.overrides || {}) ? " (override)" : "";
+      fanRows.push(row(ch + " PWM" + override, fmt((cmd.pwm || {})[ch])));
+      fanRows.push(row(ch + " RPM", fmt((obs.rpm || {})[ch], 0)));
+    }
+    table("fans", fanRows);
+
+    table("mpc", [
+      row("PWM min/max", fmt(state.pwm_min) + " / " + fmt(state.pwm_max)),
+      row("Diagnostics", fmt(JSON.stringify(cmd.diagnostics || {}))),
+    ]);
+
+    const host = (state.extra || {}).host || {};
+    table("host", [
+      row("CPU temp", fmt(host.cpu_temp_c) + " C"),
+      row("Load (1m)", fmt(host.load1)),
+      row("RAM used", fmt(host.mem_used_pct, 0) + " %"),
+      row("Disk used", fmt(host.disk_used_pct, 0) + " %"),
+      row("Wi-Fi RSSI", fmt(host.wifi_rssi_dbm, 0) + " dBm"),
+      row("MQTT", fmt(health.mqtt_connected)),
+      row("USB", fmt(health.usb_present)),
+    ]);
+  } catch (e) {
+    document.getElementById("fault").className = "show";
+    document.getElementById("fault").textContent = "FAULT (UI: " + e + ")";
+  }
+}
+
+poll();
+setInterval(poll, 2000);
+</script>
+</body>
+</html>
