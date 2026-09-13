@@ -6,6 +6,6 @@ MPC fan controller on a Raspberry Pi for Aqua Computer aquaero 6 XT
 Spec, TODO, Pi packages, new-Pi checklist, GitHub/`gh` setup:
 **[PROJECT.md](PROJECT.md)**
 
-Development happens on the Mac Studio. The board is hardware and runtime only.
+Development happens on a desktop or laptop. The board is hardware and runtime only.
 
 Project language is English only (docs, comments, commit messages, issues).
