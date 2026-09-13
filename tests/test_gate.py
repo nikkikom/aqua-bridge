@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 import pytest
 
@@ -24,13 +24,17 @@ from aqua_bridge.control.gate import (
     REASON_SLEW,
     REASON_STUCK,
     GateResult,
+    advance_slow_windows,
     evaluate_gate,
     filtered_value,
     median3_of,
     push_window,
     sanitize_temps,
 )
-from aqua_bridge.model import MpcConfig, PlantObservation, WindowSample
+from aqua_bridge.control.mpc import step
+from aqua_bridge.control.solver_pi import SolverResult
+from aqua_bridge.model import Mode, MpcConfig, MpcState, PlantObservation, WindowSample
+from das_fixtures import das_cfg, das_mapping, das_obs, default_temps
 from invariants import assert_no_non_finite, make_obs
 
 SP = 35.0  # coolant setpoint in config.example.yaml
@@ -534,3 +538,311 @@ def test_gate_is_pure(gcfg):
     r2 = gate(gcfg, obs, last_raw=last_raw, window=window)
     assert r1 == r2
     assert before == (tuple(w.to_dict() for w in window), dict(last_raw), obs.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# zoned DAS: per-role Stuck sizing, zone/role-restricted evidence, decimation
+# (plan section 0.2)
+# ---------------------------------------------------------------------------
+
+
+class DasReplay:
+    """Replays samples through the gate the way ``mpc.step`` does with zones:
+    decimated windows advanced from the dense window before the gate, the
+    latch fed back, the dense window trimmed to ``cfg.window_ticks``."""
+
+    def __init__(self, cfg: MpcConfig) -> None:
+        self.cfg = cfg
+        self.window: tuple[WindowSample, ...] = ()
+        self.last_raw: dict[str, float | None] | None = None
+        self.last_good: PlantObservation | None = None
+        self.latch: dict[str, float] = {}
+        self.slow: dict[str, list] = {}
+        self.seq = 0
+        self.ts = 0.0
+
+    def tick(self, temps: Mapping[str, float | None], pwm: Mapping[str, float]) -> GateResult:
+        cfg = self.cfg
+        self.slow = advance_slow_windows(self.slow, self.window, self.seq, cfg)
+        obs = PlantObservation(
+            temps=dict(temps), rpm=dict.fromkeys(cfg.channels, 900.0), pwm=dict(pwm), ts=self.ts
+        )
+        r = evaluate_gate(
+            obs,
+            cfg,
+            last_good_obs=self.last_good,
+            last_raw_temps=self.last_raw,
+            window=self.window,
+            stuck_latch=self.latch,
+            slow_windows=self.slow,
+        )
+        if r.trusted:
+            self.last_good = dataclasses.replace(obs, temps=dict(r.filtered))
+        self.window = push_window(self.window, r.raw, dict(pwm), cfg.window_ticks)
+        self.last_raw = r.raw
+        self.latch = dict(r.stuck_latch)
+        self.seq += 1
+        self.ts += cfg.dt
+        return r
+
+
+def _das(**sensor_overrides: Mapping[str, object]) -> MpcConfig:
+    m = das_mapping()
+    for name, patch in sensor_overrides.items():
+        m["sensors"].setdefault(name, {}).update(patch)
+    return MpcConfig.from_mapping(m)
+
+
+def _q(value: float, lsb: float) -> float:
+    return round(value / lsb) * lsb
+
+
+def _base_temps() -> dict[str, float | None]:
+    return default_temps(das_cfg())
+
+
+def test_ds18b20_plateaus_next_to_a_drive_never_flag_stuck():
+    """A proximal DS18B20 (1/16 degC) follows a slow drive: minutes on one code at every
+    turning point while its zone's fans move hardest. The per-role window (1800 s) and
+    band (1.5 LSB) never call that Stuck; a 180 s window would."""
+    m = das_mapping()
+    m.update(dt=5.0, confirm_s=10.0, fallback_hold_s=20.0, stuck_s=10.0)
+    cfg = MpcConfig.from_mapping(m)
+    m["sensors"]["prox_a2"]["stuck_s"] = 180.0
+    short = MpcConfig.from_mapping(m)
+    assert cfg.stuck_params("prox_a2").decimate == 6
+    period = 1800.0
+
+    def sample(i: int) -> tuple[dict[str, float | None], dict[str, float]]:
+        w = 2.0 * math.pi * i * cfg.dt / period
+        dither = 0.03 * (-1) ** i  # thermistor noise on the zone-air sensors
+        temps: dict[str, float | None] = {
+            "inlet": 25.0,
+            "air_a": _q(35.0 + 0.3 * math.sin(w) + dither, 0.01),
+            "air_a2": _q(35.1 + 0.3 * math.sin(w) + dither, 0.01),
+            "air_b": 35.0,
+            "air_c": 35.0,
+            "prox_a1": _q(41.0 + 0.5 * math.sin(w + 1.0), 0.0625),
+            "prox_a1b": _q(41.2 + 0.5 * math.sin(w + 1.1), 0.0625),
+            "prox_a2": _q(40.0 + 0.5 * math.sin(w), 0.0625),
+            "prox_b1": 40.0,
+            "prox_c1": 30.0,
+            "exhaust": 38.0,
+        }
+        fan = 0.55 + 0.4 * math.cos(w)  # moves fastest where the sensor plateaus
+        return temps, {"fa1": fan, "fa2": fan, "fb1": 0.5, "fc1": 0.5}
+
+    longest_plateau = run = 0
+    last = None
+    replay, replay_short = DasReplay(cfg), DasReplay(short)
+    short_flags = 0
+    for i in range(1100):
+        temps, pwm = sample(i)
+        r = replay.tick(temps, pwm)
+        assert not any(r.stuck.values()), f"tick {i}: stuck {r.stuck}"
+        assert r.trusted, f"tick {i}: {r.reasons}"
+        short_flags += replay_short.tick(temps, pwm).stuck["prox_a2"]
+        run = run + 1 if temps["prox_a2"] == last else 1
+        last = temps["prox_a2"]
+        longest_plateau = max(longest_plateau, run)
+    assert longest_plateau * cfg.dt >= 150.0  # the scenario really has multi-minute plateaus
+    assert short_flags > 0  # and a 180 s window would have branded the sensor Stuck
+    # Decimated storage stays bounded: 60 samples per factor, dense window 36 ticks.
+    assert {k: len(v) for k, v in replay.slow.items()} == {"2": 60, "6": 60}
+    assert len(replay.window) == cfg.window_ticks == 36
+
+
+def _dense_das(**extra: Mapping[str, object]) -> MpcConfig:
+    """Small non-decimated windows (8 ticks at dt=1) on the sensors under test."""
+    overrides: dict[str, dict[str, object]] = {
+        name: {"stuck_s": 8.0, "stuck_decimate": 1}
+        for name in ("air_c", "prox_a2", "prox_a1", "inlet")
+    }
+    for name, patch in extra.items():
+        overrides.setdefault(name, {}).update(patch)
+    return _das(**overrides)
+
+
+def _history(
+    cfg: MpcConfig,
+    n: int,
+    temps_at: Callable[[int], dict[str, float | None]],
+    pwm_at: Callable[[int], dict[str, float]],
+) -> tuple[DasReplay, GateResult]:
+    replay = DasReplay(cfg)
+    r = None
+    for i in range(n):
+        r = replay.tick(temps_at(i), pwm_at(i))
+    assert r is not None
+    return replay, r
+
+
+def test_pwm_evidence_counts_only_the_sensors_zone_channels():
+    cfg = _dense_das()
+    n = cfg.stuck_params("air_c").ticks + 1
+
+    def others_move(i: int) -> dict[str, float]:
+        v = 0.2 + 0.07 * i
+        return {"fa1": v, "fa2": v, "fb1": v, "fc1": 0.5}
+
+    _, r = _history(cfg, n, lambda i: _base_temps(), others_move)
+    assert not r.stuck["air_c"]  # fans of za / zb moved, air_c's own fan did not
+
+    def own_moves(i: int) -> dict[str, float]:
+        return {"fa1": 0.5, "fa2": 0.5, "fb1": 0.5, "fc1": 0.2 + 0.07 * i}
+
+    _, r = _history(cfg, n, lambda i: _base_temps(), own_moves)
+    assert r.stuck["air_c"] and r.reasons["air_c"] == (REASON_STUCK,)
+    assert not r.stuck["prox_a2"]  # za's fans did not move
+
+
+def test_sibling_evidence_counts_only_same_zone_and_role():
+    cfg = _dense_das()
+    n = cfg.stuck_params("prox_a2").ticks + 1
+
+    def still(i: int) -> dict[str, float]:
+        return dict.fromkeys(cfg.channels, 0.5)
+
+    def moving(name: str) -> Callable[[int], dict[str, float | None]]:
+        def temps(i: int) -> dict[str, float | None]:
+            t = _base_temps()
+            t[name] = float(t[name]) + 0.2 * i  # net 1.6 degC > stuck_sibling_dT_c, no jump
+            return t
+
+        return temps
+
+    for other in ("air_a", "prox_b1"):  # other role / other zone: no evidence
+        _, r = _history(cfg, n, moving(other), still)
+        assert not r.stuck["prox_a2"], other
+    _, r = _history(cfg, n, moving("prox_a1"), still)  # same zone and role
+    assert r.stuck["prox_a2"]
+    assert not r.stuck["prox_a1"]
+
+
+def test_inlet_without_zone_gets_no_pwm_evidence_but_other_inlets_count():
+    cfg = _dense_das()
+    n = cfg.stuck_params("inlet").ticks + 1
+    assert cfg.stuck_params("inlet").channels == ()
+
+    def ramp(i: int) -> dict[str, float]:
+        return dict.fromkeys(cfg.channels, 0.2 + 0.07 * i)
+
+    _, r = _history(cfg, n, lambda i: _base_temps(), ramp)
+    assert not r.stuck["inlet"]
+
+    m = das_mapping()
+    m["temps"].append("inlet_b")
+    m["sensors"]["inlet"].update(stuck_s=8.0, stuck_decimate=1)
+    m["sensors"]["inlet_b"] = {"role": "inlet", "redundant": True}
+    cfg2 = MpcConfig.from_mapping(m)
+    assert cfg2.stuck_params("inlet").siblings == ("inlet_b",)
+
+    def inlet_b_warms(i: int) -> dict[str, float | None]:
+        t = _base_temps()
+        t["inlet_b"] = 25.0 + 0.2 * i
+        return t
+
+    _, r = _history(cfg2, n, inlet_b_warms, lambda i: dict.fromkeys(cfg2.channels, 0.5))
+    assert r.stuck["inlet"]
+
+
+def test_per_sensor_band_and_latch():
+    cfg = _dense_das(prox_a2={"stuck_eps_c": 0.2})
+    n = cfg.stuck_params("prox_a2").ticks + 1
+
+    def dither(i: int) -> dict[str, float | None]:
+        t = _base_temps()
+        t["prox_a2"] = 40.0 + 0.125 * (i % 2)  # two DS18B20 codes: inside a 0.2 band
+        return t
+
+    def ramp(i: int) -> dict[str, float]:
+        return {"fa1": 0.2 + 0.07 * i, "fa2": 0.5, "fb1": 0.5, "fc1": 0.5}
+
+    replay, r = _history(cfg, n, dither, ramp)
+    assert r.stuck["prox_a2"] and replay.latch["prox_a2"] == pytest.approx(40.0)
+    t = _base_temps()
+    t["prox_a2"] = 40.19  # still inside the sensor's own band: latched
+    assert replay.tick(t, ramp(n)).stuck["prox_a2"]
+    t["prox_a2"] = 40.3  # left the band (the global 0.02 band would have cleared long ago)
+    assert not replay.tick(t, ramp(n)).stuck["prox_a2"]
+
+
+def test_decimated_window_flags_a_truly_frozen_sensor_once_full():
+    cfg = _das(prox_a2={"stuck_s": 120.0, "stuck_decimate": 10})
+    p = cfg.stuck_params("prox_a2")
+    assert (p.ticks, p.decimate, p.samples) == (120, 10, 12)
+    replay = DasReplay(cfg)
+    first_flag = None
+    for i in range(200):
+        fan = min(1.0, 0.2 + 0.004 * i)
+        r = replay.tick(_base_temps(), {"fa1": fan, "fa2": fan, "fb1": 0.5, "fc1": 0.5})
+        # factor 10 is shared with the inlet (600 ticks / 60 samples): the longer keep wins
+        assert len(replay.slow["10"]) <= cfg.slow_window_samples[10] == 60
+        if r.stuck["prox_a2"] and first_flag is None:
+            first_flag = i
+    # Sample 10k enters the decimated window one tick after it was taken: the twelfth
+    # sample (tick 110) is there at tick 111.
+    assert first_flag == 111
+    assert r.stuck["prox_a2"]
+
+
+def test_advance_slow_windows_phase_and_purity(fast_cfg):
+    cfg = _das(prox_a2={"stuck_s": 40.0, "stuck_decimate": 4})
+    assert cfg.slow_window_samples[4] == 10
+    window: tuple[WindowSample, ...] = ()
+    slow: dict[str, list] = {}
+    for seq in range(12):
+        before = {k: list(v) for k, v in slow.items()}
+        nxt = advance_slow_windows(slow, window, seq, cfg)
+        assert slow == before  # never mutated
+        slow = nxt
+        raw = sanitize_temps({**_base_temps(), "prox_a2": 40.0 + seq}, cfg.temps)
+        window = push_window(window, raw, dict.fromkeys(cfg.channels, 0.1 * seq), cfg.window_ticks)
+    # Samples 0, 4 and 8 were taken (sample 8 at seq 9): values 40, 44, 48.
+    assert [s["t"]["prox_a2"] for s in slow["4"]] == [40.0, 44.0, 48.0]
+    assert [s["p"]["fa1"] for s in slow["4"]] == pytest.approx([0.0, 0.4, 0.8])
+    assert advance_slow_windows(slow, (), 0, cfg) == slow  # nothing due without a sample
+    assert advance_slow_windows(None, (), 0, fast_cfg) == {}  # legacy: no decimated windows
+
+
+def test_step_keeps_decimated_windows_bounded_and_drops_them_on_a_gap():
+    cfg = _das(prox_a2={"stuck_s": 40.0, "stuck_decimate": 4})
+    state = MpcState.cold()
+    for i in range(80):
+        _, state = step(das_obs(cfg, float(i)), cfg, state)
+    sizes = {int(k): len(v) for k, v in state.solver_memory["stuck_slow"].items()}
+    assert set(sizes) == set(cfg.slow_window_samples)
+    assert all(sizes[k] <= n for k, n in cfg.slow_window_samples.items())
+    assert sizes[4] == 10
+    assert state.solver_memory["stuck_seq"] == 80
+    json.dumps(state.to_dict(), allow_nan=False)
+    _, gapped = step(das_obs(cfg, 200.0), cfg, state)  # gap: history dropped
+    assert gapped.solver_memory["stuck_seq"] == 1
+    assert all(v == [] for v in gapped.solver_memory["stuck_slow"].values())
+
+
+def test_stuck_proximal_sensor_faults_only_its_zone_through_step():
+    cfg = _das(prox_a2={"stuck_s": 30.0, "stuck_decimate": 3})
+
+    class Ramp:
+        name = "pi"
+
+        def initialise(self, cfg, req):
+            return {ch: 0.0 for ch in cfg.channels if ch not in req.fixed_channels}, {}
+
+        def solve(self, cfg, req):
+            pwm = {ch: min(1.0, req.prev_pwm[ch] + 0.02) for ch in cfg.channels}
+            pwm.update(req.fixed_channels)
+            integrator = {ch: 0.0 for ch in cfg.channels if ch not in req.fixed_channels}
+            return SolverResult(pwm=pwm, integrator=integrator)
+
+    state = MpcState.cold()
+    cmd = None
+    for i in range(80):
+        cmd, state = step(das_obs(cfg, float(i), pwm=0.3), cfg, state, solver=Ramp())
+        if cmd.mode is Mode.DEGRADED:
+            break
+    assert cmd is not None and cmd.mode is Mode.DEGRADED
+    assert cmd.diagnostics["zones_in_fault"] == ["za"]
+    assert cmd.diagnostics["gate"]["reasons"]["prox_a2"] == [REASON_STUCK]
+    assert "bay:a2:prox_a2=stuck" in cmd.diagnostics["zones"]["za"]["reasons"]
