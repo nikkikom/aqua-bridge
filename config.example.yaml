@@ -58,6 +58,17 @@ mpc:
   channels:
     - radiator
     - intake
+  # Zoned DAS layout (plan "zoned DAS thermal control"). All absent/empty = legacy
+  # mode: one implicit zone with every channel and temperature, exactly the
+  # behaviour described above. topology switches DAS mode on and then needs
+  # sensors (keys exactly temps), fans (keys exactly channels) and fan_models;
+  # the other DAS sections are rejected without topology.
+  topology: null         # {zones: {<z>: {channels, coupled_to, inlet}}, bays: {<b>: {zone, class, occupied, serial}}, default_class}
+  sensors: {}            # <temp>: {role: inlet|zone_air|drive_proximal|exhaust, zone, bay, quant_c, stuck_s, stuck_eps_c, stuck_decimate, redundant, tau_s}
+  drive_classes: {}      # <class>: {limit_c, comfort_c, tau_d_s, models}; empty = hdd 50/5, ssd_sata 65/10, nvme 70/10
+  fans: {}               # <channel>: {model, count, group, noise_weight, forbidden_pwm: [[lo, hi]]}
+  fan_models: {}         # <model>: {rpm_max, deadband, exponent, noise_db_at_max}
+  zones: null            # {trust_rule: strict|sigma, fault_coupling: declared|none}
 
 xt6:
   prefer: hwmon

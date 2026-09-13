@@ -24,28 +24,86 @@ Design notes
   cannot exist, so ``step`` never sees one. ``validate()`` is public and
   idempotent so tests can call it explicitly.
 * ``to_dict`` / ``from_dict`` round-trip through plain JSON types.
+
+DAS layout (zoned enclosure)
+----------------------------
+``MpcConfig`` optionally carries the zoned DAS description: ``topology``
+(zones, bays, default drive class), ``sensors`` (placement role, zone, bay,
+quantisation and the per-sensor Stuck parameters), ``drive_classes``,
+``fans`` and ``fan_models`` (parsed and validated now, consumed by later
+solvers) and ``zones`` (the zone trust policy). Every one of them defaults
+to "absent" and a config without ``topology`` is *legacy mode*: one implicit
+zone that contains every channel and every temperature, behaving bit for
+bit as before. The sections other than ``topology`` are rejected without
+it, so a half-declared layout can never silently run in legacy mode.
+
+Rules that go beyond the plan's section 7 table, each the conservative
+choice for cooling:
+
+* ``coupled_to`` must be declared symmetrically (``z0: [z1]`` needs
+  ``z1: [z0]``); the fault closure uses the declared relation only.
+* ``drive_classes`` absent means the built-in ``hdd`` / ``ssd_sata`` /
+  ``nvme`` classes; present means exactly the classes given, each with
+  ``limit_c``, ``comfort_c`` and ``tau_d_s``. ``topology.default_class``
+  absent means the strictest class (lowest ``limit_c``, then lowest
+  ``limit_c - comfort_c``, then name).
+* ``sensors.<name>.quant_c`` defaults to 0.0625 (DS18B20 at 12 bit, the
+  common case): the wider the Stuck band, the more readily a frozen sensor
+  is flagged, which faults its zone and raises cooling.
+* A group (the zone-air sensors of a zone, the proximal sensors of a bay,
+  the inlet sensors) needs at least one member that is not
+  ``redundant: true``; ``redundant`` marks the backups of a group.
+* With ``topology`` a setpoint may only sit on a zoned sensor
+  (``zone_air`` / ``drive_proximal``), ``channel_temps`` must be absent and a
+  channel controls the setpoint temperatures of the zones that list it.
+  When ``setpoints`` is not empty every channel must control at least one.
+  An empty ``setpoints`` is accepted (the DAS solvers of later milestones
+  regulate on drive limits); until those exist the ``pi`` / ``mpc``
+  solvers cannot compute a demand without a setpoint, raise, and every
+  zone stays in fallback (high cooling), visible as ``solver_error``.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 import numbers
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from typing import Any
 
 __all__ = [
+    "BUILTIN_DRIVE_CLASSES",
+    "DAS_SECTIONS",
+    "FAULT_COUPLINGS",
+    "IMPLICIT_ZONE",
+    "ROLE_STUCK_S",
+    "SENSOR_ROLES",
+    "STUCK_WINDOW_SAMPLES",
+    "TRUST_RULES",
+    "BaySpec",
     "ConfigError",
+    "DriveClass",
+    "FanModel",
+    "FanSpec",
     "FaultReason",
     "Mode",
     "MpcCommand",
     "MpcConfig",
     "MpcState",
     "PlantObservation",
+    "SensorSpec",
     "SolverKind",
+    "StuckParams",
+    "Topology",
     "WindowSample",
+    "ZoneFault",
+    "ZoneLayout",
+    "ZonePolicy",
+    "ZoneSpec",
     "is_finite_number",
 ]
 
@@ -56,11 +114,18 @@ __all__ = [
 
 
 class Mode(StrEnum):
-    """Command mode. ``fallback`` for the whole time a fault cause is active."""
+    """Command mode.
+
+    ``fallback`` while every zone is in fault (legacy mode: the one implicit
+    zone, i.e. the whole time a fault cause is active); ``degraded`` while
+    some but not all zones are in fault (only possible with a
+    ``topology``); otherwise ``saturated`` or ``auto``.
+    """
 
     AUTO = "auto"
     SATURATED = "saturated"
     FALLBACK = "fallback"
+    DEGRADED = "degraded"
 
 
 class FaultReason(StrEnum):
@@ -143,6 +208,24 @@ def _opt_float_map(name: str, value: object) -> dict[str, float | None] | None:
 # ---------------------------------------------------------------------------
 
 
+def _json_inputs(value: object) -> dict[str, Any]:
+    """Validate ``PlantObservation.inputs``: a str-keyed mapping of finite JSON.
+
+    Returns an independent deep copy (a JSON round trip), so the frozen
+    observation cannot be changed through the caller's dict.
+    """
+    if not isinstance(value, Mapping):
+        raise TypeError(f"inputs must be a mapping, got {type(value).__name__}")
+    for key in value:
+        if not isinstance(key, str):
+            raise TypeError(f"inputs key must be str, got {type(key).__name__}: {key!r}")
+    try:
+        text = json.dumps(dict(value), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"inputs must be finite JSON: {exc}") from exc
+    return json.loads(text)
+
+
 @dataclass(frozen=True)
 class PlantObservation:
     """One raw sample from the plant.
@@ -150,12 +233,20 @@ class PlantObservation:
     ``temps``/``rpm``/``pwm`` use *logical* names (``coolant``, ``radiator``,
     ...). Values may be ``None`` or NaN; structure must be sound.
     ``ts`` is monotonic cycle seconds (not wall clock) and must be finite.
+
+    ``inputs`` carries exogenous, non-gated data by source name (for example
+    ``inputs["smart"]`` from the PC's SMART agent in a later milestone). It
+    must be a str-keyed mapping of finite JSON; it never enters the sensor
+    gate and never faults anything. It defaults to empty and is omitted from
+    :meth:`to_dict` while empty, so an observation without inputs serialises
+    exactly as before.
     """
 
     temps: dict[str, float | None]
     rpm: dict[str, float | None]
     pwm: dict[str, float | None]
     ts: float
+    inputs: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "temps", _channel_values("temps", self.temps))
@@ -167,14 +258,18 @@ class PlantObservation:
         if not math.isfinite(ts):
             raise ValueError(f"ts must be finite, got {ts!r}")
         object.__setattr__(self, "ts", ts)
+        object.__setattr__(self, "inputs", _json_inputs(self.inputs))
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "temps": dict(self.temps),
             "rpm": dict(self.rpm),
             "pwm": dict(self.pwm),
             "ts": self.ts,
         }
+        if self.inputs:
+            out["inputs"] = json.loads(json.dumps(self.inputs))
+        return out
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> PlantObservation:
@@ -187,6 +282,7 @@ class PlantObservation:
             rpm=data.get("rpm", {}),
             pwm=data.get("pwm", {}),
             ts=data["ts"],
+            inputs=data.get("inputs", {}),
         )
 
 
@@ -270,6 +366,62 @@ class WindowSample:
 
 
 @dataclass(frozen=True)
+class ZoneFault:
+    """Fault bookkeeping of one zone (``MpcState.zone_faults``).
+
+    * ``since_ts`` -- first ``ts`` at which a fault cause of this zone became active,
+      ``None`` while the zone is not in fault
+    * ``reason``   -- which cause; set exactly when ``since_ts`` is set
+    * ``streak``   -- consecutive ticks on which the zone was trusted
+    * ``ticks``    -- consecutive ticks the zone has been in fault (0 when not)
+    """
+
+    since_ts: float | None = None
+    reason: FaultReason | None = None
+    streak: int = 0
+    ticks: int = 0
+
+    def __post_init__(self) -> None:
+        if self.since_ts is not None:
+            if not _is_real(self.since_ts) or not math.isfinite(float(self.since_ts)):
+                raise TypeError("ZoneFault.since_ts must be a finite number or None")
+            object.__setattr__(self, "since_ts", float(self.since_ts))
+        if self.reason is not None:
+            object.__setattr__(self, "reason", FaultReason(self.reason))
+        if (self.since_ts is None) != (self.reason is None):
+            raise ValueError("ZoneFault.since_ts and ZoneFault.reason must be set together")
+        for name in ("streak", "ticks"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"ZoneFault.{name} must be an int")
+            if value < 0:
+                raise ValueError(f"ZoneFault.{name} must be >= 0")
+
+    @property
+    def in_fault(self) -> bool:
+        return self.since_ts is not None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "since_ts": self.since_ts,
+            "reason": None if self.reason is None else self.reason.value,
+            "streak": self.streak,
+            "ticks": self.ticks,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ZoneFault:
+        if not isinstance(data, Mapping):
+            raise TypeError(f"ZoneFault.from_dict expects a mapping, got {type(data).__name__}")
+        return cls(
+            since_ts=data.get("since_ts"),
+            reason=data.get("reason"),
+            streak=data.get("streak", 0),
+            ticks=data.get("ticks", 0),
+        )
+
+
+@dataclass(frozen=True)
 class MpcState:
     """Everything ``step`` remembers between ticks. Immutable; ``step`` returns a new one.
 
@@ -284,6 +436,11 @@ class MpcState:
     * ``trusted_streak`` -- consecutive trusted observations; any untrusted tick resets to 0
     * ``integrator``     -- PI / MPC integral term per channel (bumpless transfer rules apply)
     * ``solver_memory``  -- generic slot for any other solver memory; must stay JSON-serialisable
+    * ``zone_faults``    -- per-zone fault bookkeeping (:class:`ZoneFault`), one entry per
+      ``topology`` zone; empty in legacy mode. With zones, ``fault_since_ts`` /
+      ``fault_reason`` / ``trusted_streak`` are the aggregates: the earliest zone
+      fault and its reason, and the smallest zone streak. ``to_dict`` omits the key
+      while it is empty, so a legacy state serialises exactly as before.
     """
 
     last_cmd: MpcCommand | None = None
@@ -295,6 +452,7 @@ class MpcState:
     trusted_streak: int = 0
     integrator: dict[str, float] = field(default_factory=dict)
     solver_memory: dict[str, Any] = field(default_factory=dict)
+    zone_faults: dict[str, ZoneFault] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.last_cmd is not None and not isinstance(self.last_cmd, MpcCommand):
@@ -326,6 +484,16 @@ class MpcState:
             if not isinstance(key, str):
                 raise TypeError("solver_memory keys must be str")
         object.__setattr__(self, "solver_memory", dict(self.solver_memory))
+        if not isinstance(self.zone_faults, Mapping):
+            raise TypeError("zone_faults must be a mapping zone -> ZoneFault")
+        zone_faults: dict[str, ZoneFault] = {}
+        for key, value in self.zone_faults.items():
+            if not isinstance(key, str) or not key:
+                raise TypeError("zone_faults keys must be non-empty str")
+            if not isinstance(value, ZoneFault):
+                raise TypeError("zone_faults values must be ZoneFault")
+            zone_faults[key] = value
+        object.__setattr__(self, "zone_faults", zone_faults)
 
     @classmethod
     def cold(cls) -> MpcState:
@@ -337,7 +505,7 @@ class MpcState:
         return self.fault_since_ts is not None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "last_cmd": None if self.last_cmd is None else self.last_cmd.to_dict(),
             "last_good_obs": None if self.last_good_obs is None else self.last_good_obs.to_dict(),
             "last_raw_temps": None if self.last_raw_temps is None else dict(self.last_raw_temps),
@@ -348,6 +516,9 @@ class MpcState:
             "integrator": dict(self.integrator),
             "solver_memory": dict(self.solver_memory),
         }
+        if self.zone_faults:
+            out["zone_faults"] = {z: f.to_dict() for z, f in self.zone_faults.items()}
+        return out
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> MpcState:
@@ -367,6 +538,9 @@ class MpcState:
             trusted_streak=data.get("trusted_streak", 0),
             integrator=data.get("integrator", {}),
             solver_memory=data.get("solver_memory", {}),
+            zone_faults={
+                str(z): ZoneFault.from_dict(f) for z, f in (data.get("zone_faults") or {}).items()
+            },
         )
 
 
@@ -413,6 +587,560 @@ def _cfg_float_map(name: str, value: object) -> dict[str, float]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# DAS layout sections (topology, sensors, drive classes, fans, zone policy)
+# ---------------------------------------------------------------------------
+
+#: ``MpcConfig`` fields that describe the zoned DAS; all absent = legacy mode.
+DAS_SECTIONS: tuple[str, ...] = (
+    "topology",
+    "sensors",
+    "drive_classes",
+    "fans",
+    "fan_models",
+    "zones",
+)
+
+#: Name of the single zone that stands for the whole config in legacy mode.
+IMPLICIT_ZONE = "all"
+
+#: Placement roles of ``sensors.<name>.role``.
+SENSOR_ROLES: tuple[str, ...] = ("inlet", "zone_air", "drive_proximal", "exhaust")
+
+#: Default Stuck window per role, seconds (plan section 0.2).
+ROLE_STUCK_S: dict[str, float] = {
+    "drive_proximal": 1800.0,
+    "zone_air": 180.0,
+    "inlet": 600.0,
+    "exhaust": 600.0,
+}
+
+#: Default ``quant_c`` (DS18B20 at 12 bit) and the default Stuck band factor on it.
+DEFAULT_QUANT_C = 0.0625
+STUCK_EPS_QUANT_FACTOR = 1.5
+
+#: Automatic ``stuck_decimate`` keeps about this many stored samples per window.
+STUCK_WINDOW_SAMPLES = 60
+
+#: ``zones.trust_rule`` and ``zones.fault_coupling`` values.
+TRUST_RULES: tuple[str, ...] = ("strict", "sigma")
+FAULT_COUPLINGS: tuple[str, ...] = ("declared", "none")
+
+_MIX = "mix"
+
+
+def _section_keys(
+    path: str, data: object, *, required: Iterable[str] = (), optional: Iterable[str] = ()
+) -> dict[str, Any]:
+    """A nested config mapping with only known keys and every required key present."""
+    if not isinstance(data, Mapping):
+        raise ConfigError(f"mpc.{path} must be a mapping, got {type(data).__name__}")
+    required = tuple(required)
+    known = set(required) | set(optional)
+    for key in data:
+        if not isinstance(key, str):
+            raise ConfigError(f"mpc.{path} keys must be strings, got {key!r}")
+    unknown = sorted(set(data) - known)
+    if unknown:
+        raise ConfigError(f"unknown mpc.{path} keys: {unknown}")
+    missing = [key for key in required if key not in data]
+    if missing:
+        raise ConfigError(f"missing mpc.{path} keys: {missing}")
+    return dict(data)
+
+
+def _named_map(path: str, data: object) -> dict[str, Any]:
+    """``name -> entry`` mapping with non-empty string names (``None`` -> empty)."""
+    if data is None:
+        return {}
+    if not isinstance(data, Mapping):
+        raise ConfigError(f"mpc.{path} must be a mapping name -> entry, got {type(data).__name__}")
+    for key in data:
+        if not isinstance(key, str) or not key:
+            raise ConfigError(f"mpc.{path} names must be non-empty strings, got {key!r}")
+    return dict(data)
+
+
+def _req_str(path: str, value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"mpc.{path} must be a non-empty string, got {value!r}")
+    return value
+
+
+def _opt_str(path: str, value: object) -> str | None:
+    return None if value is None else _req_str(path, value)
+
+
+def _cfg_bool(path: str, value: object) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError(f"mpc.{path} must be a bool (true/false), got {value!r}")
+    return value
+
+
+def _choice(path: str, value: object, choices: tuple[str, ...]) -> str:
+    if not isinstance(value, str) or value not in choices:
+        raise ConfigError(f"mpc.{path} must be one of {list(choices)}, got {value!r}")
+    return value
+
+
+def _cfg_list(path: str, value: object) -> tuple[Any, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str | bytes | Mapping) or not isinstance(value, Iterable):
+        raise ConfigError(f"mpc.{path} must be a list, got {type(value).__name__}")
+    return tuple(value)
+
+
+@dataclass(frozen=True)
+class ZoneSpec:
+    """``topology.zones.<zone>``: the channels that move air through it and its neighbours.
+
+    ``channels`` lists every channel whose fans move air through the zone (a
+    channel that touches several zones is listed in each). ``coupled_to``
+    names the zones it exchanges air with (declared symmetrically); ``inlet``
+    is the sensor of role ``inlet`` that feeds it, or ``mix`` (every inlet
+    sensor, the default).
+    """
+
+    channels: tuple[str, ...]
+    coupled_to: tuple[str, ...] = ()
+    inlet: str = _MIX
+
+    @classmethod
+    def coerce(cls, path: str, data: object) -> ZoneSpec:
+        if isinstance(data, ZoneSpec):
+            return data
+        raw = _section_keys(path, data, required=("channels",), optional=("coupled_to", "inlet"))
+        return cls(
+            channels=_cfg_names(f"{path}.channels", raw["channels"]),
+            coupled_to=_cfg_names(f"{path}.coupled_to", raw.get("coupled_to") or ()),
+            inlet=_req_str(f"{path}.inlet", raw.get("inlet", _MIX)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "channels": list(self.channels),
+            "coupled_to": list(self.coupled_to),
+            "inlet": self.inlet,
+        }
+
+
+@dataclass(frozen=True)
+class BaySpec:
+    """``topology.bays.<bay>``: a drive slot. The YAML key ``class`` is ``drive_class`` here.
+
+    ``occupied`` is ``true``, ``false`` or ``"auto"`` (unknown until an estimator
+    decides; an unknown bay is treated like an occupied one: conservative).
+    """
+
+    zone: str
+    drive_class: str | None = None
+    occupied: bool | str = "auto"
+    serial: str | None = None
+
+    @classmethod
+    def coerce(cls, path: str, data: object) -> BaySpec:
+        if isinstance(data, BaySpec):
+            return data
+        raw = _section_keys(
+            path, data, required=("zone",), optional=("class", "occupied", "serial")
+        )
+        occupied = raw.get("occupied", "auto")
+        if not (isinstance(occupied, bool) or occupied == "auto"):
+            raise ConfigError(f"mpc.{path}.occupied must be true, false or auto, got {occupied!r}")
+        return cls(
+            zone=_req_str(f"{path}.zone", raw["zone"]),
+            drive_class=_opt_str(f"{path}.class", raw.get("class")),
+            occupied=occupied,
+            serial=_opt_str(f"{path}.serial", raw.get("serial")),
+        )
+
+    @property
+    def constrained(self) -> bool:
+        """Occupied or unknown: the drive carries constraints, its proximal sensors are required."""
+        return self.occupied is not False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "zone": self.zone,
+            "class": self.drive_class,
+            "occupied": self.occupied,
+            "serial": self.serial,
+        }
+
+
+@dataclass(frozen=True)
+class Topology:
+    """``topology``: zones, bays and the class of a bay that declares none."""
+
+    zones: dict[str, ZoneSpec]
+    bays: dict[str, BaySpec] = field(default_factory=dict)
+    default_class: str | None = None
+
+    @classmethod
+    def coerce(cls, data: object) -> Topology:
+        if isinstance(data, Topology):
+            return data
+        raw = _section_keys(
+            "topology", data, required=("zones",), optional=("bays", "default_class")
+        )
+        zones = {
+            name: ZoneSpec.coerce(f"topology.zones.{name}", entry)
+            for name, entry in _named_map("topology.zones", raw["zones"]).items()
+        }
+        bays = {
+            name: BaySpec.coerce(f"topology.bays.{name}", entry)
+            for name, entry in _named_map("topology.bays", raw.get("bays")).items()
+        }
+        return cls(
+            zones=zones,
+            bays=bays,
+            default_class=_opt_str("topology.default_class", raw.get("default_class")),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "zones": {name: z.to_dict() for name, z in self.zones.items()},
+            "bays": {name: b.to_dict() for name, b in self.bays.items()},
+            "default_class": self.default_class,
+        }
+
+
+@dataclass(frozen=True)
+class DriveClass:
+    """``drive_classes.<class>``: absolute limit, comfort band, thermal time constant.
+
+    ``models`` are regular expressions matched against a SMART model string
+    (used by a later milestone); they are compiled here so a typo is a config error.
+    """
+
+    limit_c: float
+    comfort_c: float
+    tau_d_s: float
+    models: tuple[str, ...] = ()
+
+    @classmethod
+    def coerce(cls, path: str, data: object) -> DriveClass:
+        if isinstance(data, DriveClass):
+            return data
+        raw = _section_keys(
+            path, data, required=("limit_c", "comfort_c", "tau_d_s"), optional=("models",)
+        )
+        models = _cfg_list(f"{path}.models", raw.get("models"))
+        for pattern in models:
+            if not isinstance(pattern, str):
+                raise ConfigError(f"mpc.{path}.models entries must be strings, got {pattern!r}")
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ConfigError(f"mpc.{path}.models: invalid regex {pattern!r}: {exc}") from exc
+        return cls(
+            limit_c=_cfg_num(f"{path}.limit_c", raw["limit_c"]),
+            comfort_c=_cfg_num(f"{path}.comfort_c", raw["comfort_c"]),
+            tau_d_s=_cfg_num(f"{path}.tau_d_s", raw["tau_d_s"]),
+            models=models,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "limit_c": self.limit_c,
+            "comfort_c": self.comfort_c,
+            "tau_d_s": self.tau_d_s,
+            "models": list(self.models),
+        }
+
+
+#: Built-in drive classes (owner decision: HDD 50 / SATA SSD 65 / NVMe 70 degC,
+#: comfort 5 / 10 / 10 degC), used when ``drive_classes`` is absent.
+BUILTIN_DRIVE_CLASSES: dict[str, DriveClass] = {
+    "hdd": DriveClass(limit_c=50.0, comfort_c=5.0, tau_d_s=720.0),
+    "ssd_sata": DriveClass(limit_c=65.0, comfort_c=10.0, tau_d_s=200.0),
+    "nvme": DriveClass(limit_c=70.0, comfort_c=10.0, tau_d_s=120.0),
+}
+
+
+@dataclass(frozen=True)
+class SensorSpec:
+    """``sensors.<name>``: where a temperature sensor sits and how its Stuck rule is sized.
+
+    ``stuck_s`` defaults per role (:data:`ROLE_STUCK_S`), ``stuck_eps_c`` to
+    ``1.5 * quant_c``; both are resolved at construction so ``to_dict`` shows
+    the values in force. ``stuck_decimate`` ``None`` means automatic (see
+    :meth:`MpcConfig.stuck_params`). ``tau_s`` is parsed for the estimator of
+    a later milestone.
+    """
+
+    role: str
+    zone: str | None = None
+    bay: str | None = None
+    quant_c: float = DEFAULT_QUANT_C
+    stuck_s: float | None = None
+    stuck_eps_c: float | None = None
+    stuck_decimate: int | None = None
+    redundant: bool = False
+    tau_s: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.role in ROLE_STUCK_S and self.stuck_s is None:
+            object.__setattr__(self, "stuck_s", ROLE_STUCK_S[self.role])
+        if self.stuck_eps_c is None and _is_real(self.quant_c):
+            object.__setattr__(self, "stuck_eps_c", STUCK_EPS_QUANT_FACTOR * float(self.quant_c))
+
+    @classmethod
+    def coerce(cls, path: str, data: object) -> SensorSpec:
+        if isinstance(data, SensorSpec):
+            return data
+        raw = _section_keys(
+            path,
+            data,
+            required=("role",),
+            optional=(
+                "zone",
+                "bay",
+                "quant_c",
+                "stuck_s",
+                "stuck_eps_c",
+                "stuck_decimate",
+                "redundant",
+                "tau_s",
+            ),
+        )
+        stuck_s = raw.get("stuck_s")
+        stuck_eps = raw.get("stuck_eps_c")
+        decimate = raw.get("stuck_decimate")
+        tau = raw.get("tau_s")
+        return cls(
+            role=_choice(f"{path}.role", raw["role"], SENSOR_ROLES),
+            zone=_opt_str(f"{path}.zone", raw.get("zone")),
+            bay=_opt_str(f"{path}.bay", raw.get("bay")),
+            quant_c=_cfg_num(f"{path}.quant_c", raw.get("quant_c", DEFAULT_QUANT_C)),
+            stuck_s=None if stuck_s is None else _cfg_num(f"{path}.stuck_s", stuck_s),
+            stuck_eps_c=None if stuck_eps is None else _cfg_num(f"{path}.stuck_eps_c", stuck_eps),
+            stuck_decimate=(
+                None if decimate is None else _cfg_int(f"{path}.stuck_decimate", decimate)
+            ),
+            redundant=_cfg_bool(f"{path}.redundant", raw.get("redundant", False)),
+            tau_s=None if tau is None else _cfg_num(f"{path}.tau_s", tau),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "role": self.role,
+            "zone": self.zone,
+            "bay": self.bay,
+            "quant_c": self.quant_c,
+            "stuck_s": self.stuck_s,
+            "stuck_eps_c": self.stuck_eps_c,
+            "stuck_decimate": self.stuck_decimate,
+            "redundant": self.redundant,
+            "tau_s": self.tau_s,
+        }
+
+
+@dataclass(frozen=True)
+class FanSpec:
+    """``fans.<channel>``: what hangs on one PWM output (1-2 fans on one tach is typical).
+
+    ``group`` names the air path the channel shares with other channels
+    (``None``: its own). ``forbidden_pwm`` is parsed and validated only; the
+    solver that honours it is a later milestone.
+    """
+
+    model: str
+    count: int = 1
+    group: str | None = None
+    noise_weight: float = 1.0
+    forbidden_pwm: tuple[tuple[float, float], ...] = ()
+
+    @classmethod
+    def coerce(cls, path: str, data: object) -> FanSpec:
+        if isinstance(data, FanSpec):
+            return data
+        raw = _section_keys(
+            path,
+            data,
+            required=("model",),
+            optional=("count", "group", "noise_weight", "forbidden_pwm"),
+        )
+        bands: list[tuple[float, float]] = []
+        for band in _cfg_list(f"{path}.forbidden_pwm", raw.get("forbidden_pwm")):
+            pair = _cfg_list(f"{path}.forbidden_pwm entry", band)
+            if len(pair) != 2:
+                raise ConfigError(
+                    f"mpc.{path}.forbidden_pwm entries must be [lo, hi], got {band!r}"
+                )
+            bands.append(
+                (
+                    _cfg_num(f"{path}.forbidden_pwm lo", pair[0]),
+                    _cfg_num(f"{path}.forbidden_pwm hi", pair[1]),
+                )
+            )
+        return cls(
+            model=_req_str(f"{path}.model", raw["model"]),
+            count=_cfg_int(f"{path}.count", raw.get("count", 1)),
+            group=_opt_str(f"{path}.group", raw.get("group")),
+            noise_weight=_cfg_num(f"{path}.noise_weight", raw.get("noise_weight", 1.0)),
+            forbidden_pwm=tuple(bands),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model": self.model,
+            "count": self.count,
+            "group": self.group,
+            "noise_weight": self.noise_weight,
+            "forbidden_pwm": [list(b) for b in self.forbidden_pwm],
+        }
+
+
+@dataclass(frozen=True)
+class FanModel:
+    """``fan_models.<model>``: RPM curve and noise at full speed of one fan type.
+
+    ``noise_db_at_max`` defaults to 0 dB: the noise figure is an index, and
+    equal defaults weigh every model the same.
+    """
+
+    rpm_max: float
+    deadband: float = 0.1
+    exponent: float = 1.0
+    noise_db_at_max: float = 0.0
+
+    @classmethod
+    def coerce(cls, path: str, data: object) -> FanModel:
+        if isinstance(data, FanModel):
+            return data
+        raw = _section_keys(
+            path,
+            data,
+            required=("rpm_max",),
+            optional=("deadband", "exponent", "noise_db_at_max"),
+        )
+        return cls(
+            rpm_max=_cfg_num(f"{path}.rpm_max", raw["rpm_max"]),
+            deadband=_cfg_num(f"{path}.deadband", raw.get("deadband", 0.1)),
+            exponent=_cfg_num(f"{path}.exponent", raw.get("exponent", 1.0)),
+            noise_db_at_max=_cfg_num(f"{path}.noise_db_at_max", raw.get("noise_db_at_max", 0.0)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "rpm_max": self.rpm_max,
+            "deadband": self.deadband,
+            "exponent": self.exponent,
+            "noise_db_at_max": self.noise_db_at_max,
+        }
+
+
+@dataclass(frozen=True)
+class ZonePolicy:
+    """``zones``: how a zone's trust is decided and how far a zone fault reaches.
+
+    * ``trust_rule``     -- ``strict`` (every required sensor group has a trusted
+      member) or ``sigma`` (estimator uncertainty; the estimator is a later
+      milestone and until it exists ``strict`` applies, see
+      ``aqua_bridge.control.zones``)
+    * ``fault_coupling`` -- ``declared`` (a zone fault also puts the channels of
+      the zones in its ``coupled_to`` under fallback policy) or ``none``
+      (strictly per zone)
+    """
+
+    trust_rule: str = "strict"
+    fault_coupling: str = "declared"
+
+    @classmethod
+    def coerce(cls, data: object) -> ZonePolicy:
+        if isinstance(data, ZonePolicy):
+            return data
+        raw = _section_keys("zones", data, optional=("trust_rule", "fault_coupling"))
+        return cls(
+            trust_rule=_choice("zones.trust_rule", raw.get("trust_rule", "strict"), TRUST_RULES),
+            fault_coupling=_choice(
+                "zones.fault_coupling", raw.get("fault_coupling", "declared"), FAULT_COUPLINGS
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"trust_rule": self.trust_rule, "fault_coupling": self.fault_coupling}
+
+
+@dataclass(frozen=True)
+class StuckParams:
+    """Stuck rule parameters of one temperature (gate rule 3), derived from the config.
+
+    * ``ticks``    -- window length in ticks
+    * ``eps_c``    -- "unchanged" band, degrees C
+    * ``decimate`` -- the window keeps one sample every ``decimate`` ticks (1: the
+      dense ``MpcState.window``; > 1: a decimated window kept in ``solver_memory``)
+    * ``samples``  -- stored samples the check needs (``ceil(ticks / decimate)``)
+    * ``channels`` -- channels whose net PWM move counts as evidence
+    * ``siblings`` -- temperatures whose plausible net move counts as evidence
+
+    Legacy mode: the global ``stuck_s`` / ``stuck_eps_c``, every channel and every
+    other temperature. With ``topology``: the sensor's own values, the channels
+    of its zone (none for a sensor without a zone) and the other sensors of the
+    same zone and role.
+    """
+
+    ticks: int
+    eps_c: float
+    decimate: int
+    samples: int
+    channels: tuple[str, ...]
+    siblings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ZoneLayout:
+    """Structural view of the zones, derived from the declared config (never identified numbers).
+
+    Legacy mode (``implicit``): the single :data:`IMPLICIT_ZONE` holding every
+    channel, no coupling, and one required group per temperature, so "every
+    group has a trusted member" is exactly the whole-tick gate rule 4.
+
+    * ``required_groups[zone]`` -- ``(label, members)`` pairs; with the ``strict`` rule
+      the zone is trusted only when every group has at least one gate-trusted member
+    * ``reach[zone]``           -- channels put under fallback policy while the zone is
+      in fault: its own channels plus, with ``fault_coupling: declared``, those of
+      the zones in its ``coupled_to``
+    """
+
+    implicit: bool
+    zones: tuple[str, ...]
+    zone_channels: dict[str, tuple[str, ...]]
+    coupled: dict[str, tuple[str, ...]]
+    channel_zones: dict[str, tuple[str, ...]]
+    sensor_zone: dict[str, str | None]
+    required_groups: dict[str, tuple[tuple[str, tuple[str, ...]], ...]]
+    reach: dict[str, tuple[str, ...]]
+
+
+def _strictest_class(classes: Mapping[str, DriveClass]) -> str:
+    """Lowest ``limit_c``, then lowest ``limit_c - comfort_c``, then name."""
+    return min(
+        classes,
+        key=lambda n: (classes[n].limit_c, classes[n].limit_c - classes[n].comfort_c, n),
+    )
+
+
+def _plain_entry(value: Any) -> Any:
+    if isinstance(value, tuple):
+        return list(value)
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    return value
+
+
+@dataclass(frozen=True)
+class _Derived:
+    """What :meth:`MpcConfig.validate` derives once (not a config field)."""
+
+    layout: ZoneLayout
+    stuck: dict[str, StuckParams]
+    window_ticks: int
+    slow_samples: dict[int, int]
+
+
 @dataclass(frozen=True)
 class MpcConfig:
     """Controller configuration, the ``mpc:`` section of ``config.yaml``.
@@ -441,6 +1169,12 @@ class MpcConfig:
       controlled temperature drops when one of its channels goes +1.0 PWM,
       and the per-tick gain of the offset-free disturbance estimator. Ignored
       by the ``pi`` solver.
+    * ``topology`` / ``sensors`` / ``drive_classes`` / ``fans`` / ``fan_models`` /
+      ``zones`` -- the zoned DAS layout (module docstring, *DAS layout*); all
+      absent is legacy mode. With ``topology`` the gate's Stuck rule is sized
+      per sensor (:meth:`stuck_params`), zone trust and fallback run per zone
+      (``aqua_bridge.control.zones``) and ``temps_for_channel`` returns the
+      setpoint temperatures of the channel's zones.
     """
 
     dt: float
@@ -473,6 +1207,12 @@ class MpcConfig:
     mpc_tau_s: float = 120.0
     mpc_gain_c_per_pwm: float = 8.0
     mpc_estimator_gain: float = 0.1
+    topology: Topology | None = None
+    sensors: dict[str, SensorSpec] = field(default_factory=dict)
+    drive_classes: dict[str, DriveClass] = field(default_factory=dict)
+    fans: dict[str, FanSpec] = field(default_factory=dict)
+    fan_models: dict[str, FanModel] = field(default_factory=dict)
+    zones: ZonePolicy | None = None
 
     # -- construction -------------------------------------------------------
 
@@ -531,6 +1271,51 @@ class MpcConfig:
         s(self, "mpc_tau_s", _cfg_num("mpc_tau_s", self.mpc_tau_s))
         s(self, "mpc_gain_c_per_pwm", _cfg_num("mpc_gain_c_per_pwm", self.mpc_gain_c_per_pwm))
         s(self, "mpc_estimator_gain", _cfg_num("mpc_estimator_gain", self.mpc_estimator_gain))
+        self._coerce_das()
+
+    def _coerce_das(self) -> None:
+        """Parse the DAS sections; fill their defaults only when ``topology`` is present."""
+        s = object.__setattr__
+        topology = None if self.topology is None else Topology.coerce(self.topology)
+        s(
+            self,
+            "sensors",
+            {
+                name: SensorSpec.coerce(f"sensors.{name}", entry)
+                for name, entry in _named_map("sensors", self.sensors).items()
+            },
+        )
+        classes = {
+            name: DriveClass.coerce(f"drive_classes.{name}", entry)
+            for name, entry in _named_map("drive_classes", self.drive_classes).items()
+        }
+        if topology is not None and not classes:
+            classes = dict(BUILTIN_DRIVE_CLASSES)
+        s(self, "drive_classes", classes)
+        s(
+            self,
+            "fans",
+            {
+                name: FanSpec.coerce(f"fans.{name}", entry)
+                for name, entry in _named_map("fans", self.fans).items()
+            },
+        )
+        s(
+            self,
+            "fan_models",
+            {
+                name: FanModel.coerce(f"fan_models.{name}", entry)
+                for name, entry in _named_map("fan_models", self.fan_models).items()
+            },
+        )
+        zones = None if self.zones is None else ZonePolicy.coerce(self.zones)
+        if topology is not None:
+            if zones is None:
+                zones = ZonePolicy()
+            if topology.default_class is None and classes:
+                topology = dataclasses.replace(topology, default_class=_strictest_class(classes))
+        s(self, "topology", topology)
+        s(self, "zones", zones)
 
     # -- validation ---------------------------------------------------------
 
@@ -598,7 +1383,7 @@ class MpcConfig:
         # regulate, so an empty setpoints map is rejected (spec only demands
         # keys ⊆ temps). A setpoint outside the gate's valid range can never
         # be reached by a trusted reading, so it is rejected too.
-        if not self.setpoints:
+        if not self.setpoints and self.topology is None:
             raise ConfigError("mpc.setpoints must not be empty")
         for name, value in self.setpoints.items():
             if name not in self.temps:
@@ -624,6 +1409,11 @@ class MpcConfig:
         if self.pi_ki < 0:
             raise ConfigError(f"mpc.pi_ki must be >= 0, got {self.pi_ki}")
 
+        if self.channel_temps and self.topology is not None:
+            raise ConfigError(
+                "mpc.channel_temps must be absent with mpc.topology: a channel controls "
+                "the setpoint temperatures of the zones that list it"
+            )
         if self.channel_temps:
             if set(self.channel_temps) != set(self.channels):
                 raise ConfigError(
@@ -662,6 +1452,317 @@ class MpcConfig:
                     "with solver 'mpc'"
                 )
 
+        if self.topology is None:
+            for name in ("sensors", "drive_classes", "fans", "fan_models"):
+                if getattr(self, name):
+                    raise ConfigError(f"mpc.{name} requires mpc.topology (DAS layout)")
+            if self.zones is not None:
+                raise ConfigError("mpc.zones requires mpc.topology (DAS layout)")
+        else:
+            self._validate_das()
+        object.__setattr__(self, "_derived", self._derive())
+        if self.topology is not None and self.setpoints:
+            for ch in self.channels:
+                if not self.temps_for_channel(ch):
+                    raise ConfigError(
+                        f"mpc.setpoints: channel {ch!r} controls no setpoint temperature; with "
+                        "mpc.topology a channel controls the setpoint sensors of its zones "
+                        f"{list(self._derived.layout.channel_zones[ch])}"
+                    )
+
+    def _validate_das(self) -> None:
+        """Section 7 rules for ``topology``, ``sensors``, ``drive_classes``, ``fans``,
+        ``fan_models`` and ``zones`` (plus the module docstring's conservative ones)."""
+        topo = self.topology
+        assert topo is not None
+        dt = self.dt
+
+        # topology.zones
+        if not topo.zones:
+            raise ConfigError("mpc.topology.zones must not be empty")
+        for z, spec in topo.zones.items():
+            if not isinstance(spec, ZoneSpec):
+                raise ConfigError(f"mpc.topology.zones[{z!r}] must be a zone entry")
+            if not spec.channels:
+                raise ConfigError(f"mpc.topology.zones.{z}.channels must not be empty")
+            for ch in spec.channels:
+                if ch not in self.channels:
+                    raise ConfigError(
+                        f"mpc.topology.zones.{z}.channels lists {ch!r}, not in mpc.channels"
+                    )
+            for other in spec.coupled_to:
+                if other == z:
+                    raise ConfigError(f"mpc.topology.zones.{z}.coupled_to must not list itself")
+                if other not in topo.zones:
+                    raise ConfigError(
+                        f"mpc.topology.zones.{z}.coupled_to lists unknown zone {other!r}"
+                    )
+                if z not in topo.zones[other].coupled_to:
+                    raise ConfigError(
+                        f"mpc.topology.zones: coupling must be symmetric, {z!r} lists {other!r} "
+                        f"but {other!r} does not list {z!r}"
+                    )
+            if spec.inlet != _MIX:
+                inlet = self.sensors.get(spec.inlet)
+                if inlet is None or inlet.role != "inlet":
+                    raise ConfigError(
+                        f"mpc.topology.zones.{z}.inlet must be 'mix' or a sensor of role "
+                        f"inlet, got {spec.inlet!r}"
+                    )
+        for ch in self.channels:
+            if not any(ch in spec.channels for spec in topo.zones.values()):
+                raise ConfigError(f"mpc.channels: {ch!r} appears in no mpc.topology zone")
+
+        # drive_classes
+        for name, dc in self.drive_classes.items():
+            if not self.temp_min_c < dc.limit_c < self.temp_max_c:
+                raise ConfigError(
+                    f"mpc.drive_classes.{name}.limit_c={dc.limit_c} must lie inside "
+                    f"({self.temp_min_c}, {self.temp_max_c})"
+                )
+            if dc.comfort_c < 0:
+                raise ConfigError(f"mpc.drive_classes.{name}.comfort_c must be >= 0")
+            if dc.tau_d_s <= 0:
+                raise ConfigError(f"mpc.drive_classes.{name}.tau_d_s must be > 0")
+        if topo.default_class not in self.drive_classes:
+            raise ConfigError(
+                f"mpc.topology.default_class {topo.default_class!r} is not in mpc.drive_classes "
+                f"{sorted(self.drive_classes)}"
+            )
+
+        # topology.bays
+        for b, bay in topo.bays.items():
+            if not isinstance(bay, BaySpec):
+                raise ConfigError(f"mpc.topology.bays[{b!r}] must be a bay entry")
+            if bay.zone not in topo.zones:
+                raise ConfigError(f"mpc.topology.bays.{b}.zone {bay.zone!r} is not a zone")
+            if bay.drive_class is not None and bay.drive_class not in self.drive_classes:
+                raise ConfigError(
+                    f"mpc.topology.bays.{b}.class {bay.drive_class!r} is not in mpc.drive_classes"
+                )
+            if not (isinstance(bay.occupied, bool) or bay.occupied == "auto"):
+                raise ConfigError(f"mpc.topology.bays.{b}.occupied must be true, false or auto")
+
+        # sensors
+        if set(self.sensors) != set(self.temps):
+            raise ConfigError(
+                "mpc.sensors keys must be exactly mpc.temps with mpc.topology: "
+                f"missing {sorted(set(self.temps) - set(self.sensors))}, "
+                f"extra {sorted(set(self.sensors) - set(self.temps))}"
+            )
+        for name, sp in self.sensors.items():
+            where = f"mpc.sensors.{name}"
+            if sp.role not in SENSOR_ROLES:
+                raise ConfigError(f"{where}.role must be one of {list(SENSOR_ROLES)}")
+            if sp.role in ("zone_air", "drive_proximal") and sp.zone is None:
+                raise ConfigError(f"{where}.zone is required for role {sp.role}")
+            if sp.zone is not None and sp.zone not in topo.zones:
+                raise ConfigError(f"{where}.zone {sp.zone!r} is not a zone")
+            if sp.role == "drive_proximal":
+                if sp.bay is None:
+                    raise ConfigError(f"{where}.bay is required for role drive_proximal")
+                if sp.bay not in topo.bays:
+                    raise ConfigError(f"{where}.bay {sp.bay!r} is not a bay")
+                if topo.bays[sp.bay].zone != sp.zone:
+                    raise ConfigError(
+                        f"{where}: bay {sp.bay!r} belongs to zone {topo.bays[sp.bay].zone!r}, "
+                        f"not {sp.zone!r}"
+                    )
+            elif sp.bay is not None:
+                raise ConfigError(f"{where}.bay: only drive_proximal sensors sit in a bay")
+            if sp.quant_c <= 0:
+                raise ConfigError(f"{where}.quant_c must be > 0, got {sp.quant_c}")
+            if sp.stuck_s is None or sp.stuck_s < 2 * dt:
+                raise ConfigError(f"{where}.stuck_s must be >= 2 * dt ({2 * dt}), got {sp.stuck_s}")
+            if sp.stuck_eps_c is None or sp.stuck_eps_c < sp.quant_c:
+                raise ConfigError(
+                    f"{where}.stuck_eps_c must be >= quant_c ({sp.quant_c}), got {sp.stuck_eps_c}"
+                )
+            if sp.stuck_decimate is not None and sp.stuck_decimate < 1:
+                raise ConfigError(f"{where}.stuck_decimate must be >= 1")
+            if sp.tau_s is not None and sp.tau_s <= 0:
+                raise ConfigError(f"{where}.tau_s must be > 0")
+            if not isinstance(sp.redundant, bool):
+                raise ConfigError(f"{where}.redundant must be a bool")
+
+        def has_primary(role: str, *, zone: str | None = None, bay: str | None = None) -> bool:
+            return any(
+                sp.role == role
+                and not sp.redundant
+                and (zone is None or sp.zone == zone)
+                and (bay is None or sp.bay == bay)
+                for sp in self.sensors.values()
+            )
+
+        for z in topo.zones:
+            if not has_primary("zone_air", zone=z):
+                raise ConfigError(
+                    f"mpc.sensors: zone {z!r} needs a zone_air sensor that is not redundant"
+                )
+        for b in topo.bays:
+            if not has_primary("drive_proximal", bay=b):
+                raise ConfigError(
+                    f"mpc.sensors: bay {b!r} needs a drive_proximal sensor that is not redundant"
+                )
+        if not has_primary("inlet"):
+            raise ConfigError("mpc.sensors: at least one inlet sensor that is not redundant")
+        for name in self.setpoints:
+            if self.sensors[name].role not in ("zone_air", "drive_proximal"):
+                raise ConfigError(
+                    f"mpc.setpoints[{name!r}]: with mpc.topology a setpoint must sit on a "
+                    "zone_air or drive_proximal sensor"
+                )
+
+        # fans / fan_models
+        if set(self.fans) != set(self.channels):
+            raise ConfigError(
+                "mpc.fans keys must be exactly mpc.channels with mpc.topology: "
+                f"{sorted(self.fans)} != {sorted(self.channels)}"
+            )
+        for name, fm in self.fan_models.items():
+            where = f"mpc.fan_models.{name}"
+            if fm.rpm_max <= 0:
+                raise ConfigError(f"{where}.rpm_max must be > 0, got {fm.rpm_max}")
+            if not 0.0 <= fm.deadband < 0.5:
+                raise ConfigError(f"{where}.deadband must be in [0, 0.5), got {fm.deadband}")
+            if not 0.5 <= fm.exponent <= 1.5:
+                raise ConfigError(f"{where}.exponent must be in [0.5, 1.5], got {fm.exponent}")
+            if not math.isfinite(fm.noise_db_at_max):
+                raise ConfigError(f"{where}.noise_db_at_max must be finite")
+        for ch, fan in self.fans.items():
+            where = f"mpc.fans.{ch}"
+            if fan.model not in self.fan_models:
+                raise ConfigError(f"{where}.model {fan.model!r} is not in mpc.fan_models")
+            if fan.count < 1:
+                raise ConfigError(f"{where}.count must be >= 1, got {fan.count}")
+            if fan.noise_weight < 0:
+                raise ConfigError(f"{where}.noise_weight must be >= 0, got {fan.noise_weight}")
+            for lo, hi in fan.forbidden_pwm:
+                if not self.pwm_min <= lo < hi <= self.pwm_max:
+                    raise ConfigError(
+                        f"{where}.forbidden_pwm band [{lo}, {hi}] must satisfy "
+                        f"pwm_min <= lo < hi <= pwm_max ({self.pwm_min}, {self.pwm_max})"
+                    )
+                if hi - lo > 0.2 + 1e-12:
+                    raise ConfigError(f"{where}.forbidden_pwm band [{lo}, {hi}] is wider than 0.2")
+
+        # zones policy
+        policy = self.zones
+        if policy is None or policy.trust_rule not in TRUST_RULES:
+            raise ConfigError(f"mpc.zones.trust_rule must be one of {list(TRUST_RULES)}")
+        if policy.fault_coupling not in FAULT_COUPLINGS:
+            raise ConfigError(f"mpc.zones.fault_coupling must be one of {list(FAULT_COUPLINGS)}")
+
+    def _derive(self) -> _Derived:
+        """Zone layout and per-temperature Stuck parameters (validated config only)."""
+        channels = tuple(self.channels)
+        topo = self.topology
+        if topo is None:
+            n = self.stuck_ticks
+            zone = IMPLICIT_ZONE
+            layout = ZoneLayout(
+                implicit=True,
+                zones=(zone,),
+                zone_channels={zone: channels},
+                coupled={zone: ()},
+                channel_zones={ch: (zone,) for ch in channels},
+                sensor_zone=dict.fromkeys(self.temps, zone),
+                required_groups={zone: tuple((t, (t,)) for t in self.temps)},
+                reach={zone: channels},
+            )
+            stuck = {
+                t: StuckParams(
+                    ticks=n,
+                    eps_c=self.stuck_eps_c,
+                    decimate=1,
+                    samples=n,
+                    channels=channels,
+                    siblings=tuple(o for o in self.temps if o != t),
+                )
+                for t in self.temps
+            }
+            return _Derived(layout=layout, stuck=stuck, window_ticks=n, slow_samples={})
+
+        sensors = self.sensors
+        zones = tuple(topo.zones)
+        zone_channels = {z: tuple(topo.zones[z].channels) for z in zones}
+        coupled = {z: tuple(topo.zones[z].coupled_to) for z in zones}
+        declared = self.zones is None or self.zones.fault_coupling == "declared"
+        reach: dict[str, tuple[str, ...]] = {}
+        for z in zones:
+            touched = set(zone_channels[z])
+            if declared:
+                for other in coupled[z]:
+                    touched.update(zone_channels[other])
+            reach[z] = tuple(ch for ch in channels if ch in touched)
+        groups: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {}
+        for z in zones:
+            air = tuple(
+                t for t in self.temps if sensors[t].role == "zone_air" and sensors[t].zone == z
+            )
+            zone_groups: list[tuple[str, tuple[str, ...]]] = [("zone_air", air)]
+            for b, bay in topo.bays.items():
+                if bay.zone != z or not bay.constrained:
+                    continue
+                members = tuple(
+                    t
+                    for t in self.temps
+                    if sensors[t].role == "drive_proximal" and sensors[t].bay == b
+                )
+                zone_groups.append((f"bay:{b}", members))
+            for t in self.temps:
+                if t in self.setpoints and sensors[t].zone == z:
+                    zone_groups.append((f"setpoint:{t}", (t,)))
+            groups[z] = tuple(zone_groups)
+
+        stuck: dict[str, StuckParams] = {}
+        for t in self.temps:
+            sp = sensors[t]
+            assert sp.stuck_s is not None and sp.stuck_eps_c is not None
+            n = max(2, math.ceil(sp.stuck_s / self.dt))
+            k = sp.stuck_decimate or max(1, n // STUCK_WINDOW_SAMPLES)
+            samples = n if k == 1 else math.ceil(n / k)
+            if samples < 2:
+                raise ConfigError(
+                    f"mpc.sensors.{t}.stuck_decimate={k} leaves fewer than 2 samples in a "
+                    f"{n}-tick Stuck window"
+                )
+            stuck[t] = StuckParams(
+                ticks=n,
+                eps_c=sp.stuck_eps_c,
+                decimate=k,
+                samples=samples,
+                channels=zone_channels[sp.zone] if sp.zone is not None else (),
+                siblings=tuple(
+                    o
+                    for o in self.temps
+                    if o != t and sensors[o].zone == sp.zone and sensors[o].role == sp.role
+                ),
+            )
+        window_ticks = max([2, *(p.ticks for p in stuck.values() if p.decimate == 1)])
+        slow_samples: dict[int, int] = {}
+        for p in stuck.values():
+            if p.decimate > 1:
+                slow_samples[p.decimate] = max(slow_samples.get(p.decimate, 0), p.samples)
+        layout = ZoneLayout(
+            implicit=False,
+            zones=zones,
+            zone_channels=zone_channels,
+            coupled=coupled,
+            channel_zones={
+                ch: tuple(z for z in zones if ch in zone_channels[z]) for ch in channels
+            },
+            sensor_zone={t: sensors[t].zone for t in self.temps},
+            required_groups=groups,
+            reach=reach,
+        )
+        return _Derived(
+            layout=layout,
+            stuck=stuck,
+            window_ticks=window_ticks,
+            slow_samples=dict(sorted(slow_samples.items())),
+        )
+
     # -- derived tick quantities (section 3) ---------------------------------
 
     @property
@@ -679,16 +1780,64 @@ class MpcConfig:
         """Stuck window length in ticks: ``max(2, ceil(stuck_s / dt))``."""
         return max(2, math.ceil(self.stuck_s / self.dt))
 
+    # -- derived zone layout and Stuck sizing ---------------------------------
+
+    @property
+    def is_das(self) -> bool:
+        """``True`` when ``topology`` is present (zoned DAS), ``False`` in legacy mode."""
+        return self.topology is not None
+
+    @property
+    def zone_layout(self) -> ZoneLayout:
+        """The zones (legacy mode: the one implicit zone), see :class:`ZoneLayout`."""
+        return self._derived.layout
+
+    def stuck_params(self, name: str) -> StuckParams:
+        """Stuck rule parameters of temperature ``name`` (:class:`StuckParams`).
+
+        With ``topology``: window ``max(2, ceil(sensors.<name>.stuck_s / dt))``
+        ticks, band ``sensors.<name>.stuck_eps_c``, and a decimation of
+        ``stuck_decimate`` or, when that is absent,
+        ``max(1, ticks // STUCK_WINDOW_SAMPLES)`` -- so a 1800 s window at
+        ``dt = 5`` keeps 60 samples, one every 6 ticks.
+        """
+        return self._derived.stuck[name]
+
+    @property
+    def window_ticks(self) -> int:
+        """Length of ``MpcState.window``: ``stuck_ticks`` in legacy mode; with
+        ``topology`` the longest window of a sensor that is not decimated (>= 2)."""
+        return self._derived.window_ticks
+
+    @property
+    def slow_window_samples(self) -> dict[int, int]:
+        """Decimated Stuck windows: decimation factor -> stored samples kept (empty in legacy)."""
+        return dict(self._derived.slow_samples)
+
+    def bay_class(self, bay: str) -> str:
+        """Drive class of ``bay``: its declared ``class`` or ``topology.default_class``."""
+        if self.topology is None:
+            raise KeyError(bay)
+        cls = self.topology.bays[bay].drive_class or self.topology.default_class
+        assert cls is not None
+        return cls
+
     def temps_for_channel(self, channel: str) -> tuple[str, ...]:
         """Temperatures (all with setpoints) that ``channel`` controls.
 
         Resolves the ``channel_temps`` default: every setpoint temperature,
-        in ``temps`` order.
+        in ``temps`` order. With ``topology``: the setpoint temperatures whose
+        sensor sits in a zone that lists ``channel``.
         """
         if channel not in self.channels:
             raise KeyError(channel)
         if self.channel_temps:
             return self.channel_temps[channel]
+        if self.topology is not None:
+            zones = self._derived.layout.channel_zones[channel]
+            return tuple(
+                t for t in self.temps if t in self.setpoints and self.sensors[t].zone in zones
+            )
         return tuple(t for t in self.temps if t in self.setpoints)
 
     def weight_for(self, temp: str) -> float:
@@ -706,7 +1855,9 @@ class MpcConfig:
             elif isinstance(value, tuple):
                 value = list(value)
             elif isinstance(value, dict):
-                value = {k: (list(v) if isinstance(v, tuple) else v) for k, v in value.items()}
+                value = {k: _plain_entry(v) for k, v in value.items()}
+            elif hasattr(value, "to_dict"):
+                value = value.to_dict()
             out[f.name] = value
         return out
 
