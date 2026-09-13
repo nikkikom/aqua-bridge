@@ -909,6 +909,39 @@ def test_fallback_is_bumpless_and_returns_after_the_dwell_with_hysteresis():
     assert c.diagnostics["target_pwm"] == pytest.approx(prev, abs=1e-12)  # bumpless back
 
 
+def test_a_clock_stepped_back_keeps_the_prediction_error_guard_and_the_dwell():
+    """A wall clock stepped back (NTP) after the solver ran: a prediction pending in the
+    old future must not silence the prediction-error guard until the clock catches up,
+    and a fallback must not wait that long to count its dwell."""
+    cfg = mpc_cfg(mpc_every_ticks=1, model_max_drift_c_per_min=100.0)
+    req = fresh_req(recorded_request(cfg, drive=43.0, ticks=4))
+    solver = DasMpcSolver()
+
+    def ticks(memory, ts, n, warming=0.0):
+        res = None
+        for i in range(n):
+            plant = copy.deepcopy(req.plant)
+            for info in plant["bays"].values():
+                info["t"] += warming * i  # drives the model does not see coming
+            changes = {"ts": ts + i * cfg.dt, "memory": memory, "plant": plant}
+            res = solver.solve(cfg, dataclasses.replace(req, **changes))
+            memory = res.memory
+        return res, memory
+
+    t0 = 100_000.0
+    res, memory = ticks(req.memory, t0, 20)
+    assert res.diagnostics["model"]["active"] == "mpc" and memory["pred"] is not None
+    back = t0 + 20 * cfg.dt - 86_400.0
+    res, memory = ticks(memory, back, 40, warming=0.25)  # 1.5 degC per prediction step
+    assert res.diagnostics["model"]["active"] == "pi_das"
+    assert res.diagnostics["model"]["reason"].startswith("pred_err:")
+    # in fallback, the clock steps back again: the dwell counts from the new clock
+    later = back + 40 * cfg.dt
+    memory = {**memory, "err2": 0.0, "pred": None}
+    res, memory = ticks(memory, later - 86_400.0, int(2 * solver_das.MODEL_DWELL_S / cfg.dt))
+    assert res.diagnostics["model"]["active"] == "mpc"
+
+
 def test_a_swap_the_estimator_follows_as_a_jump_is_left_out_of_the_drift_check():
     cfg = mpc_cfg()
     req = recorded_request(cfg, drive=40.0, ticks=4)

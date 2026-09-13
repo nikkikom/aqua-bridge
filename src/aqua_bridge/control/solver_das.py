@@ -149,7 +149,11 @@ and why. The MPC comes back only after the checks have passed with the numeric l
 scaled by :data:`MODEL_HYSTERESIS` continuously for :data:`MODEL_DWELL_S` (so at least
 that long after the fallback began). A cold solver starts on whichever model passes.
 The PI-like DAS fallback regulates every drive at its soft target with the same margins,
-so a model fallback changes loudness, not safety. (The plan's "no unknown bay whose
+so a model fallback changes loudness, not safety. A clock stepped back (``step``
+re-confirms the zones and then calls the solver with the earlier ``ts``) drops a pending
+prediction made in the new clock's future, restarts the dwell from the new clock and
+re-solves instead of replaying a plan made in the future, so neither the guard nor the
+return waits for the old clock. (The plan's "no unknown bay whose
 sigma exceeds sigma_fault_c" is a zone fault of the ``sigma`` trust rule, not a model
 check, and is not evaluated here.)
 
@@ -1264,6 +1268,11 @@ class DasMpcSolver:
         if pending is None:
             return
         due = pending["ts"]
+        if ts < due - cfg.mpc_pred_dt_s - 0.5 * cfg.dt:
+            # made in the future of this clock (a wall clock stepped back): drop it, or it
+            # would silence the guard until the clock caught up
+            mem["pred"] = None
+            return
         if ts < due - 0.5 * cfg.dt:
             return
         mem["pred"] = None
@@ -1470,6 +1479,11 @@ class DasMpcSolver:
     def _decide(self, cfg: MpcConfig, mem: dict[str, Any], model: _Model, ts: float) -> bool:
         """Run the validity gate and switch the active model; ``True`` on a switch."""
         in_fallback = mem["active"] == PI_DAS
+        # a clock stepped back: the times of the last switch and of the first passing check
+        # count from now (the dwell restarts rather than waiting for the old clock)
+        for name in ("since", "ok_since"):
+            if mem[name] is not None and mem[name] > ts:
+                mem[name] = ts
         err = None if mem["err2"] is None else math.sqrt(mem["err2"])
         verdict = check_model(
             cfg,
@@ -1667,7 +1681,7 @@ class DasMpcSolver:
     def _block_index(cfg: MpcConfig, mem: Mapping[str, Any], ts: float) -> int | None:
         """Block of the stored plan that holds at ``ts`` (``None``: none left)."""
         plan_ts = mem["plan_ts"]
-        if plan_ts is None:
+        if plan_ts is None or ts < plan_ts - 0.5 * cfg.dt:  # none, or planned in the future
             return None
         step = int(max(ts - plan_ts, 0.0) // cfg.mpc_pred_dt_s)
         total = 0
