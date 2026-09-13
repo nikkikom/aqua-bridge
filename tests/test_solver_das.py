@@ -303,6 +303,57 @@ def test_zoh_matches_the_eigen_discretisation_and_fine_euler():
     assert np.allclose(m_int @ c, ref.cd, atol=1e-9)
 
 
+def test_zoh_with_the_inverse_matches_the_block_exponential():
+    rng = np.random.default_rng(5)
+    a = -np.diag(rng.uniform(0.01, 2.0, size=5)) + 0.01 * rng.normal(size=(5, 5))
+    ad, m_int = zoh(a, 30.0)
+    ad2, m_int2 = zoh(a, 30.0, np.linalg.inv(a))
+    assert np.allclose(ad, ad2, atol=1e-12) and np.allclose(m_int, m_int2, rtol=1e-8, atol=1e-10)
+
+
+def test_the_prediction_matches_the_thermal_jacobians():
+    """``build_prediction`` builds ``B`` from its affine structure; it must equal
+    ``thermal.jacobians`` at the linearisation command and the exact state."""
+    cfg = mpc_cfg()
+    st_ = thermal.cached_structure(cfg)
+    rng = np.random.default_rng(2)
+    theta = thermal.prior_theta(cfg)
+    theta.update({k: v * rng.uniform(0.7, 1.3) for k, v in theta.items() if v > 0})
+    occupancy = {b: ("empty" if b in ("b03", "b11") else "occupied") for b in st_.bays}
+    params = thermal.model_params(cfg, theta, st=st_, occupancy=occupancy)
+    x_air = {z: 30.0 + rng.uniform(0, 3) for z in st_.zones}
+    x_drive = {b: 38.0 + rng.uniform(0, 8) for b in st_.bays if params.occupied[b]}
+    t_in = {z: 25.0 + rng.uniform(0, 1) for z in st_.zones}
+    u = {ch: rng.uniform(0.25, 0.9) for ch in cfg.channels}
+    pred, _ = solver_das.build_prediction(
+        cfg, st_, params, x_air=x_air, x_drive=x_drive, u=u, t_in=t_in
+    )
+    x_full = np.zeros(st_.n_states)
+    for z in st_.zones:
+        x_full[st_.i_air(z)] = x_air[z]
+    for b, bs in st_.bays.items():
+        x_full[st_.i_drive(b)] = x_drive.get(b, x_air[bs.zone])
+        x_full[st_.i_sensor(b)] = x_air[bs.zone]
+    lin = thermal.jacobians(st_, params, x_full, np.array(pred.u_lin), t_in=t_in)
+    idx = [st_.i_air(z) for z in pred.zones] + [st_.i_drive(b) for b in pred.drives]
+    assert "b03" not in pred.drives and len(pred.drives) == 13
+    assert np.allclose(pred.a, lin.a[np.ix_(idx, idx)], rtol=1e-12, atol=1e-15)
+    assert np.allclose(pred.b, lin.b[idx], rtol=1e-12, atol=1e-15)
+    assert all(
+        abs(q - u[ch]) <= solver_das.QUANT_U
+        for q, ch in zip(pred.u_lin, pred.channels, strict=True)
+    )
+    ad = solver_das._expm(pred.a * pred.h)
+    assert np.allclose(pred.ad, ad, atol=1e-12)
+    # a command within one step of the previous linearisation keeps it (no rebuild)
+    nudged = {ch: v + 0.4 * solver_das.QUANT_U for ch, v in u.items()}
+    last = dict(zip(pred.channels, pred.u_lin, strict=True))
+    again, hit = solver_das.build_prediction(
+        cfg, st_, params, x_air=x_air, x_drive=x_drive, u=nudged, t_in=t_in, u_lin=last
+    )
+    assert again.u_lin == pred.u_lin and hit
+
+
 def test_zoh_handles_repeated_eigenvalues():
     a = np.diag([-0.1, -0.1, -0.1]) + np.array([[0, 0.01, 0], [0.01, 0, 0], [0, 0, 0]])
     ad, m_int = zoh(a, 30.0)
@@ -588,8 +639,7 @@ def test_every_n_ticks_replays_the_plan_and_a_new_fault_solves_at_once():
 def test_the_linearisation_memo_is_a_pure_memo():
     cfg = mpc_cfg()
     req = fresh_req(recorded_request(cfg, drive=43.0, ticks=4))
-    solver_das._LIN_CACHE.clear()
-    solver_das._A_CACHE.clear()
+    solver_das._DYN_CACHE.clear()
     cold = DasMpcSolver().solve(cfg, req)
     warm = DasMpcSolver().solve(cfg, req)
     assert cold.diagnostics["cache_hit"] is False and warm.diagnostics["cache_hit"] is True

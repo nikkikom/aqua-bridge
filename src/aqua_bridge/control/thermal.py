@@ -267,6 +267,7 @@ __all__ = [
     "Structure",
     "ThermalParams",
     "ThermalUpdate",
+    "airflow_gradients",
     "cached_structure",
     "current_model",
     "derivatives",
@@ -721,6 +722,15 @@ def dphi(u: float, deadband: float, exponent: float) -> float:
 
 def _group_phi(gr: Group, phis: Mapping[str, float]) -> float:
     return sum(w * phis[ch] for ch, w in gr.weights.items()) / gr.prior if gr.prior > 0 else 0.0
+
+
+def airflow_gradients(
+    st: Structure, p: ThermalParams, u: Mapping[str, float] | np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(dQ/du, dQn/du)`` per zone and channel at the command ``u`` (the pieces of
+    :func:`jacobians`' input matrix that do not depend on the state)."""
+    _, _, dq, dqn = _airflow(st, p, _vec_u(st, u))
+    return dq, dqn
 
 
 def _vec_u(st: Structure, u: Mapping[str, float] | np.ndarray | Any) -> np.ndarray:

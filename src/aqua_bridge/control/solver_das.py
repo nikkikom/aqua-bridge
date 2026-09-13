@@ -49,40 +49,46 @@ disturbances (``d_air`` per zone, ``q = q_w / C_d`` per bay) and inlet temperatu
 enter the affine term. The state is reduced to the air and drive nodes: the proximal
 sensor nodes feed nothing back into them and the outputs are drives, so dropping them
 is exact, and an empty bay's frozen drive (eigenvalue 0) is not a state at all (19
-states instead of 34 for the example layout; the plan counts 34). ``A`` and ``B``
-are taken at the **quantised operating point** (temperatures to :data:`QUANT_T_C`,
-commands to :data:`QUANT_U`, clamped into the fan curve's open range so a command at
-full speed or in the dead band keeps the one-sided slope of the curve) and the
-affine term ``c = f(x_hat, prev) - A x_hat - B prev`` exactly, so the model is exact
-at the operating point. The discretisation (exact zero-order hold by one matrix
-exponential, :func:`zoh`), the output sensitivities of the blocks and the
-terminal matrices depend only on the quantised point and are memoised on it (plan
-section 4, reduction 1): a memo, not state; cached or recomputed the result is
-bit-identical. The condensation keeps the output rows only.
+states instead of 34 for the example layout; the plan counts 34). ``A`` is taken at the
+**quantised command** (:data:`QUANT_U`, clamped into the fan curve's open range so a
+command at full speed or in the dead band keeps the one-sided slope of the curve), ``B``
+at that command and the exact state (``B`` is affine in the temperatures), and the
+affine term ``c = f(x_hat, prev) - A x_hat - B prev`` exactly, so the model is exact at
+the operating point. ``A``, its discretisation (exact zero-order hold by one matrix
+exponential, :func:`zoh`), its inverse for the terminal rows and the command-dependent
+pieces of ``B`` depend only on the parameters and the quantised command and are
+memoised on them (plan section 4, reduction 1, which also quantises the temperatures;
+the affine structure of ``B`` makes that unnecessary): a memo, not state; cached or
+recomputed the result is bit-identical. The condensation keeps the output rows only.
 
 Disturbances. The estimator's heat per drive ``q`` is a random walk that follows sensor
 noise tick by tick (about 0.4 W of tick-to-tick noise per HDD bay on the truth simulator
 with DS18B20 noise), and the terminal rows turn it into ``q / g`` degrees C of steady
 state (0.6 degC): fed raw, the plan chattered by 0.1 PWM per tick. The prediction
-therefore uses ``q`` and ``d_air`` low-passed in the solver's memory, rising with
-:data:`DIST_TAU_RISE_S` and falling with :data:`DIST_TAU_FALL_S` (a heat increase
-reaches the plan faster than a decrease: the conservative bias), restarted from the
-estimate when a bay's occupancy changes. The drive and air states are used as estimated.
+therefore uses ``q`` and ``d_air`` low-passed in the solver's memory with the time
+constant :data:`DIST_TAU_S`, restarted from the estimate when a bay's occupancy changes;
+the drive and air states are used as estimated, so a real heat burst still shows in the
+rows as the drive warms (drive time constants are minutes). Measured on the truth
+simulator: 60 s left 0.05 PWM of chatter; a filter that
+rises faster than it falls (30 s / 120 s) biased the steady state 0.3 degC high, which
+over-cooled the hot bays and cost noise; 120 s both ways did neither.
 
 Solver: active-piece SQP on ``solve_box_qp``
 --------------------------------------------
 With the currently violated rows ``V``: ``H = H0 + 2 sum_(r in V) rho_r s_r s_r^T``,
 ``f = f0 + 2 sum_(r in V) rho_r (y0_r - t_r) s_r``; solve the box QP warm-started
 (:func:`~aqua_bridge.control.solver_mpc.solve_box_qp`, the legacy MPC's exact primal
-active-set method, warm-started by a few projected Newton iterations
-(:func:`projected_newton`), on the piece normalised by its Gershgorin bound and with a Newton-step
+active-set method; when it needs more than :data:`QP_FAST_ITER` iterations from the
+current point it restarts from a few projected Newton iterations (:func:`projected_newton`)),
+on the piece normalised by its Gershgorin bound and with a Newton-step
 tolerance of :data:`QP_STEP_TOL` PWM: with penalty rows the Hessian's condition number
 reaches ~1e7, the rounding of a zero Newton step then exceeds the legacy 1e-12 and the
 method spent hundreds of iterations on rounding), then backtrack on the true penalised
 objective (convex, C1) until it does not increase, recompute ``V`` and stop when ``V``
 is unchanged after a full step (then the point is the global minimiser: the piece's KKT
 conditions are the true problem's), the decrease is below :data:`REL_DECREASE_TOL`
-relative, no step descends,
+relative, an accepted step moves no variable by more than :data:`SQP_STEP_TOL` (a
+ten-thousandth of the PWM range, below the actuators' resolution), no step descends,
 or after ``solver_outer_max`` iterations -- monotone and finite (:func:`solve_penalty_qp`).
 A box QP that hits ``solver_max_iter`` is ``converged=False``, which ``step`` turns into a
 solver fault exactly as for the legacy MPC; ``iterations`` reports the largest count of
@@ -131,10 +137,12 @@ On every solve tick the model must pass (:func:`check_model`):
 Bays within ``estimator.bay_settle_s`` of an occupancy change are left out of the last
 two checks (a hot swap's transient is real, not a model error), and so are bays within
 ``bay_settle_s`` of a tick on which the estimator's own drive variance exceeded
-:data:`SETTLE_DRIVE_VAR_C2` (an addition: a drive pulled and another pushed in within
-``empty_confirm_s`` never passes through ``empty``; the estimator's fast-swap rule follows
-it as a jump with a wide variance, and on the truth simulator that insert tripped both
-checks and held the fallback for 20 minutes). A failure switches to
+:data:`SETTLE_DRIVE_VAR_C2` or its calibration floor ``sigma_cal`` changed (additions: a
+drive pulled and another pushed in within ``empty_confirm_s`` never passes through
+``empty``, the estimator's fast-swap rule follows it as a jump with a wide variance, and
+an accepted or expired SMART calibration re-maps the drive estimate by up to the prior's
+3 degC; on the truth simulator both tripped the prediction-error check and held the
+fallback for 20 minutes). A failure switches to
 the **PI-like DAS solver on the same estimates** (``solver_pi``, margin-deficit form):
 ``mode`` stays ``auto``, ``diagnostics["solver_diag"]["model"]`` says ``active: pi_das``
 and why. The MPC comes back only after the checks have passed with the numeric limits
@@ -200,20 +208,21 @@ __all__ = [
     "ACCEPTED_STATUSES",
     "BUMPLESS_TAU_DOWN_S",
     "BUMPLESS_TAU_UP_S",
-    "DIST_TAU_FALL_S",
-    "DIST_TAU_RISE_S",
+    "DIST_TAU_S",
     "EIG_IMAG_REL",
     "GAIN_MIN",
     "MODEL_DWELL_S",
     "MODEL_HYSTERESIS",
     "PRED_ERR_ALPHA",
     "PN_ITER",
+    "QP_FAST_ITER",
     "PRIOR_STATUSES",
     "QP_STEP_TOL",
-    "QUANT_T_C",
     "QUANT_U",
     "REL_DECREASE_TOL",
     "RIDGE",
+    "SETTLE_CAL_STEP_C",
+    "SQP_STEP_TOL",
     "SETTLE_DRIVE_VAR_C2",
     "DasMpcSolver",
     "ModelCheck",
@@ -240,8 +249,7 @@ MODEL_HYSTERESIS = 0.5
 MODEL_DWELL_S = 300.0
 #: EW factor of the prediction error's mean square.
 PRED_ERR_ALPHA = 0.2
-#: Operating-point quantisation of the linearisation (degC, PWM).
-QUANT_T_C = 0.25
+#: Quantisation of the command at which ``A`` is linearised (PWM).
 QUANT_U = 1.0 / 64.0
 #: Steady-state gain below this (degC per unit PWM) is no gain.
 GAIN_MIN = 1e-6
@@ -253,17 +261,21 @@ RIDGE = 1e-9
 #: Box QP: a Newton step below this (PWM) is zero; the rounding of ``H^-1 g`` on the
 #: penalised Hessians (condition numbers up to ~1e7) is ~1e-10.
 QP_STEP_TOL = 1e-9
-#: Projected Newton warm-start iterations per box QP (:func:`projected_newton`).
+#: Projected Newton warm-start iterations per box QP (:func:`projected_newton`), used when
+#: the box QP from the current point does not finish within ``QP_FAST_ITER`` iterations.
 PN_ITER = 12
-#: SQP stops: relative decrease, backtracking halvings.
+QP_FAST_ITER = 8
+#: SQP stops: relative decrease, largest move of an accepted step (PWM), halvings.
 REL_DECREASE_TOL = 1e-8
+SQP_STEP_TOL = 1e-4
 _HALVINGS = 30
 #: A bay whose estimator drive variance (``sigma^2 - sigma_cal^2``) exceeds this, degC^2, is
 #: settling (module docstring, validity gate).
 SETTLE_DRIVE_VAR_C2 = 1.0
+#: A change of a bay's ``sigma_cal`` above this, degC, is a calibration event (settling).
+SETTLE_CAL_STEP_C = 0.05
 #: Low-pass of the estimator's disturbances for the prediction, seconds (module docstring).
-DIST_TAU_RISE_S = 30.0
-DIST_TAU_FALL_S = 120.0
+DIST_TAU_S = 120.0
 #: Bumpless offset decay, seconds (module docstring).
 BUMPLESS_TAU_UP_S = 15.0
 BUMPLESS_TAU_DOWN_S = 60.0
@@ -358,7 +370,8 @@ class SqpResult:
     ``history`` the objective after every accepted outer iteration (first: at the
     start point), ``iterations`` the largest box-QP iteration count (``warm_iterations`` the
     projected-Newton warm-start iterations, in total) and ``stop`` one of
-    ``unchanged`` | ``small_decrease`` | ``no_descent`` | ``outer_max`` | ``qp_cap``.
+    ``unchanged`` | ``small_decrease`` | ``small_step`` | ``no_descent`` | ``outer_max`` |
+    ``qp_cap``.
     """
 
     x: np.ndarray
@@ -413,8 +426,13 @@ def projected_newton(
     return x, PN_ITER
 
 
-def solve_penalty_qp(qp: PenaltyQp, x0: np.ndarray, *, max_iter: int, outer_max: int) -> SqpResult:
-    """Active-piece SQP (module docstring): monotone in :func:`objective`, finite."""
+def solve_penalty_qp(
+    qp: PenaltyQp, x0: np.ndarray, *, max_iter: int, outer_max: int, step_tol: float = 0.0
+) -> SqpResult:
+    """Active-piece SQP (module docstring): monotone in :func:`objective`, finite.
+
+    ``step_tol`` > 0 also stops after an accepted step whose largest move is below it
+    (``stop="small_step"``; the DAS MPC passes :data:`SQP_STEP_TOL`)."""
     x = np.clip(np.asarray(x0, dtype=float), qp.lo, qp.hi)
     fval = objective(qp, x)
     act_s, act_h = _activity(qp, x)
@@ -431,11 +449,18 @@ def solve_penalty_qp(qp: PenaltyQp, x0: np.ndarray, *, max_iter: int, outer_max:
         # is relative; the Newton step tolerance is in PWM (module docstring).
         lip = max(float(np.max(np.sum(np.abs(h), axis=1))), 1e-12)
         hn, fn = h / lip, f / lip
-        warm, pn_iter = projected_newton(hn, fn, qp.lo, qp.hi, x)
-        pn_total += pn_iter
-        res = solve_box_qp(hn, fn, qp.lo, qp.hi, warm, 1.0, max_iter, step_tol=QP_STEP_TOL)
-        it_max = max(it_max, res.iterations)
+        # from the current point first (a warm plan is usually a few bound changes away);
+        # only a start that needs more gets the projected Newton warm start
+        res = solve_box_qp(
+            hn, fn, qp.lo, qp.hi, x, 1.0, min(max_iter, QP_FAST_ITER), step_tol=QP_STEP_TOL
+        )
         it_total += res.iterations
+        if not res.converged and max_iter > QP_FAST_ITER:
+            warm, pn_iter = projected_newton(hn, fn, qp.lo, qp.hi, x)
+            pn_total += pn_iter
+            res = solve_box_qp(hn, fn, qp.lo, qp.hi, warm, 1.0, max_iter, step_tol=QP_STEP_TOL)
+            it_total += res.iterations
+        it_max = max(it_max, res.iterations)
         if not res.converged:
             converged = False
             stop = "qp_cap"
@@ -456,6 +481,7 @@ def solve_penalty_qp(qp: PenaltyQp, x0: np.ndarray, *, max_iter: int, outer_max:
             stop = "no_descent"
             break
         new_s, new_h = _activity(qp, x_new)
+        moved = float(np.max(np.abs(x_new - x))) if x.size else 0.0
         same = bool(np.array_equal(new_s, act_s) and np.array_equal(new_h, act_h))
         decrease = fval - f_new
         x, fval, act_s, act_h = x_new, f_new, new_s, new_h
@@ -465,6 +491,9 @@ def solve_penalty_qp(qp: PenaltyQp, x0: np.ndarray, *, max_iter: int, outer_max:
             break
         if decrease <= REL_DECREASE_TOL * max(1.0, abs(fval)):
             stop = "small_decrease"
+            break
+        if step_tol > 0.0 and moved <= step_tol:
+            stop = "small_step"
             break
     w = 2.0 * qp.rho_soft * act_s + 2.0 * qp.rho_hard * act_h
     h_diag = np.diag(qp.h0) + (qp.s * qp.s).T @ w
@@ -536,7 +565,7 @@ def snap_bands(
 
 @dataclass(frozen=True)
 class Prediction:
-    """The linearised, discretised, condensed model at one quantised operating point.
+    """The linearised, discretised, condensed model at one operating point.
 
     State ``x = [T_a (zones), T_d (drives)]``; ``drives`` are the bays with a drive
     state (occupied or unknown) in topology order. ``steps[k]`` is the sensitivity of
@@ -560,6 +589,7 @@ class Prediction:
     steps: np.ndarray
     w_ss: np.ndarray | None
     g_ss: np.ndarray | None
+    u_lin: tuple[float, ...] = ()
 
     @property
     def n(self) -> int:
@@ -570,26 +600,92 @@ class Prediction:
         return len(self.blocks) * len(self.channels)
 
 
-_LIN_CACHE: dict[tuple[Any, ...], Prediction] = {}
-#: The ``A``-only part (``A`` depends on the parameters and the command, not the state).
-_A_CACHE: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+_GRAM_CACHE: dict[tuple[int, int], np.ndarray] = {}
 
 
-def _dynamics(a: np.ndarray, h: float, n_zones: int) -> tuple[Any, ...]:
-    """``(A, Ad, M, C A^-1 | None, eigenvalues ok, largest real part)`` of a reduced ``A``."""
+def _move_gram(n_b: int, m: int) -> np.ndarray:
+    """``D^T D`` of the block-difference operator ``(D U)_b = u_b - u_(b-1)`` (``u_(-1)`` = 0)."""
+    gram = _GRAM_CACHE.get((n_b, m))
+    if gram is None:
+        n = n_b * m
+        d = np.eye(n)
+        if n_b > 1:
+            d[m:, :-m] -= np.eye(n - m)
+        gram = d.T @ d
+        gram.setflags(write=False)
+        _GRAM_CACHE[(n_b, m)] = gram
+    return gram
+
+
+@dataclass(frozen=True)
+class _Dynamics:
+    """What depends on the parameters and the quantised command only (the memo's value):
+    the reduced ``A``, its discretisation and inverse, and the pieces of ``B`` that the
+    state multiplies (``B`` is affine in the temperatures)."""
+
+    a: np.ndarray
+    ad: np.ndarray
+    m_int: np.ndarray
+    w_ss: np.ndarray | None
+    eig_ok: bool
+    eig_max: float
+    dq: np.ndarray  # zones x channels: dQ_z / du
+    dqn: np.ndarray  # zones x channels: dQn_z / du
+    k: np.ndarray  # drives: k of the bay
+    zone_of: np.ndarray  # drives: zone index
+    incidence: np.ndarray  # zones x drives
+    c_air: np.ndarray
+    c_drive: np.ndarray
+
+
+_DYN_CACHE: dict[tuple[Any, ...], _Dynamics] = {}
+
+
+def _dynamics(
+    st: thermal.Structure,
+    params: thermal.ThermalParams,
+    drives: tuple[str, ...],
+    uq: np.ndarray,
+    h: float,
+) -> _Dynamics:
+    zones = tuple(st.zones)
+    x_any = np.zeros(st.n_states)  # A does not depend on the state
+    lin = thermal.jacobians(st, params, x_any, uq, t_in=np.zeros(len(zones)))
+    idx = [st.i_air(z) for z in zones] + [st.i_drive(b) for b in drives]
+    a = lin.a[np.ix_(idx, idx)]
     n = a.shape[0]
     lam = np.linalg.eigvals(a) if n else np.zeros(0)
     eig_real = bool(np.all(np.abs(lam.imag) <= EIG_IMAG_REL * np.maximum(1.0, np.abs(lam))))
     eig_max = float(np.max(lam.real)) if n else -math.inf
-    ad, m_int = zoh(a, h)
     w_ss: np.ndarray | None
+    inv: np.ndarray | None
     try:
-        w_ss = np.linalg.inv(a)[n_zones:]
-        if not np.all(np.isfinite(w_ss)):
-            w_ss = None
+        inv = np.linalg.inv(a)
+        if not np.all(np.isfinite(inv)):
+            inv = None
     except np.linalg.LinAlgError:
-        w_ss = None
-    return a, ad, m_int, w_ss, eig_real and eig_max < 0.0, eig_max
+        inv = None
+    w_ss = None if inv is None else inv[len(zones) :]
+    ad, m_int = zoh(a, h, inv)
+    dq, dqn = thermal.airflow_gradients(st, params, uq)
+    zone_of = np.array([st.zones[st.bays[b].zone].index for b in drives], dtype=int)
+    incidence = np.zeros((len(zones), len(drives)))
+    incidence[zone_of, np.arange(len(drives))] = 1.0
+    return _Dynamics(
+        a=a,
+        ad=ad,
+        m_int=m_int,
+        w_ss=w_ss,
+        eig_ok=eig_real and eig_max < 0.0,
+        eig_max=eig_max,
+        dq=dq,
+        dqn=dqn,
+        k=np.array([params.theta[f"k.{b}"] for b in drives]),
+        zone_of=zone_of,
+        incidence=incidence,
+        c_air=np.array([params.c_air[z] for z in zones]),
+        c_drive=np.array([params.c_drive[b] for b in drives]),
+    )
 
 
 def _expm(m: np.ndarray) -> np.ndarray:
@@ -606,15 +702,22 @@ def _expm(m: np.ndarray) -> np.ndarray:
     return e
 
 
-def zoh(a: np.ndarray, h: float) -> tuple[np.ndarray, np.ndarray]:
+def zoh(a: np.ndarray, h: float, inv: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
     """``(exp(A h), int_0^h exp(A s) ds)``: the exact zero-order-hold discretisation of
-    ``dx/dt = A x + v`` is ``x+ = Ad x + M v`` (one exponential of ``[[A, I], [0, 0]] h``).
+    ``dx/dt = A x + v`` is ``x+ = Ad x + M v``.
 
-    ``thermal.discretise`` diagonalises instead; a layout with identical bays has
-    repeated eigenvalues, for which ``numpy.linalg.eig`` may return eigenvectors whose
+    With ``inv = A^-1`` (the caller's, for the terminal rows) ``M = A^-1 (Ad - I)`` from one
+    exponential of ``A h``; otherwise one exponential of ``[[A, I], [0, 0]] h``, which needs
+    no inverse. ``thermal.discretise`` diagonalises instead; a layout with identical bays
+    has repeated eigenvalues, for which ``numpy.linalg.eig`` may return eigenvectors whose
     real parts are singular, so the MPC uses the exponential, which needs no eigenvectors.
     """
     n = a.shape[0]
+    if inv is not None:
+        ad = _expm(a * h)
+        m_int = inv @ (ad - np.eye(n))
+        if np.all(np.isfinite(m_int)):
+            return ad, m_int
     big = np.zeros((2 * n, 2 * n))
     big[:n, :n] = a * h
     big[:n, n:] = np.eye(n) * h
@@ -622,14 +725,13 @@ def zoh(a: np.ndarray, h: float) -> tuple[np.ndarray, np.ndarray]:
     return e[:n, :n], e[:n, n:]
 
 
-def _u_lin(u: float, deadband: float) -> float:
-    """Quantised command clamped into the open range of the fan curve."""
+def _u_lin(u: float, deadband: float, last: float | None = None) -> float:
+    """Quantised command clamped into the open range of the fan curve; the previous
+    linearisation command ``last`` is kept while ``u`` stays within one step of it."""
     q = round(float(u) / QUANT_U) * QUANT_U
+    if last is not None and abs(float(u) - last) <= QUANT_U:
+        q = last
     return min(1.0 - QUANT_U, max(deadband + QUANT_U, q))
-
-
-def _quant_t(t: float) -> float:
-    return round(float(t) / QUANT_T_C) * QUANT_T_C
 
 
 def build_prediction(
@@ -641,55 +743,57 @@ def build_prediction(
     x_drive: Mapping[str, float],
     u: Mapping[str, float],
     t_in: Mapping[str, float],
+    u_lin: Mapping[str, float] | None = None,
 ) -> tuple[Prediction, bool]:
-    """:class:`Prediction` at the quantised point of ``(x, u, t_in)``; ``(prediction, cache
-    hit)``. Raises ``numpy.linalg.LinAlgError`` / ``ValueError`` on a numerical failure."""
+    """:class:`Prediction` at ``(x, u, t_in)``; ``(prediction, memo hit)``.
+
+    ``A`` and the command-dependent pieces of ``B`` are taken at the quantised command
+    and memoised on it (with the parameters; ``u_lin`` is the previous tick's linearisation
+    command, kept per channel while the command stays within one quantisation step of it,
+    so a fan dithering across a step boundary does not rebuild ``A``; the command used is
+    ``Prediction.u_lin``); ``B`` itself is affine in the temperatures
+    and evaluated at the exact state (the module docstring's quantisation of the
+    temperatures is therefore not needed). Raises ``numpy.linalg.LinAlgError`` /
+    ``ValueError`` on a numerical failure.
+    """
     zones = tuple(st.zones)
     drives = tuple(b for b in st.bays if params.occupied[b])
     channels = tuple(st.channels)
     blocks = cfg.blocks()
     h = float(cfg.mpc_pred_dt_s)
-    xq_air = tuple(_quant_t(x_air[z]) for z in zones)
-    xq_drive = tuple(_quant_t(x_drive[b]) for b in drives)
-    uq = tuple(_u_lin(u[ch], params.fan[ch][0]) for ch in channels)
-    tq = tuple(_quant_t(t_in[z]) for z in zones)
-    base_key = (
+    last = {} if u_lin is None else u_lin
+    uq = tuple(_u_lin(u[ch], params.fan[ch][0], last.get(ch)) for ch in channels)
+    key = (
         st.fingerprint,
-        tuple(sorted(params.theta.items())),
-        tuple(sorted(params.c_air.items())),
-        tuple(sorted(params.c_drive.items())),
-        tuple(sorted(params.fan.items())),
+        tuple(params.theta.items()),
+        tuple(params.c_air.values()),
+        tuple(params.c_drive.values()),
+        tuple(params.fan.values()),
         drives,
         uq,
         h,
     )
-    key = (base_key, xq_air, xq_drive, tq, blocks, cfg.horizon)
-    hit = _LIN_CACHE.get(key)
-    if hit is not None:
-        return hit, True
-
-    x_full = np.zeros(st.n_states)
-    for z in zones:
-        x_full[st.i_air(z)] = _quant_t(x_air[z])
-    for b, bs in st.bays.items():
-        ta = x_full[st.i_air(bs.zone)]
-        x_full[st.i_drive(b)] = _quant_t(x_drive[b]) if b in x_drive else ta
-        x_full[st.i_sensor(b)] = ta
-    lin = thermal.jacobians(st, params, x_full, np.array(uq), t_in=np.array(tq))
-    idx = [st.i_air(z) for z in zones] + [st.i_drive(b) for b in drives]
-    bm = lin.b[idx]
-    n, m = len(idx), len(channels)
-    dyn = _A_CACHE.get(base_key)
+    dyn = _DYN_CACHE.get(key)
+    hit = dyn is not None
     if dyn is None:
-        dyn = _dynamics(lin.a[np.ix_(idx, idx)], h, len(zones))
-        while len(_A_CACHE) >= _LIN_CACHE_SIZE:
-            del _A_CACHE[next(iter(_A_CACHE))]
-        _A_CACHE[base_key] = dyn
-    a, ad, m_int, w_ss, eig_ok, eig_max = dyn
-    bd = m_int @ bm
-    g_ss = None if w_ss is None else -(w_ss @ bm)
-    if g_ss is not None and not np.all(np.isfinite(g_ss)):
-        g_ss = None
+        dyn = _dynamics(st, params, drives, np.array(uq), h)
+        while len(_DYN_CACHE) >= _LIN_CACHE_SIZE:
+            del _DYN_CACHE[next(iter(_DYN_CACHE))]
+        _DYN_CACHE[key] = dyn
+    xa = np.array([float(x_air[z]) for z in zones])
+    xd = np.array([float(x_drive[b]) for b in drives])
+    tin = np.array([float(t_in[z]) for z in zones])
+    # thermal.jacobians: air rows -dQ (T_a - T_in) / C_a + sum_j k_j dQn (T_d,j - T_a) / C_a,
+    # drive rows -k dQn (T_d - T_a) / C_d
+    drive_gain = (dyn.k * (xd - xa[dyn.zone_of]))[:, None] * dyn.dqn[dyn.zone_of]
+    b_air = (-dyn.dq * (xa - tin)[:, None] + dyn.incidence @ drive_gain) / dyn.c_air[:, None]
+    b_drive = -drive_gain / dyn.c_drive[:, None]
+    bm = np.vstack([b_air, b_drive])
+    if not np.all(np.isfinite(bm)):
+        raise FloatingPointError("non-finite input matrix")
+    n, m = len(zones) + len(drives), len(channels)
+    bd = dyn.m_int @ bm
+    g_ss = None if dyn.w_ss is None else -(dyn.w_ss @ bm)
     n_b = len(blocks)
     nv = n_b * m
     steps = np.zeros((cfg.horizon, len(drives), nv))
@@ -698,7 +802,7 @@ def build_prediction(
     for bi, length in enumerate(blocks):
         cols = slice(bi * m, (bi + 1) * m)
         for _ in range(length):
-            sens = ad @ sens
+            sens = dyn.ad @ sens
             sens[:, cols] += bd
             steps[k] = sens[len(zones) :]
             k += 1
@@ -708,21 +812,19 @@ def build_prediction(
         channels=channels,
         blocks=blocks,
         h=h,
-        a=a,
+        a=dyn.a,
         b=bm,
-        ad=ad,
+        ad=dyn.ad,
         bd=bd,
-        m_int=m_int,
-        eig_ok=eig_ok,
-        eig_max=eig_max,
+        m_int=dyn.m_int,
+        eig_ok=dyn.eig_ok,
+        eig_max=dyn.eig_max,
         steps=steps,
-        w_ss=w_ss,
+        w_ss=dyn.w_ss,
         g_ss=g_ss,
+        u_lin=uq,
     )
-    while len(_LIN_CACHE) >= _LIN_CACHE_SIZE:
-        del _LIN_CACHE[next(iter(_LIN_CACHE))]
-    _LIN_CACHE[key] = pred
-    return pred, False
+    return pred, hit
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +927,8 @@ def _fresh_memory() -> dict[str, Any]:
         "fresh": None,
         "dist": {"q": {}, "d": {}, "since": {}},
         "settle": {},
+        "cal": {},
+        "lin_u": {},
     }
 
 
@@ -904,6 +1008,8 @@ def _parse(raw: object, cfg: MpcConfig) -> dict[str, Any]:
     status = raw.get("status")
     mem["status"] = status if isinstance(status, str) else None
     mem["settle"] = _num_map(raw.get("settle", {}))
+    mem["cal"] = _num_map(raw.get("cal", {}))
+    mem["lin_u"] = _num_map(raw.get("lin_u", {}), channels)
     dist = raw.get("dist")
     if dist is not None:
         since = dist.get("since", {})
@@ -1033,7 +1139,9 @@ class DasMpcSolver:
         switched = False
         model: _Model | None = None
         if solve_now:
-            model = self._model(cfg, req, rows, mem["dist"], settling)
+            model = self._model(cfg, req, rows, mem["dist"], settling, mem["lin_u"])
+            if model.pred is not None:
+                mem["lin_u"] = dict(zip(model.pred.channels, model.pred.u_lin, strict=True))
             self._store_prediction(mem, model, prev, ts)
             switched = self._decide(cfg, mem, model, ts)
             mem["tick"] = 0
@@ -1182,8 +1290,8 @@ class DasMpcSolver:
     @staticmethod
     def _filter_disturbances(req: SolverRequest, mem: dict[str, Any], ts: float) -> None:
         """Low-pass the estimator's integrating disturbances for the prediction (module
-        docstring, *Disturbances*): rises with :data:`DIST_TAU_RISE_S`, falls with
-        :data:`DIST_TAU_FALL_S`; a bay whose occupancy changed restarts from the estimate."""
+        docstring, *Disturbances*) with :data:`DIST_TAU_S`; a bay whose occupancy changed
+        restarts from the estimate."""
         plant = req.plant if isinstance(req.plant, Mapping) else {}
         last = mem["ts"]
         elapsed = 0.0 if last is None else min(max(ts - last, 0.0), 3600.0)
@@ -1193,8 +1301,7 @@ class DasMpcSolver:
         def smooth(prev: float | None, value: float) -> float:
             if prev is None:
                 return value
-            tau = DIST_TAU_RISE_S if value > prev else DIST_TAU_FALL_S
-            return prev + (value - prev) * (1.0 - math.exp(-elapsed / tau))
+            return prev + (value - prev) * (1.0 - math.exp(-elapsed / DIST_TAU_S))
 
         for zone, info in (plant.get("zones") or {}).items():
             if isinstance(info, Mapping) and _finite(info.get("d_air")):
@@ -1234,23 +1341,32 @@ class DasMpcSolver:
         """Bays left out of the prediction-error and drift checks (module docstring): within
         ``estimator.bay_settle_s`` of an occupancy change, or of the last tick on which the
         estimator's own drive uncertainty exceeded :data:`SETTLE_DRIVE_VAR_C2` (a swap it
-        followed as a jump without passing through ``empty``). Updates ``mem["settle"]``."""
+        followed as a jump without passing through ``empty``) or its calibration floor
+        ``sigma_cal`` changed (a SMART calibration accepted or expired re-maps the drive
+        estimate). Updates ``mem["settle"]`` and ``mem["cal"]``."""
         assert cfg.estimator is not None
         window = cfg.estimator.bay_settle_s
         bays = req.plant.get("bays", {}) if isinstance(req.plant, Mapping) else {}
         marks = {b: t for b, t in mem["settle"].items() if b in bays and 0.0 <= ts - t < window}
+        cal_seen: dict[str, float] = {}
         out: set[str] = set()
         for bay, info in bays.items():
             if not isinstance(info, Mapping):
                 continue
             sigma, cal = info.get("sigma"), info.get("sigma_cal")
-            wide = _finite(sigma) and _finite(cal)
-            if wide and float(sigma) ** 2 - float(cal) ** 2 > SETTLE_DRIVE_VAR_C2:
-                marks[bay] = ts
+            if _finite(sigma) and _finite(cal):
+                cal_f = float(cal)
+                if float(sigma) ** 2 - cal_f**2 > SETTLE_DRIVE_VAR_C2:
+                    marks[bay] = ts
+                last_cal = mem["cal"].get(bay)
+                if last_cal is not None and abs(cal_f - last_cal) > SETTLE_CAL_STEP_C:
+                    marks[bay] = ts
+                cal_seen[bay] = cal_f
             since = info.get("since_ts")
             if (_finite(since) and 0.0 <= ts - float(since) < window) or bay in marks:
                 out.add(bay)
         mem["settle"] = marks
+        mem["cal"] = cal_seen
         return out
 
     def _model(
@@ -1260,6 +1376,7 @@ class DasMpcSolver:
         rows: list[str],
         dist: Mapping[str, Any],
         settling: set[str],
+        lin_u: Mapping[str, float] | None = None,
     ) -> _Model:
         """Model inputs from the request and, when possible, the prediction."""
         st = thermal.cached_structure(cfg)
@@ -1271,7 +1388,7 @@ class DasMpcSolver:
             return model
         model = _Model(st, status, theta, rows, {}, {})
         try:
-            self._build(cfg, req, model, dist, settling)
+            self._build(cfg, req, model, dist, settling, lin_u)
         except Exception as exc:  # numerical failure of the model: a model fallback
             model.pred = None
             model.error = f"{type(exc).__name__}: {exc}"[:120]
@@ -1284,6 +1401,7 @@ class DasMpcSolver:
         model: _Model,
         dist: Mapping[str, Any],
         settling: set[str],
+        lin_u: Mapping[str, float] | None = None,
     ) -> None:
         st = model.st
         plant = req.plant if isinstance(req.plant, Mapping) else {}
@@ -1329,7 +1447,7 @@ class DasMpcSolver:
             raise ValueError(f"no drive state for bay {missing[0]!r}")
         u_now = {ch: min(1.0, max(0.0, float(req.prev_pwm[ch]))) for ch in cfg.channels}
         pred, hit = build_prediction(
-            cfg, st, params, x_air=x_air, x_drive=x_drive, u=u_now, t_in=t_in
+            cfg, st, params, x_air=x_air, x_drive=x_drive, u=u_now, t_in=t_in, u_lin=lin_u
         )
         x_full = np.zeros(st.n_states)
         for z in st.zones:
@@ -1442,30 +1560,16 @@ class DasMpcSolver:
         # noise surrogate and moves over every variable
         sur = noise_model.surrogate(cfg, prev)
         assert cfg.noise is not None
-        wn = cfg.noise.weight_noise
-        diag_h = np.zeros(nv)
-        f0 = np.zeros(nv)
-        for bi, length in enumerate(blocks):
-            for i, ch in enumerate(channels):
-                j = bi * m + i
-                coef = wn * length
-                diag_h[j] = coef * sur.h[ch] + RIDGE
-                f0[j] = coef * (sur.g[ch] - sur.h[ch] * sur.u_now[ch])
-        h0 = np.diag(diag_h)
+        coef = cfg.noise.weight_noise * np.repeat(np.array(blocks, dtype=float), m)
+        g_n = np.tile(np.array([sur.g[ch] for ch in channels]), n_b)
+        h_n = np.tile(np.array([sur.h[ch] for ch in channels]), n_b)
+        u_n = np.tile(np.array([sur.u_now[ch] for ch in channels]), n_b)
+        h0 = np.diag(coef * h_n + RIDGE)
+        f0 = coef * (g_n - h_n * u_n)
         wd = cfg.weight_dpwm
-        if wd > 0:
-            prev_v = np.array([prev[ch] for ch in channels])
-            for bi in range(n_b):
-                for i in range(m):
-                    j = bi * m + i
-                    h0[j, j] += 2.0 * wd
-                    if bi == 0:
-                        f0[j] -= 2.0 * wd * prev_v[i]
-                    else:
-                        jp = j - m
-                        h0[jp, jp] += 2.0 * wd
-                        h0[j, jp] -= 2.0 * wd
-                        h0[jp, j] -= 2.0 * wd
+        if wd > 0:  # weight_dpwm sum_b ||u_b - u_(b-1)||^2 with u_(-1) = prev
+            h0 += 2.0 * wd * _move_gram(n_b, m)
+            f0[:m] -= 2.0 * wd * np.array([prev[ch] for ch in channels])
 
         # remove the fixed channels
         col_free = np.array(
@@ -1502,7 +1606,11 @@ class DasMpcSolver:
         else:
             warm = np.tile(np.clip(uv, cfg.pwm_min, cfg.pwm_max), n_b)[col_free]
         res = solve_penalty_qp(
-            qp, warm, max_iter=cfg.solver_max_iter, outer_max=cfg.solver_outer_max
+            qp,
+            warm,
+            max_iter=cfg.solver_max_iter,
+            outer_max=cfg.solver_outer_max,
+            step_tol=SQP_STEP_TOL,
         )
         if not res.converged:
             return {"converged": False, "iterations": res.iterations, "stop": res.stop}
