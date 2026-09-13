@@ -1,8 +1,9 @@
 """HTTP view and control (PROJECT.md section 6).
 
 ``create_app`` wires GET ``/api/state``, GET ``/api/health``, GET ``/`` (the
-static single-page UI) and the six ``POST /api/{mode,setpoint,pwm,preset,
-auto,limit}`` intents against a :class:`aqua_bridge.control.intents.ControlSurface`.
+static single-page UI), the DAS views GET ``/api/estimate`` and GET
+``/api/bays``, and the seven ``POST /api/{mode,setpoint,pwm,preset,auto,limit,
+bay}`` intents against a :class:`aqua_bridge.control.intents.ControlSurface`.
 
 HTTP never computes PWM itself: every POST body becomes an
 :class:`~aqua_bridge.control.intents.Intent` via
@@ -14,7 +15,24 @@ its exceptions into the right HTTP status.
 ``POST /api/limit`` ``{"bay": ..., "limit_c": ...}`` or ``{"class": ...,
 "limit_c": ...}`` is the DAS-mode intent (drive limits); a legacy config
 answers 400 and keeps ``POST /api/setpoint``. The route exists for both so a
-client learns the reason from the body instead of a 404.
+client learns the reason from the body instead of a 404. ``POST /api/bay``
+``{"bay": ..., "occupied"?: true|false|"auto", "class"?: ..., "serial"?: ...}``
+(a ``null`` field restores the configured value) works the same way.
+
+DAS views (plan sections 1 and 7), read from the snapshot, never computed here:
+
+* ``GET /api/estimate`` -- ``{"estimates": {bay: ...}, "estimator": {...}}``: the
+  per-bay estimates (``t_c``, ``sigma_c``, ``margin_c``, ``soft_c``, ``hard_c``,
+  ``limit_c``, ``occupancy``, ``class``, ``calibrated``, ``q_w``, ...) and the
+  estimator summary (status, per zone air estimate, SMART counters) of the last
+  command; both empty before the first tick.
+* ``GET /api/bays`` -- ``{"bays": {bay: {"declared": {zone, occupied, class,
+  serial}, "estimator": {occupancy, class, serial, association, calibration,
+  candidates, ...} | null}}}``: the declarations in force and what the estimator
+  made of them, including the serial candidates of the association by
+  correlation with their scores (confirm one with ``POST /api/bay {bay, serial}``).
+
+A legacy config answers both with 404 and a reason.
 
 No authentication in v1: bind is LAN-only (``0.0.0.0:8080`` by default,
 see ``config.example.yaml``). Section 6: "No auth on the local network in
@@ -60,7 +78,7 @@ _SMART_KEY: web.AppKey[Any] = web.AppKey("smart_inbox")
 
 # URL tail -> intent kind (identical today, kept separate so the route table
 # and aqua_bridge.control.intents.INTENT_KINDS can diverge later).
-_POST_KINDS = ("mode", "setpoint", "pwm", "preset", "auto", "limit")
+_POST_KINDS = ("mode", "setpoint", "pwm", "preset", "auto", "limit", "bay")
 
 
 def _error(status: int, message: str) -> web.Response:
@@ -113,6 +131,41 @@ async def _get_health(request: web.Request) -> web.Response:
     return web.json_response(snapshot.health_payload())
 
 
+_NOT_DAS = "estimates and bays need a DAS config (mpc.topology)"
+
+
+def _diagnostics(snapshot: Any) -> dict[str, Any]:
+    cmd = snapshot.last_cmd
+    return {} if cmd is None else dict(cmd.diagnostics)
+
+
+async def _get_estimate(request: web.Request) -> web.Response:
+    surface: ControlSurface = request.app[_SURFACE_KEY]
+    snapshot = surface.snapshot()
+    if not snapshot.bays:
+        return _error(404, _NOT_DAS)
+    diag = _diagnostics(snapshot)
+    return web.json_response(
+        {"estimates": diag.get("estimates") or {}, "estimator": diag.get("estimator") or {}}
+    )
+
+
+async def _get_bays(request: web.Request) -> web.Response:
+    surface: ControlSurface = request.app[_SURFACE_KEY]
+    snapshot = surface.snapshot()
+    if not snapshot.bays:
+        return _error(404, _NOT_DAS)
+    seen = _diagnostics(snapshot).get("bays") or {}
+    return web.json_response(
+        {
+            "bays": {
+                bay: {"declared": dict(declared), "estimator": seen.get(bay)}
+                for bay, declared in snapshot.bays.items()
+            }
+        }
+    )
+
+
 async def _post_in_smart(request: web.Request) -> web.Response:
     inbox = request.app.get(_SMART_KEY)
     if inbox is None:
@@ -156,6 +209,8 @@ def create_app(
     app[_SMART_KEY] = smart_inbox
     app.router.add_get("/api/state", _get_state)
     app.router.add_get("/api/health", _get_health)
+    app.router.add_get("/api/estimate", _get_estimate)
+    app.router.add_get("/api/bays", _get_bays)
     app.router.add_get("/", _get_index)
     for kind in _POST_KINDS:
         app.router.add_post(f"/api/{kind}", _make_intent_handler(kind))

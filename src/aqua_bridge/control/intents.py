@@ -20,7 +20,8 @@ checks (channel exists, ``pwm`` within ``[pwm_min, pwm_max]``) belong to
 Setpoints and limits: ``SetSetpoint`` (``POST /api/setpoint``) targets a
 temperature of a legacy (setpoint) config. In DAS mode drives are regulated
 to their limits instead and ``SetLimit`` (``POST /api/limit``) changes the
-absolute limit of one bay or one drive class.
+absolute limit of one bay or one drive class. ``SetBay`` (``POST /api/bay``,
+DAS mode) declares a bay's occupancy, drive class or drive serial at runtime.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ __all__ = [
     "IntentError",
     "IntentInvalid",
     "Preset",
+    "SetBay",
     "SetLimit",
     "SetMode",
     "SetPreset",
@@ -235,6 +237,46 @@ class SetLimit:
             object.__setattr__(self, "drive_class", _name("class", self.drive_class))
 
 
+#: Fields of ``SetBay.changes`` (JSON body keys of ``POST /api/bay``).
+BAY_FIELDS: tuple[str, ...] = ("occupied", "class", "serial")
+
+
+@dataclass(frozen=True)
+class SetBay:
+    """``POST /api/bay`` ``{"bay": "b03", "occupied": true, "class": "ssd_sata", "serial": "X"}``.
+
+    DAS mode only. ``changes`` holds at least one of ``occupied`` (``true``,
+    ``false`` or ``"auto"``), ``class`` (a drive class) and ``serial`` (the
+    drive's serial, which then wins over the association by correlation). A
+    JSON ``null`` puts that field back to the value written in the config.
+    ``submit`` checks that the bay and class exist and that the resulting
+    config is valid (a serial may be declared on one bay only).
+    """
+
+    bay: str
+    changes: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "bay", _name("bay", self.bay))
+        if not isinstance(self.changes, Mapping):
+            raise IntentInvalid("bay changes must be a mapping")
+        changes = dict(self.changes)
+        unknown = sorted(str(k) for k in changes if k not in BAY_FIELDS)
+        if unknown:
+            raise IntentInvalid(f"unknown bay fields: {unknown}")
+        if not changes:
+            raise IntentInvalid(f"give at least one of {list(BAY_FIELDS)}")
+        occupied = changes.get("occupied")
+        if "occupied" in changes and not (
+            occupied is None or isinstance(occupied, bool) or occupied == "auto"
+        ):
+            raise IntentInvalid(f"occupied must be true, false, 'auto' or null, got {occupied!r}")
+        for key in ("class", "serial"):
+            if key in changes and changes[key] is not None:
+                changes[key] = _name(key, changes[key])
+        object.__setattr__(self, "changes", {k: changes[k] for k in BAY_FIELDS if k in changes})
+
+
 @dataclass(frozen=True)
 class ClearOverride:
     """``POST /api/auto`` ``{"channel": "radiator"}`` or ``{}`` (all channels)."""
@@ -246,7 +288,7 @@ class ClearOverride:
             object.__setattr__(self, "channel", _channel(self.channel))
 
 
-Intent = SetMode | SetSetpoint | SetPwm | SetPreset | ClearOverride | SetLimit
+Intent = SetMode | SetSetpoint | SetPwm | SetPreset | ClearOverride | SetLimit | SetBay
 
 # URL tail / MQTT command name -> intent class and the body keys it accepts.
 INTENT_KINDS: dict[str, tuple[type, tuple[str, ...]]] = {
@@ -256,6 +298,7 @@ INTENT_KINDS: dict[str, tuple[type, tuple[str, ...]]] = {
     "preset": (SetPreset, ("name",)),
     "auto": (ClearOverride, ("channel",)),
     "limit": (SetLimit, ("bay", "class", "limit_c")),
+    "bay": (SetBay, ("bay", *BAY_FIELDS)),
 }
 
 
@@ -280,6 +323,10 @@ def parse_intent(kind: str, body: object) -> Intent:
         if "limit_c" not in body:
             raise IntentInvalid("missing fields for 'limit': ['limit_c']")
         return SetLimit(limit_c=body["limit_c"], bay=body.get("bay"), drive_class=body.get("class"))
+    if cls is SetBay:
+        if "bay" not in body:
+            raise IntentInvalid("missing fields for 'bay': ['bay']")
+        return SetBay(bay=body["bay"], changes={k: body[k] for k in BAY_FIELDS if k in body})
     if cls is not ClearOverride:
         missing = [k for k in allowed if k not in body]
         if missing:
@@ -301,6 +348,8 @@ class ControlSnapshot:
     a legacy config; in DAS mode it holds the limits in force
     (``{"classes": {class: limit_c}, "bays": {bay: limit_c}}``) and appears in
     :meth:`state_payload` only then, so the legacy payload keeps its shape.
+    ``bays`` likewise: in DAS mode the bay declarations in force (config plus
+    ``SetBay``), ``{bay: {"zone", "occupied", "class", "serial"}}``.
     """
 
     obs: PlantObservation | None
@@ -322,6 +371,7 @@ class ControlSnapshot:
     version: str = ""
     extra: dict[str, Any] = field(default_factory=dict)  # host stats etc., JSON-serialisable
     limits: dict[str, Any] = field(default_factory=dict)
+    bays: dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def solver_status_for(cmd: MpcCommand | None) -> SolverStatus:
@@ -350,6 +400,8 @@ class ControlSnapshot:
         }
         if self.limits:
             out["limits"] = {k: dict(v) for k, v in self.limits.items()}
+        if self.bays:
+            out["bays"] = {k: dict(v) for k, v in self.bays.items()}
         return out
 
     def health_payload(self) -> dict[str, Any]:

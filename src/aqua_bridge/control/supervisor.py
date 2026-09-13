@@ -29,6 +29,13 @@ Rules (section 6 "Control", section 4.8, section 5 "Modes")
   tighten or restore what the owner wrote, never exceed it. A bay's limit in
   force is ``min(class limit, bay limit)``, so lowering a class also lowers every
   bay of that class. Limits apply on top of the preset.
+* ``SetBay`` (DAS mode only) overrides ``topology.bays.<bay>.occupied``,
+  ``class`` and ``serial`` in the effective config; a ``null`` field restores the
+  configured value. The bay and class must exist and the result must be a valid
+  config (a serial may be declared on one bay only). This is the owner's
+  declaration: ``occupied: false`` removes the bay's constraints like it does in
+  the config file, and a declared serial wins over the estimator's association
+  by correlation.
 * ``SetMode(auto)`` clears every override. ``SetMode(manual)`` gives every
   channel without an override one, seeded from the last applied PWM (or
   ``fallback_pwm`` before anything was applied) so entering manual does
@@ -108,6 +115,7 @@ from aqua_bridge.control.intents import (
     IntentConflict,
     IntentInvalid,
     Preset,
+    SetBay,
     SetLimit,
     SetMode,
     SetPreset,
@@ -123,7 +131,15 @@ from aqua_bridge.model import (
     PlantObservation,
 )
 
-__all__ = ["PRESETS", "PresetEffect", "RuntimeLimits", "Supervisor", "TickPlan", "apply_preset"]
+__all__ = [
+    "PRESETS",
+    "PresetEffect",
+    "RuntimeBays",
+    "RuntimeLimits",
+    "Supervisor",
+    "TickPlan",
+    "apply_preset",
+]
 
 _EPS = 1e-12
 
@@ -166,25 +182,37 @@ class RuntimeLimits:
     bays: dict[str, float] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class RuntimeBays:
+    """Bay declarations set through ``SetBay``: bay -> ``{occupied?, class?, serial?}``."""
+
+    bays: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
 def apply_preset(
     cfg: MpcConfig,
     setpoints: Mapping[str, float],
     preset: Preset,
     limits: RuntimeLimits | None = None,
+    bays: RuntimeBays | None = None,
 ) -> MpcConfig:
-    """``cfg`` with ``setpoints``, runtime ``limits`` and the preset transform applied.
+    """``cfg`` with ``setpoints``, runtime ``limits`` and ``bays`` and the preset transform.
 
-    Legacy configs: setpoint offset, gain and move-penalty scales (``limits``
-    must be empty). DAS configs: comfort offset and noise weight scale plus the
-    runtime limits (module docstring). Raises
+    Legacy configs: setpoint offset, gain and move-penalty scales (``limits`` and
+    ``bays`` must be empty). DAS configs: comfort offset and noise weight scale
+    plus the runtime limits and bay declarations (module docstring). Raises
     :class:`~aqua_bridge.model.ConfigError` when the result is not a valid
     config (setpoint outside the gate's absolute range, for instance).
     """
     effect = PRESETS[Preset(preset)]
     if cfg.is_das:
-        return _apply_das_preset(cfg, setpoints, effect, limits or RuntimeLimits())
+        return _apply_das_preset(
+            cfg, setpoints, effect, limits or RuntimeLimits(), bays or RuntimeBays()
+        )
     if limits is not None and (limits.classes or limits.bays):
         raise ConfigError("drive limits need a DAS config (mpc.topology)")
+    if bays is not None and bays.bays:
+        raise ConfigError("bay declarations need a DAS config (mpc.topology)")
     return dataclasses.replace(
         cfg,
         setpoints={name: float(v) + effect.setpoint_offset_c for name, v in setpoints.items()},
@@ -194,8 +222,15 @@ def apply_preset(
     )
 
 
+_BAY_ATTRS = {"occupied": "occupied", "class": "drive_class", "serial": "serial"}
+
+
 def _apply_das_preset(
-    cfg: MpcConfig, setpoints: Mapping[str, float], effect: PresetEffect, limits: RuntimeLimits
+    cfg: MpcConfig,
+    setpoints: Mapping[str, float],
+    effect: PresetEffect,
+    limits: RuntimeLimits,
+    declared: RuntimeBays,
 ) -> MpcConfig:
     topo = cfg.topology
     assert topo is not None and cfg.noise is not None
@@ -207,12 +242,14 @@ def _apply_das_preset(
         )
         for name, dc in cfg.drive_classes.items()
     }
-    bays = {
-        name: dataclasses.replace(bay, limit_c=float(limits.bays[name]))
-        if name in limits.bays
-        else bay
-        for name, bay in topo.bays.items()
-    }
+    bays = {}
+    for name, bay in topo.bays.items():
+        changes: dict[str, Any] = {
+            _BAY_ATTRS[key]: value for key, value in declared.bays.get(name, {}).items()
+        }
+        if name in limits.bays:
+            changes["limit_c"] = float(limits.bays[name])
+        bays[name] = dataclasses.replace(bay, **changes) if changes else bay
     out = dataclasses.replace(
         cfg,
         setpoints={name: float(v) for name, v in setpoints.items()},
@@ -297,7 +334,8 @@ class Supervisor:
         self._setpoints: dict[str, float] = dict(cfg.setpoints)
         self._preset = Preset(preset)
         self._limits = RuntimeLimits()
-        self._effective = apply_preset(cfg, self._setpoints, self._preset, self._limits)
+        self._bays = RuntimeBays()
+        self._effective = apply_preset(cfg, self._setpoints, self._preset, self._limits, self._bays)
         self._released: set[str] = set()
 
         # Loop-reported facts.
@@ -342,6 +380,12 @@ class Supervisor:
         with self._lock:
             return RuntimeLimits(dict(self._limits.classes), dict(self._limits.bays))
 
+    @property
+    def bays(self) -> RuntimeBays:
+        """Bay declarations set at runtime (``SetBay``); empty until one is set."""
+        with self._lock:
+            return RuntimeBays({b: dict(v) for b, v in self._bays.bays.items()})
+
     def effective_config(self) -> MpcConfig:
         """The config ``step`` must run with right now (setpoints, limits + preset)."""
         with self._lock:
@@ -354,6 +398,20 @@ class Supervisor:
         return {
             "classes": {name: dc.limit_c for name, dc in cfg.drive_classes.items()},
             "bays": {bay: cfg.bay_limit(bay) for bay in cfg.topology.bays},
+        }
+
+    def _bays_in_force(self) -> dict[str, Any]:
+        cfg = self._effective
+        if cfg.topology is None:
+            return {}
+        return {
+            name: {
+                "zone": bay.zone,
+                "occupied": bay.occupied,
+                "class": cfg.bay_class(name),
+                "serial": bay.serial,
+            }
+            for name, bay in cfg.topology.bays.items()
         }
 
     def snapshot(self) -> ControlSnapshot:
@@ -383,6 +441,7 @@ class Supervisor:
                 version=self._version,
                 extra=extra,
                 limits=self._limits_in_force(),
+                bays=self._bays_in_force(),
             )
 
     # -- intents ----------------------------------------------------------
@@ -399,6 +458,8 @@ class Supervisor:
                 self._set_preset(intent.name)
             elif isinstance(intent, SetLimit):
                 self._set_limit(intent)
+            elif isinstance(intent, SetBay):
+                self._set_bay(intent)
             elif isinstance(intent, ClearOverride):
                 self._clear_override(intent.channel)
             else:
@@ -443,12 +504,12 @@ class Supervisor:
             )
         candidate = dict(self._setpoints)
         candidate[temp] = float(celsius)
-        self._effective = self._validated(candidate, self._preset, self._limits)
+        self._effective = self._validated(candidate, self._preset, self._limits, self._bays)
         self._setpoints = candidate
 
     def _set_preset(self, name: Preset) -> None:
         preset = Preset(name)
-        self._effective = self._validated(self._setpoints, preset, self._limits)
+        self._effective = self._validated(self._setpoints, preset, self._limits, self._bays)
         self._preset = preset
 
     def _set_limit(self, intent: SetLimit) -> None:
@@ -482,14 +543,43 @@ class Supervisor:
                 f"({cfg.temp_min_c}, {ceiling}]: a runtime limit cannot exceed the configured one"
             )
         candidate = RuntimeLimits(classes=classes, bays=bays)
-        self._effective = self._validated(self._setpoints, self._preset, candidate)
+        self._effective = self._validated(self._setpoints, self._preset, candidate, self._bays)
         self._limits = candidate
 
+    def _set_bay(self, intent: SetBay) -> None:
+        cfg = self._base_cfg
+        topo = cfg.topology
+        if topo is None:
+            raise IntentInvalid("bay declarations need a DAS config (mpc.topology)")
+        if intent.bay not in topo.bays:
+            raise IntentInvalid(f"unknown bay {intent.bay!r}; bays are {sorted(topo.bays)}")
+        drive_class = intent.changes.get("class")
+        if drive_class is not None and drive_class not in cfg.drive_classes:
+            raise IntentInvalid(
+                f"unknown drive class {drive_class!r}; classes are {sorted(cfg.drive_classes)}"
+            )
+        current = dict(self._bays.bays.get(intent.bay, {}))
+        for key, value in intent.changes.items():
+            if value is None:
+                current.pop(key, None)
+            else:
+                current[key] = value
+        declared = {b: dict(v) for b, v in self._bays.bays.items() if b != intent.bay}
+        if current:
+            declared[intent.bay] = current
+        candidate = RuntimeBays(declared)
+        self._effective = self._validated(self._setpoints, self._preset, self._limits, candidate)
+        self._bays = candidate
+
     def _validated(
-        self, setpoints: Mapping[str, float], preset: Preset, limits: RuntimeLimits
+        self,
+        setpoints: Mapping[str, float],
+        preset: Preset,
+        limits: RuntimeLimits,
+        bays: RuntimeBays,
     ) -> MpcConfig:
         try:
-            return apply_preset(self._base_cfg, setpoints, preset, limits)
+            return apply_preset(self._base_cfg, setpoints, preset, limits, bays)
         except ConfigError as exc:
             raise IntentInvalid(f"rejected: {exc}") from exc
 

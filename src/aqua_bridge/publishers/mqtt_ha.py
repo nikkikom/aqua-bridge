@@ -17,13 +17,25 @@ Topic layout (``node_id`` from ``config.yaml`` ``mqtt.node_id``):
 * ``{node_id}/cmd/pwm/<channel>``     -- raw number, manual PWM 0..1
 * ``{node_id}/cmd/limit/<bay>``       -- raw number, drive limit of one bay (DAS mode)
 * ``{node_id}/cmd/limit/class/<class>`` -- raw number, limit of a drive class (DAS mode)
+* ``{node_id}/cmd/bay/<bay>``         -- raw string ``occupied`` | ``empty`` | ``auto``,
+  the bay's declared occupancy (DAS mode; ``POST /api/bay`` for class and serial)
 
-DAS mode (``mpc.topology``) subscribes to the limit topics and adds one
+DAS mode (``mpc.topology``) subscribes to the limit and bay topics and adds one
 ``limit_<class>`` number entity per drive class (state from
 ``value_json.limits.classes.<class>``, range ``temp_min_c`` .. the configured
 limit); setpoint topics and numbers exist only for temperatures with a
 setpoint, so a DAS config without setpoints publishes none. A tail after
 ``limit/`` that starts with ``class/`` is a class, anything else a bay name.
+
+Per bay, DAS mode also publishes the estimator's view from
+``value_json.cmd.diagnostics``: sensors ``drive_temp_<bay>`` (estimated drive
+temperature, ``estimates.<bay>.t_c``), ``drive_margin_<bay>`` (degrees left to the
+limit after the uncertainty margin, ``estimates.<bay>.limit_margin_c`` =
+``limit - k * sigma - t``; negative means the drive may be over its limit) and
+``drive_sigma_<bay>`` (``estimates.<bay>.sigma_c``), and a binary sensor
+``bay_occupied_<bay>`` (``bays.<bay>.occupancy``: ``empty`` is off, ``occupied``
+and ``unknown`` are on, the conservative reading). An empty bay has no estimate,
+so its drive sensors read ``None`` (unknown in Home Assistant).
 
 Discovery config topics follow the standard
 ``{discovery_prefix}/{component}/{node_id}/{object_id}/config``.
@@ -54,6 +66,7 @@ from aqua_bridge.control.intents import (
     ControlMode,
     Intent,
     IntentError,
+    SetBay,
     SetLimit,
     SetMode,
     SetPreset,
@@ -105,6 +118,8 @@ def command_topics(node_id: str, cfg: MpcConfig) -> dict[str, str]:
             topics[f"limit/{bay}"] = f"{node_id}/cmd/limit/{bay}"
         for drive_class in cfg.drive_classes:
             topics[f"limit/class/{drive_class}"] = f"{node_id}/cmd/limit/class/{drive_class}"
+        for bay in cfg.topology.bays:
+            topics[f"bay/{bay}"] = f"{node_id}/cmd/bay/{bay}"
     for ch in cfg.channels:
         topics[f"pwm/{ch}"] = f"{node_id}/cmd/pwm/{ch}"
     return topics
@@ -311,6 +326,45 @@ def build_discovery_entities(
         topic = f"{discovery_prefix}/number/{node_id}/{object_id}/config"
         entities.append(MqttEntity("number", object_id, topic, payload))
 
+    bays = {} if cfg.topology is None else cfg.topology.bays
+    for bay in bays:  # empty in legacy mode
+        estimate = f"value_json.cmd.diagnostics.estimates.{bay}"
+        for object_id, name, key, device_class in (
+            (f"drive_temp_{bay}", f"{bay} drive temperature", "t_c", "temperature"),
+            (f"drive_margin_{bay}", f"{bay} drive margin to limit", "limit_margin_c", None),
+            (f"drive_sigma_{bay}", f"{bay} drive temperature sigma", "sigma_c", None),
+        ):
+            entities.append(
+                _sensor(
+                    discovery_prefix=discovery_prefix,
+                    node_id=node_id,
+                    object_id=object_id,
+                    name=name,
+                    value_template=f"{{{{ {estimate}.{key} | default(None) }}}}",
+                    unit="°C",
+                    device_class=device_class,
+                )
+            )
+        object_id = f"bay_occupied_{bay}"
+        unique_id = f"{node_id}_{object_id}"
+        payload = {
+            "name": f"{bay} occupied",
+            "unique_id": unique_id,
+            "object_id": unique_id,
+            "state_topic": state_topic(node_id),
+            "value_template": (
+                f"{{{{ 'OFF' if value_json.cmd.diagnostics.bays.{bay}.occupancy "
+                "| default('unknown') == 'empty' else 'ON' }}"
+            ),
+            "payload_on": "ON",
+            "payload_off": "OFF",
+            "device_class": "occupancy",
+            "device": _device_block(node_id),
+            **_availability(node_id),
+        }
+        topic = f"{discovery_prefix}/binary_sensor/{node_id}/{object_id}/config"
+        entities.append(MqttEntity("binary_sensor", object_id, topic, payload))
+
     if control_mode is ControlMode.MANUAL:
         for ch in cfg.channels:
             object_id = f"pwm_cmd_{ch}"
@@ -355,6 +409,10 @@ def state_payload(snapshot_dict: Mapping[str, Any], host: Mapping[str, Any]) -> 
 # ---------------------------------------------------------------------------
 
 
+#: ``cmd/bay/<bay>`` payload -> ``SetBay`` ``occupied`` value.
+_BAY_PAYLOADS: dict[str, bool | str] = {"occupied": True, "empty": False, "auto": "auto"}
+
+
 def parse_command(node_id: str, topic: str, payload: bytes | str) -> Intent | None:
     """Turn one inbound MQTT message into an :class:`Intent`, or ``None``.
 
@@ -391,6 +449,13 @@ def parse_command(node_id: str, topic: str, payload: bytes | str) -> Intent | No
             return SetLimit(limit_c=float(text), drive_class=tail[len("limit/class/") :])
         if tail.startswith("limit/"):
             return SetLimit(limit_c=float(text), bay=tail[len("limit/") :])
+        if tail.startswith("bay/"):
+            occupied = _BAY_PAYLOADS.get(text)
+            if occupied is None:
+                raise ValueError(
+                    f"bay payload must be one of {sorted(_BAY_PAYLOADS)}, got {text!r}"
+                )
+            return SetBay(bay=tail[len("bay/") :], changes={"occupied": occupied})
     except (IntentError, ValueError) as exc:
         _LOG.info("mqtt: rejected command on %s: %s", topic, exc)
         return None
