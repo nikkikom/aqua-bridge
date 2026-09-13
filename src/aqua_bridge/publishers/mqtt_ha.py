@@ -15,6 +15,15 @@ Topic layout (``node_id`` from ``config.yaml`` ``mqtt.node_id``):
 * ``{node_id}/cmd/auto``          -- raw string channel name, or empty = all
 * ``{node_id}/cmd/setpoint/<temp>``   -- raw number, target Celsius
 * ``{node_id}/cmd/pwm/<channel>``     -- raw number, manual PWM 0..1
+* ``{node_id}/cmd/limit/<bay>``       -- raw number, drive limit of one bay (DAS mode)
+* ``{node_id}/cmd/limit/class/<class>`` -- raw number, limit of a drive class (DAS mode)
+
+DAS mode (``mpc.topology``) subscribes to the limit topics and adds one
+``limit_<class>`` number entity per drive class (state from
+``value_json.limits.classes.<class>``, range ``temp_min_c`` .. the configured
+limit); setpoint topics and numbers exist only for temperatures with a
+setpoint, so a DAS config without setpoints publishes none. A tail after
+``limit/`` that starts with ``class/`` is a class, anything else a bay name.
 
 Discovery config topics follow the standard
 ``{discovery_prefix}/{component}/{node_id}/{object_id}/config``.
@@ -45,6 +54,7 @@ from aqua_bridge.control.intents import (
     ControlMode,
     Intent,
     IntentError,
+    SetLimit,
     SetMode,
     SetPreset,
     SetPwm,
@@ -90,6 +100,11 @@ def command_topics(node_id: str, cfg: MpcConfig) -> dict[str, str]:
     }
     for temp in cfg.setpoints:
         topics[f"setpoint/{temp}"] = f"{node_id}/cmd/setpoint/{temp}"
+    if cfg.topology is not None:
+        for bay in cfg.topology.bays:
+            topics[f"limit/{bay}"] = f"{node_id}/cmd/limit/{bay}"
+        for drive_class in cfg.drive_classes:
+            topics[f"limit/class/{drive_class}"] = f"{node_id}/cmd/limit/class/{drive_class}"
     for ch in cfg.channels:
         topics[f"pwm/{ch}"] = f"{node_id}/cmd/pwm/{ch}"
     return topics
@@ -276,6 +291,26 @@ def build_discovery_entities(
         topic = f"{discovery_prefix}/number/{node_id}/{object_id}/config"
         entities.append(MqttEntity("number", object_id, topic, payload))
 
+    for drive_class, dc in cfg.drive_classes.items():  # empty in legacy mode
+        object_id = f"limit_{drive_class}"
+        unique_id = f"{node_id}_{object_id}"
+        payload = {
+            "name": f"{drive_class} drive limit",
+            "unique_id": unique_id,
+            "object_id": unique_id,
+            "state_topic": state_topic(node_id),
+            "value_template": f"{{{{ value_json.limits.classes.{drive_class} }}}}",
+            "command_topic": f"{node_id}/cmd/limit/class/{drive_class}",
+            "min": cfg.temp_min_c,
+            "max": dc.limit_c,
+            "step": 0.5,
+            "unit_of_measurement": "°C",
+            "device": _device_block(node_id),
+            **_availability(node_id),
+        }
+        topic = f"{discovery_prefix}/number/{node_id}/{object_id}/config"
+        entities.append(MqttEntity("number", object_id, topic, payload))
+
     if control_mode is ControlMode.MANUAL:
         for ch in cfg.channels:
             object_id = f"pwm_cmd_{ch}"
@@ -352,6 +387,10 @@ def parse_command(node_id: str, topic: str, payload: bytes | str) -> Intent | No
         if tail.startswith("pwm/"):
             channel = tail[len("pwm/") :]
             return SetPwm(channel=channel, pwm=float(text))
+        if tail.startswith("limit/class/"):
+            return SetLimit(limit_c=float(text), drive_class=tail[len("limit/class/") :])
+        if tail.startswith("limit/"):
+            return SetLimit(limit_c=float(text), bay=tail[len("limit/") :])
     except (IntentError, ValueError) as exc:
         _LOG.info("mqtt: rejected command on %s: %s", topic, exc)
         return None

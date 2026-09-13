@@ -16,6 +16,11 @@ Intent constructors do *structural* validation (types, finite numbers,
 ``pwm`` in ``[0, 1]``) and raise :class:`IntentInvalid`. Config-dependent
 checks (channel exists, ``pwm`` within ``[pwm_min, pwm_max]``) belong to
 ``ControlSurface.submit``.
+
+Setpoints and limits: ``SetSetpoint`` (``POST /api/setpoint``) targets a
+temperature of a legacy (setpoint) config. In DAS mode drives are regulated
+to their limits instead and ``SetLimit`` (``POST /api/limit``) changes the
+absolute limit of one bay or one drive class.
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ __all__ = [
     "IntentError",
     "IntentInvalid",
     "Preset",
+    "SetLimit",
     "SetMode",
     "SetPreset",
     "SetPwm",
@@ -64,7 +70,11 @@ class ControlMode(StrEnum):
 
 
 class Preset(StrEnum):
-    """Solver aggressiveness (``POST /api/preset``)."""
+    """Solver aggressiveness (``POST /api/preset``).
+
+    Legacy configs shift setpoints and gains; DAS configs shift the drive
+    comfort bands and the noise weight (``aqua_bridge.control.supervisor.PRESETS``).
+    """
 
     QUIET = "quiet"
     NORMAL = "normal"
@@ -109,6 +119,12 @@ class IntentConflict(IntentError):
 def _channel(value: object) -> str:
     if not isinstance(value, str) or not value:
         raise IntentInvalid(f"channel must be a non-empty string, got {value!r}")
+    return value
+
+
+def _name(field_name: str, value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise IntentInvalid(f"{field_name} must be a non-empty string, got {value!r}")
     return value
 
 
@@ -196,6 +212,30 @@ class SetPreset:
 
 
 @dataclass(frozen=True)
+class SetLimit:
+    """``POST /api/limit`` ``{"bay": "b03", "limit_c": 45}`` or ``{"class": "hdd", "limit_c": 48}``.
+
+    DAS mode only. Exactly one of ``bay`` / ``drive_class`` (JSON key ``class``).
+    ``submit`` checks that the bay or class exists and that ``limit_c`` lies in
+    ``(temp_min_c, configured limit]``: a runtime limit can tighten the limit
+    written in the config or restore it, never exceed it.
+    """
+
+    limit_c: float
+    bay: str | None = None
+    drive_class: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "limit_c", _finite("limit_c", self.limit_c))
+        if (self.bay is None) == (self.drive_class is None):
+            raise IntentInvalid("give exactly one of 'bay' or 'class'")
+        if self.bay is not None:
+            object.__setattr__(self, "bay", _name("bay", self.bay))
+        if self.drive_class is not None:
+            object.__setattr__(self, "drive_class", _name("class", self.drive_class))
+
+
+@dataclass(frozen=True)
 class ClearOverride:
     """``POST /api/auto`` ``{"channel": "radiator"}`` or ``{}`` (all channels)."""
 
@@ -206,7 +246,7 @@ class ClearOverride:
             object.__setattr__(self, "channel", _channel(self.channel))
 
 
-Intent = SetMode | SetSetpoint | SetPwm | SetPreset | ClearOverride
+Intent = SetMode | SetSetpoint | SetPwm | SetPreset | ClearOverride | SetLimit
 
 # URL tail / MQTT command name -> intent class and the body keys it accepts.
 INTENT_KINDS: dict[str, tuple[type, tuple[str, ...]]] = {
@@ -215,6 +255,7 @@ INTENT_KINDS: dict[str, tuple[type, tuple[str, ...]]] = {
     "pwm": (SetPwm, ("channel", "pwm")),
     "preset": (SetPreset, ("name",)),
     "auto": (ClearOverride, ("channel",)),
+    "limit": (SetLimit, ("bay", "class", "limit_c")),
 }
 
 
@@ -235,6 +276,10 @@ def parse_intent(kind: str, body: object) -> Intent:
     unknown = sorted(str(k) for k in body if k not in allowed)
     if unknown:
         raise IntentInvalid(f"unknown fields for {kind!r}: {unknown}")
+    if cls is SetLimit:
+        if "limit_c" not in body:
+            raise IntentInvalid("missing fields for 'limit': ['limit_c']")
+        return SetLimit(limit_c=body["limit_c"], bay=body.get("bay"), drive_class=body.get("class"))
     if cls is not ClearOverride:
         missing = [k for k in allowed if k not in body]
         if missing:
@@ -252,7 +297,10 @@ class ControlSnapshot:
     """Everything ``/api/state`` and ``/api/health`` show, taken atomically.
 
     ``obs`` / ``last_cmd`` are ``None`` until the loop has run once.
-    ``mqtt_connected`` is ``None`` when MQTT is disabled.
+    ``mqtt_connected`` is ``None`` when MQTT is disabled. ``limits`` is empty for
+    a legacy config; in DAS mode it holds the limits in force
+    (``{"classes": {class: limit_c}, "bays": {bay: limit_c}}``) and appears in
+    :meth:`state_payload` only then, so the legacy payload keeps its shape.
     """
 
     obs: PlantObservation | None
@@ -273,6 +321,7 @@ class ControlSnapshot:
     uptime_s: float
     version: str = ""
     extra: dict[str, Any] = field(default_factory=dict)  # host stats etc., JSON-serialisable
+    limits: dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def solver_status_for(cmd: MpcCommand | None) -> SolverStatus:
@@ -286,8 +335,8 @@ class ControlSnapshot:
         return SolverStatus.OK
 
     def state_payload(self) -> dict[str, Any]:
-        """``GET /api/state``: observation + last command + mode + setpoints."""
-        return {
+        """``GET /api/state``: observation + last command + mode + setpoints (+ DAS limits)."""
+        out: dict[str, Any] = {
             "obs": None if self.obs is None else self.obs.to_dict(),
             "cmd": None if self.last_cmd is None else self.last_cmd.to_dict(),
             "mode": self.control_mode.value,
@@ -299,6 +348,9 @@ class ControlSnapshot:
             "pwm_min": self.pwm_min,
             "pwm_max": self.pwm_max,
         }
+        if self.limits:
+            out["limits"] = {k: dict(v) for k, v in self.limits.items()}
+        return out
 
     def health_payload(self) -> dict[str, Any]:
         """``GET /api/health``: USB present, MQTT, solver ok/degraded/fallback/fault, uptime."""

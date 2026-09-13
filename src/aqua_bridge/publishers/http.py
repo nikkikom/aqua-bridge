@@ -1,8 +1,8 @@
 """HTTP view and control (PROJECT.md section 6).
 
 ``create_app`` wires GET ``/api/state``, GET ``/api/health``, GET ``/`` (the
-static single-page UI) and the five ``POST /api/{mode,setpoint,pwm,preset,
-auto}`` intents against a :class:`aqua_bridge.control.intents.ControlSurface`.
+static single-page UI) and the six ``POST /api/{mode,setpoint,pwm,preset,
+auto,limit}`` intents against a :class:`aqua_bridge.control.intents.ControlSurface`.
 
 HTTP never computes PWM itself: every POST body becomes an
 :class:`~aqua_bridge.control.intents.Intent` via
@@ -10,6 +10,11 @@ HTTP never computes PWM itself: every POST body becomes an
 ``surface.submit()``. All of the actual arithmetic (channel exists, PWM
 range, auto/manual conflict) lives in ``submit``; this module only turns
 its exceptions into the right HTTP status.
+
+``POST /api/limit`` ``{"bay": ..., "limit_c": ...}`` or ``{"class": ...,
+"limit_c": ...}`` is the DAS-mode intent (drive limits); a legacy config
+answers 400 and keeps ``POST /api/setpoint``. The route exists for both so a
+client learns the reason from the body instead of a 404.
 
 No authentication in v1: bind is LAN-only (``0.0.0.0:8080`` by default,
 see ``config.example.yaml``). Section 6: "No auth on the local network in
@@ -55,7 +60,7 @@ _SMART_KEY: web.AppKey[Any] = web.AppKey("smart_inbox")
 
 # URL tail -> intent kind (identical today, kept separate so the route table
 # and aqua_bridge.control.intents.INTENT_KINDS can diverge later).
-_POST_KINDS = ("mode", "setpoint", "pwm", "preset", "auto")
+_POST_KINDS = ("mode", "setpoint", "pwm", "preset", "auto", "limit")
 
 
 def _error(status: int, message: str) -> web.Response:
