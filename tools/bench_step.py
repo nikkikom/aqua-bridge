@@ -31,7 +31,7 @@ import numpy as np
 
 from aqua_bridge.config import load_config
 from aqua_bridge.control.mpc import step
-from aqua_bridge.model import MpcConfig, MpcState, SolverKind
+from aqua_bridge.model import Mode, MpcConfig, MpcState, SolverKind
 from aqua_bridge.sim.plant import Plant, PlantParams
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -57,7 +57,7 @@ def bench_solver(
     )
     state = MpcState.cold()
     times_ms: list[float] = []
-    modes = dict.fromkeys(("auto", "saturated", "fallback"), 0)
+    modes = dict.fromkeys((m.value for m in Mode), 0)
     iterations: list[int] = []
     for i in range(ticks):
         if i == ticks // 3:

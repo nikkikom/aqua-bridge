@@ -38,6 +38,12 @@ Rules (section 6 "Control", section 4.8, section 5 "Modes")
   A fault (untrusted sensors, broken solver) must never reduce cooling, and
   a manual override that pins a fan low would do exactly that while the
   controller is blind. Overrides are kept and resume when the fault clears.
+* ``mpc_cmd.mode == degraded`` (zones) -> the same rule per channel: an
+  override applies only on a channel that is *not* under fallback policy
+  (``mpc_cmd.diagnostics["fallback_channels"]``); on the others the solver
+  command stands and the blocked overrides are listed in
+  ``diagnostics["supervisor"]["overrides_blocked"]``. A degraded command
+  without a readable channel list blocks every override (conservative).
 * Otherwise every overridden channel is replaced by its override, rate
   limited to ``|delta| <= d_pwm_max`` against the last *applied* PWM and
   clamped into ``[pwm_min, pwm_max]``; other channels keep the solver's
@@ -151,6 +157,23 @@ class TickPlan:
 
 def _clamp(value: float, lo: float, hi: float) -> float:
     return lo if value < lo else hi if value > hi else value
+
+
+def _fallback_channels(cmd: MpcCommand, cfg: MpcConfig) -> frozenset[str]:
+    """Channels of ``cmd`` under fallback policy, where no override may apply.
+
+    ``fallback``: every channel. ``degraded``: the list in
+    ``diagnostics["fallback_channels"]``, or every channel when it is not a
+    list of strings. Other modes: none.
+    """
+    if cmd.mode is Mode.FALLBACK:
+        return frozenset(cfg.channels)
+    if cmd.mode is not Mode.DEGRADED:
+        return frozenset()
+    listed = cmd.diagnostics.get("fallback_channels")
+    if not isinstance(listed, list | tuple) or not all(isinstance(ch, str) for ch in listed):
+        return frozenset(cfg.channels)
+    return frozenset(listed)
 
 
 class Supervisor:
@@ -373,10 +396,13 @@ class Supervisor:
             diagnostics["supervisor"] = supervisor_diag
             return MpcCommand(pwm=dict(mpc_cmd.pwm), mode=mpc_cmd.mode, diagnostics=diagnostics)
 
+        blocked = _fallback_channels(mpc_cmd, cfg)
         pwm: dict[str, float] = {}
         limited: dict[str, bool] = {}
+        applied_any = False
         for ch in cfg.channels:
-            if ch in plan.overrides:
+            if ch in plan.overrides and ch not in blocked:
+                applied_any = True
                 want = float(plan.overrides[ch])
                 prev = float(prev_pwm[ch])
                 moved = _clamp(want, prev - cfg.d_pwm_max, prev + cfg.d_pwm_max)
@@ -384,8 +410,12 @@ class Supervisor:
                 pwm[ch] = _clamp(moved, cfg.pwm_min, cfg.pwm_max)
             else:
                 pwm[ch] = float(mpc_cmd.pwm[ch])
-        supervisor_diag["overrides_applied"] = True
+        supervisor_diag["overrides_applied"] = applied_any
         supervisor_diag["override_rate_limited"] = limited
+        if mpc_cmd.mode is Mode.DEGRADED:
+            supervisor_diag["overrides_blocked"] = [
+                ch for ch in cfg.channels if ch in plan.overrides and ch in blocked
+            ]
         diagnostics["supervisor"] = supervisor_diag
         return MpcCommand(pwm=pwm, mode=mpc_cmd.mode, diagnostics=diagnostics)
 

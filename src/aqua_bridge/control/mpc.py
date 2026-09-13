@@ -18,23 +18,40 @@ Order inside :func:`step`
 3. Sensor gate (:mod:`aqua_bridge.control.gate`), fed the Stuck latch from
    ``solver_memory["stuck_latch"]``; the gate's next latch is stored back.
    A "gap" tick drops the window but keeps the latch: only a value that
-   leaves the ``stuck_eps_c`` band proves the sensor alive.
-4. Fault bookkeeping: an untrusted tick resets ``trusted_streak`` and opens
-   the single fault timer (``fault_since_ts`` is kept, never restarted,
-   while a fault is active -- Flicker must not reset the hold). A trusted
-   tick while in fault only counts toward ``confirm_ticks``.
-5. Solver -- only on a trusted tick that is either fault-free or the
-   ``confirm_ticks``-th consecutive trusted one. On that returning tick
-   (and on a cold integrator) the solver is re-initialised so that its
+   leaves the ``stuck_eps_c`` band proves the sensor alive. (With zones the
+   decimated Stuck windows are advanced first and dropped on a gap, too.)
+3b. Zone trust (:func:`aqua_bridge.control.zones.evaluate`). Legacy mode is
+   one implicit zone whose verdict is exactly the whole-tick gate verdict.
+4. Fault bookkeeping, per zone: an untrusted tick resets the zone's streak
+   and opens its fault timer (``since`` is kept, never restarted, while
+   the zone's fault is active -- Flicker must not reset the hold). A
+   trusted tick while in fault only counts toward ``confirm_ticks``. A
+   zone is *eligible* for the solver when it is trusted and either
+   fault-free or on its ``confirm_ticks``-th consecutive trusted tick.
+5. Solver -- only when some zone is eligible. The channels of the zones
+   that stay in fault (and, with ``fault_coupling: declared``, of the zones
+   coupled to them) are under fallback policy: they reach the solver as
+   ``SolverRequest.fixed_channels`` and only the sensors of eligible zones
+   (plus trusted sensors without a zone) reach it as ``temps``. On a
+   returning tick (legacy: the zone was in fault or the integrator is
+   incomplete; zones: a channel the solver drives lacks an integrator
+   entry, which is what a channel released from fallback policy or from
+   a manual override looks like) the solver is re-initialised so that its
    first output equals ``prev`` before the rate limit (bumpless). Any
    exception, non-finite / wrong-shaped output, ``converged=False`` or
-   ``iterations > solver_max_iter`` is a ``solver`` fault handled exactly
-   like a gate fault: same timer, same hold / ramp-high policy, and the
-   fault is *not* cleared (the old ``fault_since_ts`` survives a failed
-   retry so a persistently broken solver still ramps high).
-6. Fallback policy while a fault is active: hold ``prev`` until the fault
-   has lasted longer than ``fallback_hold_s``, then target
-   ``max(prev, cfg.fallback_pwm)`` per channel. Section 3 item 2 says
+   ``iterations > solver_max_iter`` is a ``solver`` fault of every
+   eligible zone, handled exactly like a gate fault: same timer, same
+   hold / ramp-high policy, and the fault is *not* cleared (the old
+   ``since`` survives a failed retry so a persistently broken solver still
+   ramps high). A solver fault also restarts the confirmation of every
+   zone, so the zones confirm together afterwards (a solver that refuses
+   to run beside a faulted zone would otherwise meet zones confirming out
+   of phase forever). When every channel stays under fallback policy the
+   solver is not called and the eligible zones' own faults clear.
+6. Fallback policy per channel while a zone that reaches it is in fault:
+   hold ``prev`` until that zone's fault has lasted longer than
+   ``fallback_hold_s`` (the oldest such zone when several reach it), then
+   target ``max(prev, cfg.fallback_pwm)``. Section 3 item 2 says
    "ramp toward fallback_pwm"; read literally that lowers a channel that is
    already above ``fallback_pwm`` (a hot, saturated plant at ``pwm_max``)
    while the controller is blind, which section 4.1 forbids ("never a step
@@ -45,9 +62,28 @@ Order inside :func:`step`
    broken clock cannot stall the ramp.
 7. Rate limit vs ``prev`` (``|delta| <= d_pwm_max``), then clamp into
    ``[pwm_min, pwm_max]``.
-8. Mode: ``fallback`` while a fault is active; ``saturated`` when a
-   channel's demand exceeds ``pwm_max`` *and* the emitted PWM sits at
-   ``pwm_max`` (honest: pinned at the rail); ``auto`` otherwise.
+8. Mode: ``fallback`` while every zone is in fault (legacy: while a fault
+   is active); ``degraded`` while some but not all zones are; ``saturated``
+   when a channel's demand exceeds ``pwm_max`` *and* the emitted PWM sits
+   at ``pwm_max`` (honest: pinned at the rail); ``auto`` otherwise.
+
+Zones and the global fields
+---------------------------
+Legacy mode keeps ``fault_since_ts`` / ``fault_reason`` / ``trusted_streak``
+and ``solver_memory["fault_ticks"]`` exactly as before and leaves
+``MpcState.zone_faults`` empty. With zones, ``zone_faults`` holds one
+:class:`~aqua_bridge.model.ZoneFault` per zone and the global fields are
+aggregates: the earliest zone fault and its reason, the smallest streak,
+the largest fault tick count. ``MpcState.in_fault`` is therefore true in
+``degraded`` as well as ``fallback``. Diagnostics add ``zones`` (per zone:
+trusted, reasons, fault timer, ``in_closure``, channels, policy),
+``zones_in_fault``, ``fallback_channels``, ``policy_by_channel`` and
+``trust_rule``; ``policy`` becomes ``mixed`` when channels differ. The
+legacy solvers ``pi`` / ``mpc`` regulate on setpoints: ``pi`` skips the
+fixed channels and runs per zone; the legacy ``mpc`` has one coupled
+problem over every channel and raises on fixed channels, so with zones it
+turns any zone fault into a fault of every zone it drives (whole-enclosure
+fallback, never less cooling) until the DAS MPC milestone.
 
 Time policy (documented conservative choices; section 4.3 "ts")
 ---------------------------------------------------------------
@@ -79,8 +115,9 @@ stop regulating the healthy channels.
 ``solver_memory`` layout (all JSON, all finite): ``last_ts`` (float),
 ``fault_ticks`` (int, consecutive ticks in fault), ``stall_ticks`` (dict
 channel -> int), ``stuck_latch`` (dict temperature -> band reference in
-degrees C, only latched temperatures; gate rule 3) and one sub-dict per
-solver under ``solver.name``.
+degrees C, only latched temperatures; gate rule 3), with decimated Stuck
+windows ``stuck_slow`` and ``stuck_seq`` (gate module docstring) and one
+sub-dict per solver under ``solver.name``.
 """
 
 from __future__ import annotations
@@ -89,9 +126,16 @@ import dataclasses
 import json
 import math
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
-from aqua_bridge.control.gate import GateResult, evaluate_gate, push_window
+from aqua_bridge.control import zones
+from aqua_bridge.control.gate import (
+    GateResult,
+    advance_slow_windows,
+    evaluate_gate,
+    push_window,
+)
 from aqua_bridge.control.solver_mpc import MpcSolver
 from aqua_bridge.control.solver_pi import PiSolver, Solver, SolverRequest, SolverResult
 from aqua_bridge.model import (
@@ -102,6 +146,7 @@ from aqua_bridge.model import (
     MpcState,
     PlantObservation,
     SolverKind,
+    ZoneFault,
 )
 
 __all__ = [
@@ -250,6 +295,67 @@ def _clamp(value: float, lo: float, hi: float) -> float:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _ZoneBook:
+    """Mutable per-zone fault bookkeeping inside one ``step`` call."""
+
+    since: float | None
+    reason: FaultReason | None
+    streak: int
+    ticks: int
+
+
+def _legacy_fault_ticks(mem: Mapping[str, Any]) -> int:
+    fault_ticks = mem.get("fault_ticks", 0)
+    return int(fault_ticks) if _finite(fault_ticks) else 0
+
+
+def _read_books(state: MpcState, mem: Mapping[str, Any], cfg: MpcConfig) -> dict[str, _ZoneBook]:
+    """Zone bookkeeping as it stands before this tick.
+
+    Legacy mode reads the single implicit zone from the global fields exactly
+    as before. With zones, a zone missing from ``state.zone_faults`` while the
+    global fault is active (a state from another config) starts in fault with
+    a zero streak: it has to confirm like any other faulted zone.
+    """
+    layout = cfg.zone_layout
+    if layout.implicit:
+        return {
+            layout.zones[0]: _ZoneBook(
+                since=state.fault_since_ts,
+                reason=state.fault_reason,
+                streak=state.trusted_streak,
+                ticks=_legacy_fault_ticks(mem),
+            )
+        }
+    books: dict[str, _ZoneBook] = {}
+    for zone in layout.zones:
+        zf = state.zone_faults.get(zone)
+        if zf is not None:
+            books[zone] = _ZoneBook(zf.since_ts, zf.reason, zf.streak, zf.ticks)
+        elif state.fault_since_ts is not None:
+            books[zone] = _ZoneBook(
+                since=state.fault_since_ts,
+                reason=state.fault_reason or FaultReason.SENSOR_GATE,
+                streak=0,
+                ticks=_legacy_fault_ticks(mem),
+            )
+        else:
+            books[zone] = _ZoneBook(None, None, state.trusted_streak, 0)
+    return books
+
+
+def _fault_elapsed(book: _ZoneBook, ts: float, cfg: MpcConfig, ticks: int) -> float:
+    """Fault age: wall time, but never less than the tick count says (a broken clock)."""
+    assert book.since is not None
+    return max(ts - book.since, (ticks - 1) * cfg.dt, 0.0)
+
+
+def _overall_policy(policy_by_channel: Mapping[str, str]) -> str:
+    kinds = set(policy_by_channel.values())
+    return kinds.pop() if len(kinds) == 1 else "mixed"
+
+
 def step(
     obs: PlantObservation,
     cfg: MpcConfig,
@@ -262,7 +368,8 @@ def step(
     ``solver`` overrides the registry lookup by ``cfg.solver`` (tests inject
     failing solvers). Raises ``TypeError`` only for arguments of the wrong
     *type*; every runtime problem -- malformed temperatures, bad time, a
-    solver that throws or returns garbage -- becomes ``mode=fallback``.
+    solver that throws or returns garbage -- becomes ``mode=fallback``
+    (or, with zones, fallback policy on the zones concerned).
     """
     if not isinstance(obs, PlantObservation):
         raise TypeError(f"obs must be a PlantObservation, got {type(obs).__name__}")
@@ -272,6 +379,9 @@ def step(
         raise TypeError(f"state must be an MpcState, got {type(state).__name__}")
 
     mem: dict[str, Any] = dict(state.solver_memory)
+    layout = cfg.zone_layout
+    das = not layout.implicit
+    zone_names = layout.zones
 
     # 1. prev
     prev, prev_source = resolve_prev(state, obs, cfg)
@@ -290,6 +400,17 @@ def step(
         if isinstance(latch_raw, Mapping)
         else {}
     )
+    slow_windows: dict[str, list[dict[str, Any]]] = {}
+    stuck_seq = 0
+    if cfg.slow_window_samples:
+        seq_raw = mem.get("stuck_seq")
+        valid_seq = isinstance(seq_raw, int) and not isinstance(seq_raw, bool) and seq_raw >= 0
+        if not drop_history and valid_seq:
+            stuck_seq = int(seq_raw)  # type: ignore[arg-type]
+            slow_in = mem.get("stuck_slow")
+        else:
+            slow_in = None
+        slow_windows = advance_slow_windows(slow_in, window, stuck_seq, cfg)
     gate: GateResult = evaluate_gate(
         obs,
         cfg,
@@ -298,84 +419,157 @@ def step(
         window=window,
         dT_limit=slew_limit,
         stuck_latch=stuck_latch,
+        slow_windows=slow_windows or None,
     )
     trusted = gate.trusted and time_status in ("ok", "first")
 
-    # 4. fault bookkeeping
-    fault_since = state.fault_since_ts
-    fault_reason = state.fault_reason
-    if trusted:
-        streak = state.trusted_streak + 1
-    else:
-        streak = 0
-        if fault_since is None:
-            fault_since = obs.ts
-        fault_reason = FaultReason.SENSOR_GATE
+    # 3b. zone trust (legacy: the implicit zone's verdict is exactly ``trusted``)
+    verdicts = zones.evaluate(gate, time_status, cfg)
+
+    # 4. fault bookkeeping per zone
+    books = _read_books(state, mem, cfg)
+    for zone in zone_names:
+        book = books[zone]
+        if verdicts[zone].trusted:
+            book.streak += 1
+        else:
+            book.streak = 0
+            if book.since is None:
+                book.since = obs.ts
+            book.reason = FaultReason.SENSOR_GATE
+    eligible = [
+        z
+        for z in zone_names
+        if verdicts[z].trusted and (books[z].since is None or books[z].streak >= cfg.confirm_ticks)
+    ]
+    # Zones that stay in fault whatever the solver does, and their channels.
+    remaining = [z for z in zone_names if z not in eligible]
+    fixed_pre = set(zones.fallback_channels(remaining, cfg))
+    active = [ch for ch in cfg.channels if ch not in fixed_pre]
 
     # 5. solver
     integrator: dict[str, float] = dict(state.integrator)
+    if das:  # a channel under fallback policy re-initialises bumplessly when released
+        integrator = {ch: v for ch, v in integrator.items() if ch not in fixed_pre}
     solver_obj = SOLVERS.get(cfg.solver) if solver is None else solver
     solver_name = getattr(solver_obj, "name", str(cfg.solver.value)) if solver_obj else "none"
     solver_mem: dict[str, Any] = dict(mem.get(solver_name) or {})
-    target: dict[str, float] | None = None
-    policy = "hold"
+    result_pwm: dict[str, float] | None = None
     solver_error: str | None = None
     solver_diag: dict[str, Any] = {}
     returning = False
     ran_solver = False
 
-    run_solver = trusted and (fault_since is None or streak >= cfg.confirm_ticks)
-    if run_solver:
+    if eligible and not active:
+        # Every channel stays under fallback policy (coupled to a zone still in
+        # fault): nothing for the solver to drive; the eligible zones' own
+        # sensor faults are confirmed over.
+        for zone in eligible:
+            books[zone].since = None
+            books[zone].reason = None
+    elif eligible:
         ran_solver = True
-        was_in_fault = fault_since is not None
-        temps = {name: float(gate.filtered[name]) for name in cfg.temps}  # type: ignore[arg-type]
-        req = SolverRequest(
-            temps=temps, prev_pwm=dict(prev), integrator=integrator, memory=solver_mem
-        )
+        was_in_fault = any(books[z].since is not None for z in eligible)
+        if das:
+            usable_zones = set(eligible)
+            temps = {
+                name: float(gate.filtered[name])  # type: ignore[arg-type]
+                for name in cfg.temps
+                if gate.per_temp[name]
+                and (layout.sensor_zone[name] is None or layout.sensor_zone[name] in usable_zones)
+            }
+            elapsed_pre = {
+                z: _fault_elapsed(books[z], obs.ts, cfg, books[z].ticks + 1) for z in remaining
+            }
+            ch_elapsed_pre = zones.channel_fallback_elapsed(elapsed_pre, cfg)
+            req = SolverRequest(
+                temps=temps,
+                prev_pwm=dict(prev),
+                integrator=integrator,
+                memory=solver_mem,
+                fixed_channels={
+                    ch: zones.fallback_target(
+                        prev[ch], cfg.fallback_pwm[ch], ch_elapsed_pre[ch], cfg
+                    )[0]
+                    for ch in cfg.channels
+                    if ch in fixed_pre
+                },
+                zone_trust={z: z in usable_zones for z in zone_names},
+            )
+        else:
+            temps = {name: float(gate.filtered[name]) for name in cfg.temps}  # type: ignore[arg-type]
+            req = SolverRequest(
+                temps=temps, prev_pwm=dict(prev), integrator=integrator, memory=solver_mem
+            )
         try:
             if solver_obj is None:
                 raise SolverFault(f"no solver registered for {cfg.solver.value!r}")
-            if was_in_fault or set(integrator) != set(cfg.channels):
-                # Bumpless transfer: first auto output == prev before the rate limit.
+            if das:
+                need_init = any(ch not in integrator for ch in active)
+            else:
+                need_init = was_in_fault or set(integrator) != set(cfg.channels)
+            if need_init:
+                # Bumpless transfer: first auto output == prev before the rate limit
+                # (with zones: on the channels that lack an integrator entry).
                 returning = True
                 init_i, init_m = solver_obj.initialise(cfg, req)
-                req = dataclasses.replace(req, integrator=dict(init_i), memory=dict(init_m))
+                if das:
+                    merged = dict(integrator)
+                    merged.update({ch: init_i[ch] for ch in active if ch not in integrator})
+                    req = dataclasses.replace(req, integrator=merged, memory=dict(init_m))
+                else:
+                    req = dataclasses.replace(req, integrator=dict(init_i), memory=dict(init_m))
             result = _check_result(solver_obj.solve(cfg, req), cfg)
         except Exception as exc:  # every solver failure is a fault, never a raise out of step
             solver_error = f"{type(exc).__name__}: {exc}"[:200]
         if solver_error is None:
-            target = {ch: float(result.pwm[ch]) for ch in cfg.channels}
+            result_pwm = {ch: float(result.pwm[ch]) for ch in cfg.channels}
             integrator = {ch: float(v) for ch, v in result.integrator.items()}
             solver_mem = dict(result.memory)
             solver_diag = dict(result.diagnostics) if _json_finite(result.diagnostics) else {}
-            fault_since = None
-            fault_reason = None
-            policy = "solver"
+            for zone in eligible:
+                books[zone].since = None
+                books[zone].reason = None
         else:
+            # A solver fault faults every zone it was asked to drive: same timer,
+            # same hold / ramp-high policy, the old since survives a failed retry.
+            # Every zone restarts its confirmation, so zones re-confirm together
+            # (otherwise a solver that cannot run beside a faulted zone, like the
+            # legacy mpc, meets the zones confirming out of phase forever).
             returning = False
-            if fault_since is None:
-                fault_since = obs.ts
-            fault_reason = FaultReason.SOLVER
-            streak = 0
+            for zone in eligible:
+                book = books[zone]
+                if book.since is None:
+                    book.since = obs.ts
+                book.reason = FaultReason.SOLVER
+            for zone in zone_names:
+                books[zone].streak = 0
 
-    # 6. fallback policy
-    fault_ticks = mem.get("fault_ticks", 0)
-    fault_ticks = int(fault_ticks) if _finite(fault_ticks) else 0
-    elapsed = 0.0
-    if fault_since is not None:
-        fault_ticks += 1
-        elapsed = max(obs.ts - fault_since, (fault_ticks - 1) * cfg.dt, 0.0)
-        if elapsed > cfg.fallback_hold_s:
-            # Never below what is already on the fans (module docstring, step 6).
-            target = {ch: max(prev[ch], cfg.fallback_pwm[ch]) for ch in cfg.channels}
-            policy = "ramp_high"
+    # 6. fallback policy per channel from the zone timers
+    faulted = [z for z in zone_names if books[z].since is not None]
+    elapsed_by_zone: dict[str, float] = {}
+    for zone in zone_names:
+        book = books[zone]
+        if book.since is not None:
+            book.ticks += 1
+            elapsed_by_zone[zone] = _fault_elapsed(book, obs.ts, cfg, book.ticks)
         else:
-            target = dict(prev)
-            policy = "hold"
-    else:
-        fault_ticks = 0
-    if target is None:  # unreachable: every branch above sets it; hold is the safe default
-        target = dict(prev)
+            book.ticks = 0
+    ch_elapsed = zones.channel_fallback_elapsed(elapsed_by_zone, cfg)
+    target: dict[str, float] = {}
+    policy_by_channel: dict[str, str] = {}
+    for ch in cfg.channels:
+        if ch in ch_elapsed:
+            # Never below what is already on the fans (module docstring, step 6).
+            target[ch], policy_by_channel[ch] = zones.fallback_target(
+                prev[ch], cfg.fallback_pwm[ch], ch_elapsed[ch], cfg
+            )
+        elif result_pwm is not None:
+            target[ch], policy_by_channel[ch] = result_pwm[ch], "solver"
+        else:  # unreachable: a channel outside fallback policy had a solver result; hold
+            target[ch], policy_by_channel[ch] = prev[ch], "hold"
+    policy = _overall_policy(policy_by_channel)
+    elapsed = max(elapsed_by_zone.values(), default=0.0)
 
     # 7. rate limit vs prev, then clamp
     pwm: dict[str, float] = {}
@@ -390,12 +584,37 @@ def step(
     saturated = {
         ch: target[ch] > cfg.pwm_max + _EPS and pwm[ch] >= cfg.pwm_max - _EPS for ch in cfg.channels
     }
-    if fault_since is not None:
+    if faulted and len(faulted) == len(zone_names):
         mode = Mode.FALLBACK
+    elif faulted:
+        mode = Mode.DEGRADED
     elif any(saturated.values()):
         mode = Mode.SATURATED
     else:
         mode = Mode.AUTO
+
+    # global aggregates (legacy: the implicit zone itself)
+    if das:
+        first_fault = min(
+            (
+                (books[z].since, i, z)
+                for i, z in enumerate(zone_names)
+                if books[z].since is not None
+            ),
+            default=None,
+        )
+        fault_since = None if first_fault is None else first_fault[0]
+        fault_reason = None if first_fault is None else books[first_fault[2]].reason
+        streak = min(books[z].streak for z in zone_names)
+        fault_ticks = max(books[z].ticks for z in zone_names)
+    else:
+        only = books[zone_names[0]]
+        fault_since, fault_reason, streak, fault_ticks = (
+            only.since,
+            only.reason,
+            only.streak,
+            only.ticks,
+        )
 
     # fan stall bookkeeping
     stall_counts = mem.get("stall_ticks")
@@ -433,6 +652,35 @@ def step(
         "fan_stall": fan_stall,
         "median3": cfg.median3,
     }
+    if das:
+        in_closure = set(zones.closure(faulted, cfg))
+        zone_diag: dict[str, Any] = {}
+        for zone in zone_names:
+            book = books[zone]
+            if book.since is not None:
+                zone_policy = "ramp_high" if elapsed_by_zone[zone] > cfg.fallback_hold_s else "hold"
+            elif zone in in_closure:
+                zone_policy = "coupled"
+            else:
+                zone_policy = "solver"
+            zone_diag[zone] = {
+                "trusted": verdicts[zone].trusted,
+                "reasons": list(verdicts[zone].reasons),
+                "fault": book.since is not None,
+                "fault_reason": None if book.reason is None else book.reason.value,
+                "fault_since_ts": book.since,
+                "fault_elapsed_s": elapsed_by_zone.get(zone, 0.0),
+                "fault_ticks": book.ticks,
+                "trusted_streak": book.streak,
+                "in_closure": zone in in_closure,
+                "channels": list(layout.zone_channels[zone]),
+                "policy": zone_policy,
+            }
+        diagnostics["zones"] = zone_diag
+        diagnostics["zones_in_fault"] = list(faulted)
+        diagnostics["fallback_channels"] = [ch for ch in cfg.channels if ch in ch_elapsed]
+        diagnostics["policy_by_channel"] = policy_by_channel
+        diagnostics["trust_rule"] = zones.effective_trust_rule(cfg)
     cmd = MpcCommand(pwm=pwm, mode=mode, diagnostics=diagnostics)
 
     # 9. next state (gate rule 5: raw values and cmd.pwm always go into the window)
@@ -440,29 +688,103 @@ def step(
     mem["fault_ticks"] = fault_ticks
     mem["stall_ticks"] = stall_ticks
     mem["stuck_latch"] = dict(gate.stuck_latch)
-    mem[solver_name] = solver_mem
-    good_now = trusted and fault_since is None
-    if good_now:
-        # last_good holds what the gate trusted: the filtered temperatures (with
-        # median3 the raw sample may hide a Jump the median has not shown yet),
-        # and rpm/pwm with NaN/inf replaced by None so the state stays finite.
-        good_obs = PlantObservation(
-            temps=dict(gate.filtered),
-            rpm={k: (v if _finite(v) else None) for k, v in obs.rpm.items()},
-            pwm={k: (v if _finite(v) else None) for k, v in obs.pwm.items()},
-            ts=obs.ts,
-        )
+    if cfg.slow_window_samples:
+        mem["stuck_slow"] = slow_windows
+        mem["stuck_seq"] = stuck_seq + 1
     else:
-        good_obs = state.last_good_obs
+        mem.pop("stuck_slow", None)
+        mem.pop("stuck_seq", None)
+    mem[solver_name] = solver_mem
+    if das:
+        integrator = {ch: v for ch, v in integrator.items() if ch not in ch_elapsed}
+    good_obs = _next_good_obs(obs, cfg, state, gate, trusted, fault_since, faulted, time_status)
     new_state = MpcState(
         last_cmd=cmd,
         last_good_obs=good_obs,
         last_raw_temps=dict(gate.raw),
-        window=push_window(window, gate.raw, pwm, cfg.stuck_ticks),
+        window=push_window(window, gate.raw, pwm, cfg.window_ticks),
         fault_since_ts=fault_since,
         fault_reason=fault_reason,
         trusted_streak=streak,
         integrator=integrator,
         solver_memory=mem,
+        zone_faults=(
+            {
+                z: ZoneFault(
+                    since_ts=books[z].since,
+                    reason=books[z].reason,
+                    streak=books[z].streak,
+                    ticks=books[z].ticks,
+                )
+                for z in zone_names
+            }
+            if das
+            else {}
+        ),
     )
     return cmd, new_state
+
+
+def _sanitized(values: Mapping[str, float | None]) -> dict[str, float | None]:
+    return {k: (v if _finite(v) else None) for k, v in values.items()}
+
+
+def _next_good_obs(
+    obs: PlantObservation,
+    cfg: MpcConfig,
+    state: MpcState,
+    gate: GateResult,
+    trusted: bool,
+    fault_since: float | None,
+    faulted: list[str],
+    time_status: str,
+) -> PlantObservation | None:
+    """``last_good_obs`` for the next state.
+
+    Legacy mode: replaced as a whole by what the gate trusted -- the filtered
+    temperatures (with median3 the raw sample may hide a Jump the median has
+    not shown yet), and rpm/pwm with NaN/inf replaced by None so the state
+    stays finite -- on a trusted tick that ends fault-free.
+
+    With zones: per temperature. A gate-trusted value on a time-valid tick
+    replaces the old one when its zone is not in fault (a sensor without a
+    zone: when some zone is not in fault); every other temperature keeps its
+    last good value. Nothing usable keeps the old observation as a whole.
+    """
+    layout = cfg.zone_layout
+    if layout.implicit:
+        if trusted and fault_since is None:
+            return PlantObservation(
+                temps=dict(gate.filtered),
+                rpm=_sanitized(obs.rpm),
+                pwm=_sanitized(obs.pwm),
+                ts=obs.ts,
+            )
+        return state.last_good_obs
+    if time_status not in ("ok", "first"):
+        return state.last_good_obs
+    faulted_set = set(faulted)
+    some_zone_ok = len(faulted_set) < len(layout.zones)
+    usable = {
+        name
+        for name in cfg.temps
+        if gate.per_temp[name]
+        and (
+            some_zone_ok
+            if layout.sensor_zone[name] is None
+            else layout.sensor_zone[name] not in faulted_set
+        )
+    }
+    if not usable:
+        return state.last_good_obs
+    old = {} if state.last_good_obs is None else state.last_good_obs.temps
+    temps: dict[str, float | None] = {}
+    for name in cfg.temps:
+        if name in usable:
+            temps[name] = gate.filtered[name]
+        else:
+            v = old.get(name)
+            temps[name] = v if _finite(v) else None
+    return PlantObservation(
+        temps=temps, rpm=_sanitized(obs.rpm), pwm=_sanitized(obs.pwm), ts=obs.ts
+    )

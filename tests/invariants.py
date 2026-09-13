@@ -25,6 +25,7 @@ __all__ = [
     "obs_pwm_trusted",
     "obs_structurally_untrusted",
     "resolve_prev_pwm",
+    "structurally_faulted_zones",
 ]
 
 # Float slack for the rate-limit and bound comparisons (not for NaN/Inf).
@@ -147,6 +148,34 @@ def obs_structurally_untrusted(obs: PlantObservation, cfg: MpcConfig) -> bool:
     return False
 
 
+def _structurally_bad(obs: PlantObservation, cfg: MpcConfig, name: str) -> bool:
+    v = obs.temps.get(name)
+    if v is None or not math.isfinite(v):
+        return True
+    return not cfg.median3 and not cfg.temp_min_c <= v <= cfg.temp_max_c
+
+
+def structurally_faulted_zones(obs: PlantObservation, cfg: MpcConfig) -> set[str]:
+    """Zones the gate *must* fault without any history (zoned counterpart of
+    :func:`obs_structurally_untrusted`).
+
+    An unknown key faults every zone; otherwise a zone faults when some
+    required group (``cfg.zone_layout.required_groups``) has every member
+    structurally bad. Legacy mode: the implicit zone iff
+    :func:`obs_structurally_untrusted`.
+    """
+    layout = cfg.zone_layout
+    if set(obs.temps) - set(cfg.temps):
+        return set(layout.zones)
+    out: set[str] = set()
+    for zone in layout.zones:
+        for _label, members in layout.required_groups[zone]:
+            if all(_structurally_bad(obs, cfg, name) for name in members):
+                out.add(zone)
+                break
+    return out
+
+
 def assert_command_safe(
     obs: PlantObservation,
     cfg: MpcConfig,
@@ -190,10 +219,33 @@ def assert_command_safe(
     )
 
     # A tick the gate can reject without history must be fallback.
-    if obs_structurally_untrusted(obs, cfg):
+    if not cfg.is_das:
+        if obs_structurally_untrusted(obs, cfg):
+            assert cmd.mode is Mode.FALLBACK, (
+                f"observation is structurally untrusted but cmd.mode={cmd.mode.value!r}"
+            )
+        return
+    # Zones: the structurally faulted zones must be in fault, their channels under
+    # fallback policy and never commanded below prev (clamped into the box).
+    bad = structurally_faulted_zones(obs, cfg)
+    if not bad:
+        return
+    if bad == set(cfg.zone_layout.zones):
         assert cmd.mode is Mode.FALLBACK, (
-            f"observation is structurally untrusted but cmd.mode={cmd.mode.value!r}"
+            f"every zone structurally untrusted but {cmd.mode.value!r}"
         )
+    else:
+        assert cmd.mode in (Mode.FALLBACK, Mode.DEGRADED), (
+            f"zones {sorted(bad)} structurally untrusted but cmd.mode={cmd.mode.value!r}"
+        )
+    in_fault = set(cmd.diagnostics.get("zones_in_fault", ()))
+    assert bad <= in_fault, (
+        f"zones {sorted(bad - in_fault)} structurally untrusted but not in fault"
+    )
+    fixed = set(cmd.diagnostics.get("fallback_channels", ()))
+    for zone in bad:
+        for ch in cfg.zone_layout.zone_channels[zone]:
+            assert ch in fixed, f"channel {ch!r} of faulted zone {zone!r} not under fallback policy"
 
 
 def assert_state_finite(state: MpcState) -> None:
@@ -229,7 +281,48 @@ def checked_step(
     assert_state_finite(nxt)
     assert state.to_dict() == before, "step mutated its input state"
     assert nxt.last_cmd == cmd, "returned state must carry the returned command as last_cmd"
-    assert (cmd.mode is Mode.FALLBACK) == nxt.in_fault, (
+    assert (cmd.mode in (Mode.FALLBACK, Mode.DEGRADED)) == nxt.in_fault, (
         f"mode {cmd.mode.value!r} disagrees with fault state {nxt.fault_since_ts!r}"
     )
+    if cfg.is_das:
+        assert_zone_step_safe(cfg, cmd, nxt, prev)
     return cmd, nxt
+
+
+def assert_zone_step_safe(
+    cfg: MpcConfig, cmd: MpcCommand, nxt: MpcState, prev: Mapping[str, float]
+) -> None:
+    """Per-zone invariants of one zoned ``step`` (plan section 0.1).
+
+    * ``zone_faults`` has exactly the zones; ``fallback`` iff every zone is in
+      fault, ``degraded`` iff some are; the global fields are the aggregates;
+    * the channels under fallback policy are exactly the reach of the faulted
+      zones (own channels plus declared coupling), and none of them is
+      commanded below ``prev`` (clamped into ``[pwm_min, pwm_max]``).
+    """
+    layout = cfg.zone_layout
+    assert set(nxt.zone_faults) == set(layout.zones), (
+        f"zone_faults {sorted(nxt.zone_faults)} != zones {sorted(layout.zones)}"
+    )
+    faulted = [z for z in layout.zones if nxt.zone_faults[z].in_fault]
+    if len(faulted) == len(layout.zones):
+        assert cmd.mode is Mode.FALLBACK, f"every zone in fault but mode={cmd.mode.value!r}"
+    elif faulted:
+        assert cmd.mode is Mode.DEGRADED, f"zones {faulted} in fault but mode={cmd.mode.value!r}"
+    else:
+        assert cmd.mode in (Mode.AUTO, Mode.SATURATED), f"no zone in fault but {cmd.mode.value!r}"
+    assert cmd.diagnostics["zones_in_fault"] == faulted
+    since = [nxt.zone_faults[z].since_ts for z in faulted]
+    assert nxt.fault_since_ts == (min(since) if since else None)  # type: ignore[type-var]
+    assert nxt.trusted_streak == min(nxt.zone_faults[z].streak for z in layout.zones)
+    reach: set[str] = set()
+    for zone in faulted:
+        reach.update(layout.reach[zone])
+    fixed = set(cmd.diagnostics["fallback_channels"])
+    assert fixed == reach, f"fallback channels {sorted(fixed)} != reach {sorted(reach)}"
+    for ch in fixed:
+        floor = min(max(prev[ch], cfg.pwm_min), cfg.pwm_max)
+        assert cmd.pwm[ch] >= floor - TOL, (
+            f"channel {ch!r} under fallback policy went below prev: {cmd.pwm[ch]} < {floor}"
+        )
+        assert ch not in nxt.integrator, f"channel {ch!r} under fallback kept an integrator entry"

@@ -578,9 +578,20 @@ class MpcSolver:
                 break
         return d, err
 
+    @staticmethod
+    def _require_all_channels(req: SolverRequest) -> None:
+        """One coupled problem over every channel: channels under fallback policy are not
+        supported (``step`` turns the raise into a fault of the zones it would drive)."""
+        if req.fixed_channels:
+            raise ValueError(
+                "the linear MPC plans every channel jointly and cannot run with channels "
+                f"under fallback policy: {sorted(req.fixed_channels)}"
+            )
+
     def initialise(
         self, cfg: MpcConfig, req: SolverRequest
     ) -> tuple[dict[str, float], dict[str, Any]]:
+        self._require_all_channels(req)
         prob = build_problem(cfg)
         T0 = _finite_vec(req.temps, prob.temps, "temps")
         prev = _finite_vec(req.prev_pwm, prob.channels, "prev_pwm")
@@ -599,6 +610,7 @@ class MpcSolver:
     # -- one tick -------------------------------------------------------------
 
     def solve(self, cfg: MpcConfig, req: SolverRequest) -> SolverResult:
+        self._require_all_channels(req)
         prob = build_problem(cfg)
         T0 = _finite_vec(req.temps, prob.temps, "temps")
         prev = _finite_vec(req.prev_pwm, prob.channels, "prev_pwm")

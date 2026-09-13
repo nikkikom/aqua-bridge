@@ -75,11 +75,16 @@ class SolverStatus(StrEnum):
     """``/api/health`` solver field.
 
     * ``ok``       -- last command was ``auto`` or ``saturated``
-    * ``fallback`` -- last command was ``fallback`` (gate or solver fault active)
+    * ``degraded`` -- last command was ``degraded``: some zones are in fault and their
+      channels (and those of zones coupled to them) are under fallback policy, the
+      rest are regulated; ``cmd.diagnostics["zones_in_fault"]`` names the zones
+    * ``fallback`` -- last command was ``fallback`` (every zone in fault: gate or solver
+      fault active)
     * ``fault``    -- no command at all (no observation yet, read/apply failing)
     """
 
     OK = "ok"
+    DEGRADED = "degraded"
     FALLBACK = "fallback"
     FAULT = "fault"
 
@@ -276,6 +281,8 @@ class ControlSnapshot:
             return SolverStatus.FAULT
         if cmd.mode is Mode.FALLBACK:
             return SolverStatus.FALLBACK
+        if cmd.mode is Mode.DEGRADED:
+            return SolverStatus.DEGRADED
         return SolverStatus.OK
 
     def state_payload(self) -> dict[str, Any]:
@@ -294,7 +301,7 @@ class ControlSnapshot:
         }
 
     def health_payload(self) -> dict[str, Any]:
-        """``GET /api/health``: USB present, MQTT, solver ok/fallback/fault, uptime."""
+        """``GET /api/health``: USB present, MQTT, solver ok/degraded/fallback/fault, uptime."""
         return {
             "usb_present": self.usb_present,
             "mqtt_connected": self.mqtt_connected,

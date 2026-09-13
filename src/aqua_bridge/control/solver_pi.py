@@ -14,7 +14,15 @@ a ``solver`` fault, never an exception out of ``step``):
 * ``initialise`` returns an integrator/memory such that an immediately
   following ``solve`` with the same request yields ``prev_pwm`` (bumpless
   transfer, section 3) up to float rounding;
-* ``converged=False`` means the iteration cap was hit (section 4.3).
+* ``converged=False`` means the iteration cap was hit (section 4.3);
+* channels in ``SolverRequest.fixed_channels`` are under ``step``'s fallback
+  policy (their zone, or a zone coupled to it, is in fault): the solver
+  must still return a demand for them (``step`` ignores it), should treat
+  them as known inputs at the given command, must not need the
+  temperatures of faulted zones (they are absent from ``temps``) and
+  ``initialise`` owes bumplessness only on the other channels. A solver
+  that cannot honour this raises, which ``step`` turns into a fault of
+  every zone it was asked to drive. Legacy mode never fixes a channel.
 
 PI policy (per fan channel ``ch``)::
 
@@ -23,7 +31,9 @@ PI policy (per fan channel ``ch``)::
     I'  = clamp(I + pi_ki * e * dt, pwm_min, pwm_max)
 
 The ``max`` over a channel's temperatures is the conservative choice for a
-cooling loop: the hottest deviation drives the fan. Anti-windup is the
+cooling loop: the hottest deviation drives the fan. A channel in
+``fixed_channels`` gets no error, no integrator entry (so it starts
+bumplessly when released) and its fixed command as demand. Anti-windup is the
 clamp of ``I`` into ``[pwm_min, pwm_max]`` ("the integral alone stays in
 the actuator range"), deliberately *not* conditional integration: holding
 ``I`` as soon as ``u`` crosses a rail parks the integrator exactly where
@@ -39,7 +49,7 @@ errs toward more cooling. Bumpless re-initialisation sets
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Container, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -58,16 +68,24 @@ __all__ = [
 class SolverRequest:
     """Everything a solver may look at for one tick.
 
-    * ``temps``      -- trusted (gate-filtered) temperatures, keys ``cfg.temps``
-    * ``prev_pwm``   -- the PWM the command will be rate-limited against
-    * ``integrator`` -- ``MpcState.integrator`` (may be empty or lack channels)
-    * ``memory``     -- the solver's own slot of ``MpcState.solver_memory``
+    * ``temps``          -- trusted (gate-filtered) temperatures, keys ``cfg.temps``
+      (with zones: only the sensors of zones that are not in fault and trusted
+      sensors without a zone)
+    * ``prev_pwm``       -- the PWM the command will be rate-limited against
+    * ``integrator``     -- ``MpcState.integrator`` (may be empty or lack channels)
+    * ``memory``         -- the solver's own slot of ``MpcState.solver_memory``
+    * ``fixed_channels`` -- channels under fallback policy -> the command ``step`` will
+      target on them this tick (empty in legacy mode)
+    * ``zone_trust``     -- zone -> whether the solver may rely on its sensors this tick
+      (empty in legacy mode)
     """
 
     temps: dict[str, float]
     prev_pwm: dict[str, float]
     integrator: dict[str, float] = field(default_factory=dict)
     memory: dict[str, Any] = field(default_factory=dict)
+    fixed_channels: dict[str, float] = field(default_factory=dict)
+    zone_trust: dict[str, bool] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -104,14 +122,20 @@ class Solver(Protocol):
         ...
 
 
-def channel_errors(cfg: MpcConfig, temps: Mapping[str, float]) -> dict[str, float]:
+def channel_errors(
+    cfg: MpcConfig, temps: Mapping[str, float], skip: Container[str] = ()
+) -> dict[str, float]:
     """Tracking error per channel: ``max(T - setpoint)`` over the channel's temperatures.
 
     Raises ``KeyError`` when a controlled temperature is absent from
-    ``temps``; ``step`` only calls solvers with a complete trusted set.
+    ``temps``; ``step`` only calls solvers with a complete trusted set for
+    every channel outside ``skip`` (the fixed channels). Raises
+    ``ValueError`` for a channel that controls no temperature.
     """
     out: dict[str, float] = {}
     for ch in cfg.channels:
+        if ch in skip:
+            continue
         names = cfg.temps_for_channel(ch)
         out[ch] = max(float(temps[name]) - cfg.setpoints[name] for name in names)
     return out
@@ -129,12 +153,18 @@ class PiSolver:
     def initialise(
         self, cfg: MpcConfig, req: SolverRequest
     ) -> tuple[dict[str, float], dict[str, Any]]:
-        errors = channel_errors(cfg, req.temps)
-        integrator = {ch: float(req.prev_pwm[ch]) - cfg.pi_kp * errors[ch] for ch in cfg.channels}
+        fixed = req.fixed_channels
+        errors = channel_errors(cfg, req.temps, fixed)
+        integrator = {
+            ch: float(req.prev_pwm[ch]) - cfg.pi_kp * errors[ch]
+            for ch in cfg.channels
+            if ch not in fixed
+        }
         return integrator, {}
 
     def solve(self, cfg: MpcConfig, req: SolverRequest) -> SolverResult:
-        errors = channel_errors(cfg, req.temps)
+        fixed = req.fixed_channels
+        errors = channel_errors(cfg, req.temps, fixed)
         pwm: dict[str, float] = {}
         integrator: dict[str, float] = {}
         p_term: dict[str, float] = {}
@@ -142,6 +172,9 @@ class PiSolver:
         sat_hi: dict[str, bool] = {}
         sat_lo: dict[str, bool] = {}
         for ch in cfg.channels:
+            if ch in fixed:
+                pwm[ch] = float(fixed[ch])
+                continue
             e = errors[ch]
             i_now = req.integrator.get(ch)
             if i_now is None:  # channel without memory: start bumpless

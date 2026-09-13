@@ -14,11 +14,14 @@
   td.v { text-align: right; font-variant-numeric: tabular-nums; }
   #fault { display: none; background: #a33; color: #fff; padding: 8px 12px; border-radius: 6px; margin-bottom: 10px; font-weight: bold; }
   #fault.show { display: block; }
+  #degraded { display: none; background: #a70; color: #fff; padding: 8px 12px; border-radius: 6px; margin-bottom: 10px; font-weight: bold; }
+  #degraded.show { display: block; }
 </style>
 </head>
 <body>
 <h1>aqua-bridge</h1>
 <div id="fault">FAULT</div>
+<div id="degraded">DEGRADED</div>
 
 <section id="overview"><h2>Overview</h2><table></table></section>
 <section id="temps"><h2>Temps</h2><table></table></section>
@@ -51,6 +54,17 @@ async function poll() {
 
     const obs = state.obs || {};
     const cmd = state.cmd || {};
+
+    // Some zones in fault: their fans (and coupled zones' fans) are on fallback policy.
+    const degraded = document.getElementById("degraded");
+    if (health.solver === "degraded") {
+      const zones = (cmd.diagnostics || {}).zones_in_fault || [];
+      degraded.textContent = "DEGRADED: zone" + (zones.length === 1 ? " " : "s ") +
+        (zones.length ? zones.join(", ") : "?") + " in fault";
+      degraded.className = "show";
+    } else {
+      degraded.className = "";
+    }
 
     table("overview", [
       row("Mode", fmt(state.mode)),
