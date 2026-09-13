@@ -1,6 +1,7 @@
-"""DAS-mode intents: ``SetLimit`` (``POST /api/limit``, MQTT ``cmd/limit``) and the DAS
-preset semantics (plan sections 4 and 7). Legacy configs keep ``/api/setpoint`` and
-the legacy presets unchanged.
+"""DAS-mode intents and views: ``SetLimit`` (``POST /api/limit``, MQTT ``cmd/limit``),
+``SetBay`` (``POST /api/bay``, MQTT ``cmd/bay``), ``GET /api/estimate``, ``GET /api/bays``,
+the Home Assistant drive entities and the DAS preset semantics (plan sections 4 and 7).
+Legacy configs keep ``/api/setpoint`` and the legacy presets unchanged.
 """
 
 from __future__ import annotations
@@ -22,13 +23,20 @@ from aqua_bridge.control.intents import (
     IntentError,
     IntentInvalid,
     Preset,
+    SetBay,
     SetLimit,
     SetPreset,
     SetSetpoint,
     parse_intent,
 )
 from aqua_bridge.control.mpc import step
-from aqua_bridge.control.supervisor import PRESETS, RuntimeLimits, Supervisor, apply_preset
+from aqua_bridge.control.supervisor import (
+    PRESETS,
+    RuntimeBays,
+    RuntimeLimits,
+    Supervisor,
+    apply_preset,
+)
 from aqua_bridge.model import ConfigError, MpcConfig, MpcState
 from aqua_bridge.publishers.mqtt_ha import build_discovery_entities, command_topics, parse_command
 from das_fixtures import das_obs
@@ -388,3 +396,245 @@ def test_presets_on_a_zoned_setpoint_config_keep_the_setpoint_semantics():
         assert eff.pi_kp == pytest.approx(zcfg.pi_kp * effect.gain_scale)
         assert eff.pi_ki == pytest.approx(zcfg.pi_ki * effect.gain_scale)
         assert eff.weight_dpwm == pytest.approx(zcfg.weight_dpwm * effect.move_penalty_scale)
+
+
+# ---------------------------------------------------------------------------
+# bays: SetBay (POST /api/bay, MQTT cmd/bay/<bay>), GET /api/estimate, GET /api/bays
+# ---------------------------------------------------------------------------
+
+
+def test_parse_bay_intent():
+    assert parse_intent("bay", {"bay": "b03", "occupied": False}) == SetBay(
+        bay="b03", changes={"occupied": False}
+    )
+    intent = parse_intent(
+        "bay", {"bay": "b03", "class": "ssd_sata", "serial": "X1", "occupied": "auto"}
+    )
+    assert intent.changes == {"occupied": "auto", "class": "ssd_sata", "serial": "X1"}
+    assert parse_intent("bay", {"bay": "b03", "serial": None}).changes == {"serial": None}
+    assert "bay" in INTENT_KINDS
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"bay": "b03"},
+        {"occupied": True},
+        {"bay": "b03", "occupied": "yes"},
+        {"bay": "b03", "occupied": 1},
+        {"bay": "b03", "class": 3},
+        {"bay": "b03", "serial": ""},
+        {"bay": "", "occupied": True},
+        {"bay": "b03", "occupied": True, "limit_c": 40},
+        "b03",
+    ],
+)
+def test_parse_bay_rejects_malformed_bodies(body):
+    with pytest.raises(IntentInvalid):
+        parse_intent("bay", body)
+
+
+def test_set_bay_declares_occupancy_class_and_serial_and_null_restores(dcfg):
+    sup = Supervisor(dcfg)
+    sup.submit(SetBay(bay="b04", changes={"occupied": False, "class": "ssd_sata"}))
+    sup.submit(SetBay(bay="b05", changes={"serial": "WD-1"}))
+    eff = sup.effective_config()
+    assert eff.topology.bays["b04"].occupied is False and eff.bay_class("b04") == "ssd_sata"
+    assert eff.topology.bays["b05"].serial == "WD-1"
+    assert sup.base_config.topology.bays["b04"].occupied == "auto"  # base untouched
+    snap = sup.snapshot()
+    assert snap.bays["b04"] == {
+        "zone": "z0",
+        "occupied": False,
+        "class": "ssd_sata",
+        "serial": None,
+    }
+    assert snap.state_payload()["bays"]["b05"]["serial"] == "WD-1"
+    sup.submit(SetBay(bay="b04", changes={"occupied": None}))
+    eff = sup.effective_config()
+    assert eff.topology.bays["b04"].occupied == "auto" and eff.bay_class("b04") == "ssd_sata"
+    sup.submit(SetBay(bay="b04", changes={"class": None}))
+    assert "b04" not in sup.bays.bays and sup.effective_config().bay_class("b04") == "hdd"
+    # declarations survive presets and limits
+    sup.submit(SetPreset(name=Preset.COOL))
+    sup.submit(SetLimit(limit_c=45.0, bay="b05"))
+    eff = sup.effective_config()
+    assert eff.topology.bays["b05"].serial == "WD-1" and eff.bay_limit("b05") == 45.0
+
+
+@pytest.mark.parametrize(
+    "intent, match",
+    [
+        (SetBay(bay="b99", changes={"occupied": True}), "unknown bay"),
+        (SetBay(bay="b01", changes={"class": "tape"}), "unknown drive class"),
+    ],
+)
+def test_set_bay_rejects_unknown_names(dcfg, intent, match):
+    sup = Supervisor(dcfg)
+    before = sup.effective_config()
+    with pytest.raises(IntentInvalid, match=match):
+        sup.submit(intent)
+    assert sup.effective_config() is before
+
+
+def test_set_bay_rejects_a_serial_declared_twice_and_changes_nothing(dcfg):
+    sup = Supervisor(dcfg)
+    sup.submit(SetBay(bay="b01", changes={"serial": "S"}))
+    before = sup.effective_config()
+    with pytest.raises(IntentInvalid, match="declared on both"):
+        sup.submit(SetBay(bay="b02", changes={"serial": "S"}))
+    assert sup.effective_config() is before and "b02" not in sup.bays.bays
+
+
+def test_set_bay_on_a_legacy_config_is_invalid(cfg):
+    sup = Supervisor(cfg)
+    with pytest.raises(IntentInvalid, match="DAS config"):
+        sup.submit(SetBay(bay="b01", changes={"occupied": True}))
+    assert "bays" not in sup.snapshot().state_payload()
+    with pytest.raises(ConfigError):
+        apply_preset(cfg, cfg.setpoints, Preset.NORMAL, None, RuntimeBays({"b": {"serial": "x"}}))
+
+
+def test_a_bay_declared_empty_at_runtime_loses_its_constraints_in_step(dcfg):
+    sup = Supervisor(dcfg)
+    obs = das_obs(dcfg, 0.0, pwm=0.5)
+    cmd, state = step(obs, sup.effective_config(), MpcState.cold())
+    assert "b07" in cmd.diagnostics["estimates"]
+    sup.submit(SetBay(bay="b07", changes={"occupied": False}))
+    cmd, state = step(dataclasses.replace(obs, ts=dcfg.dt), sup.effective_config(), state)
+    assert "b07" not in cmd.diagnostics["estimates"]
+    assert cmd.diagnostics["bays"]["b07"]["occupancy"] == "empty"
+
+
+def test_mqtt_bay_topics_and_parsing(dcfg, cfg):
+    topics = command_topics(NODE, dcfg)
+    assert topics["bay/b07"] == "aqua-bridge/cmd/bay/b07"
+    assert not any(k.startswith("bay/") for k in command_topics(NODE, cfg))
+    for payload, occupied in (("occupied", True), (b"empty", False), (" auto ", "auto")):
+        assert parse_command(NODE, "aqua-bridge/cmd/bay/b07", payload) == SetBay(
+            bay="b07", changes={"occupied": occupied}
+        )
+    for topic, payload in (
+        ("aqua-bridge/cmd/bay/b07", b"yes"),
+        ("aqua-bridge/cmd/bay/b07", b""),
+        ("aqua-bridge/cmd/bay/", b"empty"),
+    ):
+        assert parse_command(NODE, topic, payload) is None, (topic, payload)
+
+
+def test_mqtt_drive_entities_in_das_mode_only(dcfg, cfg):
+    entities = build_discovery_entities(
+        dcfg, node_id=NODE, discovery_prefix="homeassistant", control_mode=ControlMode.AUTO
+    )
+    by_id = {e.object_id: e for e in entities}
+    assert len(by_id) == len(entities)
+    for bay in dcfg.topology.bays:
+        temp = by_id[f"drive_temp_{bay}"]
+        assert temp.component == "sensor" and temp.payload["device_class"] == "temperature"
+        assert f"estimates.{bay}.t_c" in temp.payload["value_template"]
+        assert (
+            f"estimates.{bay}.limit_margin_c"
+            in by_id[f"drive_margin_{bay}"].payload["value_template"]
+        )
+        assert f"estimates.{bay}.sigma_c" in by_id[f"drive_sigma_{bay}"].payload["value_template"]
+        occupied = by_id[f"bay_occupied_{bay}"]
+        assert occupied.component == "binary_sensor"
+        assert (
+            occupied.config_topic == f"homeassistant/binary_sensor/{NODE}/bay_occupied_{bay}/config"
+        )
+        assert f"bays.{bay}.occupancy" in occupied.payload["value_template"]
+        assert occupied.payload["device_class"] == "occupancy"
+    legacy = build_discovery_entities(
+        cfg, node_id=NODE, discovery_prefix="homeassistant", control_mode=ControlMode.AUTO
+    )
+    assert not any(e.object_id.startswith(("drive_", "bay_")) for e in legacy)
+
+
+def test_limit_margin_is_the_hard_target_minus_the_estimate(dcfg):
+    cmd, _ = step(das_obs(dcfg, 0.0, pwm=0.5), dcfg, MpcState.cold())
+    for entry in cmd.diagnostics["estimates"].values():
+        assert entry["limit_margin_c"] == pytest.approx(entry["hard_c"] - entry["t_c"])
+
+
+@needs_socket
+def test_http_bay_estimate_and_bays_on_a_das_config(dcfg):
+    sup = Supervisor(dcfg)
+    obs = das_obs(dcfg, 0.0, pwm=0.5)
+    before = asyncio.run(_post_all(sup, [("GET /api/estimate", None), ("GET /api/bays", None)]))
+    assert before[0] == (200, {"estimates": {}, "estimator": {}})
+    assert before[1][0] == 200 and before[1][1]["bays"]["b01"]["estimator"] is None
+    cmd, state = step(obs, sup.effective_config(), MpcState.cold())
+    sup.record_tick(obs=obs, mpc_cmd=cmd, cmd=cmd, state=state, applied=True, usb_present=True)
+    results = asyncio.run(
+        _post_all(
+            sup,
+            [
+                ("/api/bay", {"bay": "b02", "occupied": False, "serial": "WD-9"}),
+                ("/api/bay", {"bay": "b02", "class": "tape"}),
+                ("/api/bay", {"bay": "b77", "occupied": True}),
+                ("/api/bay", {"bay": "b02", "occupied": "maybe"}),
+                ("/api/bay", {"bay": "b03", "serial": "WD-9"}),
+                ("GET /api/estimate", None),
+                ("GET /api/bays", None),
+            ],
+        )
+    )
+    assert [s for s, _ in results] == [200, 400, 400, 400, 400, 200, 200]
+    estimate = results[5][1]
+    assert set(estimate["estimates"]) == set(dcfg.topology.bays)
+    assert estimate["estimates"]["b01"]["source"] == "estimator"
+    assert estimate["estimator"]["status"] == "ok" and set(estimate["estimator"]["zones"]) == {
+        "z0",
+        "z1",
+        "z2",
+        "z3",
+    }
+    bays = results[6][1]["bays"]
+    assert bays["b02"]["declared"] == {
+        "zone": "z0",
+        "occupied": False,
+        "class": "hdd",
+        "serial": "WD-9",
+    }
+    assert bays["b02"]["estimator"]["occupancy"] == "occupied"  # seen before the declaration
+    assert "candidates" in bays["b01"]["estimator"]
+
+
+@needs_socket
+def test_http_estimate_and_bays_on_a_legacy_config_are_404(cfg):
+    results = asyncio.run(
+        _post_all(
+            Supervisor(cfg),
+            [
+                ("GET /api/estimate", None),
+                ("GET /api/bays", None),
+                ("/api/bay", {"bay": "b01", "occupied": True}),
+            ],
+        )
+    )
+    assert [s for s, _ in results] == [404, 404, 400]
+    assert "DAS config" in results[0][1]["error"]
+
+
+@needs_socket
+@settings(max_examples=40, deadline=None)
+@given(
+    body=st.dictionaries(
+        st.sampled_from(["bay", "occupied", "class", "serial", "x"]),
+        st.one_of(
+            st.sampled_from(["b01", "b15", "hdd", "auto", "", "zz"]),
+            st.booleans(),
+            st.none(),
+            st.integers(-3, 3),
+            st.floats(allow_nan=True, allow_infinity=True),
+        ),
+    )
+)
+def test_fuzzed_bay_bodies_never_5xx(body: dict[str, Any]):
+    from aqua_bridge.config import load_config
+    from conftest import EXAMPLE_DAS_CONFIG
+
+    sup = Supervisor(load_config(EXAMPLE_DAS_CONFIG).mpc)
+    ((status, payload),) = asyncio.run(_post_all(sup, [("/api/bay", body)]))
+    assert status in (200, 400), (status, payload)
