@@ -2,8 +2,8 @@
 
 ``create_app`` wires GET ``/api/state``, GET ``/api/health``, GET ``/`` (the
 static single-page UI), the DAS views GET ``/api/estimate``, GET ``/api/bays`` and
-GET ``/api/model``, and the seven ``POST /api/{mode,setpoint,pwm,preset,auto,limit,
-bay}`` intents against a :class:`aqua_bridge.control.intents.ControlSurface`.
+GET ``/api/model``, and the eight ``POST /api/{mode,setpoint,pwm,preset,auto,limit,
+bay,ident}`` intents against a :class:`aqua_bridge.control.intents.ControlSurface`.
 
 HTTP never computes PWM itself: every POST body becomes an
 :class:`~aqua_bridge.control.intents.Intent` via
@@ -18,6 +18,16 @@ answers 400 and keeps ``POST /api/setpoint``. The route exists for both so a
 client learns the reason from the body instead of a 404. ``POST /api/bay``
 ``{"bay": ..., "occupied"?: true|false|"auto", "class"?: ..., "serial"?: ...}``
 (a ``null`` field restores the configured value) works the same way.
+
+``POST /api/ident`` ``{"action": "start", "group": ...}`` | ``{"action": "start",
+"channel": ...}`` | ``{"action": "stop"}`` starts or stops an identification
+experiment (DAS mode, :mod:`aqua_bridge.control.ident`): 200 on success, 400 for a
+malformed body, an unknown group or channel or a legacy config, 409 when
+``ident_enabled`` is false, an experiment already runs or a precondition fails
+(the body's ``error`` names every failed precondition, e.g. ``settle:z1``,
+``mode:degraded``, ``start_band:b03``). Its status (``ControlSnapshot.extra["experiment"]``:
+running, target, phase, level, elapsed and remaining seconds, the last result and
+abort reason) is in ``GET /api/model`` under ``experiment`` and in the MQTT state blob.
 
 DAS views (plan sections 1 and 7), read from the snapshot, never computed here:
 
@@ -38,9 +48,10 @@ DAS views (plan sections 1 and 7), read from the snapshot, never computed here:
   coefficients with their relative standard errors, see
   :mod:`aqua_bridge.control.thermal`; ``{"status": "off"}`` without
   ``model_shadow``), the static parameter table (units, bounds, priors) and the
-  estimator's SMART calibration per bay, and what the model store loaded at start
+  estimator's SMART calibration per bay, what the model store loaded at start
   (``diagnostics["store"]``: source ``fresh`` | ``stale`` | ``prior``, sections,
-  warnings; ``{"source": "off"}`` without a store, see :mod:`aqua_bridge.control.persist`).
+  warnings; ``{"source": "off"}`` without a store, see :mod:`aqua_bridge.control.persist`),
+  and ``"experiment"``: the identification experiment's status.
 
 A legacy config answers all three with 404 and a reason.
 
@@ -89,7 +100,7 @@ _SMART_KEY: web.AppKey[Any] = web.AppKey("smart_inbox")
 
 # URL tail -> intent kind (identical today, kept separate so the route table
 # and aqua_bridge.control.intents.INTENT_KINDS can diverge later).
-_POST_KINDS = ("mode", "setpoint", "pwm", "preset", "auto", "limit", "bay")
+_POST_KINDS = ("mode", "setpoint", "pwm", "preset", "auto", "limit", "bay", "ident")
 
 
 def _error(status: int, message: str) -> web.Response:
@@ -188,6 +199,7 @@ async def _get_model(request: web.Request) -> web.Response:
         {
             "thermal": diag.get("thermal") or {"status": "off"},
             "parameters": {kind: spec.to_dict() for kind, spec in PARAMETERS.items()},
+            "experiment": snapshot.extra.get("experiment"),
             "calibration": {
                 bay: {
                     "serial": info.get("serial"),

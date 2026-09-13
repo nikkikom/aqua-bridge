@@ -396,3 +396,51 @@ def test_add_topic_handler_subscribes_immediately_if_already_connected(cfg: MpcC
     client.connected = True
     client.add_topic_handler("aqua-bridge/in/smart/+", lambda t, p: None)
     assert fake.subscribed == ["aqua-bridge/in/smart/+"]
+
+
+# --- identification experiments (DAS plan section 7) --------------------
+
+
+def test_ident_topic_and_entity_in_das_mode_only(cfg: MpcConfig) -> None:
+    from aqua_bridge.control.intents import Ident
+    from test_ident_experiment import ident_cfg
+
+    das = ident_cfg()
+    assert command_topics(NODE_ID, das)["ident"] == "aqua-bridge/cmd/ident"
+    assert "ident" not in command_topics(NODE_ID, cfg)
+    ents = {
+        e.object_id: e
+        for e in build_discovery_entities(
+            das, node_id=NODE_ID, discovery_prefix=PREFIX, control_mode=ControlMode.AUTO
+        )
+    }
+    running = ents["ident_running"]
+    assert running.component == "binary_sensor"
+    assert running.config_topic == "homeassistant/binary_sensor/aqua-bridge/ident_running/config"
+    assert "extra.experiment.running" in running.payload["value_template"]
+    legacy = build_discovery_entities(
+        cfg, node_id=NODE_ID, discovery_prefix=PREFIX, control_mode=ControlMode.AUTO
+    )
+    assert "ident_running" not in {e.object_id for e in legacy}
+    topic = "aqua-bridge/cmd/ident"
+    assert parse_command(NODE_ID, topic, b"stop") == Ident("stop")
+    assert parse_command(NODE_ID, topic, "start:group:front") == Ident("start", group="front")
+    assert parse_command(NODE_ID, topic, "start:channel:fa1") == Ident("start", channel="fa1")
+    assert parse_command(NODE_ID, topic, " start:fb1 ") == Ident("start", channel="fb1")
+    for garbage in (b"", b"start", b"start:", b"go:fa1", b"start:group:", b"\xff", b"stop:fa1"):
+        assert parse_command(NODE_ID, topic, garbage) is None
+
+
+def test_ident_command_reaches_the_supervisor_through_on_message() -> None:
+    from test_ident_experiment import Rig, ident_cfg
+
+    rig = Rig(ident_cfg())
+    rig.ticks(8)
+    client = _client(rig.cfg, on_intent=rig.sup.submit)
+    topic = f"{NODE_ID}/cmd/ident"
+    client._on_message(client.client, None, _Msg(topic, b"start:group:front"))
+    assert rig.sup.experiment is not None
+    client._on_message(client.client, None, _Msg(topic, b"start:group:front"))  # 409, dropped
+    assert rig.sup.experiment is not None
+    client._on_message(client.client, None, _Msg(topic, b"stop"))
+    assert rig.sup.experiment is None

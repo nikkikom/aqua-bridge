@@ -532,3 +532,105 @@ def test_fuzz_setpoint_never_5xx_and_never_leaks_bad_value(
         if isinstance(intent, SetSetpoint):
             assert math.isfinite(intent.celsius)
             assert intent.channel in surface.cfg.setpoints
+
+
+# ---------------------------------------------------------------------------
+# POST /api/ident (DAS plan sections 5 and 7) against the real Supervisor
+# ---------------------------------------------------------------------------
+
+
+async def _post_real(surface: Any, posts: list[tuple[str, Any]]) -> list[tuple[int, Any]]:
+    client = TestClient(TestServer(create_app(surface, cfg=None)))
+    await client.start_server()
+    out = []
+    try:
+        for path, body in posts:
+            if path.startswith("GET "):
+                resp = await client.get(path[4:])
+            else:
+                resp = await client.post(
+                    path,
+                    data=_dumps_allow_nan(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                )
+            out.append((resp.status, await resp.json()))
+    finally:
+        await client.close()
+    return out
+
+
+def test_post_ident_start_stop_and_refusals() -> None:
+    from test_ident_experiment import Rig, ident_cfg
+
+    rig = Rig(ident_cfg())
+    results = _run(
+        _post_real(
+            rig.sup,
+            [
+                ("/api/ident", {"action": "start", "group": "front"}),  # no tick yet
+                ("/api/ident", {"action": "start", "group": "rear"}),
+                ("/api/ident", {"action": "start"}),
+                ("/api/ident", ["start"]),
+            ],
+        )
+    )
+    assert [s for s, _ in results] == [409, 400, 400, 400]
+    assert "no_tick" in results[0][1]["error"]
+    rig.ticks(8)
+    results = _run(
+        _post_real(
+            rig.sup,
+            [
+                ("/api/ident", {"action": "start", "group": "front"}),
+                ("/api/ident", {"action": "start", "channel": "fb1"}),
+                ("GET /api/model", None),
+                ("/api/ident", {"action": "stop"}),
+                ("GET /api/model", None),
+            ],
+        )
+    )
+    assert [s for s, _ in results] == [200, 409, 200, 200, 200]
+    assert "already running" in results[1][1]["error"]
+    assert results[2][1]["experiment"]["running"] is True
+    assert results[2][1]["experiment"]["target"] == {"kind": "group", "name": "front"}
+    assert results[4][1]["experiment"]["last_abort_reason"] == "stop"
+
+
+def test_post_ident_disabled_is_409_and_legacy_is_400(cfg: MpcConfig) -> None:
+    from aqua_bridge.control.supervisor import Supervisor
+    from test_ident_experiment import Rig, ident_cfg
+
+    rig = Rig(ident_cfg(ident_enabled=False))
+    rig.ticks(8)
+    ((status, body),) = _run(
+        _post_real(rig.sup, [("/api/ident", {"action": "start", "group": "front"})])
+    )
+    assert status == 409 and "ident_enabled" in body["error"]
+    legacy = Supervisor(cfg)
+    ((status, body),) = _run(
+        _post_real(legacy, [("/api/ident", {"action": "start", "channel": cfg.channels[0]})])
+    )
+    assert status == 400 and "DAS" in body["error"]
+
+
+@pytest.mark.fuzzy
+@given(
+    body=st.one_of(
+        _json_value,
+        st.dictionaries(st.sampled_from(["action", "group", "channel", "extra"]), _json_value),
+        st.fixed_dictionaries(
+            {"action": st.sampled_from(["start", "stop"])},
+            optional={
+                "group": st.sampled_from(["front", "fb1", "nope", ""]),
+                "channel": st.sampled_from(["fa1", "fc1", "front", 3]),
+            },
+        ),
+    )
+)
+def test_fuzz_ident_never_5xx(body: Any) -> None:
+    from aqua_bridge.control.supervisor import Supervisor
+    from test_ident_experiment import ident_cfg
+
+    sup = Supervisor(ident_cfg())
+    ((status, _),) = _run(_post_real(sup, [("/api/ident", body)]))
+    assert status in (200, 400, 409)

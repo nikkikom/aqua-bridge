@@ -19,6 +19,9 @@ Topic layout (``node_id`` from ``config.yaml`` ``mqtt.node_id``):
 * ``{node_id}/cmd/limit/class/<class>`` -- raw number, limit of a drive class (DAS mode)
 * ``{node_id}/cmd/bay/<bay>``         -- raw string ``occupied`` | ``empty`` | ``auto``,
   the bay's declared occupancy (DAS mode; ``POST /api/bay`` for class and serial)
+* ``{node_id}/cmd/ident``             -- raw string ``start:group:<group>`` |
+  ``start:channel:<channel>`` | ``start:<channel>`` | ``stop``: start or stop an
+  identification experiment (DAS mode, ``POST /api/ident``)
 
 DAS mode (``mpc.topology``) subscribes to the limit and bay topics and adds one
 ``limit_<class>`` number entity per drive class (state from
@@ -45,6 +48,10 @@ one-window prediction error, degC; ``None`` until a window has closed), and the
 fan noise index ``noise_db`` (``value_json.cmd.diagnostics.noise.db_index``,
 :mod:`aqua_bridge.control.noise`: energetic total from the fans' speed; an index,
 absolute only with datasheet ``noise_db_at_max`` values).
+
+DAS mode also publishes the binary sensor ``ident_running``
+(``value_json.extra.experiment.running``, :mod:`aqua_bridge.control.ident`): on while
+an identification experiment commands fans.
 
 Discovery config topics follow the standard
 ``{discovery_prefix}/{component}/{node_id}/{object_id}/config``.
@@ -73,6 +80,7 @@ from typing import Any
 from aqua_bridge.control.intents import (
     ClearOverride,
     ControlMode,
+    Ident,
     Intent,
     IntentError,
     SetBay,
@@ -129,6 +137,7 @@ def command_topics(node_id: str, cfg: MpcConfig) -> dict[str, str]:
             topics[f"limit/class/{drive_class}"] = f"{node_id}/cmd/limit/class/{drive_class}"
         for bay in cfg.topology.bays:
             topics[f"bay/{bay}"] = f"{node_id}/cmd/bay/{bay}"
+        topics["ident"] = f"{node_id}/cmd/ident"
     for ch in cfg.channels:
         topics[f"pwm/{ch}"] = f"{node_id}/cmd/pwm/{ch}"
     return topics
@@ -367,6 +376,24 @@ def build_discovery_entities(
                 unit="dB",
             )
         )
+        object_id = "ident_running"
+        unique_id = f"{node_id}_{object_id}"
+        payload = {
+            "name": "Identification experiment running",
+            "unique_id": unique_id,
+            "object_id": unique_id,
+            "state_topic": state_topic(node_id),
+            "value_template": (
+                "{{ 'ON' if value_json.extra.experiment.running | default(false) else 'OFF' }}"
+            ),
+            "payload_on": "ON",
+            "payload_off": "OFF",
+            "device_class": "running",
+            "device": _device_block(node_id),
+            **_availability(node_id),
+        }
+        topic = f"{discovery_prefix}/binary_sensor/{node_id}/{object_id}/config"
+        entities.append(MqttEntity("binary_sensor", object_id, topic, payload))
 
     bays = {} if cfg.topology is None else cfg.topology.bays
     for bay in bays:  # empty in legacy mode
@@ -455,6 +482,22 @@ def state_payload(snapshot_dict: Mapping[str, Any], host: Mapping[str, Any]) -> 
 _BAY_PAYLOADS: dict[str, bool | str] = {"occupied": True, "empty": False, "auto": "auto"}
 
 
+def _parse_ident(text: str) -> Ident:
+    """``cmd/ident`` payload: ``stop`` | ``start:group:<g>`` | ``start:channel:<ch>`` |
+    ``start:<ch>``. Raises ``ValueError`` / ``IntentError`` for anything else."""
+    if text == "stop":
+        return Ident(action="stop")
+    action, sep, rest = text.partition(":")
+    if action != "start" or not sep or not rest:
+        raise ValueError(f"ident payload must be 'stop' or 'start:...', got {text!r}")
+    kind, sep, name = rest.partition(":")
+    if sep and kind == "group":
+        return Ident(action="start", group=name)
+    if sep and kind == "channel":
+        return Ident(action="start", channel=name)
+    return Ident(action="start", channel=rest)
+
+
 def parse_command(node_id: str, topic: str, payload: bytes | str) -> Intent | None:
     """Turn one inbound MQTT message into an :class:`Intent`, or ``None``.
 
@@ -498,6 +541,8 @@ def parse_command(node_id: str, topic: str, payload: bytes | str) -> Intent | No
                     f"bay payload must be one of {sorted(_BAY_PAYLOADS)}, got {text!r}"
                 )
             return SetBay(bay=tail[len("bay/") :], changes={"occupied": occupied})
+        if tail == "ident":
+            return _parse_ident(text)
     except (IntentError, ValueError) as exc:
         _LOG.info("mqtt: rejected command on %s: %s", topic, exc)
         return None
