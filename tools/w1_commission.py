@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Sensor commissioning for the 1-Wire buses (the DAS plan, section 10).
+
+Run on the Pi, once, before the daemon starts::
+
+    tools/w1_commission.py --list
+    tools/w1_commission.py --identify
+    tools/w1_commission.py --check --config /etc/aqua-bridge/config.yaml
+
+``--list`` prints every ROM id found on every bus master with its current
+reading, for copying into ``onewire.sensors``. ``--identify`` samples every
+discovered sensor repeatedly while you warm one with a finger and reports
+the sensors ranked by how fast their reading rose, so a ROM id can be bound
+to a name (``prox_b01``, ``air_z0``, ...) with confidence. ``--check
+--config ...`` builds the exact composite hardware source the daemon would
+build (:func:`aqua_bridge.hw.sources.build_composite_from_config`), so every
+startup binding error (a name not bound exactly once across
+hwmon/onewire) is caught here first, then runs a few dozen bulk-read cycles
+per bus and prints the measured cycle time and the CRC error rate per
+sensor (plan section 12 risk 5: "measure with w1_commission.py --check").
+
+This tool imports :mod:`aqua_bridge.config` / :mod:`aqua_bridge.hw` only,
+never :mod:`aqua_bridge.control`: commissioning runs stand-alone, before an
+``MpcConfig`` is meaningful to the sensors themselves.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+import time
+from pathlib import Path
+
+from aqua_bridge.hw.onewire import DEFAULT_ROOT, W1Source
+
+__all__ = [
+    "build_parser",
+    "cmd_check",
+    "cmd_identify",
+    "cmd_list",
+    "main",
+    "rank_by_warming_rate",
+]
+
+_ROM_PATTERN = re.compile(r"^[0-9a-f]{2}-[0-9a-f]{12}$")
+
+
+def discover_all(root: Path) -> dict[str, list[str]]:
+    """Bus master name -> sorted ROM ids currently found under it.
+
+    Discovery, not binding: every ROM-shaped subdirectory is listed, not
+    only ones a config declares (there is no config yet at this point).
+    """
+    out: dict[str, list[str]] = {}
+    if not root.is_dir():
+        return out
+    for bus_dir in sorted(root.glob("w1_bus_master*")):
+        if not bus_dir.is_dir():
+            continue
+        roms = sorted(
+            p.name for p in bus_dir.iterdir() if p.is_dir() and _ROM_PATTERN.match(p.name)
+        )
+        out[bus_dir.name] = roms
+    return out
+
+
+def _flatten_roms(roms_by_bus: dict[str, list[str]]) -> dict[str, str]:
+    return {rom: rom for roms in roms_by_bus.values() for rom in roms}
+
+
+def _probe_source(root: Path, sensors: dict[str, str]) -> W1Source:
+    """A throwaway :class:`W1Source` whose sensor *names* are the ROM ids
+    themselves, so :meth:`W1Source.run_bus_cycle` can be driven directly
+    for discovery/identify/check without an ``onewire.sensors`` binding."""
+    return W1Source(sensors, max_age_s=3600.0, root=root)
+
+
+def cmd_list(root: Path) -> int:
+    roms_by_bus = discover_all(root)
+    if not roms_by_bus:
+        print(f"no w1 bus master found under {root}")
+        return 1
+    sensors = _flatten_roms(roms_by_bus)
+    if not sensors:
+        print("no ROM ids found on any bus")
+        return 1
+    src = _probe_source(root, sensors)
+    for bus_name, roms in roms_by_bus.items():
+        readings = src.run_bus_cycle(root / bus_name)
+        print(f"{bus_name}:")
+        for rom in roms:
+            value = readings.get(rom)
+            shown = f"{value:.3f} C" if value is not None else "(no reading)"
+            print(f"  {rom}  {shown}")
+    return 0
+
+
+def rank_by_warming_rate(series: dict[str, list[float | None]]) -> list[tuple[str, float]]:
+    """``[(rom, total_rise_c)]`` sorted descending -- the fastest-rising
+    sensor first. A pure function of the sampled series so the ranking
+    logic is unit-testable without a real 1-Wire bus; missing samples
+    (``None``, a failed read mid-series) are dropped before comparing the
+    first and last finite reading.
+    """
+    ranked: list[tuple[str, float]] = []
+    for rom, values in series.items():
+        finite = [v for v in values if v is not None]
+        if len(finite) < 2:
+            continue
+        ranked.append((rom, finite[-1] - finite[0]))
+    ranked.sort(key=lambda pair: pair[1], reverse=True)
+    return ranked
+
+
+def cmd_identify(root: Path, *, samples: int = 10, interval_s: float = 2.0) -> int:
+    roms_by_bus = discover_all(root)
+    sensors = _flatten_roms(roms_by_bus)
+    if not sensors:
+        print("no ROM ids found on any bus")
+        return 1
+    src = _probe_source(root, sensors)
+    print(f"warm one sensor with a finger; sampling {samples} times every {interval_s:.0f}s ...")
+    series: dict[str, list[float | None]] = {rom: [] for rom in sensors}
+    for i in range(samples):
+        for bus_name, roms in roms_by_bus.items():
+            readings = src.run_bus_cycle(root / bus_name)
+            for rom in roms:
+                series[rom].append(readings.get(rom))
+        if i < samples - 1:
+            time.sleep(interval_s)
+    ranked = rank_by_warming_rate(series)
+    if not ranked:
+        print("not enough readings to rank any sensor")
+        return 1
+    print("ranked by rise (fastest first):")
+    for rom, delta in ranked:
+        print(f"  {rom}  {delta:+.3f} C")
+    print(f"likely the one you warmed: {ranked[0][0]}")
+    return 0
+
+
+def cmd_check(config_path: str, *, cycles: int = 20) -> int:
+    from aqua_bridge.config import ConfigError, load_config
+    from aqua_bridge.hw.sources import build_composite_from_config
+
+    try:
+        app = load_config(config_path)
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        composite, release = build_composite_from_config(
+            hwmon_section=app.hwmon,
+            xt6_section=app.section("xt6"),
+            onewire_section=app.section("onewire"),
+            channels=app.mpc.channels,
+            temps=app.mpc.temps,
+            dt=app.mpc.dt,
+        )
+    except ConfigError as exc:
+        print(f"config error: {exc}", file=sys.stderr)
+        return 2
+
+    print("binding check: every mpc.temps / mpc.channels name is bound exactly once. OK")
+    onewire = composite.onewire
+    if onewire is None:
+        print("no onewire.sensors configured; nothing more to check")
+        if release is not None:
+            release()
+        return 0
+
+    missing = onewire.missing_roms()
+    if missing:
+        print(f"WARNING: ROM id(s) declared in config but not found on any bus: {missing}")
+
+    buses = onewire.discover_buses()
+    if not buses:
+        print(f"WARNING: no w1 bus master found under {onewire.root}")
+    for bus_dir in buses:
+        t0 = time.monotonic()
+        for _ in range(cycles):
+            onewire.run_bus_cycle(bus_dir)
+        elapsed = time.monotonic() - t0
+        print(f"{bus_dir.name}: {elapsed / cycles * 1000:.0f} ms/cycle over {cycles} cycles")
+
+    total_reads = cycles * len(buses)
+    if total_reads:
+        for rom, errors in sorted(onewire.crc_error_counts().items()):
+            rate = errors / total_reads
+            flag = "  WARNING: > 1%" if rate > 0.01 else ""
+            print(f"{rom}: {errors}/{total_reads} failed reads ({rate:.1%}){flag}")
+
+    if release is not None:
+        release()
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="w1_commission", description=__doc__.split("\n\n")[0])
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument(
+        "--list", action="store_true", help="list every ROM id per bus with its current reading"
+    )
+    group.add_argument(
+        "--identify", action="store_true", help="find which ROM id is the sensor you are warming"
+    )
+    group.add_argument(
+        "--check", action="store_true", help="verify bindings, cycle time and CRC error rate"
+    )
+    p.add_argument("--config", help="config.yaml path (required with --check)")
+    p.add_argument("--root", default=DEFAULT_ROOT, help=f"w1 sysfs root (default {DEFAULT_ROOT})")
+    p.add_argument("--samples", type=int, default=10, help="--identify: sample count (default 10)")
+    p.add_argument(
+        "--interval", type=float, default=2.0, help="--identify: seconds between samples"
+    )
+    p.add_argument(
+        "--cycles", type=int, default=20, help="--check: bulk-read cycles per bus (default 20)"
+    )
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    root = Path(args.root)
+    if args.list:
+        return cmd_list(root)
+    if args.identify:
+        return cmd_identify(root, samples=args.samples, interval_s=args.interval)
+    if not args.config:
+        print("--check requires --config", file=sys.stderr)
+        return 2
+    return cmd_check(args.config, cycles=args.cycles)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
