@@ -57,10 +57,16 @@ choice for cooling:
   (``zone_air`` / ``drive_proximal``), ``channel_temps`` must be absent and a
   channel controls the setpoint temperatures of the zones that list it.
   When ``setpoints`` is not empty every channel must control at least one.
-  An empty ``setpoints`` is accepted (the DAS solvers of later milestones
-  regulate on drive limits); until those exist the ``pi`` / ``mpc``
-  solvers cannot compute a demand without a setpoint, raise, and every
-  zone stays in fallback (high cooling), visible as ``solver_error``.
+  An empty ``setpoints`` is DAS limit regulation
+  (:attr:`MpcConfig.regulates_drive_limits`): the ``pi`` solver regulates
+  the margin deficit of the drives (``aqua_bridge.control.solver_pi``); the
+  legacy ``mpc`` solver cannot compute a demand without a setpoint, raises,
+  and every zone it drives stays in fallback (high cooling), visible as
+  ``solver_error``, until the DAS MPC milestone.
+* ``topology.bays.<bay>.limit_c`` can only tighten the bay's class limit
+  (:meth:`MpcConfig.bay_limit` is the minimum of both).
+* ``noise`` (exponent, noise weight, band hysteresis) is DAS-only like the
+  other sections and defaults to :data:`NOISE_DEFAULTS` with ``topology``.
 """
 
 from __future__ import annotations
@@ -90,10 +96,12 @@ __all__ = [
     "FanModel",
     "FanSpec",
     "FaultReason",
+    "NOISE_DEFAULTS",
     "Mode",
     "MpcCommand",
     "MpcConfig",
     "MpcState",
+    "NoiseSpec",
     "PlantObservation",
     "SensorSpec",
     "SolverKind",
@@ -599,6 +607,7 @@ DAS_SECTIONS: tuple[str, ...] = (
     "fans",
     "fan_models",
     "zones",
+    "noise",
 )
 
 #: Name of the single zone that stands for the whole config in legacy mode.
@@ -731,19 +740,23 @@ class BaySpec:
 
     ``occupied`` is ``true``, ``false`` or ``"auto"`` (unknown until an estimator
     decides; an unknown bay is treated like an occupied one: conservative).
+    ``limit_c`` optionally tightens the class limit for this one bay: the bay's
+    limit is ``min(class limit_c, limit_c)`` (:meth:`MpcConfig.bay_limit`), so a
+    bay entry can never allow a drive hotter than its class.
     """
 
     zone: str
     drive_class: str | None = None
     occupied: bool | str = "auto"
     serial: str | None = None
+    limit_c: float | None = None
 
     @classmethod
     def coerce(cls, path: str, data: object) -> BaySpec:
         if isinstance(data, BaySpec):
             return data
         raw = _section_keys(
-            path, data, required=("zone",), optional=("class", "occupied", "serial")
+            path, data, required=("zone",), optional=("class", "occupied", "serial", "limit_c")
         )
         occupied = raw.get("occupied", "auto")
         if not (isinstance(occupied, bool) or occupied == "auto"):
@@ -753,6 +766,9 @@ class BaySpec:
             drive_class=_opt_str(f"{path}.class", raw.get("class")),
             occupied=occupied,
             serial=_opt_str(f"{path}.serial", raw.get("serial")),
+            limit_c=(
+                None if raw.get("limit_c") is None else _cfg_num(f"{path}.limit_c", raw["limit_c"])
+            ),
         )
 
     @property
@@ -766,6 +782,7 @@ class BaySpec:
             "class": self.drive_class,
             "occupied": self.occupied,
             "serial": self.serial,
+            "limit_c": self.limit_c,
         }
 
 
@@ -1064,6 +1081,48 @@ class ZonePolicy:
         return {"trust_rule": self.trust_rule, "fault_coupling": self.fault_coupling}
 
 
+#: ``noise`` defaults (plan section 7): fan affinity exponent, weight of the noise
+#: term, hysteresis of the forbidden PWM bands.
+NOISE_DEFAULTS: dict[str, float] = {"exponent": 5.0, "weight_noise": 1.0, "band_hysteresis": 0.02}
+
+
+@dataclass(frozen=True)
+class NoiseSpec:
+    """``noise``: how fan noise is weighed (plan section 4, "Noise model").
+
+    * ``exponent``        -- sound power ~ rpm ** exponent, in ``[3, 7]``
+    * ``weight_noise``    -- weight of the noise term in the DAS MPC cost (``>= 0``);
+      the ``quiet`` / ``cool`` presets scale it in DAS mode
+    * ``band_hysteresis`` -- PWM hysteresis for leaving a forbidden band (``>= 0``)
+
+    Parsed and validated now; the PI-like DAS solver does not read it (it
+    regulates margins, not noise) and the DAS MPC milestone consumes it.
+    """
+
+    exponent: float = NOISE_DEFAULTS["exponent"]
+    weight_noise: float = NOISE_DEFAULTS["weight_noise"]
+    band_hysteresis: float = NOISE_DEFAULTS["band_hysteresis"]
+
+    @classmethod
+    def coerce(cls, data: object) -> NoiseSpec:
+        if isinstance(data, NoiseSpec):
+            return data
+        raw = _section_keys("noise", data, optional=tuple(NOISE_DEFAULTS))
+        return cls(
+            **{
+                key: _cfg_num(f"noise.{key}", raw.get(key, default))
+                for key, default in NOISE_DEFAULTS.items()
+            }
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "exponent": self.exponent,
+            "weight_noise": self.weight_noise,
+            "band_hysteresis": self.band_hysteresis,
+        }
+
+
 @dataclass(frozen=True)
 class StuckParams:
     """Stuck rule parameters of one temperature (gate rule 3), derived from the config.
@@ -1103,6 +1162,9 @@ class ZoneLayout:
     * ``reach[zone]``           -- channels put under fallback policy while the zone is
       in fault: its own channels plus, with ``fault_coupling: declared``, those of
       the zones in its ``coupled_to``
+    * ``served[channel]``       -- zones whose air the channel moves or exchanges air
+      with: the zones that list it plus their declared ``coupled_to`` (independent of
+      ``fault_coupling``); the PI-like DAS solver regulates the drives of these zones
     """
 
     implicit: bool
@@ -1113,6 +1175,7 @@ class ZoneLayout:
     sensor_zone: dict[str, str | None]
     required_groups: dict[str, tuple[tuple[str, tuple[str, ...]], ...]]
     reach: dict[str, tuple[str, ...]]
+    served: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 def _strictest_class(classes: Mapping[str, DriveClass]) -> str:
@@ -1121,6 +1184,21 @@ def _strictest_class(classes: Mapping[str, DriveClass]) -> str:
         classes,
         key=lambda n: (classes[n].limit_c, classes[n].limit_c - classes[n].comfort_c, n),
     )
+
+
+def _served_zones(
+    channel: str,
+    zones: tuple[str, ...],
+    zone_channels: Mapping[str, tuple[str, ...]],
+    coupled: Mapping[str, tuple[str, ...]],
+) -> tuple[str, ...]:
+    """Zones listing ``channel`` plus their declared ``coupled_to``, in zone order."""
+    members: set[str] = set()
+    for z in zones:
+        if channel in zone_channels[z]:
+            members.add(z)
+            members.update(coupled[z])
+    return tuple(z for z in zones if z in members)
 
 
 def _plain_entry(value: Any) -> Any:
@@ -1213,6 +1291,7 @@ class MpcConfig:
     fans: dict[str, FanSpec] = field(default_factory=dict)
     fan_models: dict[str, FanModel] = field(default_factory=dict)
     zones: ZonePolicy | None = None
+    noise: NoiseSpec | None = None
 
     # -- construction -------------------------------------------------------
 
@@ -1309,13 +1388,17 @@ class MpcConfig:
             },
         )
         zones = None if self.zones is None else ZonePolicy.coerce(self.zones)
+        noise = None if self.noise is None else NoiseSpec.coerce(self.noise)
         if topology is not None:
+            if noise is None:
+                noise = NoiseSpec()
             if zones is None:
                 zones = ZonePolicy()
             if topology.default_class is None and classes:
                 topology = dataclasses.replace(topology, default_class=_strictest_class(classes))
         s(self, "topology", topology)
         s(self, "zones", zones)
+        s(self, "noise", noise)
 
     # -- validation ---------------------------------------------------------
 
@@ -1458,6 +1541,8 @@ class MpcConfig:
                     raise ConfigError(f"mpc.{name} requires mpc.topology (DAS layout)")
             if self.zones is not None:
                 raise ConfigError("mpc.zones requires mpc.topology (DAS layout)")
+            if self.noise is not None:
+                raise ConfigError("mpc.noise requires mpc.topology (DAS layout)")
         else:
             self._validate_das()
         object.__setattr__(self, "_derived", self._derive())
@@ -1542,6 +1627,11 @@ class MpcConfig:
                 )
             if not (isinstance(bay.occupied, bool) or bay.occupied == "auto"):
                 raise ConfigError(f"mpc.topology.bays.{b}.occupied must be true, false or auto")
+            if bay.limit_c is not None and not self.temp_min_c < bay.limit_c < self.temp_max_c:
+                raise ConfigError(
+                    f"mpc.topology.bays.{b}.limit_c={bay.limit_c} must lie inside "
+                    f"({self.temp_min_c}, {self.temp_max_c})"
+                )
 
         # sensors
         if set(self.sensors) != set(self.temps):
@@ -1653,6 +1743,18 @@ class MpcConfig:
         if policy.fault_coupling not in FAULT_COUPLINGS:
             raise ConfigError(f"mpc.zones.fault_coupling must be one of {list(FAULT_COUPLINGS)}")
 
+        noise = self.noise
+        if not isinstance(noise, NoiseSpec):
+            raise ConfigError("mpc.noise must be a noise entry")
+        if not 3.0 <= noise.exponent <= 7.0:
+            raise ConfigError(f"mpc.noise.exponent must be in [3, 7], got {noise.exponent}")
+        if noise.weight_noise < 0:
+            raise ConfigError(f"mpc.noise.weight_noise must be >= 0, got {noise.weight_noise}")
+        if noise.band_hysteresis < 0:
+            raise ConfigError(
+                f"mpc.noise.band_hysteresis must be >= 0, got {noise.band_hysteresis}"
+            )
+
     def _derive(self) -> _Derived:
         """Zone layout and per-temperature Stuck parameters (validated config only)."""
         channels = tuple(self.channels)
@@ -1669,6 +1771,7 @@ class MpcConfig:
                 sensor_zone=dict.fromkeys(self.temps, zone),
                 required_groups={zone: tuple((t, (t,)) for t in self.temps)},
                 reach={zone: channels},
+                served={ch: (zone,) for ch in channels},
             )
             stuck = {
                 t: StuckParams(
@@ -1757,6 +1860,7 @@ class MpcConfig:
             sensor_zone={t: sensors[t].zone for t in self.temps},
             required_groups=groups,
             reach=reach,
+            served={ch: _served_zones(ch, zones, zone_channels, coupled) for ch in channels},
         )
         return _Derived(
             layout=layout,
@@ -1823,6 +1927,27 @@ class MpcConfig:
         cls = self.topology.bays[bay].drive_class or self.topology.default_class
         assert cls is not None
         return cls
+
+    @property
+    def regulates_drive_limits(self) -> bool:
+        """DAS mode that regulates drive limits: ``topology`` present and ``setpoints`` empty.
+
+        A zoned config that still declares ``setpoints`` keeps the per-zone setpoint
+        regulation of the zones milestone (``pi`` on ``T - setpoint``).
+        """
+        return self.topology is not None and not self.setpoints
+
+    def bay_limit(self, bay: str) -> float:
+        """Absolute limit of ``bay``: its class ``limit_c``, tightened by ``bays.<bay>.limit_c``."""
+        if self.topology is None:
+            raise KeyError(bay)
+        limit = self.drive_classes[self.bay_class(bay)].limit_c
+        own = self.topology.bays[bay].limit_c
+        return limit if own is None else min(limit, own)
+
+    def bay_comfort(self, bay: str) -> float:
+        """Comfort band of ``bay``: its class ``comfort_c``."""
+        return self.drive_classes[self.bay_class(bay)].comfort_c
 
     def temps_for_channel(self, channel: str) -> tuple[str, ...]:
         """Temperatures (all with setpoints) that ``channel`` controls.
