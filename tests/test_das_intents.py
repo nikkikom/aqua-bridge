@@ -372,3 +372,19 @@ def test_http_limit_on_a_legacy_config_is_400_and_setpoint_still_works(cfg):
     assert [s for s, _ in results] == [400, 200, 200]
     assert "limits" not in results[-1][1]
     assert sup.setpoints[temp] == 33.0
+
+
+def test_presets_on_a_zoned_setpoint_config_keep_the_setpoint_semantics():
+    """A zoned config that still regulates on setpoints (not on drive limits) must not
+    lose its presets: ``cool`` lowers the setpoints and ``quiet`` raises them, exactly as
+    in legacy mode, otherwise ``cool`` would be a silent no-op for the PI solver."""
+    from das_fixtures import das_cfg
+
+    zcfg = das_cfg()
+    assert zcfg.is_das and zcfg.setpoints and not zcfg.regulates_drive_limits
+    for preset, effect in PRESETS.items():
+        eff = apply_preset(zcfg, zcfg.setpoints, preset)
+        assert eff.setpoints == {k: v + effect.setpoint_offset_c for k, v in zcfg.setpoints.items()}
+        assert eff.pi_kp == pytest.approx(zcfg.pi_kp * effect.gain_scale)
+        assert eff.pi_ki == pytest.approx(zcfg.pi_ki * effect.gain_scale)
+        assert eff.weight_dpwm == pytest.approx(zcfg.weight_dpwm * effect.move_penalty_scale)

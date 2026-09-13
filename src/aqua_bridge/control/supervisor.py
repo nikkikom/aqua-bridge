@@ -76,8 +76,10 @@ DAS mode (``mpc.topology`` present) changes the meaning, plan section 4:
 
 A smaller comfort band raises the soft target ``limit - comfort - k * sigma``
 (the fans may run slower); the absolute limit and the hard target never move
-with a preset. Setpoints (a zoned config may still carry them) are passed
-through unchanged and PI gains and move penalty are not scaled in DAS mode.
+with a preset. Without setpoints (drive-limit regulation) PI gains and move
+penalty are not scaled. A zoned config that still declares setpoints regulates
+on them, so it gets the setpoint transform above as well (reviewer fix: the
+comfort band alone would leave ``cool`` without effect on its solver).
 
 The offset applies on top of the user's setpoint; ``snapshot().setpoints``
 reports the user's values and ``extra["effective_setpoints"]`` the
@@ -211,7 +213,7 @@ def _apply_das_preset(
         else bay
         for name, bay in topo.bays.items()
     }
-    return dataclasses.replace(
+    out = dataclasses.replace(
         cfg,
         setpoints={name: float(v) for name, v in setpoints.items()},
         drive_classes=classes,
@@ -219,6 +221,18 @@ def _apply_das_preset(
         noise=dataclasses.replace(
             cfg.noise, weight_noise=cfg.noise.weight_noise * effect.noise_weight_scale
         ),
+    )
+    if not setpoints:
+        return out
+    # A zoned config that still regulates on setpoints: the solvers read the
+    # setpoints, not the comfort bands, so the setpoint semantics must apply too
+    # (otherwise ``cool`` would silently not cool).
+    return dataclasses.replace(
+        out,
+        setpoints={name: float(v) + effect.setpoint_offset_c for name, v in setpoints.items()},
+        pi_kp=cfg.pi_kp * effect.gain_scale,
+        pi_ki=cfg.pi_ki * effect.gain_scale,
+        weight_dpwm=cfg.weight_dpwm * effect.move_penalty_scale,
     )
 
 
