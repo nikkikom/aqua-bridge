@@ -514,3 +514,37 @@ def test_concurrent_http_and_loop_threads(cfg):
     stop.set()
     t1.join(30)
     assert not errors, errors
+
+
+# --- identification experiments (DAS plan section 5) -----------------------
+
+
+def test_compose_applies_experiment_levels_like_an_override_and_fallback_beats_them():
+    from aqua_bridge.control.intents import Ident
+    from test_ident_experiment import Rig, ident_cfg
+
+    rig = Rig(ident_cfg())
+    rig.ticks(8)
+    rig.sup.submit(Ident("start", channel="fb1"))
+    plan = rig.sup.plan_tick()
+    assert plan.control_mode is ControlMode.AUTO
+    assert set(plan.overrides) == {"fb1"} and plan.experiment["running"] is True
+    cfg = plan.cfg
+    prev = dict.fromkeys(cfg.channels, 0.2)
+    solver = MpcCommand(pwm=dict.fromkeys(cfg.channels, 0.2), mode=Mode.AUTO, diagnostics={})
+    out = rig.sup.compose(solver, plan, prev)
+    # the experiment wants base + A = 0.65; one step of d_pwm_max from 0.2
+    assert out.pwm["fb1"] == pytest.approx(0.2 + cfg.d_pwm_max)
+    assert out.diagnostics["supervisor"]["override_rate_limited"]["fb1"] is True
+    assert out.diagnostics["supervisor"]["experiment"]["target"]["name"] == "fb1"
+    for mode, diag in (
+        (Mode.FALLBACK, {}),
+        (Mode.DEGRADED, {"fallback_channels": ["fb1"]}),
+    ):
+        blind = MpcCommand(pwm=dict.fromkeys(cfg.channels, 0.8), mode=mode, diagnostics=diag)
+        out = rig.sup.compose(blind, plan, prev)
+        assert out.pwm == blind.pwm
+    # the human view: auto, no override
+    snap = rig.sup.snapshot()
+    assert snap.control_mode is ControlMode.AUTO and snap.overrides == {}
+    assert snap.extra["experiment"]["overrides"] == {"fb1": pytest.approx(0.65)}

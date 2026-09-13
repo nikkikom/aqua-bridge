@@ -297,6 +297,7 @@ class Loop:
                 "apply_error": apply_error,
                 "controller_error": controller_error,
             },
+            ts=obs.ts,
         )
         if self.on_tick is not None:
             try:

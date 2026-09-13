@@ -22,6 +22,11 @@ temperature of a legacy (setpoint) config. In DAS mode drives are regulated
 to their limits instead and ``SetLimit`` (``POST /api/limit``) changes the
 absolute limit of one bay or one drive class. ``SetBay`` (``POST /api/bay``,
 DAS mode) declares a bay's occupancy, drive class or drive serial at runtime.
+
+Experiments: ``Ident`` (``POST /api/ident``, MQTT ``cmd/ident``, DAS mode) starts
+an active identification experiment on a fan group or a single channel, or stops
+the running one (:mod:`aqua_bridge.control.ident`). ``submit`` answers a refused
+start with :class:`IntentConflict` naming every failed precondition.
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ __all__ = [
     "ControlMode",
     "ControlSnapshot",
     "ControlSurface",
+    "Ident",
     "Intent",
     "IntentConflict",
     "IntentError",
@@ -288,7 +294,40 @@ class ClearOverride:
             object.__setattr__(self, "channel", _channel(self.channel))
 
 
-Intent = SetMode | SetSetpoint | SetPwm | SetPreset | ClearOverride | SetLimit | SetBay
+#: ``Ident.action`` values.
+IDENT_ACTIONS: tuple[str, ...] = ("start", "stop")
+
+
+@dataclass(frozen=True)
+class Ident:
+    """``POST /api/ident`` ``{"action": "start", "group": "front"}`` | ``{"action": "start",
+    "channel": "xt1"}`` | ``{"action": "stop"}``.
+
+    DAS mode only. ``start`` needs exactly one of ``group`` / ``channel``; ``stop``
+    takes neither. ``submit`` checks that the target exists (:class:`IntentInvalid`),
+    that ``ident_enabled`` is set, that no experiment runs and every precondition of
+    :func:`aqua_bridge.control.ident.check_start` (:class:`IntentConflict`, 409). A
+    ``stop`` without a running experiment is accepted and does nothing.
+    """
+
+    action: str
+    group: str | None = None
+    channel: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.action not in IDENT_ACTIONS:
+            raise IntentInvalid(f"action must be one of {list(IDENT_ACTIONS)}, got {self.action!r}")
+        if self.group is not None:
+            object.__setattr__(self, "group", _name("group", self.group))
+        if self.channel is not None:
+            object.__setattr__(self, "channel", _channel(self.channel))
+        if self.action == "start" and (self.group is None) == (self.channel is None):
+            raise IntentInvalid("start needs exactly one of 'group' or 'channel'")
+        if self.action == "stop" and (self.group is not None or self.channel is not None):
+            raise IntentInvalid("stop takes no 'group' or 'channel'")
+
+
+Intent = SetMode | SetSetpoint | SetPwm | SetPreset | ClearOverride | SetLimit | SetBay | Ident
 
 # URL tail / MQTT command name -> intent class and the body keys it accepts.
 INTENT_KINDS: dict[str, tuple[type, tuple[str, ...]]] = {
@@ -299,6 +338,7 @@ INTENT_KINDS: dict[str, tuple[type, tuple[str, ...]]] = {
     "auto": (ClearOverride, ("channel",)),
     "limit": (SetLimit, ("bay", "class", "limit_c")),
     "bay": (SetBay, ("bay", *BAY_FIELDS)),
+    "ident": (Ident, ("action", "group", "channel")),
 }
 
 
@@ -327,6 +367,10 @@ def parse_intent(kind: str, body: object) -> Intent:
         if "bay" not in body:
             raise IntentInvalid("missing fields for 'bay': ['bay']")
         return SetBay(bay=body["bay"], changes={k: body[k] for k in BAY_FIELDS if k in body})
+    if cls is Ident:
+        if "action" not in body:
+            raise IntentInvalid("missing fields for 'ident': ['action']")
+        return Ident(action=body["action"], group=body.get("group"), channel=body.get("channel"))
     if cls is not ClearOverride:
         missing = [k for k in allowed if k not in body]
         if missing:
@@ -350,6 +394,12 @@ class ControlSnapshot:
     :meth:`state_payload` only then, so the legacy payload keeps its shape.
     ``bays`` likewise: in DAS mode the bay declarations in force (config plus
     ``SetBay``), ``{bay: {"zone", "occupied", "class", "serial"}}``.
+
+    In DAS mode ``extra["experiment"]`` is the identification experiment's status
+    (:func:`aqua_bridge.control.ident.status`). The ``control_mode`` stays ``auto``
+    while an experiment runs and ``overrides`` lists only human overrides: the
+    experiment's levels are overrides of the supervisor itself, shown in
+    ``extra["experiment"]["overrides"]``.
     """
 
     obs: PlantObservation | None

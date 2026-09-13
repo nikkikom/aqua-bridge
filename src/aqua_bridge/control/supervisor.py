@@ -88,6 +88,36 @@ penalty are not scaled. A zoned config that still declares setpoints regulates
 on them, so it gets the setpoint transform above as well (reviewer fix: the
 comfort band alone would leave ``cool`` without effect on its solver).
 
+Identification experiments (DAS plan section 5, :mod:`aqua_bridge.control.ident`)
+---------------------------------------------------------------------------------
+* ``Ident(start, group|channel)`` needs a DAS config (else :class:`IntentInvalid`),
+  an existing target (:class:`IntentInvalid`), ``ident_enabled`` and no running
+  experiment (:class:`IntentConflict`), and every precondition of
+  :func:`~aqua_bridge.control.ident.check_start` on the last recorded tick
+  (:class:`IntentConflict` listing the reasons). ``Ident(stop)`` aborts the
+  running experiment with reason ``stop`` (a no-op without one).
+* **Control mode during an experiment: ``auto``.** The experiment is an override of
+  the supervisor, not of a human: ``control_mode`` stays ``auto``, ``overrides`` and
+  ``snapshot().overrides`` hold only human overrides, and the experiment's levels
+  are merged into ``TickPlan.overrides`` only, so ``compose`` rate limits, clamps and
+  blocks them under fallback exactly like a human override. The precondition "auto
+  without overrides" therefore reads the human state and is not blocked by the
+  experiment itself, while a human who wants the fans back simply sends any intent.
+  ``TickPlan.experiment`` and ``diagnostics["supervisor"]["experiment"]`` carry the
+  experiment's status on its ticks only (absent otherwise, so legacy diagnostics
+  keep their shape).
+* Any other intent submitted while an experiment runs aborts it first
+  (``human_intent:<kind>``), whether or not that intent is then accepted
+  (conservative: the fans go back to the solver).
+* After every tick (:meth:`Supervisor.record_tick`) the settle tracker advances and
+  a running experiment is checked against the abort list and armed for the next
+  tick; an end (completed or aborted) puts the experiment's channels into
+  ``released``, so the solver re-initialises bumplessly on them. An unexpected error
+  in this bookkeeping aborts the experiment (reason ``error``) and never raises.
+  Every start and end is logged.
+* ``snapshot().extra["experiment"]`` is :func:`~aqua_bridge.control.ident.status`
+  (DAS mode only). Nothing of an experiment survives a restart.
+
 The offset applies on top of the user's setpoint; ``snapshot().setpoints``
 reports the user's values and ``extra["effective_setpoints"]`` the
 offset ones. A preset or setpoint whose effective config fails validation
@@ -101,16 +131,20 @@ copies, so an HTTP thread and the loop thread may interleave freely.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from aqua_bridge.control import ident
 from aqua_bridge.control.intents import (
+    INTENT_KINDS,
     ClearOverride,
     ControlMode,
     ControlSnapshot,
+    Ident,
     Intent,
     IntentConflict,
     IntentInvalid,
@@ -142,6 +176,7 @@ __all__ = [
 ]
 
 _EPS = 1e-12
+_LOG = logging.getLogger("aqua_bridge.supervisor")
 
 
 @dataclass(frozen=True)
@@ -287,6 +322,7 @@ class TickPlan:
     overrides: dict[str, float] = field(default_factory=dict)
     released: frozenset[str] = frozenset()
     preset: Preset = Preset.NORMAL
+    experiment: dict[str, Any] | None = None  # ident.status while an experiment runs
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -337,6 +373,12 @@ class Supervisor:
         self._bays = RuntimeBays()
         self._effective = apply_preset(cfg, self._setpoints, self._preset, self._limits, self._bays)
         self._released: set[str] = set()
+
+        # Identification experiments (module docstring); in memory only.
+        self._ident_tracker: dict[str, Any] = ident.new_tracker()
+        self._ident_facts: ident.TickFacts | None = None
+        self._experiment: dict[str, Any] | None = None
+        self._ident_last: dict[str, Any] = {}
 
         # Loop-reported facts.
         self._obs: PlantObservation | None = None
@@ -421,6 +463,10 @@ class Supervisor:
             extra["effective_setpoints"] = dict(self._effective.setpoints)
             extra["applied_pwm"] = None if self._applied_pwm is None else dict(self._applied_pwm)
             extra["mpc_mode"] = None if self._mpc_cmd is None else self._mpc_cmd.mode.value
+            if self._base_cfg.is_das:
+                extra["experiment"] = ident.status(
+                    self._experiment, self._ident_last, self._effective
+                )
             return ControlSnapshot(
                 obs=self._obs,
                 last_cmd=self._last_cmd,
@@ -446,8 +492,23 @@ class Supervisor:
 
     # -- intents ----------------------------------------------------------
 
+    @property
+    def experiment(self) -> dict[str, Any] | None:
+        """The running experiment (plain JSON copy), ``None`` when none runs."""
+        with self._lock:
+            return None if self._experiment is None else dict(self._experiment)
+
     def submit(self, intent: Intent) -> None:
         with self._lock:
+            if isinstance(intent, Ident):
+                self._ident(intent)
+                return
+            if self._experiment is not None:
+                kind = next(
+                    (k for k, (cls, _) in INTENT_KINDS.items() if isinstance(intent, cls)),
+                    type(intent).__name__,
+                )
+                self._end_experiment(ident.RESULT_ABORTED, f"human_intent:{kind}")
             if isinstance(intent, SetMode):
                 self._set_mode(intent.mode)
             elif isinstance(intent, SetPwm):
@@ -571,6 +632,69 @@ class Supervisor:
         self._effective = self._validated(self._setpoints, self._preset, self._limits, candidate)
         self._bays = candidate
 
+    def _ident(self, intent: Ident) -> None:
+        cfg = self._effective
+        if not cfg.is_das:
+            raise IntentInvalid("experiments need a DAS config (mpc.topology)")
+        if intent.action == "stop":
+            if self._experiment is not None:
+                self._end_experiment(ident.RESULT_ABORTED, "stop")
+            return
+        kind, name = (
+            ("group", intent.group)
+            if intent.group is not None
+            else (
+                "channel",
+                intent.channel,
+            )
+        )
+        assert name is not None
+        try:
+            ident.target_channels(cfg, kind, name)
+        except KeyError:
+            known = sorted(ident.groups(cfg)) if kind == "group" else list(cfg.channels)
+            raise IntentInvalid(f"unknown {kind} {name!r}; {kind}s are {known}") from None
+        if not cfg.ident_enabled:
+            raise IntentConflict("experiments are disabled (mpc.ident_enabled: false)")
+        if self._experiment is not None:
+            running = self._experiment["target"]
+            raise IntentConflict(
+                f"an experiment on {running['kind']} {running['name']!r} is already running"
+            )
+        human = self._control_mode is not ControlMode.AUTO or bool(self._overrides)
+        facts = self._ident_facts
+        reasons = ident.check_start(
+            cfg, self._ident_tracker, facts, kind, name, human_control=human
+        )
+        if reasons:
+            raise IntentConflict(f"cannot start the experiment: {', '.join(reasons)}")
+        assert facts is not None
+        self._experiment = ident.start(cfg, facts, kind, name)
+        _LOG.info(
+            "experiment started on %s %r: channels %s, base %s",
+            kind,
+            name,
+            self._experiment["channels"],
+            self._experiment["base"],
+        )
+
+    def _end_experiment(self, result: str, reason: str | None) -> None:
+        exp = self._experiment
+        if exp is None:
+            return
+        self._experiment = None
+        self._released.update(ch for ch in exp["channels"] if ch not in self._overrides)
+        self._ident_last = {"result": result, "reason": reason, "target": dict(exp["target"])}
+        if result == ident.RESULT_COMPLETED:
+            _LOG.info("experiment on %s %r completed", exp["target"]["kind"], exp["target"]["name"])
+        else:
+            _LOG.warning(
+                "experiment on %s %r aborted: %s",
+                exp["target"]["kind"],
+                exp["target"]["name"],
+                reason,
+            )
+
     def _validated(
         self,
         setpoints: Mapping[str, float],
@@ -604,12 +728,18 @@ class Supervisor:
         with self._lock:
             released = frozenset(self._released)
             self._released.clear()
+            overrides = dict(self._overrides)
+            experiment = None
+            if self._experiment is not None:
+                overrides = {**self._experiment["overrides"], **overrides}
+                experiment = ident.status(self._experiment, self._ident_last, self._effective)
             return TickPlan(
                 cfg=self._effective,
                 control_mode=self._control_mode,
-                overrides=dict(self._overrides),
+                overrides=overrides,
                 released=released,
                 preset=self._preset,
+                experiment=experiment,
             )
 
     def compose(
@@ -631,6 +761,8 @@ class Supervisor:
             "overrides": dict(plan.overrides),
             "overrides_applied": False,
         }
+        if plan.experiment is not None:
+            supervisor_diag["experiment"] = plan.experiment
         diagnostics = dict(mpc_cmd.diagnostics)
         if mpc_cmd.mode is Mode.FALLBACK or not plan.overrides:
             # Fallback wins over manual: the controller is blind and must not
@@ -671,8 +803,13 @@ class Supervisor:
         applied: bool,
         usb_present: bool,
         extra: Mapping[str, Any] | None = None,
+        ts: float | None = None,
     ) -> None:
-        """The loop reports what happened this tick (for ``snapshot``)."""
+        """The loop reports what happened this tick (for ``snapshot``).
+
+        ``ts`` is the tick's observation clock (the blank observation's on a read
+        failure); ``None`` falls back to ``obs.ts``. In DAS mode it also advances the
+        experiment bookkeeping (module docstring)."""
         with self._lock:
             if obs is not None:
                 self._obs = obs
@@ -687,6 +824,25 @@ class Supervisor:
             self._usb_present = bool(usb_present)
             if extra:
                 self._extra.update(extra)
+            if self._base_cfg.is_das:
+                self._ident_tick(mpc_cmd, obs.ts if ts is None and obs is not None else ts, applied)
+
+    def _ident_tick(self, mpc_cmd: MpcCommand | None, ts: float | None, applied: bool) -> None:
+        try:
+            facts = ident.facts_from_tick(mpc_cmd, ts=ts, applied=applied)
+            self._ident_facts = facts
+            self._ident_tracker = ident.track(self._ident_tracker, self._effective, facts)
+            if self._experiment is None:
+                return
+            outcome = ident.advance(self._experiment, self._effective, facts)
+            if outcome.experiment is not None:
+                self._experiment = outcome.experiment
+            else:
+                self._end_experiment(outcome.result or ident.RESULT_ABORTED, outcome.reason)
+        except Exception:  # bookkeeping never fails the tick; the fans go back to the solver
+            _LOG.exception("experiment bookkeeping failed")
+            self._ident_tracker = ident.new_tracker()
+            self._end_experiment(ident.RESULT_ABORTED, "error")
 
     def set_mqtt_connected(self, connected: bool | None) -> None:
         with self._lock:
