@@ -218,6 +218,18 @@ mpc:
   model_store_interval_s: 600.0
   model_store_max_age_days: 30.0
   model_reconfirm_s: 3600.0
+  # Active identification experiments (control/ident.py): POST /api/ident {"action": "start",
+  # "group": ...} steps one fan group, then each of its channels, between two PWM levels
+  # while every drive the group cools stays within its envelope. Explicit start only.
+  ident_enabled: false   # true: allow POST /api/ident and MQTT cmd/ident to start one
+  ident_amplitude: 0.15  # PWM step, (0, 0.3]
+  ident_levels: above    # above: never less cooling than the solver's level at start
+  ident_hold_s: [60, 120, 180]  # hold times drawn by the seeded sequence (each >= 5 * dt)
+  ident_max_duration_s: 1800    # the whole experiment, seconds
+  ident_settle_s: 600    # every zone the group serves trusted this long before a start
+  ident_start_band_c: 1.0  # start only with every drive within this of its soft target
+  ident_max_over_c: 3.0  # abort when a drive's estimate + k sigma exceeds soft + this
+  ident_seed: 1
 
 # Hardware bindings for --source hwmon: every mpc.temps name bound exactly once
 # across the hwmon temp_maps and onewire.sensors, every channel by one fans map.

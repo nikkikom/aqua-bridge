@@ -93,6 +93,16 @@ mpc:
   model_store_interval_s: 600.0   # at most one write of model.json per interval, seconds (> 0)
   model_store_max_age_days: 30.0  # an older file loads stale: shadow first, PI-DAS acts (> 0)
   model_reconfirm_s: 3600.0       # a stale model acts after converged this long with its prediction error in bounds (>= 0)
+  # Active identification experiments (control/ident.py, POST /api/ident); inert in legacy mode.
+  ident_enabled: false   # true (needs topology): an explicit start intent may run an experiment
+  ident_amplitude: 0.15  # PWM step of the two-level sequence, (0, 0.3]
+  ident_levels: above    # above: base and base + amplitude | symmetric: base +- amplitude
+  ident_hold_s: [60, 120, 180]  # hold times the seeded sequence draws from (each >= 5 * dt when enabled)
+  ident_max_duration_s: 1800    # whole experiment, seconds, (0, 7200]
+  ident_settle_s: 600    # every zone served trusted this long before a start (>= confirm_s when enabled)
+  ident_start_band_c: 1.0  # start only with every drive within this of its soft target, degC
+  ident_max_over_c: 3.0  # envelope above each drive's soft target while running, degC
+  ident_seed: 1          # seed of the hold-time sequence (int >= 0)
 
 xt6:
   prefer: hwmon

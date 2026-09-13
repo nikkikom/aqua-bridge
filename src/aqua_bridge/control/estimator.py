@@ -116,6 +116,12 @@ an empty bay has no case-to-drive offset, so with the prior ``b`` its plain
 ``unknown`` and ``occupied`` bays both carry constraints. The estimator never faults
 a zone over a removed drive; the zone trust groups stay those of the declared config.
 
+The per-bay output shows a change in progress: ``pending_empty_s`` (seconds of
+evidence toward ``empty`` counted so far) and ``pending_occupied_ticks`` (ticks of
+evidence toward ``occupied`` on an empty bay); both are 0 when nothing is pending.
+The identification experiments (:mod:`aqua_bridge.control.ident`) refuse to start
+while either is non-zero in a zone they serve.
+
 Drive class
 -----------
 ``bays.<b>.class`` or ``topology.default_class``, overridden by the SMART model
@@ -1165,6 +1171,8 @@ def update(
             "occupancy": bm["occ"],
             "declared": topo.bays[b].occupied,
             "since_ts": bm["since"],
+            "pending_empty_s": float(bm["low"]),
+            "pending_occupied_ticks": int(bm["rise"]),
             "class": cls,
             "class_source": cls_source,
             "serial": serial,

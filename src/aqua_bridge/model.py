@@ -95,6 +95,17 @@ choice for cooling:
   ``model_reconfirm_s``; ``aqua_bridge.modelstore`` and
   ``aqua_bridge.control.persist``) are flat keys as well, validated always and
   inert in legacy mode (no store is built for a legacy config).
+* The ``ident_*`` keys configure the active identification experiments
+  (``aqua_bridge.control.ident``), flat keys like the plan's table.
+  ``ident_enabled: true`` needs ``topology``. The numeric keys are validated
+  always (``ident_amplitude`` in ``(0, 0.3]``, ``ident_max_duration_s`` in
+  ``(0, 7200]``, ``ident_settle_s >= 0``, ``ident_start_band_c > 0``,
+  ``ident_max_over_c > 0``, ``ident_seed >= 0``, ``ident_hold_s`` a non-empty
+  list of positive numbers, ``ident_levels`` ``above`` | ``symmetric``); the
+  rules that depend on ``dt`` and ``confirm_s`` (every hold ``>= 5 * dt``,
+  ``ident_settle_s >= confirm_s``) are checked only with ``ident_enabled`` so a
+  default never invalidates a legacy config with a long ``dt``. There is no
+  ``ident_abort_temp_c``: the absolute abort is per drive (its limit - 1 degC).
 """
 
 from __future__ import annotations
@@ -111,6 +122,7 @@ from typing import Any
 
 __all__ = [
     "BUILTIN_DRIVE_CLASSES",
+    "IDENT_LEVELS",
     "DAS_SECTIONS",
     "FAULT_COUPLINGS",
     "IMPLICIT_ZONE",
@@ -674,6 +686,10 @@ STUCK_WINDOW_SAMPLES = 60
 #: ``zones.trust_rule`` and ``zones.fault_coupling`` values.
 TRUST_RULES: tuple[str, ...] = ("strict", "sigma")
 FAULT_COUPLINGS: tuple[str, ...] = ("declared", "none")
+
+#: ``ident_levels`` values: ``above`` (base and base + amplitude, never less cooling
+#: than the solver's level at start) or ``symmetric`` (base +- amplitude, owner opt-in).
+IDENT_LEVELS: tuple[str, ...] = ("above", "symmetric")
 
 _MIX = "mix"
 
@@ -1435,6 +1451,13 @@ class MpcConfig:
       between two writes of ``model.json``, the age above which a stored model loads
       ``stale``, and how long a stale model must stay converged with its prediction
       error in bounds before it may act again. Inert in legacy mode.
+    * ``ident_enabled`` / ``ident_amplitude`` / ``ident_levels`` / ``ident_hold_s`` /
+      ``ident_max_duration_s`` / ``ident_settle_s`` / ``ident_start_band_c`` /
+      ``ident_max_over_c`` / ``ident_seed`` -- active identification experiments
+      (``control/ident.py``): whether ``POST /api/ident`` may start one, the PWM step,
+      the two levels, the hold times the seeded sequence draws from, the total
+      duration, how long every zone the experiment serves must have been trusted,
+      the start band and the envelope above each drive's soft target, and the seed.
     * ``topology`` / ``sensors`` / ``drive_classes`` / ``fans`` / ``fan_models`` /
       ``zones`` / ``noise`` / ``estimator`` -- the zoned DAS layout (module
       docstring, *DAS layout*); all absent is legacy mode. With ``topology`` the
@@ -1500,6 +1523,15 @@ class MpcConfig:
     model_store_interval_s: float = 600.0
     model_store_max_age_days: float = 30.0
     model_reconfirm_s: float = 3600.0
+    ident_enabled: bool = False
+    ident_amplitude: float = 0.15
+    ident_levels: str = "above"
+    ident_hold_s: tuple[float, ...] = (60.0, 120.0, 180.0)
+    ident_max_duration_s: float = 1800.0
+    ident_settle_s: float = 600.0
+    ident_start_band_c: float = 1.0
+    ident_max_over_c: float = 3.0
+    ident_seed: int = 1
 
     # -- construction -------------------------------------------------------
 
@@ -1579,6 +1611,23 @@ class MpcConfig:
         s(self, "solver_outer_max", _cfg_int("solver_outer_max", self.solver_outer_max))
         blocks = _cfg_list("mpc_blocks", self.mpc_blocks)
         s(self, "mpc_blocks", tuple(_cfg_int(f"mpc_blocks[{i}]", b) for i, b in enumerate(blocks)))
+        _cfg_bool("ident_enabled", self.ident_enabled)
+        s(self, "ident_levels", _choice("ident_levels", self.ident_levels, IDENT_LEVELS))
+        holds = _cfg_list("ident_hold_s", self.ident_hold_s)
+        s(
+            self,
+            "ident_hold_s",
+            tuple(_cfg_num(f"ident_hold_s[{i}]", h) for i, h in enumerate(holds)),
+        )
+        for name in (
+            "ident_amplitude",
+            "ident_max_duration_s",
+            "ident_settle_s",
+            "ident_start_band_c",
+            "ident_max_over_c",
+        ):
+            s(self, name, _cfg_num(name, getattr(self, name)))
+        s(self, "ident_seed", _cfg_int("ident_seed", self.ident_seed))
         self._coerce_das()
 
     def _coerce_das(self) -> None:
@@ -1805,6 +1854,7 @@ class MpcConfig:
         """Rules for the ``model_*`` keys of the thermal model's identification and the
         DAS MPC keys (module docstring)."""
         self._validate_das_mpc_keys()
+        self._validate_ident_keys()
         for name in ("model_shadow", "model_use_rpm", "model_accept_prior"):
             if getattr(self, name) and self.topology is None:
                 raise ConfigError(f"mpc.{name}: true requires mpc.topology (DAS layout)")
@@ -1837,6 +1887,44 @@ class MpcConfig:
             )
         if self.model_reconfirm_s < 0:
             raise ConfigError(f"mpc.model_reconfirm_s must be >= 0, got {self.model_reconfirm_s}")
+
+    def _validate_ident_keys(self) -> None:
+        """Rules for the ``ident_*`` keys of the active experiments (module docstring)."""
+        if self.ident_enabled and self.topology is None:
+            raise ConfigError("mpc.ident_enabled: true requires mpc.topology (DAS layout)")
+        if not 0.0 < self.ident_amplitude <= 0.3:
+            raise ConfigError(
+                f"mpc.ident_amplitude must be in (0, 0.3], got {self.ident_amplitude}"
+            )
+        if not self.ident_hold_s or any(h <= 0 for h in self.ident_hold_s):
+            raise ConfigError(
+                "mpc.ident_hold_s must be a non-empty list of positive seconds, "
+                f"got {list(self.ident_hold_s)}"
+            )
+        if not 0.0 < self.ident_max_duration_s <= 7200.0:
+            raise ConfigError(
+                f"mpc.ident_max_duration_s must be in (0, 7200], got {self.ident_max_duration_s}"
+            )
+        if self.ident_settle_s < 0:
+            raise ConfigError(f"mpc.ident_settle_s must be >= 0, got {self.ident_settle_s}")
+        if self.ident_start_band_c <= 0:
+            raise ConfigError(f"mpc.ident_start_band_c must be > 0, got {self.ident_start_band_c}")
+        if self.ident_max_over_c <= 0:
+            raise ConfigError(f"mpc.ident_max_over_c must be > 0, got {self.ident_max_over_c}")
+        if self.ident_seed < 0:
+            raise ConfigError(f"mpc.ident_seed must be >= 0, got {self.ident_seed}")
+        if not self.ident_enabled:
+            return
+        if any(h < 5 * self.dt for h in self.ident_hold_s):
+            raise ConfigError(
+                f"mpc.ident_hold_s entries must each be >= 5 * dt ({5 * self.dt}) with "
+                f"ident_enabled, got {list(self.ident_hold_s)}"
+            )
+        if self.ident_settle_s < self.confirm_s:
+            raise ConfigError(
+                f"mpc.ident_settle_s must be >= confirm_s ({self.confirm_s}) with ident_enabled, "
+                f"got {self.ident_settle_s}"
+            )
 
     def _validate_das_mpc_keys(self) -> None:
         """Plan section 7 rules for the DAS MPC keys (inert in legacy mode)."""
