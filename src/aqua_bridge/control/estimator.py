@@ -102,7 +102,11 @@ an empty bay has no case-to-drive offset, so with the prior ``b`` its plain
   of the bay's associated serial arrives;
 * ``occupied | unknown -> empty`` after ``empty_confirm_s`` seconds with
   ``dT < empty_dT_c`` **and** ``heat < 1 W`` **and** no fresh SMART from an
-  associated serial (the plan's "SMART presence" evidence);
+  associated serial (the plan's "SMART presence" evidence), every one of them
+  on a tick with a trusted zone-air sensor of the bay's zone. Without one,
+  ``T_a`` is a prediction that the proximal reading itself pulls along (a
+  rising inlet dragged it onto a warm idle drive's sensor in review), so such a
+  tick restarts the count (conservative: evidence for a drive still counts);
 * ``empty -> occupied`` when ``dT > occupied_dT_c`` on 3 consecutive ticks (or a
   SMART sample of a declared serial arrives), with ``T_d`` reset to ``T_s`` and
   variance 25 degC^2 and ``q`` reset to 0: an inserted drive raises the fans
@@ -116,7 +120,11 @@ Drive class
 -----------
 ``bays.<b>.class`` or ``topology.default_class``, overridden by the SMART model
 of the bay's associated serial when a ``drive_classes.<c>.models`` regex
-matches it (``re.search``, classes in config order). The limit is
+matches it (``re.search``, classes in config order; the first matching class
+decides). A serial associated by correlation is a statistical guess, so its
+model may only make the class stricter (a limit no higher, then a soft target
+no higher); a declared serial may also relax it (deviation from the plan,
+conservative: a wrong pair must not raise an HDD bay's limit to an SSD's). The limit is
 ``min(class limit_c, bays.<b>.limit_c)``.
 
 SMART calibration (per bay and serial)
@@ -657,16 +665,32 @@ def _calibrated(entry: Mapping[str, Any] | None, ts: float, max_age_s: float) ->
 # ---------------------------------------------------------------------------
 
 
-def _drive_class(cfg: MpcConfig, bay: str, model: str | None) -> tuple[str, str]:
-    """``(class, source)``: ``smart_model`` | ``declared`` | ``default``."""
+def _strictness(cfg: MpcConfig, drive_class: str) -> tuple[float, float]:
+    """Sort key of a class: lower is stricter (limit, then soft target without margin)."""
+    dc = cfg.drive_classes[drive_class]
+    return dc.limit_c, dc.limit_c - dc.comfort_c
+
+
+def _drive_class(
+    cfg: MpcConfig, bay: str, model: str | None, *, may_relax: bool = True
+) -> tuple[str, str]:
+    """``(class, source)``: ``smart_model`` | ``declared`` | ``default``.
+
+    With ``may_relax`` false (a serial associated by correlation, module docstring)
+    a SMART model match is used only when its class is at least as strict as the
+    bay's declared (or default) class.
+    """
+    assert cfg.topology is not None
+    base = cfg.bay_class(bay)
     if model:
         for name, dc in cfg.drive_classes.items():
             if any(re.search(pattern, model) for pattern in dc.models):
-                return name, "smart_model"
-    assert cfg.topology is not None
+                if may_relax or _strictness(cfg, name) <= _strictness(cfg, base):
+                    return name, "smart_model"
+                break
     if cfg.topology.bays[bay].drive_class is not None:
-        return cfg.bay_class(bay), "declared"
-    return cfg.bay_class(bay), "default"
+        return base, "declared"
+    return base, "default"
 
 
 def _mean(values: list[float]) -> float | None:
@@ -748,7 +772,7 @@ def update(
         if b in assoc:
             known = mem["smart"].get(assoc[b][0])
             model = None if known is None else known.get("model")
-        classes[b] = _drive_class(cfg, b, model)
+        classes[b] = _drive_class(cfg, b, model, may_relax=b in assoc and assoc[b][1] == "declared")
 
     def cal_entry(b: str) -> dict[str, Any] | None:
         if b not in assoc:
@@ -936,6 +960,7 @@ def update(
         declared_occ = topo.bays[b].occupied
         zone_ready = bay.zone in arrays
         sensor_ok = any(t in temps for t in bay.sensors)
+        air_ok = bool(trusted_air.get(bay.zone))
         after = before
         if declared_occ is True:
             after = OCCUPIED
@@ -967,7 +992,8 @@ def update(
                     after = OCCUPIED
                     bm["low"] = 0.0
                 elif (
-                    d_t < spec.empty_dT_c
+                    air_ok
+                    and d_t < spec.empty_dT_c
                     and heat < EMPTY_HEAT_W
                     and not (b in assoc and assoc[b][0] in fresh_smart)
                 ):

@@ -320,6 +320,55 @@ def test_occupancy_declarations_are_fixed():
     assert all(up.bays["c1"]["occupancy"] == "empty" for up in ups)  # declared false
 
 
+def test_a_bay_never_turns_empty_while_its_zone_air_is_unobserved():
+    """Review finding: with the zone-air sensor lost, ``T_s - T_a`` is measured against a
+    *predicted* air node. A rising inlet pulled that prediction onto the proximal reading,
+    a warm idle drive (1.5 degC above air) was confirmed empty, and once the air sensor
+    came back the bay stayed empty (1.5 < occupied_dT_c): its constraint was gone for good."""
+    cfg = lcfg(empty_confirm_s=60.0)
+    ups = run_ticks(cfg, 30, prox_b1=PROX_C)
+    ups = run_ticks(cfg, 200, mem=ups[-1].memory, t0=30.0, prox_b1=SP + 1.5)
+    assert ups[-1].bays["b1"]["occupancy"] == "occupied"
+    lost = run_ticks(
+        cfg, 300, mem=ups[-1].memory, t0=230.0, prox_b1=SP + 1.5, air_b=None, inlet=30.0
+    )
+    assert all(up.bays["b1"]["occupancy"] != "empty" for up in lost)
+    back = run_ticks(cfg, 100, mem=lost[-1].memory, t0=530.0, prox_b1=SP + 1.5)
+    assert all(up.bays["b1"]["occupancy"] != "empty" for up in back)
+    assert "b1" in back[-1].estimates
+
+
+def test_a_correlation_association_never_relaxes_the_drive_class():
+    """Review finding: an association found by correlation is a statistical guess (a wrong
+    pair is possible). Its SMART model moved an hdd bay to ssd_sata, raising the limit from
+    50 to 65 degC. A guessed serial may only make the class stricter; a declared serial
+    (the owner's statement) may relax it."""
+    m = das_mapping()
+    m["setpoints"] = {}
+    m["drive_classes"] = {
+        "hdd": {"limit_c": 50.0, "comfort_c": 5.0, "tau_d_s": 720.0, "models": ["^WD"]},
+        "ssd_sata": {"limit_c": 65.0, "comfort_c": 10.0, "tau_d_s": 200.0, "models": ["^SSD"]},
+    }
+    m["topology"]["bays"]["b1"]["class"] = "hdd"
+    m["topology"]["bays"]["a1"]["class"] = "ssd_sata"
+    m["topology"]["bays"]["a2"]["class"] = "ssd_sata"
+    cfg = MpcConfig.from_mapping(m)
+    up = tick(cfg, None, 0.0)
+    mem = json.loads(json.dumps(up.memory))
+    mem["bays"]["b1"]["assoc"] = "GUESS"
+    mem["bays"]["a2"]["assoc"] = "GUESS2"
+    smart = {
+        "GUESS": {"temp_c": 44.0, "age_s": 0.0, "model": "SSD 870"},
+        "GUESS2": {"temp_c": 44.0, "age_s": 0.0, "model": "WD80EFZX"},
+    }
+    up = tick(cfg, mem, 1.0, smart=smart)
+    assert up.bays["b1"]["association"] == "correlation"
+    assert up.bays["b1"]["class"] == "hdd"
+    assert up.estimates["b1"]["limit"] == 50.0
+    assert up.bays["a2"]["association"] == "correlation"  # stricter: follows the drive
+    assert up.bays["a2"]["class"] == "hdd" and up.estimates["a2"]["limit"] == 50.0
+
+
 def test_fresh_smart_of_an_associated_serial_keeps_a_bay_occupied():
     m = das_mapping()
     m["setpoints"] = {}
