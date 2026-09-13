@@ -37,6 +37,12 @@ limit after the uncertainty margin, ``estimates.<bay>.limit_margin_c`` =
 and ``unknown`` are on, the conservative reading). An empty bay has no estimate,
 so its drive sensors read ``None`` (unknown in Home Assistant).
 
+DAS mode also publishes the zoned thermal model's identification
+(``value_json.cmd.diagnostics.thermal``, :mod:`aqua_bridge.control.thermal`): sensors
+``model_status`` (``prior`` | ``learning`` | ``converged`` | ``suspect`` | ``error``,
+``off`` without ``model_shadow``) and ``model_pred_err_c`` (the worst zone's
+one-window prediction error, degC; ``None`` until a window has closed).
+
 Discovery config topics follow the standard
 ``{discovery_prefix}/{component}/{node_id}/{object_id}/config``.
 
@@ -325,6 +331,29 @@ def build_discovery_entities(
         }
         topic = f"{discovery_prefix}/number/{node_id}/{object_id}/config"
         entities.append(MqttEntity("number", object_id, topic, payload))
+
+    if cfg.topology is not None:
+        thermal = "value_json.cmd.diagnostics.thermal"
+        entities.append(
+            _sensor(
+                discovery_prefix=discovery_prefix,
+                node_id=node_id,
+                object_id="model_status",
+                name="Thermal model status",
+                value_template=f"{{{{ {thermal}.status | default('off') }}}}",
+                state_class=None,
+            )
+        )
+        entities.append(
+            _sensor(
+                discovery_prefix=discovery_prefix,
+                node_id=node_id,
+                object_id="model_pred_err_c",
+                name="Thermal model prediction error",
+                value_template=f"{{{{ {thermal}.pred_err_c | default(None) }}}}",
+                unit="°C",
+            )
+        )
 
     bays = {} if cfg.topology is None else cfg.topology.bays
     for bay in bays:  # empty in legacy mode

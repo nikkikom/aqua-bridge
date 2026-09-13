@@ -1,8 +1,8 @@
 """HTTP view and control (PROJECT.md section 6).
 
 ``create_app`` wires GET ``/api/state``, GET ``/api/health``, GET ``/`` (the
-static single-page UI), the DAS views GET ``/api/estimate`` and GET
-``/api/bays``, and the seven ``POST /api/{mode,setpoint,pwm,preset,auto,limit,
+static single-page UI), the DAS views GET ``/api/estimate``, GET ``/api/bays`` and
+GET ``/api/model``, and the seven ``POST /api/{mode,setpoint,pwm,preset,auto,limit,
 bay}`` intents against a :class:`aqua_bridge.control.intents.ControlSurface`.
 
 HTTP never computes PWM itself: every POST body becomes an
@@ -31,8 +31,16 @@ DAS views (plan sections 1 and 7), read from the snapshot, never computed here:
   candidates, ...} | null}}}``: the declarations in force and what the estimator
   made of them, including the serial candidates of the association by
   correlation with their scores (confirm one with ``POST /api/bay {bay, serial}``).
+* ``GET /api/model`` -- ``{"thermal": {...}, "parameters": {kind: {unit, lo, hi, prior,
+  identified_from}}, "calibration": {bay: {serial, calibrated, sigma_cal_c,
+  calibration}}}``: the zoned thermal model's identification summary of the last
+  command (``diagnostics["thermal"]``: status, prediction error, per zone and bay the
+  coefficients with their relative standard errors, see
+  :mod:`aqua_bridge.control.thermal`; ``{"status": "off"}`` without
+  ``model_shadow``), the static parameter table (units, bounds, priors) and the
+  estimator's SMART calibration per bay. The model store is a later milestone.
 
-A legacy config answers both with 404 and a reason.
+A legacy config answers all three with 404 and a reason.
 
 No authentication in v1: bind is LAN-only (``0.0.0.0:8080`` by default,
 see ``config.example.yaml``). Section 6: "No auth on the local network in
@@ -64,6 +72,7 @@ from aqua_bridge.control.intents import (
     IntentInvalid,
     parse_intent,
 )
+from aqua_bridge.control.thermal import PARAMETERS
 
 __all__ = ["create_app", "run_http"]
 
@@ -131,7 +140,7 @@ async def _get_health(request: web.Request) -> web.Response:
     return web.json_response(snapshot.health_payload())
 
 
-_NOT_DAS = "estimates and bays need a DAS config (mpc.topology)"
+_NOT_DAS = "estimates, bays and the thermal model need a DAS config (mpc.topology)"
 
 
 def _diagnostics(snapshot: Any) -> dict[str, Any]:
@@ -162,6 +171,30 @@ async def _get_bays(request: web.Request) -> web.Response:
                 bay: {"declared": dict(declared), "estimator": seen.get(bay)}
                 for bay, declared in snapshot.bays.items()
             }
+        }
+    )
+
+
+async def _get_model(request: web.Request) -> web.Response:
+    surface: ControlSurface = request.app[_SURFACE_KEY]
+    snapshot = surface.snapshot()
+    if not snapshot.bays:
+        return _error(404, _NOT_DAS)
+    diag = _diagnostics(snapshot)
+    seen = diag.get("bays") or {}
+    return web.json_response(
+        {
+            "thermal": diag.get("thermal") or {"status": "off"},
+            "parameters": {kind: spec.to_dict() for kind, spec in PARAMETERS.items()},
+            "calibration": {
+                bay: {
+                    "serial": info.get("serial"),
+                    "calibrated": info.get("calibrated"),
+                    "sigma_cal_c": info.get("sigma_cal_c"),
+                    "calibration": info.get("calibration"),
+                }
+                for bay, info in seen.items()
+            },
         }
     )
 
@@ -211,6 +244,7 @@ def create_app(
     app.router.add_get("/api/health", _get_health)
     app.router.add_get("/api/estimate", _get_estimate)
     app.router.add_get("/api/bays", _get_bays)
+    app.router.add_get("/api/model", _get_model)
     app.router.add_get("/", _get_index)
     for kind in _POST_KINDS:
         app.router.add_post(f"/api/{kind}", _make_intent_handler(kind))
