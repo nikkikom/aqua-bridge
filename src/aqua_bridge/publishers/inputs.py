@@ -11,16 +11,16 @@ and can be skewed or wrong -- staleness is judged on receipt time only).
 :meth:`snapshot` is what :class:`aqua_bridge.hw.sources.CompositeSource`
 reads every tick into ``PlantObservation.inputs["smart"]``.
 
-Deliberately *not* here (later milestones per the plan):
+Deliberately *not* here:
 
-* serial -> bay association (``control/estimator.py``'s job, plan section 1
-  point 4: correlation against ``T_s - T_a`` on the DAS truth/estimate) --
-  this module only ever indexes by serial, never a bay;
-* calibration, staleness-driven ``sigma_cal`` expiry -- the estimator's
-  ``smart_max_age_s``/``calibration_max_age_days`` do not exist as config
-  yet (the ``estimator`` section is a later milestone); :data:`DEFAULT_MAX_AGE_S`
-  is this module's own constant (300 s, the plan's proposed default),
-  overridable per instance, not read from ``MpcConfig``.
+* serial -> bay association (``aqua_bridge.control.associate``, run by the
+  estimator: correlation against ``T_s - T_a``) -- this module only ever
+  indexes by serial, never a bay;
+* calibration and its expiry, and the estimator's own staleness rule
+  (``estimator.smart_max_age_s``, applied again to ``age_s`` inside
+  ``step``) -- :data:`DEFAULT_MAX_AGE_S` is this module's own constant
+  (300 s, the plan's default), overridable per instance, not read from
+  ``MpcConfig``.
 
 SMART is explicitly never a gate input (plan section 1, "Trust"): a
 malformed or implausible payload only ever increments :attr:`SmartInbox.rejected`
@@ -43,9 +43,9 @@ __all__ = ["DEFAULT_MAX_AGE_S", "SmartInbox", "smart_topic_filter"]
 
 _LOG = logging.getLogger("aqua_bridge.publishers.inputs")
 
-#: The plan's proposed ``estimator.smart_max_age_s`` default (section 7),
-#: kept here as a plain constant until the ``estimator`` config section
-#: exists (a later milestone) to read it from.
+#: The plan's ``estimator.smart_max_age_s`` default (section 7). The inbox
+#: keeps its own constant (it has no ``MpcConfig``); the estimator applies the
+#: configured value again to every ``age_s`` it reads.
 DEFAULT_MAX_AGE_S = 300.0
 
 

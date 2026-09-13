@@ -4,8 +4,10 @@ The DAS solvers never see a drive temperature: drives are latent and the
 sensors sit next to them, never on them. They read an *estimates block*
 instead, one entry per constrained bay (occupied or of unknown occupancy),
 built once per tick by ``mpc.step`` and handed over as
-``SolverRequest.estimates``. The Kalman filter of the estimator milestone
-replaces the provider below; the block's shape is the interface both share.
+``SolverRequest.estimates``. The provider is the Kalman filter of
+:mod:`aqua_bridge.control.estimator`; the prior map below is what ``step``
+falls back to for display when the estimator fails (the zones it serves are
+then in fault). Both build their entries with :func:`estimate_entry`.
 
 Estimates block (plain JSON, one entry per bay)::
 
@@ -17,12 +19,16 @@ Estimates block (plain JSON, one entry per bay)::
      "limit": 50.0, "comfort": 5.0,
      "soft": 42.0,     # limit - comfort - k * sigma
      "hard": 47.0,     # limit - k * sigma
-     "source": "prior_map", "calibrated": false}
+     "source": "estimator" | "prior_map", "calibrated": false}
 
-A bay declared ``occupied: false`` carries no constraint and has no entry.
-``occupied: true`` reads ``occupied``; ``auto`` reads ``unknown`` and is
-constrained exactly like an occupied bay (conservative: an unknown bay
-might hold a drive).
+The estimator adds ``q_w`` (the heat it attributes to the drive, W),
+``t_sensor`` (the filtered proximal sensor node, degC) and ``sigma_cal``
+(the calibration floor inside ``sigma``, degC).
+
+A bay that is ``empty`` (declared ``occupied: false``, or found empty by the
+estimator's occupancy machine) carries no constraint and has no entry.
+``unknown`` is constrained exactly like ``occupied`` (conservative: an
+unknown bay might hold a drive).
 
 Prior-map provider (:func:`prior_estimates`)
 --------------------------------------------
@@ -37,7 +43,7 @@ offset):
 coolest trusted zone-air reading of its zone. Both choices are the
 conservative ones: ``T_d`` rises with ``T_s`` and falls with ``T_a``. The
 sensor lag and the drive's own time constant are ignored (a prior map on a
-lagging sensor is exactly what the estimator milestone improves on), and
+lagging sensor is exactly what the estimator improves on), and
 ``sigma`` is the uncalibrated calibration floor, 1.5 degC, for every bay:
 without SMART the absolute offset between sensor and drive is a prior. A
 constrained bay without a trusted proximal reading or zone-air reading gets
@@ -61,8 +67,10 @@ __all__ = [
     "PRIOR_BETA",
     "PRIOR_OFFSET_C",
     "SIGMA_UNCALIBRATED_C",
+    "SOURCE_ESTIMATOR",
     "SOURCE_PRIOR_MAP",
     "drive_targets",
+    "estimate_entry",
     "occupancy",
     "prior_drive_temp",
     "prior_estimates",
@@ -78,6 +86,8 @@ SIGMA_UNCALIBRATED_C = 1.5
 K_SIGMA = 2.0
 #: ``source`` of an entry built by :func:`prior_estimates`.
 SOURCE_PRIOR_MAP = "prior_map"
+#: ``source`` of an entry built by :mod:`aqua_bridge.control.estimator`.
+SOURCE_ESTIMATOR = "estimator"
 
 
 def drive_targets(
@@ -86,6 +96,41 @@ def drive_targets(
     """``(soft, hard)``: ``limit - comfort - k * sigma`` and ``limit - k * sigma``."""
     margin = k_sigma * sigma_c
     return limit_c - comfort_c - margin, limit_c - margin
+
+
+def estimate_entry(
+    *,
+    zone: str,
+    drive_class: str,
+    occupancy: str,
+    t: float,
+    sigma: float,
+    k_sigma: float,
+    limit: float,
+    comfort: float,
+    source: str,
+    calibrated: bool,
+    **extra: Any,
+) -> dict[str, Any]:
+    """One entry of the estimates block (module docstring); ``extra`` keys are appended."""
+    soft, hard = drive_targets(limit, comfort, sigma, k_sigma)
+    out: dict[str, Any] = {
+        "zone": zone,
+        "class": drive_class,
+        "occupancy": occupancy,
+        "t": t,
+        "sigma": sigma,
+        "k_sigma": k_sigma,
+        "margin": k_sigma * sigma,
+        "limit": limit,
+        "comfort": comfort,
+        "soft": soft,
+        "hard": hard,
+        "source": source,
+        "calibrated": calibrated,
+    }
+    out.update(extra)
+    return out
 
 
 def prior_drive_temp(t_proximal: float, t_air: float) -> float:
@@ -135,24 +180,16 @@ def prior_estimates(
             continue
         if bay not in proximal or spec.zone not in air:
             continue
-        t = prior_drive_temp(max(proximal[bay]), min(air[spec.zone]))
-        limit = cfg.bay_limit(bay)
-        comfort = cfg.bay_comfort(bay)
-        sigma = SIGMA_UNCALIBRATED_C
-        soft, hard = drive_targets(limit, comfort, sigma, K_SIGMA)
-        out[bay] = {
-            "zone": spec.zone,
-            "class": cfg.bay_class(bay),
-            "occupancy": occupancy(cfg, bay),
-            "t": t,
-            "sigma": sigma,
-            "k_sigma": K_SIGMA,
-            "margin": K_SIGMA * sigma,
-            "limit": limit,
-            "comfort": comfort,
-            "soft": soft,
-            "hard": hard,
-            "source": SOURCE_PRIOR_MAP,
-            "calibrated": False,
-        }
+        out[bay] = estimate_entry(
+            zone=spec.zone,
+            drive_class=cfg.bay_class(bay),
+            occupancy=occupancy(cfg, bay),
+            t=prior_drive_temp(max(proximal[bay]), min(air[spec.zone])),
+            sigma=SIGMA_UNCALIBRATED_C,
+            k_sigma=K_SIGMA,
+            limit=cfg.bay_limit(bay),
+            comfort=cfg.bay_comfort(bay),
+            source=SOURCE_PRIOR_MAP,
+            calibrated=False,
+        )
     return out

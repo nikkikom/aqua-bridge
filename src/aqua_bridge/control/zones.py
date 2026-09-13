@@ -28,9 +28,10 @@ status is ``first`` / ``ok``, ``obs.temps`` has no key outside
   Sensors outside every group (inlet, exhaust, the proximal sensor of an
   ``occupied: false`` bay) are still gated but never fault a zone.
 * ``sigma`` -- the estimator's per-drive and zone-air uncertainty below
-  thresholds. The estimator is a later milestone: until ``estimates`` are
-  passed, the ``strict`` rule applies (more faults, never fewer), and
-  :func:`effective_trust_rule` reports ``strict`` in the diagnostics.
+  thresholds. The rule is a later milestone: ``step`` does not pass
+  ``estimates`` yet, so the ``strict`` rule applies (more faults, never
+  fewer), and :func:`effective_trust_rule` reports ``strict`` in the
+  diagnostics.
 
 Fault closure (:func:`closure`, :func:`fallback_channels`)
 ----------------------------------------------------------
@@ -105,8 +106,8 @@ def evaluate(
 ) -> dict[str, ZoneTrust]:
     """Per-zone trust for this tick, keyed and ordered like ``cfg.zone_layout.zones``.
 
-    ``estimates`` is the estimator block of a later milestone; it is accepted
-    so the ``sigma`` rule has its interface, and ignored until then (module
+    ``estimates`` is the estimator's block; it is accepted so the ``sigma``
+    rule has its interface, and ignored until that rule exists (module
     docstring). Legacy mode: the implicit zone is trusted iff the gate's
     whole-tick verdict is and the time status is ``first`` / ``ok``.
     """
