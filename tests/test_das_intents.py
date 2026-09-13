@@ -1,5 +1,6 @@
 """DAS-mode intents and views: ``SetLimit`` (``POST /api/limit``, MQTT ``cmd/limit``),
 ``SetBay`` (``POST /api/bay``, MQTT ``cmd/bay``), ``GET /api/estimate``, ``GET /api/bays``,
+``GET /api/model`` and the HA ``model_status`` / ``model_pred_err_c`` sensors,
 the Home Assistant drive entities and the DAS preset semantics (plan sections 4 and 7).
 Legacy configs keep ``/api/setpoint`` and the legacy presets unchanged.
 """
@@ -601,6 +602,47 @@ def test_http_bay_estimate_and_bays_on_a_das_config(dcfg):
     assert "candidates" in bays["b01"]["estimator"]
 
 
+def test_mqtt_thermal_model_entities_in_das_mode_only(dcfg, cfg):
+    entities = build_discovery_entities(
+        dcfg, node_id=NODE, discovery_prefix="homeassistant", control_mode=ControlMode.AUTO
+    )
+    by_id = {e.object_id: e for e in entities}
+    status = by_id["model_status"]
+    assert status.component == "sensor"
+    assert "diagnostics.thermal.status" in status.payload["value_template"]
+    assert "default('off')" in status.payload["value_template"]
+    assert "unit_of_measurement" not in status.payload and "state_class" not in status.payload
+    err = by_id["model_pred_err_c"]
+    assert "diagnostics.thermal.pred_err_c" in err.payload["value_template"]
+    assert err.payload["unit_of_measurement"] == "°C"
+    legacy = build_discovery_entities(
+        cfg, node_id=NODE, discovery_prefix="homeassistant", control_mode=ControlMode.AUTO
+    )
+    assert not any(e.object_id.startswith("model_") for e in legacy)
+
+
+@needs_socket
+def test_http_model_view_on_a_das_config(dcfg):
+    for shadow in (False, True):
+        c = dataclasses.replace(dcfg, model_shadow=shadow)
+        sup = Supervisor(c)
+        obs = das_obs(c, 0.0, pwm=0.5)
+        cmd, state = step(obs, sup.effective_config(), MpcState.cold())
+        sup.record_tick(obs=obs, mpc_cmd=cmd, cmd=cmd, state=state, applied=True, usb_present=True)
+        ((status, body),) = asyncio.run(_post_all(sup, [("GET /api/model", None)]))
+        assert status == 200
+        assert body["parameters"]["E"]["unit"] == "W/K" and body["parameters"]["k"]["lo"] == 0.05
+        assert set(body["calibration"]) == set(c.topology.bays)
+        assert body["calibration"]["b01"]["calibrated"] is False
+        if shadow:
+            assert body["thermal"]["status"] == "prior"
+            assert set(body["thermal"]["zones"]) == {"z0", "z1", "z2", "z3"}
+            assert "E.z0.xt1" in body["thermal"]["zones"]["z0"]["theta"]
+            assert set(body["thermal"]["bays"]["b01"]["theta"]) == {"q_s.b01", "g0.b01", "k.b01"}
+        else:
+            assert body["thermal"] == {"status": "off"}
+
+
 @needs_socket
 def test_http_estimate_and_bays_on_a_legacy_config_are_404(cfg):
     results = asyncio.run(
@@ -610,11 +652,13 @@ def test_http_estimate_and_bays_on_a_legacy_config_are_404(cfg):
                 ("GET /api/estimate", None),
                 ("GET /api/bays", None),
                 ("/api/bay", {"bay": "b01", "occupied": True}),
+                ("GET /api/model", None),
             ],
         )
     )
-    assert [s for s, _ in results] == [404, 404, 400]
+    assert [s for s, _ in results] == [404, 404, 400, 404]
     assert "DAS config" in results[0][1]["error"]
+    assert "DAS config" in results[3][1]["error"]
 
 
 @needs_socket
