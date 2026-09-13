@@ -112,7 +112,10 @@ Identification experiments (DAS plan section 5, :mod:`aqua_bridge.control.ident`
 * After every tick (:meth:`Supervisor.record_tick`) the settle tracker advances and
   a running experiment is checked against the abort list and armed for the next
   tick; an end (completed or aborted) puts the experiment's channels into
-  ``released``, so the solver re-initialises bumplessly on them. An unexpected error
+  ``released``, so the solver re-initialises bumplessly on them. A tick whose applied
+  command is the loop's emergency fallback while the solver's command was not
+  (``compose`` raised) counts as a tick without a solver command: it aborts with
+  ``fallback`` and restarts the settle count. An unexpected error
   in this bookkeeping aborts the experiment (reason ``error``) and never raises.
   Every start and end is logged.
 * ``snapshot().extra["experiment"]`` is :func:`~aqua_bridge.control.ident.status`
@@ -825,7 +828,18 @@ class Supervisor:
             if extra:
                 self._extra.update(extra)
             if self._base_cfg.is_das:
-                self._ident_tick(mpc_cmd, obs.ts if ts is None and obs is not None else ts, applied)
+                # The loop's emergency path (compose or a later stage raised after step)
+                # applies a fallback command while mpc_cmd still says what the solver
+                # wanted: that tick is a fallback tick for the experiment (reviewer fix).
+                solver_cmd = mpc_cmd
+                if (
+                    cmd is not None
+                    and cmd.mode is Mode.FALLBACK
+                    and (mpc_cmd is None or mpc_cmd.mode is not Mode.FALLBACK)
+                ):
+                    solver_cmd = None
+                tick_ts = obs.ts if ts is None and obs is not None else ts
+                self._ident_tick(solver_cmd, tick_ts, applied)
 
     def _ident_tick(self, mpc_cmd: MpcCommand | None, ts: float | None, applied: bool) -> None:
         try:

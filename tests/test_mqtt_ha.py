@@ -444,3 +444,25 @@ def test_ident_command_reaches_the_supervisor_through_on_message() -> None:
     assert rig.sup.experiment is not None
     client._on_message(client.client, None, _Msg(topic, b"stop"))
     assert rig.sup.experiment is None
+
+
+def test_a_retained_ident_start_never_starts_an_experiment() -> None:
+    # Reviewer finding: a start left retained on the broker (``mosquitto_pub -r``) is
+    # redelivered on every (re)connect and would start experiments nobody asked for,
+    # e.g. after a broker restart. Only a live start counts; a retained stop is harmless.
+    from test_ident_experiment import Rig, ident_cfg
+
+    rig = Rig(ident_cfg())
+    rig.ticks(8)
+    client = _client(rig.cfg, on_intent=rig.sup.submit)
+    topic = f"{NODE_ID}/cmd/ident"
+    retained = _Msg(topic, b"start:group:front")
+    retained.retain = True  # type: ignore[attr-defined]
+    client._on_message(client.client, None, retained)
+    assert rig.sup.experiment is None
+    client._on_message(client.client, None, _Msg(topic, b"start:group:front"))
+    assert rig.sup.experiment is not None
+    stop = _Msg(topic, b"stop")
+    stop.retain = True  # type: ignore[attr-defined]
+    client._on_message(client.client, None, stop)
+    assert rig.sup.experiment is None

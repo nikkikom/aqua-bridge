@@ -716,6 +716,28 @@ def test_every_zone_in_fault_aborts_with_fallback():
     assert rig.status["last_abort_reason"] == "fallback"
 
 
+def test_an_emergency_command_after_a_good_solver_tick_aborts(monkeypatch):
+    # Reviewer finding: when compose raises after step succeeded, the loop applies the
+    # emergency (fallback) command but still reports the solver's auto command. That
+    # tick is a fallback tick and must abort the experiment and restart the settle count.
+    rig = started_rig()
+    rig.ticks(3)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("compose bug")
+
+    monkeypatch.setattr(rig.sup, "compose", boom)
+    (r,) = rig.ticks(1)
+    assert r.controller_error is not None and r.cmd.mode is Mode.FALLBACK
+    assert r.mpc_cmd is not None and r.mpc_cmd.mode is Mode.AUTO
+    assert not rig.status["running"]
+    assert rig.status["last_abort_reason"] == "fallback"
+    monkeypatch.undo()
+    rig.ticks(1)
+    with pytest.raises(IntentConflict, match="settle"):
+        rig.sup.submit(Ident("start", group="front"))
+
+
 def test_two_apply_failures_abort_through_the_loop():
     rig = started_rig()
     rig.ticks(2)

@@ -21,7 +21,8 @@ Topic layout (``node_id`` from ``config.yaml`` ``mqtt.node_id``):
   the bay's declared occupancy (DAS mode; ``POST /api/bay`` for class and serial)
 * ``{node_id}/cmd/ident``             -- raw string ``start:group:<group>`` |
   ``start:channel:<channel>`` | ``start:<channel>`` | ``stop``: start or stop an
-  identification experiment (DAS mode, ``POST /api/ident``)
+  identification experiment (DAS mode, ``POST /api/ident``); a retained ``start`` is
+  ignored (it would be redelivered on every reconnect), only a live one starts
 
 DAS mode (``mpc.topology``) subscribes to the limit and bay topics and adds one
 ``limit_<class>`` number entity per drive class (state from
@@ -683,6 +684,11 @@ class MqttClient:
                     return
         intent = parse_command(self.node_id, msg.topic, msg.payload)
         if intent is None or self._on_intent is None:
+            return
+        if isinstance(intent, Ident) and intent.action == "start" and getattr(msg, "retain", False):
+            # A retained start is redelivered on every (re)connect: an experiment starts
+            # only from a live, explicit command (reviewer fix; a retained stop is kept).
+            _LOG.info("mqtt: ignored retained experiment start on %s", msg.topic)
             return
         try:
             self._on_intent(intent)
