@@ -58,20 +58,58 @@ Rules implemented (numbers as in the spec):
    ``GateResult.stuck_latch``. A ``None`` value keeps the latch (nothing
    proved the sensor alive).
 4. **Whole tick**: trusted iff every temperature in ``cfg.temps`` is
-   trusted and ``obs.temps`` has no key outside ``cfg.temps``.
+   trusted and ``obs.temps`` has no key outside ``cfg.temps``. With a
+   ``topology`` this whole-tick verdict is only informative: ``mpc.step``
+   decides trust per zone from ``per_temp`` (``aqua_bridge.control.zones``).
 5. :func:`push_window` / :func:`sanitize_temps` store raw values (``None``
    for missing / NaN / inf, never NaN) restricted to ``cfg.temps`` and trim
-   the window to ``cfg.stuck_ticks`` entries.
+   the window to ``cfg.window_ticks`` entries (``cfg.stuck_ticks`` in legacy
+   mode).
+
+Per-sensor Stuck sizing (zoned DAS, plan section 0.2)
+-----------------------------------------------------
+A DS18B20 next to a drive with a time constant of about 12 minutes sits on
+one 1/16 degC code for minutes while the fans of its zone move; the global
+rule above would brand it Stuck and fault its zone. With ``topology``
+every number of rule 3 comes from :meth:`MpcConfig.stuck_params`:
+
+* the window (``sensors.<name>.stuck_s``, per role 1800 s proximal, 180 s
+  zone air, 600 s inlet / exhaust) and the band (``stuck_eps_c``, default
+  ``1.5 * quant_c``) are the sensor's own;
+* the PWM evidence counts only the channels of the sensor's zone (a sensor
+  without a zone, such as an inlet in front of the intake, has none: fans
+  do not move the inlet temperature);
+* the sibling evidence counts only the other sensors of the same zone and
+  the same role.
+
+Long windows are **decimated**: a sensor whose ``StuckParams.decimate`` is
+``k > 1`` is checked on a window that keeps one sample every ``k`` ticks
+(``StuckParams.samples`` of them). :func:`advance_slow_windows` feeds those
+windows from the newest sample of ``MpcState.window`` -- the previous tick,
+whose command the loop has already replaced by what was applied -- storing
+the value the checks ran on (median3 when enabled) and the command. The
+decimated check interpolates nothing: it compares the stored samples and
+the current value against the band, measures the net PWM move from the
+oldest stored sample to the one ``stuck_pwm_lag(samples)`` samples before
+the newest, and bounds a sibling's single step by ``k * dT_max_tick``. An
+excursion shorter than ``k`` ticks can therefore go unseen, which can only
+flag Stuck *more* readily (its zone faults, cooling rises), never less.
+The decimated windows live in ``solver_memory["stuck_slow"]`` (factor as a
+string -> list of ``{"t": temps, "p": pwm}``) with the dense sample counter
+``solver_memory["stuck_seq"]``; legacy mode has neither key.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from aqua_bridge.model import MpcConfig, PlantObservation, WindowSample
+
+#: A decimated Stuck window sample: ``{"t": {temp: value | None}, "p": {channel: pwm}}``.
+SlowSample = Mapping[str, Any]
 
 __all__ = [
     "REASON_MISSING",
@@ -81,6 +119,8 @@ __all__ = [
     "REASON_SLEW",
     "REASON_STUCK",
     "GateResult",
+    "SlowSample",
+    "advance_slow_windows",
     "evaluate_gate",
     "filtered_value",
     "median3_of",
@@ -218,52 +258,114 @@ def stuck_pwm_lag(stuck_ticks: int) -> int:
     return max(0, min(stuck_ticks // 4, stuck_ticks - 2))
 
 
+def advance_slow_windows(
+    slow: Mapping[str, Any] | None,
+    window: Sequence[WindowSample],
+    seq: int,
+    cfg: MpcConfig,
+) -> dict[str, list[dict[str, Any]]]:
+    """Decimated Stuck windows for this tick (module docstring, *Per-sensor Stuck sizing*).
+
+    ``window`` is the dense window as it arrives in ``step`` (newest entry =
+    the previous tick, sample number ``seq - 1`` since the last history
+    reset). Every decimation factor ``k`` of ``cfg.slow_window_samples``
+    takes that sample when ``(seq - 1) % k == 0`` and keeps its newest
+    ``samples`` entries. Pure: returns new lists, never mutates ``slow``.
+    """
+    sizes = cfg.slow_window_samples
+    if not sizes:
+        return {}
+    out: dict[str, list[dict[str, Any]]] = {}
+    newest: dict[str, Any] | None = None
+    for k, keep in sizes.items():
+        key = str(k)
+        old = slow.get(key) if isinstance(slow, Mapping) else None
+        samples = list(old) if isinstance(old, list) else []
+        if window and seq >= 1 and (seq - 1) % k == 0:
+            if newest is None:
+                last = window[-1]
+                temps: dict[str, float | None] = {}
+                for name in cfg.temps:
+                    series = _window_series(window[-3:], name)
+                    temps[name] = filtered_value(series[:-1], series[-1], cfg.median3)
+                newest = {"t": temps, "p": dict(last.cmd_pwm)}
+            samples.append(newest)
+        out[key] = samples[-keep:]
+    return out
+
+
 def _stuck(
     name: str,
     cfg: MpcConfig,
     window: Sequence[WindowSample],
     filtered_now: Mapping[str, float | None],
+    slow_windows: Mapping[str, Sequence[SlowSample]] | None = None,
 ) -> float | None:
     """Rule 3 (fresh window check) for one temperature.
 
     Returns the band reference (the oldest window sample) when the rule
     fires, ``None`` otherwise. Needs a full window; ``None`` anywhere in the
-    run breaks it.
+    run breaks it. The window, band and evidence come from
+    ``cfg.stuck_params(name)`` (legacy mode: the global rule).
     """
-    n = cfg.stuck_ticks
-    if len(window) < n:
-        return None
-    recent = window[-n:]
-    current = filtered_now.get(name)
-    if current is None:
-        return None
-    series = _filtered_series(_window_series(recent, name), cfg.median3)
+    params = cfg.stuck_params(name)
+    series_of: Callable[[str], list[float | None]]
+    if params.decimate == 1:
+        n = params.ticks
+        if len(window) < n:
+            return None
+        recent = window[-n:]
+        current = filtered_now.get(name)
+        if current is None:
+            return None
+
+        def series_of(other: str) -> list[float | None]:
+            return _filtered_series(_window_series(recent, other), cfg.median3)
+
+        oldest_pwm: Mapping[str, Any] = recent[0].cmd_pwm
+        # the PWM move must be old enough for the plant to have answered it
+        newest_pwm: Mapping[str, Any] = recent[-1 - stuck_pwm_lag(n)].cmd_pwm
+        step_limit = cfg.dT_max_tick
+    else:
+        stored = None if slow_windows is None else slow_windows.get(str(params.decimate))
+        m = params.samples
+        if not stored or len(stored) < m:
+            return None
+        slow = stored[-m:]
+        current = filtered_now.get(name)
+        if current is None:
+            return None
+
+        def series_of(other: str) -> list[float | None]:
+            return [_finite_or_none(sample["t"].get(other)) for sample in slow]
+
+        oldest_pwm = slow[0]["p"]
+        newest_pwm = slow[-1 - stuck_pwm_lag(m)]["p"]
+        step_limit = cfg.dT_max_tick * params.decimate
+
+    series = series_of(name)
     first = series[0]
     if first is None:
         return None
     for v in [*series[1:], current]:
-        if v is None or abs(v - first) > cfg.stuck_eps_c:
+        if v is None or abs(v - first) > params.eps_c:
             return None
 
-    # Frozen. Did anything that should have moved it actually move? (rule 3:
-    # the PWM move must be old enough for the plant to have answered it)
-    oldest_pwm = recent[0].cmd_pwm
-    newest_pwm = recent[-1 - stuck_pwm_lag(n)].cmd_pwm
-    for ch in cfg.channels:
+    # Frozen. Did anything that should have moved it actually move?
+    for ch in params.channels:
         a = _finite_or_none(oldest_pwm.get(ch))
         b = _finite_or_none(newest_pwm.get(ch))
         if a is not None and b is not None and abs(b - a) > cfg.stuck_pwm_net:
             return first
-    for other in cfg.temps:
-        if other == name:
-            continue
-        series_other = _filtered_series(_window_series(recent, other), cfg.median3)
-        if _plausible_net_move(cfg, [*series_other, filtered_now.get(other)]):
+    for other in params.siblings:
+        if _plausible_net_move(cfg, [*series_of(other), filtered_now.get(other)], step_limit):
             return first
     return None
 
 
-def _plausible_net_move(cfg: MpcConfig, series: Sequence[float | None]) -> bool:
+def _plausible_net_move(
+    cfg: MpcConfig, series: Sequence[float | None], step_limit: float | None = None
+) -> bool:
     """A sibling counts as "moved" only when its trajectory could be the plant's.
 
     Every sample finite and inside the valid range, no single step larger
@@ -277,7 +379,8 @@ def _plausible_net_move(cfg: MpcConfig, series: Sequence[float | None]) -> bool:
     vals = [float(v) for v in series]  # type: ignore[arg-type]
     if any(not cfg.temp_min_c <= v <= cfg.temp_max_c for v in vals):
         return False
-    if any(abs(b - a) > cfg.dT_max_tick for a, b in zip(vals, vals[1:], strict=False)):
+    limit = cfg.dT_max_tick if step_limit is None else step_limit
+    if any(abs(b - a) > limit for a, b in zip(vals, vals[1:], strict=False)):
         return False
     return abs(vals[-1] - vals[0]) > cfg.stuck_sibling_dT_c
 
@@ -291,14 +394,17 @@ def evaluate_gate(
     window: Sequence[WindowSample],
     dT_limit: float | None = None,  # noqa: N803 - matches the spec's dT naming
     stuck_latch: Mapping[str, float] | None = None,
+    slow_windows: Mapping[str, Sequence[SlowSample]] | None = None,
 ) -> GateResult:
     """Run rules 1-4 on ``obs``. Never raises for malformed temperatures.
 
     ``dT_limit`` overrides ``cfg.dT_max_tick`` (``mpc.step`` scales it when
     the observation arrives late). ``stuck_latch`` is the previous call's
     ``GateResult.stuck_latch`` (rule 3 latch); ``None`` / empty means no
-    temperature is currently latched. Missing history (``None`` / empty) is
-    allowed and simply disables the slew and stuck checks that need it.
+    temperature is currently latched. ``slow_windows`` are the decimated
+    Stuck windows of :func:`advance_slow_windows` (only a config with a
+    ``topology`` has decimated sensors). Missing history (``None`` / empty)
+    is allowed and simply disables the slew and stuck checks that need it.
     """
     limit = cfg.dT_max_tick if dT_limit is None else float(dT_limit)
     latch_in: dict[str, float] = {}
@@ -349,10 +455,10 @@ def evaluate_gate(
             if refs and not any(abs(value - r) <= limit for r in refs):
                 why.append(REASON_SLEW)
             latched = latch_in.get(name)
-            if latched is not None and abs(value - latched) <= cfg.stuck_eps_c:
+            if latched is not None and abs(value - latched) <= cfg.stuck_params(name).eps_c:
                 stuck_ref: float | None = latched  # still inside the band: flag stays
-            else:
-                stuck_ref = _stuck(name, cfg, window, filtered)  # left the band (or never in)
+            else:  # left the band (or never in)
+                stuck_ref = _stuck(name, cfg, window, filtered, slow_windows)
             stuck[name] = stuck_ref is not None
             if stuck_ref is not None:
                 latch_out[name] = stuck_ref
