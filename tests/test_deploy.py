@@ -66,6 +66,17 @@ def test_unit_has_an_explicit_start_timeout(unit):
     assert float(timeout) >= float(unit["WatchdogSec"][0])
 
 
+def test_unit_gives_the_model_store_a_state_directory(unit):
+    """Milestone model-store: systemd creates /var/lib/aqua-bridge owned by User= and
+    exports it as $STATE_DIRECTORY, which the daemon reads for model.json; ExecStart
+    passes no --model-store, so the unit and the default agree."""
+    assert unit["StateDirectory"] == ["aqua-bridge"]
+    (exec_start,) = unit["ExecStart"]
+    assert "--model-store" not in exec_start
+    source = (DEPLOY.parent / "src" / "aqua_bridge" / "modelstore.py").read_text()
+    assert '"STATE_DIRECTORY"' in source and 'FILENAME = "model.json"' in source
+
+
 # --- udev rules vs the service account's groups (review finding F2) ---------------------
 
 

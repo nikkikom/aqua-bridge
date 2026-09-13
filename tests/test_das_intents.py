@@ -634,6 +634,7 @@ def test_http_model_view_on_a_das_config(dcfg):
         assert body["parameters"]["E"]["unit"] == "W/K" and body["parameters"]["k"]["lo"] == 0.05
         assert set(body["calibration"]) == set(c.topology.bays)
         assert body["calibration"]["b01"]["calibrated"] is False
+        assert body["store"] == {"source": "off"}  # no model store behind this state
         if shadow:
             assert body["thermal"]["status"] == "prior"
             assert set(body["thermal"]["zones"]) == {"z0", "z1", "z2", "z3"}
