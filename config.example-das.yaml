@@ -166,6 +166,26 @@ mpc:
     case120: {rpm_max: 1500, deadband: 0.1, exponent: 1.0, noise_db_at_max: 30.0}
   zones: {trust_rule: strict, fault_coupling: declared}
   noise: {exponent: 5.0, weight_noise: 1.0, band_hysteresis: 0.02}
+  estimator:             # drive temperature estimator (per-zone Kalman filter), defaults shown
+    k_sigma: 2.0         # margin = k_sigma * sigma; sigma >= 1.5 degC until SMART calibrates a bay
+    sigma_fault_c: 4.0   # thresholds of zones.trust_rule: sigma (not used by strict)
+    sigma_air_fault_c: 2.0
+    q_t_air: 1.0e-4      # process noise per tick: air, air disturbance, drive, sensor node, heat
+    q_d_air: 4.0e-7
+    q_t_drive: 1.0e-5
+    q_t_sensor: 1.0e-4
+    q_heat: 4.0e-7
+    sensor_noise_c: 0.03 # sensor white noise; variance adds quant_c^2 / 12
+    smart_max_age_s: 300 # older SMART samples are ignored; a silent serial loses its bay
+    smart_reject_c: 8.0  # a SMART value this far from the estimate is dropped
+    occupied_dT_c: 2.0   # proximal minus zone air above this: a drive is there
+    empty_dT_c: 0.7      # below this (and < 1 W) for empty_confirm_s: the bay is empty
+    empty_confirm_s: 300
+    bay_settle_s: 600
+    calibration_max_age_days: 30  # a SMART calibration without samples this long is not trusted
+    associate_window_s: 3600      # serial -> bay association by correlation (no SES)
+    associate_min_corr: 0.8
+    associate_margin: 0.15
 
 # Hardware bindings for --source hwmon: every mpc.temps name bound exactly once
 # across the hwmon temp_maps and onewire.sensors, every channel by one fans map.

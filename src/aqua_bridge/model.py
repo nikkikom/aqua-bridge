@@ -65,8 +65,12 @@ choice for cooling:
   ``solver_error``, until the DAS MPC milestone.
 * ``topology.bays.<bay>.limit_c`` can only tighten the bay's class limit
   (:meth:`MpcConfig.bay_limit` is the minimum of both).
+* A ``topology.bays.<bay>.serial`` may be declared on one bay only.
 * ``noise`` (exponent, noise weight, band hysteresis) is DAS-only like the
   other sections and defaults to :data:`NOISE_DEFAULTS` with ``topology``.
+* ``estimator`` (the per-zone Kalman filter, occupancy, SMART calibration and
+  association of ``aqua_bridge.control.estimator``) is DAS-only as well and
+  defaults to :data:`ESTIMATOR_DEFAULTS` with ``topology``.
 """
 
 from __future__ import annotations
@@ -93,6 +97,8 @@ __all__ = [
     "BaySpec",
     "ConfigError",
     "DriveClass",
+    "ESTIMATOR_DEFAULTS",
+    "EstimatorSpec",
     "FanModel",
     "FanSpec",
     "FaultReason",
@@ -608,6 +614,7 @@ DAS_SECTIONS: tuple[str, ...] = (
     "fan_models",
     "zones",
     "noise",
+    "estimator",
 )
 
 #: Name of the single zone that stands for the whole config in legacy mode.
@@ -827,8 +834,9 @@ class Topology:
 class DriveClass:
     """``drive_classes.<class>``: absolute limit, comfort band, thermal time constant.
 
-    ``models`` are regular expressions matched against a SMART model string
-    (used by a later milestone); they are compiled here so a typo is a config error.
+    ``models`` are regular expressions searched in the SMART model string of a
+    bay's associated drive (``aqua_bridge.control.estimator``: a match sets the
+    bay's class); they are compiled here so a typo is a config error.
     """
 
     limit_c: float
@@ -883,8 +891,9 @@ class SensorSpec:
     ``stuck_s`` defaults per role (:data:`ROLE_STUCK_S`), ``stuck_eps_c`` to
     ``1.5 * quant_c``; both are resolved at construction so ``to_dict`` shows
     the values in force. ``stuck_decimate`` ``None`` means automatic (see
-    :meth:`MpcConfig.stuck_params`). ``tau_s`` is parsed for the estimator of
-    a later milestone.
+    :meth:`MpcConfig.stuck_params`). ``tau_s`` (default 15 s) is the lag of the
+    bay's sensor node in the estimator; a bay's first non-redundant proximal
+    sensor sets it.
     """
 
     role: str
@@ -1054,9 +1063,8 @@ class ZonePolicy:
     """``zones``: how a zone's trust is decided and how far a zone fault reaches.
 
     * ``trust_rule``     -- ``strict`` (every required sensor group has a trusted
-      member) or ``sigma`` (estimator uncertainty; the estimator is a later
-      milestone and until it exists ``strict`` applies, see
-      ``aqua_bridge.control.zones``)
+      member) or ``sigma`` (estimator uncertainty; the rule itself is a later
+      milestone and until then ``strict`` applies, see ``aqua_bridge.control.zones``)
     * ``fault_coupling`` -- ``declared`` (a zone fault also puts the channels of
       the zones in its ``coupled_to`` under fallback policy) or ``none``
       (strictly per zone)
@@ -1121,6 +1129,134 @@ class NoiseSpec:
             "weight_noise": self.weight_noise,
             "band_hysteresis": self.band_hysteresis,
         }
+
+
+#: ``estimator`` defaults (plan sections 2 and 7): ``k`` of the ``k * sigma`` margin,
+#: sigma trust-rule thresholds, per-tick process noise of the Kalman filter states,
+#: sensor white noise, SMART staleness and rejection, occupancy thresholds, SMART
+#: calibration expiry and serial -> bay association.
+ESTIMATOR_DEFAULTS: dict[str, float] = {
+    "k_sigma": 2.0,
+    "sigma_fault_c": 4.0,
+    "sigma_air_fault_c": 2.0,
+    "q_t_air": 1e-4,
+    "q_d_air": 4e-7,
+    "q_t_drive": 1e-5,
+    "q_t_sensor": 1e-4,
+    "q_heat": 4e-7,
+    "sensor_noise_c": 0.03,
+    "smart_max_age_s": 300.0,
+    "smart_reject_c": 8.0,
+    "occupied_dT_c": 2.0,
+    "empty_dT_c": 0.7,
+    "empty_confirm_s": 300.0,
+    "bay_settle_s": 600.0,
+    "calibration_max_age_days": 30.0,
+    "associate_window_s": 3600.0,
+    "associate_min_corr": 0.8,
+    "associate_margin": 0.15,
+}
+
+
+@dataclass(frozen=True)
+class EstimatorSpec:
+    """``estimator``: the drive temperature estimator (``aqua_bridge.control.estimator``).
+
+    * ``k_sigma``                  -- ``k`` in ``margin = k * sigma``, in ``[0, 4]``
+    * ``sigma_fault_c`` / ``sigma_air_fault_c`` -- thresholds of the ``sigma`` zone trust
+      rule (parsed; the rule itself is a later milestone)
+    * ``q_t_air`` / ``q_d_air`` / ``q_t_drive`` / ``q_t_sensor`` / ``q_heat`` -- process
+      noise per tick of the filter states ``T_a``, ``d_a``, ``T_d``, ``T_s``, ``q`` (> 0)
+    * ``sensor_noise_c``           -- white noise of a temperature sensor, degC (>= 0);
+      the measurement variance is ``sensor_noise_c ** 2 + quant_c ** 2 / 12``
+    * ``smart_max_age_s``          -- a SMART sample older than this is ignored and an
+      association whose serial stays silent this long is dropped (``>= dt``)
+    * ``smart_reject_c``           -- a SMART value this far from the estimate is dropped
+    * ``occupied_dT_c`` / ``empty_dT_c`` -- occupancy evidence thresholds on
+      ``T_s - T_a`` (``occupied_dT_c > empty_dT_c > 0``)
+    * ``empty_confirm_s``          -- low evidence must last this long before a bay is
+      empty (``>= 2 dt``)
+    * ``bay_settle_s``             -- settling time after an occupancy change (``>= 0``)
+    * ``calibration_max_age_days`` -- a SMART calibration without an accepted sample for
+      this long is no longer trusted (> 0)
+    * ``associate_window_s`` / ``associate_min_corr`` / ``associate_margin`` -- serial
+      -> bay association by correlation (``>= 600``, ``(0, 1)``, ``(0, 1)``)
+    """
+
+    k_sigma: float = ESTIMATOR_DEFAULTS["k_sigma"]
+    sigma_fault_c: float = ESTIMATOR_DEFAULTS["sigma_fault_c"]
+    sigma_air_fault_c: float = ESTIMATOR_DEFAULTS["sigma_air_fault_c"]
+    q_t_air: float = ESTIMATOR_DEFAULTS["q_t_air"]
+    q_d_air: float = ESTIMATOR_DEFAULTS["q_d_air"]
+    q_t_drive: float = ESTIMATOR_DEFAULTS["q_t_drive"]
+    q_t_sensor: float = ESTIMATOR_DEFAULTS["q_t_sensor"]
+    q_heat: float = ESTIMATOR_DEFAULTS["q_heat"]
+    sensor_noise_c: float = ESTIMATOR_DEFAULTS["sensor_noise_c"]
+    smart_max_age_s: float = ESTIMATOR_DEFAULTS["smart_max_age_s"]
+    smart_reject_c: float = ESTIMATOR_DEFAULTS["smart_reject_c"]
+    occupied_dT_c: float = ESTIMATOR_DEFAULTS["occupied_dT_c"]  # noqa: N815 - YAML key
+    empty_dT_c: float = ESTIMATOR_DEFAULTS["empty_dT_c"]  # noqa: N815 - YAML key
+    empty_confirm_s: float = ESTIMATOR_DEFAULTS["empty_confirm_s"]
+    bay_settle_s: float = ESTIMATOR_DEFAULTS["bay_settle_s"]
+    calibration_max_age_days: float = ESTIMATOR_DEFAULTS["calibration_max_age_days"]
+    associate_window_s: float = ESTIMATOR_DEFAULTS["associate_window_s"]
+    associate_min_corr: float = ESTIMATOR_DEFAULTS["associate_min_corr"]
+    associate_margin: float = ESTIMATOR_DEFAULTS["associate_margin"]
+
+    @classmethod
+    def coerce(cls, data: object) -> EstimatorSpec:
+        if isinstance(data, EstimatorSpec):
+            return data
+        raw = _section_keys("estimator", data, optional=tuple(ESTIMATOR_DEFAULTS))
+        return cls(
+            **{
+                key: _cfg_num(f"estimator.{key}", raw.get(key, default))
+                for key, default in ESTIMATOR_DEFAULTS.items()
+            }
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {key: getattr(self, key) for key in ESTIMATOR_DEFAULTS}
+
+    def validate(self, dt: float) -> None:
+        """Plan section 7 rules; raises :class:`ConfigError`."""
+        where = "mpc.estimator"
+        if not 0.0 <= self.k_sigma <= 4.0:
+            raise ConfigError(f"{where}.k_sigma must be in [0, 4], got {self.k_sigma}")
+        for key in ("sigma_fault_c", "sigma_air_fault_c", "smart_reject_c"):
+            if getattr(self, key) <= 0:
+                raise ConfigError(f"{where}.{key} must be > 0, got {getattr(self, key)}")
+        for key in ("q_t_air", "q_d_air", "q_t_drive", "q_t_sensor", "q_heat"):
+            if getattr(self, key) <= 0:
+                raise ConfigError(f"{where}.{key} must be > 0, got {getattr(self, key)}")
+        if self.sensor_noise_c < 0:
+            raise ConfigError(f"{where}.sensor_noise_c must be >= 0, got {self.sensor_noise_c}")
+        if self.smart_max_age_s < dt:
+            raise ConfigError(
+                f"{where}.smart_max_age_s must be >= dt ({dt}), got {self.smart_max_age_s}"
+            )
+        if not self.occupied_dT_c > self.empty_dT_c > 0:
+            raise ConfigError(
+                f"{where}: occupied_dT_c > empty_dT_c > 0 is required, got "
+                f"{self.occupied_dT_c} and {self.empty_dT_c}"
+            )
+        if self.empty_confirm_s < 2 * dt:
+            raise ConfigError(
+                f"{where}.empty_confirm_s must be >= 2 * dt ({2 * dt}), got {self.empty_confirm_s}"
+            )
+        if self.bay_settle_s < 0:
+            raise ConfigError(f"{where}.bay_settle_s must be >= 0, got {self.bay_settle_s}")
+        if self.calibration_max_age_days <= 0:
+            raise ConfigError(
+                f"{where}.calibration_max_age_days must be > 0, got {self.calibration_max_age_days}"
+            )
+        if self.associate_window_s < 600:
+            raise ConfigError(
+                f"{where}.associate_window_s must be >= 600, got {self.associate_window_s}"
+            )
+        for key in ("associate_min_corr", "associate_margin"):
+            if not 0.0 < getattr(self, key) < 1.0:
+                raise ConfigError(f"{where}.{key} must be in (0, 1), got {getattr(self, key)}")
 
 
 @dataclass(frozen=True)
@@ -1248,8 +1384,9 @@ class MpcConfig:
       and the per-tick gain of the offset-free disturbance estimator. Ignored
       by the ``pi`` solver.
     * ``topology`` / ``sensors`` / ``drive_classes`` / ``fans`` / ``fan_models`` /
-      ``zones`` -- the zoned DAS layout (module docstring, *DAS layout*); all
-      absent is legacy mode. With ``topology`` the gate's Stuck rule is sized
+      ``zones`` / ``noise`` / ``estimator`` -- the zoned DAS layout (module
+      docstring, *DAS layout*); all absent is legacy mode. With ``topology`` the
+      gate's Stuck rule is sized
       per sensor (:meth:`stuck_params`), zone trust and fallback run per zone
       (``aqua_bridge.control.zones``) and ``temps_for_channel`` returns the
       setpoint temperatures of the channel's zones.
@@ -1292,6 +1429,7 @@ class MpcConfig:
     fan_models: dict[str, FanModel] = field(default_factory=dict)
     zones: ZonePolicy | None = None
     noise: NoiseSpec | None = None
+    estimator: EstimatorSpec | None = None
 
     # -- construction -------------------------------------------------------
 
@@ -1389,9 +1527,12 @@ class MpcConfig:
         )
         zones = None if self.zones is None else ZonePolicy.coerce(self.zones)
         noise = None if self.noise is None else NoiseSpec.coerce(self.noise)
+        estimator = None if self.estimator is None else EstimatorSpec.coerce(self.estimator)
         if topology is not None:
             if noise is None:
                 noise = NoiseSpec()
+            if estimator is None:
+                estimator = EstimatorSpec()
             if zones is None:
                 zones = ZonePolicy()
             if topology.default_class is None and classes:
@@ -1399,6 +1540,7 @@ class MpcConfig:
         s(self, "topology", topology)
         s(self, "zones", zones)
         s(self, "noise", noise)
+        s(self, "estimator", estimator)
 
     # -- validation ---------------------------------------------------------
 
@@ -1543,6 +1685,8 @@ class MpcConfig:
                 raise ConfigError("mpc.zones requires mpc.topology (DAS layout)")
             if self.noise is not None:
                 raise ConfigError("mpc.noise requires mpc.topology (DAS layout)")
+            if self.estimator is not None:
+                raise ConfigError("mpc.estimator requires mpc.topology (DAS layout)")
         else:
             self._validate_das()
         object.__setattr__(self, "_derived", self._derive())
@@ -1632,6 +1776,18 @@ class MpcConfig:
                     f"mpc.topology.bays.{b}.limit_c={bay.limit_c} must lie inside "
                     f"({self.temp_min_c}, {self.temp_max_c})"
                 )
+        serial_bays: dict[str, str] = {}
+        for b, bay in topo.bays.items():
+            if bay.serial is None:
+                continue
+            if bay.serial in serial_bays:
+                # a declared serial wins over the association by correlation; two bays
+                # declaring it would make SMART data of one drive calibrate both
+                raise ConfigError(
+                    f"mpc.topology.bays: serial {bay.serial!r} is declared on both "
+                    f"{serial_bays[bay.serial]!r} and {b!r}"
+                )
+            serial_bays[bay.serial] = b
 
         # sensors
         if set(self.sensors) != set(self.temps):
@@ -1754,6 +1910,9 @@ class MpcConfig:
             raise ConfigError(
                 f"mpc.noise.band_hysteresis must be >= 0, got {noise.band_hysteresis}"
             )
+        if not isinstance(self.estimator, EstimatorSpec):
+            raise ConfigError("mpc.estimator must be an estimator entry")
+        self.estimator.validate(dt)
 
     def _derive(self) -> _Derived:
         """Zone layout and per-temperature Stuck parameters (validated config only)."""
