@@ -143,6 +143,115 @@ def test_sim_plant_follows_config_names(cfg):
     assert io.read().ts == pytest.approx(ts0 + cfg.dt)
 
 
+# --- recorder wiring (milestone record-and-fit) --------------------------------------
+
+
+def test_build_recorder_is_none_without_record_path_or_flag(example_config_path):
+    app = load_config(example_config_path)
+    assert main_mod.build_recorder(app, app.mpc, None) is None
+
+
+def test_build_recorder_cli_flag_takes_precedence_over_config_key(tmp_path, example_config_path):
+    import yaml
+
+    data = yaml.safe_load(example_config_path.read_text())
+    data["record_path"] = str(tmp_path / "from_config.jsonl")
+    conf = tmp_path / "rec.yaml"
+    conf.write_text(yaml.safe_dump(data))
+    app = load_config(conf)
+
+    from_config = main_mod.build_recorder(app, app.mpc, None)
+    assert from_config is not None and from_config.path == tmp_path / "from_config.jsonl"
+
+    from_cli = main_mod.build_recorder(app, app.mpc, str(tmp_path / "from_cli.jsonl"))
+    assert from_cli.path == tmp_path / "from_cli.jsonl"
+
+
+def test_build_recorder_reads_rotation_settings(tmp_path, example_config_path):
+    import yaml
+
+    data = yaml.safe_load(example_config_path.read_text())
+    data["record_path"] = str(tmp_path / "rec.jsonl")
+    data["record_max_bytes"] = 123
+    data["record_backup_count"] = 4
+    conf = tmp_path / "rec.yaml"
+    conf.write_text(yaml.safe_dump(data))
+    app = load_config(conf)
+
+    rec = main_mod.build_recorder(app, app.mpc, None)
+    assert rec.max_bytes == 123 and rec.backup_count == 4
+
+
+def test_build_recorder_rejects_non_integer_rotation_settings(tmp_path, example_config_path):
+    import yaml
+
+    data = yaml.safe_load(example_config_path.read_text())
+    data["record_path"] = str(tmp_path / "rec.jsonl")
+    data["record_max_bytes"] = "lots"
+    conf = tmp_path / "rec.yaml"
+    conf.write_text(yaml.safe_dump(data))
+    app = load_config(conf)
+
+    with pytest.raises(main_mod.ConfigError):
+        main_mod.build_recorder(app, app.mpc, None)
+
+
+def test_main_records_ticks_via_cli_flag(tmp_path, example_config_path, restore_signals):
+    out = tmp_path / "rec.jsonl"
+    rc = main_mod.main(
+        [
+            "--config",
+            str(example_config_path),
+            "--source",
+            "sim",
+            "--ticks",
+            "3",
+            "--sim-speed",
+            "0",
+            "--record",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3
+    assert [json.loads(x)["i"] for x in lines] == [0, 1, 2]
+
+
+def test_main_records_ticks_via_config_key(tmp_path, example_config_path, restore_signals):
+    import yaml
+
+    out = tmp_path / "rec.jsonl"
+    data = yaml.safe_load(example_config_path.read_text())
+    data["record_path"] = str(out)
+    conf = tmp_path / "rec.yaml"
+    conf.write_text(yaml.safe_dump(data))
+    rc = main_mod.main(
+        ["--config", str(conf), "--source", "sim", "--ticks", "2", "--sim-speed", "0"]
+    )
+    assert rc == 0
+    assert len(out.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_main_without_record_path_or_flag_writes_nothing(
+    tmp_path, example_config_path, restore_signals
+):
+    rc = main_mod.main(
+        [
+            "--config",
+            str(example_config_path),
+            "--source",
+            "sim",
+            "--ticks",
+            "2",
+            "--sim-speed",
+            "0",
+        ]
+    )
+    assert rc == 0
+    assert not any(tmp_path.iterdir())  # nothing written anywhere under our scratch dir
+
+
 def test_build_io_sim_and_unknown(example_config_path):
     app = load_config(example_config_path)
     src, sink, release = main_mod.build_io(app, "sim")

@@ -61,12 +61,14 @@ from aqua_bridge.control.loop import Loop, Sink, Source
 from aqua_bridge.control.supervisor import Supervisor
 from aqua_bridge.model import MpcCommand, MpcConfig, PlantObservation
 from aqua_bridge.publishers.inputs import SmartInbox, smart_topic_filter
+from aqua_bridge.recorder import DEFAULT_BACKUP_COUNT, DEFAULT_MAX_BYTES, Recorder, chain_on_tick
 from aqua_bridge.sdnotify import SdNotifier
 
 __all__ = [
     "PlantIO",
     "build_io",
     "build_parser",
+    "build_recorder",
     "main",
     "make_das_sim_plant",
     "make_sim_plant",
@@ -273,6 +275,24 @@ def build_io(
     raise RuntimeError(f"unknown source {source!r}")
 
 
+def build_recorder(app: AppConfig, cfg: MpcConfig, cli_path: str | None) -> Recorder | None:
+    """A :class:`~aqua_bridge.recorder.Recorder` from ``--record`` or the config's
+    top-level ``record_path`` (``--record`` wins; neither given: ``None``, no
+    recording). ``record_max_bytes``/``record_backup_count`` are read the same way,
+    from :attr:`AppConfig.extra` -- flat top-level scalars, not a typed section, the
+    same treatment the interim ``sim.das`` section got before it had one (recorder.py
+    module docstring)."""
+    path = cli_path if cli_path is not None else app.extra.get("record_path")
+    if path is None:
+        return None
+    max_bytes = app.extra.get("record_max_bytes", DEFAULT_MAX_BYTES)
+    backup_count = app.extra.get("record_backup_count", DEFAULT_BACKUP_COUNT)
+    try:
+        return Recorder(cfg, str(path), max_bytes=int(max_bytes), backup_count=int(backup_count))
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"record_max_bytes/record_backup_count must be integers: {exc}") from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="aqua_bridge", description=__doc__.split("\n\n")[0])
     p.add_argument("--config", required=True, help="path to config.yaml")
@@ -301,6 +321,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="sim only: X=1 real time, X=0 as fast as possible",
     )
     p.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARNING, ERROR")
+    p.add_argument(
+        "--record",
+        metavar="PATH",
+        default=None,
+        help="record every tick as JSONL to PATH (overrides the config's record_path)",
+    )
     return p
 
 
@@ -329,10 +355,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         app = load_config(args.config)
+        cfg = app.mpc
+        recorder = build_recorder(app, cfg, args.record)
     except ConfigError as exc:
         _LOG.error("config: %s", exc)
         return 2
-    cfg = app.mpc
 
     # Built regardless of --source: the MQTT/HTTP inbound side (below) works
     # the same whichever plant is behind the loop, and only --source hwmon's
@@ -357,8 +384,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     loop = Loop(source, sink, cfg, supervisor, clock=time.monotonic, notifier=notifier, sleep=sleep)
 
     http_service, mqtt_service = start_publishers(app, supervisor, smart_inbox=smart_inbox)
-    if mqtt_service is not None:
-        loop.on_tick = mqtt_service.on_tick
+    hooks = [h.on_tick if h is not None else None for h in (mqtt_service, recorder)]
+    if any(h is not None for h in hooks):
+        loop.on_tick = chain_on_tick(*hooks)
 
     stop = threading.Event()
     # Signal numbers the handler saw, logged by the main thread once the loop has
@@ -419,6 +447,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             except Exception:
                 _LOG.exception("release failed")
         stop_publishers(http_service, mqtt_service)
+        if recorder is not None:
+            recorder.close()
     if len(signals_seen) > 1:
         _LOG.info("%d further signal(s) during shutdown ignored", len(signals_seen) - 1)
     _LOG.info("exit %d after %d ticks", exit_code, loop.tick_count)
