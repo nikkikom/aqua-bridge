@@ -1778,14 +1778,10 @@ def current_model(memory: object, cfg: MpcConfig) -> tuple[str, dict[str, float]
     (``"prior"``), exactly as :func:`update` would start over from it.
     """
     d = _derived(cfg)
-    theta = dict(d.prior)
     if memory is None:
-        return "off", theta
+        return "off", dict(d.prior)
     mem = _load(memory, cfg, d.st)
-    for z, zone in d.st.zones.items():
-        theta.update(zip(zone.air_keys, mem["zones"][z]["air"]["theta"], strict=True))
-    for b, bay in d.st.bays.items():
-        theta.update(zip(bay.keys, mem["bays"][b]["theta"], strict=True))
+    theta = theta_from_memory(cfg, mem, st=d.st)
     status = overall_status([zm["status"] for zm in mem["zones"].values()])
     return status, {k: float(v) for k, v in theta.items()}
 
