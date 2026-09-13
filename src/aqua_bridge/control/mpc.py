@@ -22,6 +22,13 @@ Order inside :func:`step`
    decimated Stuck windows are advanced first and dropped on a gap, too.)
 3b. Zone trust (:func:`aqua_bridge.control.zones.evaluate`). Legacy mode is
    one implicit zone whose verdict is exactly the whole-tick gate verdict.
+   With zones, the drive estimates block follows
+   (:func:`aqua_bridge.control.estimates.prior_estimates`, the prior-map
+   provider until the estimator milestone): it is built from the
+   gate-trusted temperatures every tick, fault ticks included, and is not
+   an input of zone trust (``zones.evaluate`` gets ``estimates=None``: the
+   prior map has no uncertainty that grows with a lost sensor, so the
+   ``sigma`` trust rule keeps falling back to ``strict``).
 4. Fault bookkeeping, per zone: an untrusted tick resets the zone's streak
    and opens its fault timer (``since`` is kept, never restarted, while
    the zone's fault is active -- Flicker must not reset the hold). A
@@ -32,7 +39,8 @@ Order inside :func:`step`
    that stay in fault (and, with ``fault_coupling: declared``, of the zones
    coupled to them) are under fallback policy: they reach the solver as
    ``SolverRequest.fixed_channels`` and only the sensors of eligible zones
-   (plus trusted sensors without a zone) reach it as ``temps``. On a
+   (plus trusted sensors without a zone) reach it as ``temps``, and the
+   estimates of the bays of eligible zones as ``estimates``. On a
    returning tick (legacy: the zone was in fault or the integrator is
    incomplete; zones: a channel the solver drives lacks an integrator
    entry, which is what a channel released from fallback policy or from
@@ -77,10 +85,15 @@ aggregates: the earliest zone fault and its reason, the smallest streak,
 the largest fault tick count. ``MpcState.in_fault`` is therefore true in
 ``degraded`` as well as ``fallback``. Diagnostics add ``zones`` (per zone:
 trusted, reasons, fault timer, ``in_closure``, channels, policy),
-``zones_in_fault``, ``fallback_channels``, ``policy_by_channel`` and
-``trust_rule``; ``policy`` becomes ``mixed`` when channels differ. The
-legacy solvers ``pi`` / ``mpc`` regulate on setpoints: ``pi`` skips the
-fixed channels and runs per zone; the legacy ``mpc`` has one coupled
+``zones_in_fault``, ``fallback_channels``, ``policy_by_channel``,
+``trust_rule`` and ``estimates`` (per bay with a computable estimate, any
+zone: ``t_c``, ``sigma_c``, ``margin_c``, ``soft_c``, ``hard_c``, ``limit_c``,
+``occupancy``, ``class``, ``zone``, ``zone_trusted``, ``calibrated``,
+``source``); ``policy`` becomes ``mixed`` when channels differ. Without
+``setpoints`` the ``pi`` solver regulates the margin deficit of the drives
+(PI-like DAS form, :mod:`aqua_bridge.control.solver_pi`). A zoned config
+that still declares setpoints keeps the per-zone setpoint regulation: ``pi``
+skips the fixed channels and runs per zone; the legacy ``mpc`` has one coupled
 problem over every channel and raises on fixed channels, so with zones it
 turns any zone fault into a fault of every zone it drives (whole-enclosure
 fallback, never less cooling) until the DAS MPC milestone.
@@ -129,7 +142,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from aqua_bridge.control import zones
+from aqua_bridge.control import estimates, zones
 from aqua_bridge.control.gate import (
     GateResult,
     advance_slow_windows,
@@ -425,6 +438,13 @@ def step(
 
     # 3b. zone trust (legacy: the implicit zone's verdict is exactly ``trusted``)
     verdicts = zones.evaluate(gate, time_status, cfg)
+    trusted_temps: dict[str, float] = {}
+    if das:
+        trusted_temps = {
+            name: float(gate.filtered[name])  # type: ignore[arg-type]
+            for name in cfg.temps
+            if gate.per_temp[name] and time_status in ("ok", "first")
+        }
 
     # 4. fault bookkeeping per zone
     books = _read_books(state, mem, cfg)
@@ -495,6 +515,7 @@ def step(
                     if ch in fixed_pre
                 },
                 zone_trust={z: z in usable_zones for z in zone_names},
+                estimates=estimates.prior_estimates(cfg, trusted_temps, usable_zones),
             )
         else:
             temps = {name: float(gate.filtered[name]) for name in cfg.temps}  # type: ignore[arg-type]
@@ -681,6 +702,9 @@ def step(
         diagnostics["fallback_channels"] = [ch for ch in cfg.channels if ch in ch_elapsed]
         diagnostics["policy_by_channel"] = policy_by_channel
         diagnostics["trust_rule"] = zones.effective_trust_rule(cfg)
+        diagnostics["estimates"] = _estimate_diagnostics(
+            estimates.prior_estimates(cfg, trusted_temps), verdicts, faulted
+        )
     cmd = MpcCommand(pwm=pwm, mode=mode, diagnostics=diagnostics)
 
     # 9. next state (gate rule 5: raw values and cmd.pwm always go into the window)
@@ -723,6 +747,32 @@ def step(
         ),
     )
     return cmd, new_state
+
+
+def _estimate_diagnostics(
+    block: Mapping[str, Mapping[str, Any]],
+    verdicts: Mapping[str, zones.ZoneTrust],
+    faulted: list[str],
+) -> dict[str, dict[str, Any]]:
+    """``diagnostics["estimates"]``: the estimates block in display units (module docstring)."""
+    out: dict[str, dict[str, Any]] = {}
+    for bay, est in block.items():
+        zone = est["zone"]
+        out[bay] = {
+            "zone": zone,
+            "class": est["class"],
+            "occupancy": est["occupancy"],
+            "t_c": est["t"],
+            "sigma_c": est["sigma"],
+            "margin_c": est["margin"],
+            "soft_c": est["soft"],
+            "hard_c": est["hard"],
+            "limit_c": est["limit"],
+            "zone_trusted": verdicts[zone].trusted and zone not in faulted,
+            "calibrated": est["calibrated"],
+            "source": est["source"],
+        }
+    return out
 
 
 def _sanitized(values: Mapping[str, float | None]) -> dict[str, float | None]:

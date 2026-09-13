@@ -31,8 +31,45 @@ PI policy (per fan channel ``ch``)::
     I'  = clamp(I + pi_ki * e * dt, pwm_min, pwm_max)
 
 The ``max`` over a channel's temperatures is the conservative choice for a
-cooling loop: the hottest deviation drives the fan. A channel in
-``fixed_channels`` gets no error, no integrator entry (so it starts
+cooling loop: the hottest deviation drives the fan (anti-windup and bumpless
+start below).
+
+PI-like DAS form (plan section 4, "PI-like DAS fallback")
+---------------------------------------------------------
+With ``topology`` and no ``setpoints`` (:attr:`MpcConfig.regulates_drive_limits`)
+the error is the *margin deficit* of the worst drive the channel cools, read
+from ``SolverRequest.estimates`` (:mod:`aqua_bridge.control.estimates`)::
+
+    e = max(est[b].t + est[b].margin - est[b].soft
+            for b in the constrained bays of cfg.zone_layout.served[ch]
+            whose zone is trusted this tick)
+
+with ``margin = k * sigma`` and ``soft = limit - comfort - k * sigma``; the rest
+(integrator, anti-windup, bumpless start) is exactly the PI above, and the
+solver keeps ``name = "pi"``. The served zones are the zones that list the
+channel plus their declared ``coupled_to``: the drives next door feel the
+channel's air too, so the channel works for them as well; drives of unknown
+occupancy count. The formula is the plan's as written, and it counts
+``k * sigma`` twice (once inside ``soft``, once added to ``t``), so the
+drive settles ``2 k sigma`` below ``limit - comfort``. That errs toward more
+cooling; whether the DAS MPC keeps the single count of its soft rows is
+for that milestone.
+
+Two edge cases, both documented choices:
+
+* a constrained bay in a trusted served zone without an estimate is a
+  contract violation (``KeyError``, which ``step`` turns into a fault: never
+  less cooling);
+* a channel whose served zones hold no constrained bay with a trusted zone
+  (every bay ``occupied: false``, or the only drives sit in a coupled zone in
+  fault under ``fault_coupling: none``) has nothing to regulate: ``e = 0``,
+  so the integrator holds the command where it is (neither raised nor lowered)
+  and ``diagnostics["unconstrained"]`` lists the channel.
+
+In legacy mode, and on zoned configs that still declare ``setpoints``, the
+error is today's ``channel_errors`` bit for bit.
+
+Both forms: a channel in ``fixed_channels`` gets no error, no integrator entry (so it starts
 bumplessly when released) and its fixed command as demand. Anti-windup is the
 clamp of ``I`` into ``[pwm_min, pwm_max]`` ("the integral alone stays in
 the actuator range"), deliberately *not* conditional integration: holding
@@ -61,6 +98,7 @@ __all__ = [
     "SolverRequest",
     "SolverResult",
     "channel_errors",
+    "channel_margin_errors",
 ]
 
 
@@ -78,6 +116,8 @@ class SolverRequest:
       target on them this tick (empty in legacy mode)
     * ``zone_trust``     -- zone -> whether the solver may rely on its sensors this tick
       (empty in legacy mode)
+    * ``estimates``      -- bay -> estimate entry (``aqua_bridge.control.estimates``) for
+      the constrained bays of trusted zones (empty in legacy mode)
     """
 
     temps: dict[str, float]
@@ -86,6 +126,7 @@ class SolverRequest:
     memory: dict[str, Any] = field(default_factory=dict)
     fixed_channels: dict[str, float] = field(default_factory=dict)
     zone_trust: dict[str, bool] = field(default_factory=dict)
+    estimates: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -141,6 +182,43 @@ def channel_errors(
     return out
 
 
+def channel_margin_errors(
+    cfg: MpcConfig,
+    estimates: Mapping[str, Mapping[str, Any]],
+    zone_trust: Mapping[str, bool],
+    skip: Container[str] = (),
+) -> tuple[dict[str, float], dict[str, str | None]]:
+    """Margin deficit per channel and the bay that sets it (module docstring, DAS form).
+
+    Returns ``(errors, worst_bay)``; ``worst_bay[ch]`` is ``None`` for an
+    unconstrained channel (error 0). Raises ``KeyError`` when a constrained bay
+    of a trusted served zone has no estimate.
+    """
+    topo = cfg.topology
+    if topo is None:
+        raise ValueError("the margin-deficit form needs mpc.topology")
+    layout = cfg.zone_layout
+    errors: dict[str, float] = {}
+    worst: dict[str, str | None] = {}
+    for ch in cfg.channels:
+        if ch in skip:
+            continue
+        served = layout.served[ch]
+        best: tuple[float, str] | None = None
+        for bay, spec in topo.bays.items():
+            if not spec.constrained or spec.zone not in served or not zone_trust.get(spec.zone):
+                continue
+            est = estimates[bay]
+            e = float(est["t"]) + float(est["margin"]) - float(est["soft"])
+            if best is None or e > best[0]:
+                best = (e, bay)
+        if best is None:
+            errors[ch], worst[ch] = 0.0, None
+        else:
+            errors[ch], worst[ch] = best
+    return errors, worst
+
+
 def _clamp(value: float, lo: float, hi: float) -> float:
     return lo if value < lo else hi if value > hi else value
 
@@ -150,11 +228,19 @@ class PiSolver:
 
     name = "pi"
 
+    @staticmethod
+    def _errors(
+        cfg: MpcConfig, req: SolverRequest
+    ) -> tuple[dict[str, float], dict[str, str | None] | None]:
+        if cfg.regulates_drive_limits:
+            return channel_margin_errors(cfg, req.estimates, req.zone_trust, req.fixed_channels)
+        return channel_errors(cfg, req.temps, req.fixed_channels), None
+
     def initialise(
         self, cfg: MpcConfig, req: SolverRequest
     ) -> tuple[dict[str, float], dict[str, Any]]:
         fixed = req.fixed_channels
-        errors = channel_errors(cfg, req.temps, fixed)
+        errors, _ = self._errors(cfg, req)
         integrator = {
             ch: float(req.prev_pwm[ch]) - cfg.pi_kp * errors[ch]
             for ch in cfg.channels
@@ -164,7 +250,7 @@ class PiSolver:
 
     def solve(self, cfg: MpcConfig, req: SolverRequest) -> SolverResult:
         fixed = req.fixed_channels
-        errors = channel_errors(cfg, req.temps, fixed)
+        errors, worst_bay = self._errors(cfg, req)
         pwm: dict[str, float] = {}
         integrator: dict[str, float] = {}
         p_term: dict[str, float] = {}
@@ -192,17 +278,22 @@ class PiSolver:
             i_term[ch] = i_now
             sat_hi[ch] = hi
             sat_lo[ch] = lo
+        diagnostics: dict[str, Any] = {
+            "error": errors,
+            "p_term": p_term,
+            "i_term": i_term,
+            "saturated_high": sat_hi,
+            "saturated_low": sat_lo,
+        }
+        if worst_bay is not None:  # DAS form only: legacy diagnostics keep their keys
+            diagnostics["form"] = "margin_deficit"
+            diagnostics["worst_bay"] = worst_bay
+            diagnostics["unconstrained"] = [ch for ch, bay in worst_bay.items() if bay is None]
         return SolverResult(
             pwm=pwm,
             integrator=integrator,
             memory={},
             converged=True,
             iterations=1,
-            diagnostics={
-                "error": errors,
-                "p_term": p_term,
-                "i_term": i_term,
-                "saturated_high": sat_hi,
-                "saturated_low": sat_lo,
-            },
+            diagnostics=diagnostics,
         )
