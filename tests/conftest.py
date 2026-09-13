@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from enum import StrEnum
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from aqua_bridge.model import MpcConfig, SolverKind
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE_CONFIG = REPO_ROOT / "config.example.yaml"
+EXAMPLE_DAS_CONFIG = REPO_ROOT / "config.example-das.yaml"
 HWMON_ROOT = Path("/sys/class/hwmon")
 AQUAERO_HWMON_NAME = "aquaero"
 
@@ -93,13 +95,47 @@ def cfg() -> MpcConfig:
     return load_config(EXAMPLE_CONFIG).mpc
 
 
-@pytest.fixture(params=[SolverKind.PI, SolverKind.MPC], ids=["pi", "mpc"])
-def solver_kind(request) -> SolverKind:
-    """Both section 3 solvers (section 8: "replace PI with a small linear MPC; keep the
-    same tests"). The core suites override ``cfg`` with it so every section 4 scenario
-    runs once per solver; the shared ``cfg`` fixture itself stays the example config.
+class SolverCase(StrEnum):
+    """What the ``solver_kind`` argument of the core suites stands for.
+
+    * ``pi`` / ``mpc`` -- the legacy config (``config.example.yaml``) with that solver
+    * ``pi_das``       -- the zoned DAS config (``config.example-das.yaml``) with the
+      ``pi`` solver in its margin-deficit form (plan section 4)
+
+    A ``SolverCase`` is a ``str``, so ``dataclasses.replace(cfg, solver=case)`` works
+    for the legacy cases; :attr:`kind` is the ``SolverKind`` of every case.
     """
-    return request.param
+
+    PI = "pi"
+    MPC = "mpc"
+    PI_DAS = "pi_das"
+
+    @property
+    def kind(self) -> SolverKind:
+        return SolverKind.MPC if self is SolverCase.MPC else SolverKind.PI
+
+    @property
+    def das(self) -> bool:
+        return self is SolverCase.PI_DAS
+
+
+LEGACY_SOLVER_CASES: tuple[SolverCase, ...] = (SolverCase.PI, SolverCase.MPC)
+DAS_SOLVER_CASES: tuple[SolverCase, ...] = (SolverCase.PI_DAS,)
+
+
+def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
+    """Parametrise ``solver_kind`` over every :class:`SolverCase` (section 8: "keep the
+    same tests" for every solver).
+
+    A test or module marked ``@pytest.mark.solver_cases("pi", "mpc")`` runs only those
+    cases: the legacy core suites are written against the coolant example config and
+    run the legacy cases; ``tests/test_das_core.py`` runs the DAS ones.
+    """
+    if "solver_kind" not in metafunc.fixturenames:
+        return
+    marker = metafunc.definition.get_closest_marker("solver_cases")
+    cases = tuple(SolverCase(c) for c in marker.args) if marker else tuple(SolverCase)
+    metafunc.parametrize("solver_kind", cases, ids=[c.value for c in cases])
 
 
 @pytest.fixture
@@ -109,6 +145,17 @@ def aquaero_hwmon() -> Path:
     if dev is None:
         pytest.skip("no aquaero hwmon device under /sys/class/hwmon")
     return dev
+
+
+@pytest.fixture(scope="session")
+def example_das_config_path() -> Path:
+    return EXAMPLE_DAS_CONFIG
+
+
+@pytest.fixture
+def das_example_cfg() -> MpcConfig:
+    """Valid zoned MpcConfig built from config.example-das.yaml's ``mpc`` section."""
+    return load_config(EXAMPLE_DAS_CONFIG).mpc
 
 
 @pytest.fixture

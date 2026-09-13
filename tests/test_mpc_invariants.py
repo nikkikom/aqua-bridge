@@ -33,6 +33,9 @@ from invariants import (
     resolve_prev_pwm,
 )
 
+# Legacy-shaped scenarios (coolant setpoint): the DAS cases run in test_das_core.py.
+pytestmark = pytest.mark.solver_cases("pi", "mpc")
+
 SP = 35.0
 
 

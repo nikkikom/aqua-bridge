@@ -25,6 +25,9 @@ from aqua_bridge.model import FaultReason, Mode, MpcConfig, PlantObservation
 from aqua_bridge.sim.plant import Plant, PlantParams, TickRecord, run_closed_loop
 from invariants import TOL, checked_step, make_obs
 
+# Legacy-shaped scenarios (coolant setpoint): the DAS cases run in test_das_core.py.
+pytestmark = pytest.mark.solver_cases("pi", "mpc")
+
 SP = 35.0
 
 

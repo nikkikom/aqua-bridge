@@ -31,6 +31,9 @@ REGEN_ENV = "AQUA_BRIDGE_REGEN_GOLDEN"
 GOLDEN_PWM_ATOL = 1e-6
 GOLDEN_TEMP_ATOL = 1e-4
 
+# Legacy-shaped scenarios (coolant setpoint): the DAS cases run in test_das_core.py.
+pytestmark = pytest.mark.solver_cases("pi", "mpc")
+
 SP = 35.0
 
 
