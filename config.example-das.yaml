@@ -209,6 +209,15 @@ mpc:
   solver_outer_max: 4    # active-piece iterations per solve
   model_max_drift_c_per_min: 0.5  # validity gate: the model's drive drift at the estimate
   model_accept_prior: false  # true: act on the prior model (or what shadow learning has so far)
+  # Model store: the daemon keeps the thermal model, the SMART calibrations and the last
+  # bay view in $STATE_DIRECTORY/model.json (systemd StateDirectory=aqua-bridge) or
+  # --model-store PATH. A file up to model_store_max_age_days old loads frozen and the MPC
+  # acts on it (prediction-error guard on); an older one loads stale: the model learns in
+  # shadow while the PI-like DAS form acts with the loaded calibrations at twice their
+  # sigma_cal, and acts again only after converged for model_reconfirm_s.
+  model_store_interval_s: 600.0
+  model_store_max_age_days: 30.0
+  model_reconfirm_s: 3600.0
 
 # Hardware bindings for --source hwmon: every mpc.temps name bound exactly once
 # across the hwmon temp_maps and onewire.sensors, every channel by one fans map.

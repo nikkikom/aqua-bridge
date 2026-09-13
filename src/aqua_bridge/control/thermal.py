@@ -205,11 +205,31 @@ Status machine per zone (the model's status is the least advanced zone, with
   consecutive windows;
 * ``suspect`` -> ``learning`` when excitation returns;
 * ``error``: ``step`` resets the memory to the prior with this status after any
-  exception; the next excited window moves it to ``learning``.
+  exception; the next excited window moves it to ``learning``;
+* ``frozen`` (model store): a zone that was ``converged`` or ``frozen`` when a file
+  younger than ``model_store_max_age_days`` was saved loads ``frozen``
+  (:func:`restore`). It is accepted by the DAS MPC's validity gate like ``converged``
+  and its windows still close, score the prediction error and advance the PE monitor,
+  but never move ``theta``/``P`` (``learn=False`` for its blocks). It becomes
+  ``suspect`` by the same rule as ``converged`` and then learns again from
+  ``learning``. A stored zone that had not converged keeps its status (conservative:
+  a fresh file does not make a model that never converged act).
+
+Stale hold (model store, the owner's stale rule): a model restored from a file older
+than ``model_store_max_age_days`` (or one saved while such a hold was still pending)
+carries ``"hold": {"since": ts | None}``. Its zones restart at ``learning`` (a zone that
+had not left ``prior`` stays there) with no prediction error, and the model's status is
+``stale`` whatever its zones say, so neither the validity gate nor
+``model_accept_prior`` lets it act. After every tick, ``since`` is set when every zone
+is ``converged`` and every zone's prediction error is below ``model_max_pred_err_c``,
+and cleared when either fails; the hold is dropped (the model's status is its zones'
+again) once that has lasted ``model_reconfirm_s``. The DAS MPC then still needs its own
+checks, including its rolling one-step prediction error, for its dwell before it acts.
 
 Memory (plain JSON)::
 
     {"v": 1, "fp": <structure fingerprint>, "ts": last ts, "error": str | None,
+     "hold": {"since": ts | None} (only while a stale model is re-confirmed),
      "zones": {zone: {"status", "conv", "bad", "err2", "prev": sample, "air": block}},
      "bays": {bay: block}}
     block = {"theta": [...], "P": [[...]], "s2": float, "n": excited windows,
@@ -251,6 +271,7 @@ __all__ = [
     "EXCITATION_MIN",
     "HUBER_SIGMAS",
     "LAG_DS18B20_S",
+    "MODEL_STATUSES",
     "LAG_THERMISTOR_S",
     "MIN_WINDOWS",
     "PARAMETERS",
@@ -274,12 +295,14 @@ __all__ = [
     "discretise",
     "fresh_memory",
     "jacobians",
+    "model_status",
     "model_params",
     "overall_status",
     "parameter_keys",
     "phi",
     "prior_theta",
     "project",
+    "restore",
     "sensor_lag_s",
     "structure",
     "summary",
@@ -290,7 +313,10 @@ __all__ = [
 VERSION = 1
 
 #: Status machine states (module docstring).
-STATUSES: tuple[str, ...] = ("prior", "learning", "converged", "suspect", "error")
+#: Zone statuses (module docstring, *Status machine*).
+STATUSES: tuple[str, ...] = ("prior", "learning", "converged", "suspect", "error", "frozen")
+#: Statuses of the whole model: a zone status, or ``stale`` while a stale hold is pending.
+MODEL_STATUSES: tuple[str, ...] = (*STATUSES, "stale")
 
 #: Weak cross-zone effectiveness prior, as a fraction of the in-zone prior.
 WEAK_E_FACTOR = 0.1
@@ -1365,6 +1391,11 @@ def _parse(memory: object, cfg: MpcConfig, st: Structure) -> dict[str, Any]:
         "zones": {},
         "bays": {},
     }
+    hold = memory.get("hold")
+    if hold is not None:
+        if not isinstance(hold, Mapping):
+            raise TypeError("hold")
+        out["hold"] = {"since": _opt_num(hold.get("since"))}
     zones = memory["zones"]
     for z, zone in st.zones.items():
         raw = zones[z]
@@ -1553,6 +1584,7 @@ def update(
         }
         prev = zm["prev"]
         zm["prev"] = sample
+        zone_learn = learn and zm["status"] != "frozen"
         if not (interval_ok and ok and prev is not None and prev["ok"]):
             zm["air"]["acc"] = None
             for b in zone.bays:
@@ -1611,7 +1643,9 @@ def update(
             # rows stay in kelvin (a change of the sensor target mid-window weighs 1)
             fan = np.array(acc["fan"]) / acc["x"][0]
             x = np.array(acc["x"])
-            residual, excited = _rls_window(block, bay_specs[b], x, acc["y"], fan, cfg, learn=learn)
+            residual, excited = _rls_window(
+                block, bay_specs[b], x, acc["y"], fan, cfg, learn=zone_learn
+            )
             closed.setdefault(z, []).append((residual, excited))
             block["acc"] = None
 
@@ -1677,7 +1711,7 @@ def update(
         x = np.array(acc["x"]) / norm
         fan = np.array(acc["fan"]) / norm
         residual, excited = _rls_window(
-            block, zone_specs[z], x, acc["y"] / norm, fan, cfg, learn=learn
+            block, zone_specs[z], x, acc["y"] / norm, fan, cfg, learn=zone_learn
         )
         conductance = q_flow + theta[f"leak.{z}"]
         conductance += sum(theta[f"kappa.{z}.{o}"] for o in zone.coupled)
@@ -1699,6 +1733,7 @@ def update(
             zm, mem, cfg, st, z, math.sqrt(err2), excited, params, zone_specs, bay_specs
         )
 
+    _advance_hold(mem, cfg, ts)
     mem["ts"] = ts
     return ThermalUpdate(memory=mem, summary=summary(mem, cfg, st=st, occupancy=occupancy))
 
@@ -1750,12 +1785,141 @@ def _advance_status(
         status = "converged"
         zm["conv"] = max(pred_err, PRED_ERR_FLOOR_C)
         zm["bad"] = 0
-    elif status == "converged":
+    elif status in ("converged", "frozen"):
         level = max(float(zm["conv"] or PRED_ERR_FLOOR_C), PRED_ERR_FLOOR_C)
         zm["bad"] = int(zm["bad"]) + 1 if window_err > SUSPECT_FACTOR * level else 0
         if zm["bad"] >= SUSPECT_WINDOWS:
             status = "suspect"
     zm["status"] = status
+
+
+def _advance_hold(mem: dict[str, Any], cfg: MpcConfig, ts: float) -> None:
+    """The stale hold after a tick (module docstring, *Stale hold*)."""
+    hold = mem.get("hold")
+    if hold is None:
+        return
+    zones = list(mem["zones"].values())
+    errs = [zm["err2"] for zm in zones]
+    ok = (
+        overall_status([zm["status"] for zm in zones]) == "converged"
+        and all(e is not None for e in errs)
+        and math.sqrt(max(float(e) for e in errs)) < cfg.model_max_pred_err_c
+    )
+    if not ok:
+        hold["since"] = None
+        return
+    since = hold["since"]
+    if since is None or since > ts:  # a clock stepped back restarts the count from now
+        since = ts
+    if ts - since >= cfg.model_reconfirm_s:
+        del mem["hold"]
+        return
+    hold["since"] = since
+
+
+# ---------------------------------------------------------------------------
+# model store: restoring a saved memory (aqua_bridge.control.persist)
+# ---------------------------------------------------------------------------
+
+#: Stored zone status -> restored status, for a fresh file and for a stale one.
+_RESTORE_FRESH = {
+    "converged": "frozen",
+    "frozen": "frozen",
+    "learning": "learning",
+    "prior": "prior",
+    "suspect": "suspect",
+    "error": "prior",
+}
+_RESTORE_STALE = {
+    "converged": "learning",
+    "frozen": "learning",
+    "learning": "learning",
+    "prior": "prior",
+    "suspect": "suspect",
+    "error": "prior",
+}
+_SYMMETRY_TOL = 1e-6
+
+
+def _check_block_bounds(raw: object, spec: _BlockSpec, where: str) -> None:
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{where}: not a mapping")
+    theta = raw.get("theta")
+    n = len(spec.keys)
+    if not isinstance(theta, list) or len(theta) != n:
+        raise ValueError(f"{where}: theta has the wrong shape")
+    for i, value in enumerate(theta):
+        if not _finite(value):
+            raise ValueError(f"{where}: {spec.keys[i]} is not a finite number")
+        if not float(spec.lo[i]) <= float(value) <= float(spec.hi[i]):
+            raise ValueError(
+                f"{where}: {spec.keys[i]} = {value} outside [{spec.lo[i]:g}, {spec.hi[i]:g}]"
+            )
+    try:
+        p = np.asarray(raw.get("P"), dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{where}: P is not a matrix") from exc
+    if p.shape != (n, n) or not np.all(np.isfinite(p)):
+        raise ValueError(f"{where}: P is not a finite {n}x{n} matrix")
+    scale = max(1.0, float(np.max(np.abs(p))))
+    if float(np.max(np.abs(p - p.T))) > _SYMMETRY_TOL * scale or np.any(np.diag(p) < 0):
+        raise ValueError(f"{where}: P is not a covariance (asymmetric or negative variance)")
+    s2 = raw.get("s2")
+    if not _finite(s2) or float(s2) <= 0:  # type: ignore[arg-type]
+        raise ValueError(f"{where}: s2 must be a finite number > 0")
+
+
+def restore(stored: object, cfg: MpcConfig, *, stale: bool) -> dict[str, Any]:
+    """A thermal memory saved by the model store, ready for :func:`update`.
+
+    Strict, unlike :func:`update`'s own loading (which starts over on anything it cannot
+    read and clamps coefficients into their bounds): raises ``ValueError`` naming the
+    first problem -- schema version, a structure that differs from ``cfg``'s, a
+    coefficient that is not finite or lies outside its bounds (:data:`PARAMETERS`), a
+    covariance that is not finite, symmetric and non-negative on its diagonal, or any
+    malformed field. The result has no open window, no previous sample, no error and no
+    ``ts`` (the next tick starts the windows in the new clock); zone statuses are mapped
+    for a fresh or a ``stale`` file (module docstring, ``frozen`` and *Stale hold*), and a
+    stale file -- or a stored memory with a pending hold -- gets a new hold.
+    """
+    d = _derived(cfg)
+    st = d.st
+    if not isinstance(stored, Mapping) or stored.get("v") != VERSION:
+        raise ValueError("thermal: unknown schema version")
+    if stored.get("fp") != st.fingerprint:
+        raise ValueError("thermal: the model structure differs from the config")
+    zones = stored.get("zones")
+    bays = stored.get("bays")
+    if not isinstance(zones, Mapping) or not isinstance(bays, Mapping):
+        raise ValueError("thermal: zones or bays missing")
+    for z in st.zones:
+        raw = zones.get(z)
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"thermal: zone {z!r} missing")
+        _check_block_bounds(raw.get("air"), d.zone_specs[z], f"thermal: zone {z!r}")
+    for b in st.bays:
+        _check_block_bounds(bays.get(b), d.bay_specs[b], f"thermal: bay {b!r}")
+    try:
+        mem = _parse(stored, cfg, st)
+    except (TypeError, ValueError, KeyError, AttributeError, IndexError) as exc:
+        raise ValueError(f"thermal: malformed memory ({type(exc).__name__}: {exc})") from exc
+    stale = stale or "hold" in mem
+    mapping = _RESTORE_STALE if stale else _RESTORE_FRESH
+    mem["ts"] = None
+    mem["error"] = None
+    for zm in mem["zones"].values():
+        zm["status"] = mapping[zm["status"]]
+        zm["prev"] = None
+        zm["bad"] = 0
+        zm["air"]["acc"] = None
+        if stale:
+            zm["err2"] = None
+    for block in mem["bays"].values():
+        block["acc"] = None
+    mem.pop("hold", None)
+    if stale:
+        mem["hold"] = {"since": None}
+    return mem
 
 
 # ---------------------------------------------------------------------------
@@ -1771,7 +1935,7 @@ def cached_structure(cfg: MpcConfig) -> Structure:
 def current_model(memory: object, cfg: MpcConfig) -> tuple[str, dict[str, float]]:
     """``(status, theta)`` of a thermal memory, for the DAS MPC's validity gate.
 
-    ``status`` is the model's overall status (:func:`overall_status`) and ``theta``
+    ``status`` is the model's status (:func:`model_status`) and ``theta``
     every identified parameter (:func:`prior_theta` layout) as the blocks hold it.
     ``None`` (no ``model_shadow``) reads ``("off", prior)``; a memory that does not
     match the config's structure, or is malformed, reads as the fresh prior
@@ -1782,12 +1946,14 @@ def current_model(memory: object, cfg: MpcConfig) -> tuple[str, dict[str, float]
         return "off", dict(d.prior)
     mem = _load(memory, cfg, d.st)
     theta = theta_from_memory(cfg, mem, st=d.st)
-    status = overall_status([zm["status"] for zm in mem["zones"].values()])
-    return status, {k: float(v) for k, v in theta.items()}
+    return model_status(mem), {k: float(v) for k, v in theta.items()}
 
 
 def overall_status(zone_statuses: Collection[str]) -> str:
-    """The model's status from its zones' (module docstring)."""
+    """The model's status from its zones' (module docstring): ``error``, then ``suspect``,
+    then ``frozen`` when every zone is ``converged`` or ``frozen`` and one is ``frozen``,
+    ``converged`` when every zone is, ``learning`` when some zone got that far, else
+    ``prior``."""
     statuses = set(zone_statuses)
     if not statuses:
         return "prior"
@@ -1795,11 +1961,19 @@ def overall_status(zone_statuses: Collection[str]) -> str:
         return "error"
     if "suspect" in statuses:
         return "suspect"
-    if statuses == {"converged"}:
-        return "converged"
-    if statuses & {"learning", "converged"}:
+    if statuses <= {"converged", "frozen"}:
+        return "frozen" if "frozen" in statuses else "converged"
+    if statuses & {"learning", "converged", "frozen"}:
         return "learning"
     return "prior"
+
+
+def model_status(memory: Mapping[str, Any]) -> str:
+    """The status of a (parsed) thermal memory: ``stale`` while a stale hold is pending,
+    else :func:`overall_status` of its zones."""
+    if memory.get("hold") is not None:
+        return "stale"
+    return overall_status([zm["status"] for zm in memory["zones"].values()])
 
 
 def summary(
@@ -1843,8 +2017,8 @@ def summary(
         }
         if occupancy is not None and b in occupancy:
             bays_out[b]["occupancy"] = occupancy[b]
-    return {
-        "status": overall_status([zm["status"] for zm in memory["zones"].values()]),
+    out: dict[str, Any] = {
+        "status": model_status(memory),
         "error": memory.get("error"),
         "pred_err_c": worst,
         "max_pred_err_c": cfg.model_max_pred_err_c,
@@ -1852,3 +2026,7 @@ def summary(
         "zones": zones_out,
         "bays": bays_out,
     }
+    hold = memory.get("hold")
+    if hold is not None:
+        out["hold"] = {"since_ts": hold.get("since"), "reconfirm_s": cfg.model_reconfirm_s}
+    return out

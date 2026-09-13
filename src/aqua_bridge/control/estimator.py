@@ -146,6 +146,15 @@ accepted sample for ``calibration_max_age_days`` (or when ``ts`` runs backwards)
 the fresh-sample count restarts at 0, so ``sigma_cal`` returns to 1.5 degC while
 ``s, b`` stay as the starting point; 20 fresh samples confirm it again.
 
+**Restored from the model store** (:func:`restore_calibration`): entries come back per
+bay and serial with their ``s, b``, covariance and counts, their time re-based on the
+new clock from the stored age of their last accepted sample (an entry whose age is
+unknown, negative or past its stored expiry restarts its fresh-sample count, as on
+expiry). Entries from a ``stale`` file also carry ``"inflate": 2.0`` and
+``"confirm": 20``: a calibrated ``sigma_cal`` is multiplied by ``inflate`` until
+``confirm`` SMART samples of that serial have updated the entry (without SMART it
+stays inflated), the owner's stale rule.
+
 A new sample is one whose ``ts - age_s`` lies more than :data:`NEW_SAMPLE_EPS_S`
 after the previous one of that serial. Serial -> bay association:
 :mod:`aqua_bridge.control.associate`.
@@ -155,7 +164,8 @@ Memory (plain JSON)::
     {"v": 1, "fp": <structure fingerprint>, "ts": last ts,
      "zones": {zone: {"x": [...], "P": [[...]], "t_in": float | None}},
      "bays": {bay: {"occ", "low", "rise", "since", "assoc", "map"}},
-     "cal": {bay: {serial: {"th", "P", "n", "fresh", "rms2", "ts", "used"}}},
+     "cal": {bay: {serial: {"th", "P", "n", "fresh", "rms2", "ts", "used"
+                            [, "inflate", "confirm"]}}},
      "smart": {serial: {"ts", "t", "model", "hist"}},
      "series": associate series | None, "scores": {serial: {bay: score}},
      "pending": {bay: [serial, evaluations]}, "next_assoc": ts,
@@ -205,12 +215,14 @@ __all__ = [
     "MAX_PREDICT_S",
     "NEW_SAMPLE_EPS_S",
     "OCCUPIED",
+    "CAL_OFFSET_BOUNDS",
     "RESET_DRIVE_VAR",
     "SIGMA_CAL_FLOOR_C",
     "UNKNOWN",
     "EstimatorUpdate",
     "calibration_update",
     "drive_capacity",
+    "restore_calibration",
     "update",
 ]
 
@@ -256,6 +268,10 @@ CAL_PRIOR = (1.0 - PRIOR_BETA, PRIOR_OFFSET_C)
 CAL_PRIOR_VAR = (0.05, 4.0)
 CAL_ROW_VAR = 0.25
 CAL_SLOPE_BOUNDS = (0.3, 0.98)
+#: Offset of an accepted map, degC (the thermal parameter table's bounds on ``b``).
+CAL_OFFSET_BOUNDS = (-10.0, 10.0)
+#: sigma_cal factor of a calibration restored from a stale model file.
+STALE_SIGMA_CAL_FACTOR = 2.0
 CAL_MIN_SAMPLES = 20
 CAL_SLOPE_VAR_MAX = 0.01
 CAL_RMS_ALPHA = 0.1
@@ -544,6 +560,12 @@ def _parse(memory: object, st: _Structure) -> dict[str, Any]:
                 "ts": _opt_num(raw.get("ts")),
                 "used": bool(raw.get("used", False)),
             }
+            if "inflate" in raw:
+                inflate, confirm = _num(raw["inflate"]), raw.get("confirm")
+                if inflate < 1.0 or isinstance(confirm, bool) or not isinstance(confirm, int):
+                    raise ValueError("inflate")
+                entries[serial]["inflate"] = inflate
+                entries[serial]["confirm"] = confirm
         out["cal"][b] = entries
     for serial, raw in dict(memory.get("smart") or {}).items():
         if not isinstance(serial, str):
@@ -646,6 +668,11 @@ def calibration_update(
         "ts": float(ts),
         "used": bool(entry.get("used", False)),
     }
+    if "inflate" in entry:  # a stale restored calibration: confirmed by this many samples
+        confirm = int(entry.get("confirm", 0)) - 1
+        if confirm > 0:
+            out["inflate"] = float(entry["inflate"])
+            out["confirm"] = confirm
     return out, drive_residual
 
 
@@ -1129,6 +1156,7 @@ def update(
         calibrated = _calibrated(entry, float(ts), max_age_cal)
         sigma_cal = (
             max(SIGMA_CAL_FLOOR_C, math.sqrt(float(entry["rms2"])))  # type: ignore[index]
+            * float(entry.get("inflate", 1.0))  # type: ignore[union-attr]
             if calibrated
             else SIGMA_UNCALIBRATED_C
         )
@@ -1192,6 +1220,133 @@ def update(
     return EstimatorUpdate(
         estimates=estimates_out, memory=mem, zones=zones_out, bays=bays_out, summary=summary
     )
+
+
+# ---------------------------------------------------------------------------
+# model store
+# ---------------------------------------------------------------------------
+
+
+def _restored_entry(raw: object, ts: float, stale: bool) -> dict[str, Any]:
+    """One stored calibration entry in the new clock (module docstring); ``ValueError``
+    names the first problem."""
+    if not isinstance(raw, Mapping):
+        raise ValueError("not a mapping")
+    th = raw.get("th")
+    if not isinstance(th, list) or len(th) != 2 or not all(_finite(v) for v in th):
+        raise ValueError("th must be two finite numbers")
+    slope, offset = float(th[0]), float(th[1])
+    if not CAL_SLOPE_BOUNDS[0] <= slope <= CAL_SLOPE_BOUNDS[1]:
+        raise ValueError(f"slope {slope} outside {list(CAL_SLOPE_BOUNDS)}")
+    if not CAL_OFFSET_BOUNDS[0] <= offset <= CAL_OFFSET_BOUNDS[1]:
+        raise ValueError(f"offset {offset} outside {list(CAL_OFFSET_BOUNDS)}")
+    p = raw.get("P")
+    if (
+        not isinstance(p, list)
+        or len(p) != 2
+        or not all(isinstance(row, list) and len(row) == 2 for row in p)
+        or not all(_finite(v) for row in p for v in row)
+    ):
+        raise ValueError("P must be a finite 2x2 matrix")
+    cov = [[float(v) for v in row] for row in p]
+    if (
+        cov[0][0] < 0
+        or cov[1][1] < 0
+        or abs(cov[0][1] - cov[1][0]) > 1e-6 * max(1.0, abs(cov[0][0]), abs(cov[1][1]))
+    ):
+        raise ValueError("P is not a covariance")
+    n_all, fresh = raw.get("n"), raw.get("fresh")
+    for count in (n_all, fresh):
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("n and fresh must be integers >= 0")
+    assert isinstance(n_all, int) and isinstance(fresh, int)
+    if fresh > n_all:
+        raise ValueError("fresh exceeds n")
+    rms2 = raw.get("rms2")
+    if not _finite(rms2) or float(rms2) < 0:  # type: ignore[arg-type]
+        raise ValueError("rms2 must be a finite number >= 0")
+    used = raw.get("used", False)
+    if not isinstance(used, bool):
+        raise ValueError("used must be a bool")
+    age = raw.get("age_s")
+    entry: dict[str, Any] = {
+        "th": [slope, offset],
+        "P": cov,
+        "n": n_all,
+        "fresh": fresh,
+        "rms2": float(rms2),  # type: ignore[arg-type]
+        "ts": None,
+        "used": used,
+    }
+    if _finite(age) and float(age) >= 0 and raw.get("expired") is not True:  # type: ignore[arg-type]
+        entry["ts"] = float(ts) - float(age)  # type: ignore[arg-type]
+    else:  # unknown, negative or expired age: restart the fresh count (as on expiry)
+        entry["fresh"] = 0
+        if _finite(age) and float(age) >= 0:  # type: ignore[arg-type]
+            entry["ts"] = float(ts) - float(age)  # type: ignore[arg-type]
+    if stale:
+        entry["inflate"] = STALE_SIGMA_CAL_FACTOR
+        entry["confirm"] = CAL_MIN_SAMPLES
+    elif "inflate" in raw:
+        inflate, confirm = raw.get("inflate"), raw.get("confirm")
+        if (
+            not _finite(inflate)
+            or float(inflate) < 1.0  # type: ignore[arg-type]
+            or isinstance(confirm, bool)
+            or not isinstance(confirm, int)
+        ):
+            raise ValueError("inflate must be a number >= 1 with an integer confirm")
+        if confirm > 0:
+            entry["inflate"] = float(inflate)  # type: ignore[arg-type]
+            entry["confirm"] = confirm
+    return entry
+
+
+def restore_calibration(
+    memory: object, calibration: object, cfg: MpcConfig, *, ts: float, stale: bool
+) -> tuple[dict[str, Any], list[str]]:
+    """``(estimator memory, warnings)`` with the model store's calibrations installed.
+
+    ``calibration`` is ``{bay: {serial: {"th", "P", "n", "fresh", "rms2", "used",
+    "age_s", "expired"?, "inflate"?, "confirm"?}}}`` (``age_s``: seconds since the entry's
+    last accepted SMART sample at load time, ``None`` when unknown) and ``ts`` the clock of
+    the tick it is applied on. A bay that is not in the topology or an entry that is
+    malformed, not finite or outside the bounds (slope in :data:`CAL_SLOPE_BOUNDS`,
+    offset in :data:`CAL_OFFSET_BOUNDS`) is dropped with a warning; at most
+    ``CAL_SERIALS_PER_BAY`` entries per bay are kept (the most recent). Entries already in
+    ``memory`` (same bay and serial) are kept as they are. Pure; never raises for a bad
+    ``calibration`` (only for a legacy ``cfg``).
+    """
+    if cfg.topology is None or cfg.estimator is None:
+        raise ValueError("the estimator needs a zoned config (mpc.topology)")
+    st = _structure(cfg)
+    mem = _load(memory, st)
+    warnings: list[str] = []
+    if not isinstance(calibration, Mapping):
+        return mem, ["calibration: not a mapping, section dropped"]
+    for bay, per_serial in calibration.items():
+        if bay not in st.bays:
+            warnings.append(f"calibration: bay {bay!r} is not in the topology, dropped")
+            continue
+        if not isinstance(per_serial, Mapping):
+            warnings.append(f"calibration: bay {bay!r} is not a mapping, dropped")
+            continue
+        entries: dict[str, dict[str, Any]] = {}
+        for serial, raw in per_serial.items():
+            if not isinstance(serial, str) or not serial:
+                warnings.append(f"calibration: bay {bay!r} has an invalid serial, dropped")
+                continue
+            try:
+                entries[serial] = _restored_entry(raw, ts, stale)
+            except ValueError as exc:
+                warnings.append(f"calibration: {bay}/{serial}: {exc}; dropped")
+        newest = sorted(entries, key=lambda s: (-(entries[s]["ts"] or -1e300), s))
+        per_bay = mem["cal"].setdefault(bay, {})
+        for serial in newest[:CAL_SERIALS_PER_BAY]:
+            per_bay.setdefault(serial, entries[serial])
+        if not per_bay:
+            del mem["cal"][bay]
+    return mem, warnings
 
 
 def _declared_state(declared: bool | str, current: str) -> str:

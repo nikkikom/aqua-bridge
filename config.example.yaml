@@ -89,6 +89,10 @@ mpc:
   solver_outer_max: 4    # active-piece iterations per solve (>= 1)
   model_max_drift_c_per_min: 0.5  # validity gate: model drift at the estimate, degC/min (> 0)
   model_accept_prior: false  # true (needs topology): the MPC may act on a model that has not converged
+  # DAS model store ($STATE_DIRECTORY/model.json or --model-store PATH); inert in legacy mode.
+  model_store_interval_s: 600.0   # at most one write of model.json per interval, seconds (> 0)
+  model_store_max_age_days: 30.0  # an older file loads stale: shadow first, PI-DAS acts (> 0)
+  model_reconfirm_s: 3600.0       # a stale model acts after converged this long with its prediction error in bounds (>= 0)
 
 xt6:
   prefer: hwmon

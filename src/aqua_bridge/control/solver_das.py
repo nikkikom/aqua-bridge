@@ -115,8 +115,10 @@ Validity gate and model fallback
 --------------------------------
 On every solve tick the model must pass (:func:`check_model`):
 
-* the thermal status is ``converged`` or ``frozen`` (``frozen`` comes with the model
-  store, a later milestone); with ``model_accept_prior: true`` also ``prior`` /
+* the thermal status is ``converged`` or ``frozen`` (a model loaded from a fresh store
+  file, :mod:`aqua_bridge.control.persist`; ``stale``, a model from an old file still
+  re-confirming in shadow, is never accepted); with ``model_accept_prior: true`` also
+  ``prior`` /
   ``learning`` and ``off`` (no ``model_shadow``: the prior parameters) -- an owner
   opt-in this milestone adds, because without experiments and the store no model
   can reach ``converged`` yet (identification from regulation alone never does);

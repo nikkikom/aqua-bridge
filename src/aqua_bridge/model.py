@@ -91,6 +91,10 @@ choice for cooling:
   ``solver: mpc`` the legacy MPC weight rules do not apply (the DAS MPC tracks
   no setpoint); ``noise.weight_noise + weight_dpwm > 0`` is required instead.
   ``model_accept_prior: true`` needs ``topology``.
+* The model store keys (``model_store_interval_s``, ``model_store_max_age_days``,
+  ``model_reconfirm_s``; ``aqua_bridge.modelstore`` and
+  ``aqua_bridge.control.persist``) are flat keys as well, validated always and
+  inert in legacy mode (no store is built for a legacy config).
 """
 
 from __future__ import annotations
@@ -112,6 +116,8 @@ __all__ = [
     "IMPLICIT_ZONE",
     "ROLE_STUCK_S",
     "SENSOR_ROLES",
+    "STORE_KEY",
+    "STORE_SEED_KEY",
     "STUCK_WINDOW_SAMPLES",
     "TRUST_RULES",
     "BaySpec",
@@ -639,6 +645,13 @@ DAS_SECTIONS: tuple[str, ...] = (
 
 #: Name of the single zone that stands for the whole config in legacy mode.
 IMPLICIT_ZONE = "all"
+
+#: ``MpcState.solver_memory`` key of a model loaded from the store and not yet applied:
+#: ``aqua_bridge.modelstore`` puts it into the initial state and ``mpc.step`` applies it on
+#: its first zoned tick (``aqua_bridge.control.persist``).
+STORE_SEED_KEY = "store_seed"
+#: ``solver_memory`` key of what the store loaded (source, sections, warnings).
+STORE_KEY = "store"
 
 #: Placement roles of ``sensors.<name>.role``.
 SENSOR_ROLES: tuple[str, ...] = ("inlet", "zone_air", "drive_proximal", "exhaust")
@@ -1417,6 +1430,11 @@ class MpcConfig:
       active-piece iterations, the validity gate's equilibrium drift limit and whether
       a thermal model that has not converged (its prior or what it learnt so far) may
       drive the fans. Inert in legacy mode.
+    * ``model_store_interval_s`` / ``model_store_max_age_days`` / ``model_reconfirm_s`` --
+      the model store (``modelstore.py``, ``control/persist.py``): the shortest interval
+      between two writes of ``model.json``, the age above which a stored model loads
+      ``stale``, and how long a stale model must stay converged with its prediction
+      error in bounds before it may act again. Inert in legacy mode.
     * ``topology`` / ``sensors`` / ``drive_classes`` / ``fans`` / ``fan_models`` /
       ``zones`` / ``noise`` / ``estimator`` -- the zoned DAS layout (module
       docstring, *DAS layout*); all absent is legacy mode. With ``topology`` the
@@ -1479,6 +1497,9 @@ class MpcConfig:
     solver_outer_max: int = 4
     model_max_drift_c_per_min: float = 0.5
     model_accept_prior: bool = False
+    model_store_interval_s: float = 600.0
+    model_store_max_age_days: float = 30.0
+    model_reconfirm_s: float = 3600.0
 
     # -- construction -------------------------------------------------------
 
@@ -1549,6 +1570,9 @@ class MpcConfig:
             "rho_soft",
             "rho_hard",
             "model_max_drift_c_per_min",
+            "model_store_interval_s",
+            "model_store_max_age_days",
+            "model_reconfirm_s",
         ):
             s(self, name, _cfg_num(name, getattr(self, name)))
         s(self, "mpc_every_ticks", _cfg_int("mpc_every_ticks", self.mpc_every_ticks))
@@ -1803,6 +1827,16 @@ class MpcConfig:
             raise ConfigError(
                 f"mpc.model_max_pred_err_c must be > 0, got {self.model_max_pred_err_c}"
             )
+        if self.model_store_interval_s <= 0:
+            raise ConfigError(
+                f"mpc.model_store_interval_s must be > 0, got {self.model_store_interval_s}"
+            )
+        if self.model_store_max_age_days <= 0:
+            raise ConfigError(
+                f"mpc.model_store_max_age_days must be > 0, got {self.model_store_max_age_days}"
+            )
+        if self.model_reconfirm_s < 0:
+            raise ConfigError(f"mpc.model_reconfirm_s must be >= 0, got {self.model_reconfirm_s}")
 
     def _validate_das_mpc_keys(self) -> None:
         """Plan section 7 rules for the DAS MPC keys (inert in legacy mode)."""

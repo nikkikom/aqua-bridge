@@ -22,6 +22,14 @@ Order inside :func:`step`
    decimated Stuck windows are advanced first and dropped on a gap, too.)
 3b. Zone trust (:func:`aqua_bridge.control.zones.evaluate`). Legacy mode is
    one implicit zone whose verdict is exactly the whole-tick gate verdict.
+3b'. With zones, a model loaded from the store (``solver_memory["store_seed"]``, put
+   into the initial state by :mod:`aqua_bridge.modelstore`) is applied once, on the
+   first zoned tick, by :func:`aqua_bridge.control.persist.apply_seed` with this tick's
+   ``ts``: the thermal memory (``frozen`` from a fresh file, a stale hold from an old
+   one), the SMART calibrations and the fan curves go into ``solver_memory``; what was
+   loaded stays in ``solver_memory["store"]`` and is ``diagnostics["store"]`` on every
+   zoned tick. Never a raise, never a fault: whatever fails its checks starts at the
+   prior with a warning.
 3c. With zones, the estimator (:func:`aqua_bridge.control.estimator.update`,
    plan section 6 step 5a) runs every tick, fault ticks included, on the
    gate-trusted temperatures of this tick (none on a tick whose time status
@@ -94,7 +102,8 @@ Order inside :func:`step`
    (status, prediction error, coefficients). Any exception resets the memory to
    the prior with ``status: error`` (never a raise, never a fault; the DAS MPC,
    which reads this memory on the next tick, falls back to its PI-like DAS
-   form on a model in error). Without ``model_shadow`` nothing runs and
+   form on a model in error; a pending stale hold survives that reset, so a stale
+   model still has to re-confirm). Without ``model_shadow`` nothing runs and
    neither key exists.
 
 Zones and the global fields
@@ -163,8 +172,9 @@ stop regulating the healthy channels.
 channel -> int), ``stuck_latch`` (dict temperature -> band reference in
 degrees C, only latched temperatures; gate rule 3), with decimated Stuck
 windows ``stuck_slow`` and ``stuck_seq`` (gate module docstring), with zones
-``estimator`` (step 3c) and, with ``model_shadow``, ``thermal`` (step 8b), and one
-sub-dict per solver under ``solver.name``.
+``estimator`` (step 3c) and, with ``model_shadow``, ``thermal`` (step 8b), with a model
+store ``store`` and ``fan_curves`` (step 3b'), and one sub-dict per solver under
+``solver.name``.
 """
 
 from __future__ import annotations
@@ -176,7 +186,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from aqua_bridge.control import estimates, estimator, noise, thermal, zones
+from aqua_bridge.control import estimates, estimator, noise, persist, thermal, zones
 from aqua_bridge.control.gate import (
     GateResult,
     advance_slow_windows,
@@ -187,6 +197,8 @@ from aqua_bridge.control.solver_das import DasMpcSolver
 from aqua_bridge.control.solver_mpc import MpcSolver
 from aqua_bridge.control.solver_pi import PiSolver, Solver, SolverRequest, SolverResult
 from aqua_bridge.model import (
+    STORE_KEY,
+    STORE_SEED_KEY,
     FaultReason,
     Mode,
     MpcCommand,
@@ -496,6 +508,10 @@ def step(
             for name in cfg.temps
             if gate.per_temp[name] and time_status in ("ok", "first")
         }
+
+    # 3b'. a model loaded from the store, applied once (zones only; module docstring)
+    if das and STORE_SEED_KEY in mem:
+        persist.apply_seed(mem, cfg, mem.pop(STORE_SEED_KEY), obs.ts)
 
     # 3c. estimator (zones only; module docstring)
     est_block: dict[str, dict[str, Any]] = {}
@@ -810,6 +826,8 @@ def step(
         }
         if thermal_summary is not None:
             diagnostics["thermal"] = thermal_summary
+        if isinstance(mem.get(STORE_KEY), Mapping):
+            diagnostics["store"] = mem[STORE_KEY]
         diagnostics["noise"] = noise.noise_diagnostics(cfg, prev=prev, pwm=pwm, rpm=obs.rpm)
     cmd = MpcCommand(pwm=pwm, mode=mode, diagnostics=diagnostics)
 
@@ -898,6 +916,9 @@ def _thermal_shadow(
     except Exception as exc:  # identification never raises out of step and never faults
         error = f"{type(exc).__name__}: {exc}"[:200]
         memory = thermal.fresh_memory(cfg, status="error", error=error)
+        old = mem.get("thermal")
+        if isinstance(old, Mapping) and old.get("hold") is not None:
+            memory["hold"] = {"since": None}  # a stale model still re-confirms after a reset
         mem["thermal"] = memory
         return thermal.summary(memory, cfg, occupancy=occupancy)
     mem["thermal"] = result.memory
