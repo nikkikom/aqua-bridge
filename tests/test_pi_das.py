@@ -220,13 +220,23 @@ def test_step_regulates_hot_drives_up_and_cool_drives_down(lcfg):
 
 
 def test_step_reports_estimates_in_diagnostics(lcfg):
+    """The estimator is the provider: on its first tick it inverts the prior map, and its
+    sigma is the uncalibrated floor plus the (small) transient drive variance."""
     cmd, _ = run_ticks(lcfg, 1)
     diag = cmd.diagnostics["estimates"]
     assert set(diag) == {"a1", "a2", "b1"}
     a1 = diag["a1"]
     assert a1["t_c"] == pytest.approx(est.prior_drive_temp(PROX_C, SP))
-    assert (a1["soft_c"], a1["hard_c"], a1["margin_c"], a1["sigma_c"]) == (42.0, 47.0, 3.0, 1.5)
-    assert a1["zone_trusted"] and a1["source"] == "prior_map" and a1["calibrated"] is False
+    sigma = a1["sigma_c"]
+    assert est.SIGMA_UNCALIBRATED_C < sigma < 1.55
+    assert a1["margin_c"] == pytest.approx(2.0 * sigma)
+    assert a1["soft_c"] == pytest.approx(50.0 - 5.0 - 2.0 * sigma)
+    assert a1["hard_c"] == pytest.approx(50.0 - 2.0 * sigma)
+    assert a1["zone_trusted"] and a1["source"] == "estimator" and a1["calibrated"] is False
+    assert "q_w" in a1
+    assert cmd.diagnostics["estimator"]["status"] == "ok"
+    assert set(cmd.diagnostics["bays"]) == {"a1", "a2", "b1", "c1"}
+    assert cmd.diagnostics["bays"]["c1"]["occupancy"] == "empty"
     assert cmd.diagnostics["solver_diag"]["form"] == "margin_deficit"
 
 
@@ -243,9 +253,10 @@ def test_request_carries_only_eligible_zones_estimates(lcfg):
     req = spy.requests[-1]
     assert req.zone_trust == {"za": True, "zb": False, "zc": True}
     assert set(req.fixed_channels) == {"fa1", "fa2", "fb1"}
-    assert "b1" not in req.estimates  # never built from an untrusted zone
+    assert "b1" not in req.estimates  # never handed over from an untrusted zone
     assert cmd.diagnostics["estimates"]["a1"]["zone_trusted"]
-    assert "b1" not in cmd.diagnostics["estimates"]  # air_b untrusted: no estimate at all
+    # the estimator keeps predicting b1 without air_b; the display marks it untrusted
+    assert not cmd.diagnostics["estimates"]["b1"]["zone_trusted"]
 
 
 def test_unconstrained_channel_holds_through_many_ticks(lcfg):
@@ -273,4 +284,9 @@ def test_hot_ssd_is_regulated_against_its_own_class():
         prox_b1=prox_for(30.0),
         prox_a2=prox_for(44.0),
     )
-    assert cmd.diagnostics["solver_diag"]["error"]["fa1"] == pytest.approx(44.0 + 3.0 - 42.0)
+    a2 = cmd.diagnostics["estimates"]["a2"]
+    assert a2["class"] == "hdd" and a2["t_c"] == pytest.approx(44.0, abs=0.5)
+    assert cmd.diagnostics["solver_diag"]["worst_bay"]["fa1"] == "a2"
+    assert cmd.diagnostics["solver_diag"]["error"]["fa1"] == pytest.approx(
+        a2["t_c"] + a2["margin_c"] - a2["soft_c"]
+    )

@@ -56,7 +56,8 @@ def cfg(das_example_cfg: MpcConfig, solver_kind) -> MpcConfig:
 
 
 def prox_for(t_drive: float, t_air: float = 35.0) -> float:
-    """Proximal reading whose prior-map drive estimate is ``t_drive``."""
+    """Proximal reading whose prior-map drive estimate is ``t_drive`` (also the
+    estimator's estimate on the tick it initialises, which inverts the same map)."""
     return (1.0 - est.PRIOR_BETA) * t_drive + est.PRIOR_BETA * t_air + est.PRIOR_OFFSET_C
 
 
@@ -193,22 +194,30 @@ def test_saturation_pins_at_pwm_max_and_reports_it(cfg):
         obs = das_obs(cfg, i * cfg.dt, pwm=0.5, **all_prox(cfg, prox_for(60.0)), **air)
         cmd, state = checked_step(obs, cfg, state)
         modes.append(cmd.mode)
-        if cmd.mode is Mode.SATURATED:
-            assert all(v == pytest.approx(cfg.pwm_max) for v in cmd.pwm.values())
+        # honest per channel: a channel reported saturated sits at the rail (the zones'
+        # estimates differ slightly, so channels reach the rail on different ticks)
+        for ch, saturated in cmd.diagnostics["saturated"].items():
+            if saturated:
+                assert cmd.pwm[ch] == pytest.approx(cfg.pwm_max)
     assert modes[0] is Mode.AUTO and modes[-1] is Mode.SATURATED
+    assert all(v == pytest.approx(cfg.pwm_max) for v in cmd.pwm.values())
+    assert all(cmd.diagnostics["saturated"].values())
     assert all(v <= cfg.pwm_max + TOL for v in state.integrator.values())
 
 
 def test_drives_at_their_target_hold_the_output(cfg):
-    # soft 42 for hdd, e = t + 3 - 42 = 0 at t = 39
+    """soft 42 for hdd at sigma 1.5, e = t + 3 - 42 = 0 at t = 39. The estimator's sigma
+    starts a little above its settled value (the transient part of the drive variance
+    decays), so the output moves by a few thousandths at most and the estimates hold."""
     target = {n: prox_for(39.0) for n in all_prox(cfg, 0.0)}
     state = MpcState.cold()
-    first = None
     for i in range(40):
         cmd, state = checked_step(das_obs(cfg, i * cfg.dt, pwm=0.45, **target), cfg, state)
         assert cmd.mode is Mode.AUTO
-        first = cmd.pwm if first is None else first
-        assert cmd.pwm == pytest.approx(first, abs=1e-9)
+        assert cmd.pwm == pytest.approx(dict.fromkeys(cfg.channels, 0.45), abs=0.01)
+        for bay, entry in cmd.diagnostics["estimates"].items():
+            assert entry["t_c"] == pytest.approx(39.0, abs=0.05), bay
+            assert 1.5 <= entry["sigma_c"] <= 1.54, bay
 
 
 # ---------------------------------------------------------------------------

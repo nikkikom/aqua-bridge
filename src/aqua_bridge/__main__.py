@@ -178,8 +178,9 @@ class PlantIO:
     """Source and sink over one simulated plant (``sim.plant.Plant`` or ``sim.das.DasPlant``).
 
     ``read`` reports the plant's current observation restricted to
-    ``cfg.temps``; ``apply`` feeds the command in and advances the plant one
-    ``dt``, so the observation clock is the plant's ``ts``.
+    ``cfg.temps`` (plus the DAS plant's SMART view as ``inputs["smart"]`` when a
+    drive reports one); ``apply`` feeds the command in and advances the plant
+    one ``dt``, so the observation clock is the plant's ``ts``.
     """
 
     def __init__(self, plant: Any, cfg: MpcConfig) -> None:
@@ -190,7 +191,15 @@ class PlantIO:
     def read(self) -> PlantObservation:
         obs = self.plant.observe()
         temps = {name: obs.temps.get(name) for name in self.cfg.temps}
-        return PlantObservation(temps=temps, rpm=dict(obs.rpm), pwm=dict(obs.pwm), ts=obs.ts)
+        observe_smart = getattr(self.plant, "observe_smart", None)
+        smart = observe_smart() if callable(observe_smart) else {}
+        return PlantObservation(
+            temps=temps,
+            rpm=dict(obs.rpm),
+            pwm=dict(obs.pwm),
+            ts=obs.ts,
+            inputs={"smart": smart} if smart else {},
+        )
 
     def apply(self, cmd: MpcCommand) -> None:
         self.applied.append(cmd)

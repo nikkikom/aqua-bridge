@@ -22,13 +22,23 @@ Order inside :func:`step`
    decimated Stuck windows are advanced first and dropped on a gap, too.)
 3b. Zone trust (:func:`aqua_bridge.control.zones.evaluate`). Legacy mode is
    one implicit zone whose verdict is exactly the whole-tick gate verdict.
-   With zones, the drive estimates block follows
-   (:func:`aqua_bridge.control.estimates.prior_estimates`, the prior-map
-   provider until the estimator milestone): it is built from the
-   gate-trusted temperatures every tick, fault ticks included, and is not
-   an input of zone trust (``zones.evaluate`` gets ``estimates=None``: the
-   prior map has no uncertainty that grows with a lost sensor, so the
-   ``sigma`` trust rule keeps falling back to ``strict``).
+3c. With zones, the estimator (:func:`aqua_bridge.control.estimator.update`,
+   plan section 6 step 5a) runs every tick, fault ticks included, on the
+   gate-trusted temperatures of this tick (none on a tick whose time status
+   is not ``first`` / ``ok``), the command ``prev`` and
+   ``obs.inputs["smart"]``; its memory is ``solver_memory["estimator"]`` and
+   its estimates block feeds the solver and the diagnostics. It is not an
+   input of zone trust (``zones.evaluate`` gets ``estimates=None``, so the
+   ``sigma`` trust rule still applies ``strict``). Any exception from it is an
+   *estimator fault*: its memory is dropped (the next tick starts over), the
+   diagnostics fall back to the prior map
+   (:func:`aqua_bridge.control.estimates.prior_estimates`) and, when the
+   solver regulates on the estimates (``cfg.regulates_drive_limits``), every
+   zone with a constrained bay (``occupied: true`` / ``auto``) is untrusted
+   this tick with reason ``estimator`` and fault reason ``solver`` (without
+   estimates nothing in it can be constrained). A zoned config that still
+   regulates on setpoints does not read the estimates, so there the fault is
+   only reported.
 4. Fault bookkeeping, per zone: an untrusted tick resets the zone's streak
    and opens its fault timer (``since`` is kept, never restarted, while
    the zone's fault is active -- Flicker must not reset the hold). A
@@ -86,10 +96,15 @@ the largest fault tick count. ``MpcState.in_fault`` is therefore true in
 ``degraded`` as well as ``fallback``. Diagnostics add ``zones`` (per zone:
 trusted, reasons, fault timer, ``in_closure``, channels, policy),
 ``zones_in_fault``, ``fallback_channels``, ``policy_by_channel``,
-``trust_rule`` and ``estimates`` (per bay with a computable estimate, any
+``trust_rule``, ``estimates`` (per constrained bay with an estimate, any
 zone: ``t_c``, ``sigma_c``, ``margin_c``, ``soft_c``, ``hard_c``, ``limit_c``,
-``occupancy``, ``class``, ``zone``, ``zone_trusted``, ``calibrated``,
-``source``); ``policy`` becomes ``mixed`` when channels differ. Without
+``limit_margin_c`` (``hard_c - t_c``), ``occupancy``, ``class``, ``zone``,
+``zone_trusted``, ``calibrated``,
+``source`` and, from the estimator, ``q_w``), ``bays`` (every bay: occupancy,
+class, serial association, calibration, association candidates; see
+:class:`~aqua_bridge.control.estimator.EstimatorUpdate`) and ``estimator``
+(``status`` ``ok`` | ``error``, ``error``, per zone air estimate, SMART
+counters); ``policy`` becomes ``mixed`` when channels differ. Without
 ``setpoints`` the ``pi`` solver regulates the margin deficit of the drives
 (PI-like DAS form, :mod:`aqua_bridge.control.solver_pi`). A zoned config
 that still declares setpoints keeps the per-zone setpoint regulation: ``pi``
@@ -142,7 +157,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from aqua_bridge.control import estimates, zones
+from aqua_bridge.control import estimates, estimator, zones
 from aqua_bridge.control.gate import (
     GateResult,
     advance_slow_windows,
@@ -446,6 +461,34 @@ def step(
             if gate.per_temp[name] and time_status in ("ok", "first")
         }
 
+    # 3c. estimator (zones only; module docstring)
+    est_block: dict[str, dict[str, Any]] = {}
+    est_update: estimator.EstimatorUpdate | None = None
+    estimator_error: str | None = None
+    estimator_faulted: set[str] = set()
+    if das:
+        try:
+            est_update = estimator.update(
+                mem.get("estimator"),
+                cfg,
+                temps=trusted_temps,
+                u=prev,
+                ts=obs.ts,
+                smart=obs.inputs.get("smart"),
+            )
+            est_block = est_update.estimates
+        except Exception as exc:  # an estimator failure is a fault, never a raise out of step
+            estimator_error = f"{type(exc).__name__}: {exc}"[:200]
+            est_block = estimates.prior_estimates(cfg, trusted_temps)
+            if cfg.regulates_drive_limits and cfg.topology is not None:
+                constrained = {b.zone for b in cfg.topology.bays.values() if b.constrained}
+                estimator_faulted = {z for z in zone_names if z in constrained}
+        for zone in estimator_faulted:
+            verdicts[zone] = zones.ZoneTrust(
+                trusted=False,
+                reasons=(*verdicts[zone].reasons, f"estimator:{estimator_error}"),
+            )
+
     # 4. fault bookkeeping per zone
     books = _read_books(state, mem, cfg)
     for zone in zone_names:
@@ -456,7 +499,9 @@ def step(
             book.streak = 0
             if book.since is None:
                 book.since = obs.ts
-            book.reason = FaultReason.SENSOR_GATE
+            book.reason = (
+                FaultReason.SOLVER if zone in estimator_faulted else FaultReason.SENSOR_GATE
+            )
     eligible = [
         z
         for z in zone_names
@@ -515,7 +560,12 @@ def step(
                     if ch in fixed_pre
                 },
                 zone_trust={z: z in usable_zones for z in zone_names},
-                estimates=estimates.prior_estimates(cfg, trusted_temps, usable_zones),
+                estimates={b: e for b, e in est_block.items() if e["zone"] in usable_zones},
+                occupancy=(
+                    {}
+                    if est_update is None
+                    else {b: info["occupancy"] for b, info in est_update.bays.items()}
+                ),
             )
         else:
             temps = {name: float(gate.filtered[name]) for name in cfg.temps}  # type: ignore[arg-type]
@@ -702,9 +752,14 @@ def step(
         diagnostics["fallback_channels"] = [ch for ch in cfg.channels if ch in ch_elapsed]
         diagnostics["policy_by_channel"] = policy_by_channel
         diagnostics["trust_rule"] = zones.effective_trust_rule(cfg)
-        diagnostics["estimates"] = _estimate_diagnostics(
-            estimates.prior_estimates(cfg, trusted_temps), verdicts, faulted
-        )
+        diagnostics["estimates"] = _estimate_diagnostics(est_block, verdicts, faulted)
+        diagnostics["bays"] = {} if est_update is None else est_update.bays
+        diagnostics["estimator"] = {
+            "status": "ok" if estimator_error is None else "error",
+            "error": estimator_error,
+            "zones": {} if est_update is None else est_update.zones,
+            **({} if est_update is None else est_update.summary),
+        }
     cmd = MpcCommand(pwm=pwm, mode=mode, diagnostics=diagnostics)
 
     # 9. next state (gate rule 5: raw values and cmd.pwm always go into the window)
@@ -718,6 +773,10 @@ def step(
     else:
         mem.pop("stuck_slow", None)
         mem.pop("stuck_seq", None)
+    if est_update is not None:
+        mem["estimator"] = est_update.memory
+    else:  # legacy mode, or an estimator fault: the next tick starts over
+        mem.pop("estimator", None)
     mem[solver_name] = solver_mem
     if das:
         integrator = {ch: v for ch, v in integrator.items() if ch not in ch_elapsed}
@@ -768,10 +827,13 @@ def _estimate_diagnostics(
             "soft_c": est["soft"],
             "hard_c": est["hard"],
             "limit_c": est["limit"],
+            "limit_margin_c": est["hard"] - est["t"],
             "zone_trusted": verdicts[zone].trusted and zone not in faulted,
             "calibrated": est["calibrated"],
             "source": est["source"],
         }
+        if "q_w" in est:
+            out[bay]["q_w"] = est["q_w"]
     return out
 
 

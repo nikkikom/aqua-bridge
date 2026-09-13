@@ -46,7 +46,9 @@ from ``SolverRequest.estimates`` (:mod:`aqua_bridge.control.estimates`)::
 
 with ``margin = k * sigma`` and ``soft = limit - comfort - k * sigma``; the rest
 (integrator, anti-windup, bumpless start) is exactly the PI above, and the
-solver keeps ``name = "pi"``. The served zones are the zones that list the
+solver keeps ``name = "pi"``. A bay is constrained unless it is declared
+``occupied: false`` or the estimator reports it ``empty`` this tick
+(``SolverRequest.occupancy``). The served zones are the zones that list the
 channel plus their declared ``coupled_to``: the drives next door feel the
 channel's air too, so the channel works for them as well; drives of unknown
 occupancy count. The formula is the plan's as written, and it counts
@@ -118,6 +120,9 @@ class SolverRequest:
       (empty in legacy mode)
     * ``estimates``      -- bay -> estimate entry (``aqua_bridge.control.estimates``) for
       the constrained bays of trusted zones (empty in legacy mode)
+    * ``occupancy``      -- bay -> ``occupied`` | ``unknown`` | ``empty`` as the estimator
+      sees it this tick; a bay missing here falls back to its declaration
+      (``occupied: false`` is empty, anything else constrained)
     """
 
     temps: dict[str, float]
@@ -127,6 +132,7 @@ class SolverRequest:
     fixed_channels: dict[str, float] = field(default_factory=dict)
     zone_trust: dict[str, bool] = field(default_factory=dict)
     estimates: dict[str, dict[str, Any]] = field(default_factory=dict)
+    occupancy: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -187,12 +193,14 @@ def channel_margin_errors(
     estimates: Mapping[str, Mapping[str, Any]],
     zone_trust: Mapping[str, bool],
     skip: Container[str] = (),
+    occupancy: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, float], dict[str, str | None]]:
     """Margin deficit per channel and the bay that sets it (module docstring, DAS form).
 
     Returns ``(errors, worst_bay)``; ``worst_bay[ch]`` is ``None`` for an
-    unconstrained channel (error 0). Raises ``KeyError`` when a constrained bay
-    of a trusted served zone has no estimate.
+    unconstrained channel (error 0). A bay is skipped when it is declared
+    ``occupied: false`` or ``occupancy`` reports it ``empty``. Raises ``KeyError``
+    when any other bay of a trusted served zone has no estimate.
     """
     topo = cfg.topology
     if topo is None:
@@ -207,6 +215,8 @@ def channel_margin_errors(
         best: tuple[float, str] | None = None
         for bay, spec in topo.bays.items():
             if not spec.constrained or spec.zone not in served or not zone_trust.get(spec.zone):
+                continue
+            if occupancy is not None and occupancy.get(bay) == "empty":
                 continue
             est = estimates[bay]
             e = float(est["t"]) + float(est["margin"]) - float(est["soft"])
@@ -233,7 +243,9 @@ class PiSolver:
         cfg: MpcConfig, req: SolverRequest
     ) -> tuple[dict[str, float], dict[str, str | None] | None]:
         if cfg.regulates_drive_limits:
-            return channel_margin_errors(cfg, req.estimates, req.zone_trust, req.fixed_channels)
+            return channel_margin_errors(
+                cfg, req.estimates, req.zone_trust, req.fixed_channels, req.occupancy
+            )
         return channel_errors(cfg, req.temps, req.fixed_channels), None
 
     def initialise(

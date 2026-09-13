@@ -1427,9 +1427,9 @@ def run_das_closed_loop(
     Per tick: truth is recorded, ``obs = plant.observe()`` restricted to
     ``cfg.temps`` (a missing name reads ``None``), ``observe_hook(i, obs)``
     may replace it (lie injection), ``smart_hook(i, smart)`` may replace the
-    SMART view, the controller steps, the plant is ``apply``-ed and advanced.
-    Until ``PlantObservation`` carries ``inputs`` the SMART view is recorded
-    in the series only.
+    SMART view, which the controller then receives as ``obs.inputs["smart"]``
+    (omitted while empty, so a plant without SMART observes exactly as before),
+    the controller steps, the plant is ``apply``-ed and advanced.
     """
     p = plant.params
     st = MpcState.cold() if state is None else state
@@ -1485,6 +1485,14 @@ def run_das_closed_loop(
         if smart_hook is not None:
             smart = smart_hook(i, smart)
         series["smart"].append(smart)
+        if smart:
+            obs = PlantObservation(
+                temps=obs.temps,
+                rpm=obs.rpm,
+                pwm=obs.pwm,
+                ts=obs.ts,
+                inputs={**obs.inputs, "smart": smart},
+            )
         push("obs", obs.temps)
         cmd, st = controller(obs, cfg, st)
         push("pwm_cmd", cmd.pwm)
