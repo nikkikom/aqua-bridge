@@ -82,8 +82,9 @@ jobs:
       - name: shellcheck version
         run: shellcheck --version | head -2
 
+      # "nightly" tests (heavy sweeps, long simulations) run only in nightly-fuzz.
       - name: pytest
-        run: pytest -m "not hardware" --durations=15
+        run: pytest -m "not hardware and not nightly" --durations=15
 
   nightly-fuzz:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
