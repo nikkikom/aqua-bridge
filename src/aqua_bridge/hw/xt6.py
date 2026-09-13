@@ -24,6 +24,7 @@ MPC) -- see the static AST check in ``tests/test_hw_map.py`` /
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -209,6 +210,79 @@ def _check_keys(label: str, mapping: Mapping[str, Any], expected: Sequence[str],
         )
 
 
+#: Keys allowed inside one ``xt6.fans`` entry.
+_FAN_ENTRY_KEYS = ("pwm", "rpm")
+#: hwmon attribute names accepted per role (bare names, no ``_input`` suffix).
+_ATTR_PATTERNS = {
+    "pwm": re.compile(r"pwm[1-9][0-9]*"),
+    "rpm": re.compile(r"fan[1-9][0-9]*"),
+    "temp": re.compile(r"temp[1-9][0-9]*"),
+}
+#: Pre-``fans`` keys and what replaced them.
+_LEGACY_KEYS = {
+    "map": "xt6.fans.<channel>.pwm",
+    "fan_map": "xt6.fans.<channel>.rpm",
+}
+_FANS_EXAMPLE = "radiator: {pwm: pwm1, rpm: fan1}"
+
+
+def _check_attr(where: str, role: str, value: Any) -> str:
+    if not isinstance(value, str) or not _ATTR_PATTERNS[role].fullmatch(value):
+        expected = {"pwm": "pwmN", "rpm": "fanN", "temp": "tempN"}[role]
+        raise ConfigError(
+            f"{where} must be a hwmon attribute name like {expected!r}, got {value!r}"
+        )
+    return value
+
+
+def _parse_fans(xt6_section: Mapping[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
+    """``xt6.fans`` -> ``(pwm_map, fan_map)``, both keyed by the channel name.
+
+    One entry per fan names the channel once and carries both attributes,
+    so a PWM output and its tachometer can never end up under two different
+    (for example misspelt) names::
+
+        fans:
+          radiator: {pwm: pwm1, rpm: fan1}
+          intake:   {pwm: pwm2}            # rpm is optional
+    """
+    for legacy, replacement in _LEGACY_KEYS.items():
+        if legacy in xt6_section:
+            raise ConfigError(
+                f"xt6.{legacy} is no longer supported; use {replacement}, one entry per fan: "
+                f"'fans: {{{_FANS_EXAMPLE}}}'"
+            )
+    fans = xt6_section.get("fans")
+    if fans is None:
+        raise ConfigError(
+            f"xt6.fans is required: one entry per fan channel, e.g. '{_FANS_EXAMPLE}'"
+        )
+    if not isinstance(fans, Mapping):
+        raise ConfigError(f"xt6.fans must be a mapping, got {type(fans).__name__}")
+    pwm_map: dict[str, str] = {}
+    fan_map: dict[str, str] = {}
+    for channel, entry in fans.items():
+        if not isinstance(channel, str) or not channel:
+            raise ConfigError(f"xt6.fans keys must be non-empty channel names, got {channel!r}")
+        where = f"xt6.fans.{channel}"
+        if not isinstance(entry, Mapping):
+            raise ConfigError(
+                f"{where} must be a mapping like {{pwm: pwm1, rpm: fan1}}, "
+                f"got {type(entry).__name__} {entry!r}"
+            )
+        unknown = sorted(str(k) for k in entry if k not in _FAN_ENTRY_KEYS)
+        if unknown:
+            raise ConfigError(
+                f"{where}: unknown key(s) {unknown}; allowed: {list(_FAN_ENTRY_KEYS)}"
+            )
+        if "pwm" not in entry:
+            raise ConfigError(f"{where}.pwm is required (the hwmon PWM attribute, e.g. 'pwm1')")
+        pwm_map[channel] = _check_attr(f"{where}.pwm", "pwm", entry["pwm"])
+        if entry.get("rpm") is not None:
+            fan_map[channel] = _check_attr(f"{where}.rpm", "rpm", entry["rpm"])
+    return pwm_map, fan_map
+
+
 def build_map_from_config(
     xt6_section: Mapping[str, Any],
     *,
@@ -220,11 +294,30 @@ def build_map_from_config(
     Not part of the hot read/apply path; kept here so the glue/loop code
     does not need to know the exact ``HwmonMap`` field names.
 
+    Section shape::
+
+        xt6:
+          hwmon_name: aquaero
+          fans:                       # one entry per fan channel
+            radiator: {pwm: pwm1, rpm: fan1}
+            intake:   {pwm: pwm2, rpm: fan2}
+          temp_map:                   # logical temperature -> tempN
+            coolant: temp1
+          root: /sys/class/hwmon      # optional
+
+    Each fan names its channel once, with the PWM attribute and the
+    optional tachometer attribute side by side (see :func:`_parse_fans`).
+    The old ``map`` / ``fan_map`` pair is rejected with a hint: a typo in
+    one of two repeated names used to split one fan into a PWM-only channel
+    and an RPM reading nobody looks at. Unknown keys inside an entry
+    (``rmp:``) and attribute names of the wrong kind (``rpm: pwm1``) are
+    config errors too.
+
     ``channels`` / ``temps`` are the ``mpc`` section's tuples (passed as plain
     sequences: this module must not know ``MpcConfig``). When given, the
-    ``map`` keys must equal ``channels`` and the ``temp_map`` keys must equal
+    ``fans`` keys must equal ``channels`` and the ``temp_map`` keys must equal
     ``temps``, or :class:`~aqua_bridge.model.ConfigError` is raised at
-    startup. Without the check a channel missing from ``map`` is silently
+    startup. Without the check a channel missing from ``fans`` is silently
     never written (the fan stays on whatever the firmware last had while
     the controller believes it commands it), and a temperature missing from
     or extra in ``temp_map`` makes every observation fail the gate, so the
@@ -235,23 +328,24 @@ def build_map_from_config(
         raise ConfigError(f"xt6 section must be a mapping, got {type(xt6_section).__name__}")
     if not xt6_section.get("hwmon_name"):
         raise ConfigError("xt6.hwmon_name is required (the hwmon 'name' file content)")
-    for key in ("map", "temp_map", "fan_map"):
-        value = xt6_section.get(key)
-        if value is not None and not isinstance(value, Mapping):
-            raise ConfigError(f"xt6.{key} must be a mapping, got {type(value).__name__}")
-    pwm_map = dict(xt6_section.get("map") or {})
-    temp_map = dict(xt6_section.get("temp_map") or {})
+    pwm_map, fan_map = _parse_fans(xt6_section)
+    temp_section = xt6_section.get("temp_map")
+    if temp_section is not None and not isinstance(temp_section, Mapping):
+        raise ConfigError(f"xt6.temp_map must be a mapping, got {type(temp_section).__name__}")
+    temp_map = {
+        name: _check_attr(f"xt6.temp_map.{name}", "temp", attr)
+        for name, attr in dict(temp_section or {}).items()
+    }
     if channels is not None:
-        _check_keys("map", pwm_map, channels, "mpc.channels")
+        _check_keys("fans", pwm_map, channels, "mpc.channels")
     if temps is not None:
         _check_keys("temp_map", temp_map, temps, "mpc.temps")
     kwargs: dict[str, Any] = {
         "hwmon_name": xt6_section["hwmon_name"],
         "pwm_map": pwm_map,
         "temp_map": temp_map,
+        "fan_map": fan_map,
     }
-    if xt6_section.get("fan_map") is not None:
-        kwargs["fan_map"] = dict(xt6_section["fan_map"])
     if "root" in xt6_section:
         kwargs["root"] = xt6_section["root"]
     try:

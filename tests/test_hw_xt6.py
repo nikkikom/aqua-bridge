@@ -254,31 +254,131 @@ def test_apply_rechecks_enable_every_tick_but_writes_only_when_needed(tmp_path: 
 
 _SECTION = {
     "hwmon_name": "aquaero",
-    "map": {"radiator": "pwm1", "intake": "pwm2"},
+    "fans": {
+        "radiator": {"pwm": "pwm1", "rpm": "fan1"},
+        "intake": {"pwm": "pwm2"},
+    },
     "temp_map": {"coolant": "temp1", "air": "temp2"},
 }
+_CHANNELS = ("radiator", "intake")
+_TEMPS = ("coolant", "air")
 
 
 def test_build_map_matching_mpc_section_is_accepted() -> None:
-    hmap = build_map_from_config(
-        _SECTION, channels=("radiator", "intake"), temps=("coolant", "air")
-    )
-    assert hmap.pwm_map == _SECTION["map"] and hmap.temp_map == _SECTION["temp_map"]
+    hmap = build_map_from_config(_SECTION, channels=_CHANNELS, temps=_TEMPS)
+    assert hmap.pwm_map == {"radiator": "pwm1", "intake": "pwm2"}
+    assert hmap.fan_map == {"radiator": "fan1"}  # rpm is optional per fan
+    assert hmap.temp_map == _SECTION["temp_map"]
     # without the mpc tuples the check is skipped (mapping-only callers)
-    assert build_map_from_config(_SECTION).pwm_map == _SECTION["map"]
+    assert build_map_from_config(_SECTION).pwm_map == hmap.pwm_map
 
 
-def test_build_map_rejects_channel_missing_from_map() -> None:
-    """A channel in mpc.channels absent from xt6.map would be silently never written."""
-    section = dict(_SECTION, map={"radiator": "pwm1"})
-    with pytest.raises(ConfigError, match="xt6.map.*missing \\['intake'\\]"):
-        build_map_from_config(section, channels=("radiator", "intake"), temps=("coolant", "air"))
+def test_fans_entry_names_the_channel_once_for_pwm_and_rpm() -> None:
+    """The point of the syntax: PWM and tachometer share one key, so they cannot drift
+    apart into two differently spelt channels."""
+    hmap = build_map_from_config(_SECTION, channels=_CHANNELS, temps=_TEMPS)
+    assert set(hmap.fan_map) <= set(hmap.pwm_map)
 
 
-def test_build_map_rejects_extra_channel_in_map() -> None:
-    section = dict(_SECTION, map={**_SECTION["map"], "pump": "pwm3"})
+def test_fans_parse_from_one_line_yaml_flow_mappings() -> None:
+    import yaml
+
+    section = yaml.safe_load(
+        """
+hwmon_name: aquaero
+fans:
+  radiator: {pwm: pwm1, rpm: fan1}
+  intake:   {pwm: pwm2, rpm: fan2}
+temp_map: {coolant: temp1, air: temp2}
+"""
+    )
+    hmap = build_map_from_config(section, channels=_CHANNELS, temps=_TEMPS)
+    assert hmap.pwm_map == {"radiator": "pwm1", "intake": "pwm2"}
+    assert hmap.fan_map == {"radiator": "fan1", "intake": "fan2"}
+
+
+def test_build_map_rejects_channel_missing_from_fans() -> None:
+    """A channel in mpc.channels absent from xt6.fans would be silently never written."""
+    section = dict(_SECTION, fans={"radiator": {"pwm": "pwm1"}})
+    with pytest.raises(ConfigError, match="xt6.fans.*missing \\['intake'\\]"):
+        build_map_from_config(section, channels=_CHANNELS, temps=_TEMPS)
+
+
+def test_build_map_rejects_extra_channel_in_fans() -> None:
+    section = dict(_SECTION, fans={**_SECTION["fans"], "pump": {"pwm": "pwm3"}})
     with pytest.raises(ConfigError, match="extra \\['pump'\\]"):
-        build_map_from_config(section, channels=("radiator", "intake"), temps=("coolant", "air"))
+        build_map_from_config(section, channels=_CHANNELS, temps=_TEMPS)
+
+
+def test_misspelt_channel_in_fans_is_a_startup_error() -> None:
+    section = dict(
+        _SECTION, fans={"radaitor": {"pwm": "pwm1", "rpm": "fan1"}, "intake": {"pwm": "pwm2"}}
+    )
+    with pytest.raises(ConfigError, match="missing \\['radiator'\\], extra \\['radaitor'\\]"):
+        build_map_from_config(section, channels=_CHANNELS, temps=_TEMPS)
+
+
+@pytest.mark.parametrize("legacy", ["map", "fan_map"])
+def test_legacy_map_keys_are_rejected_with_a_hint(legacy: str) -> None:
+    section = dict(_SECTION, **{legacy: {"radiator": "pwm1"}})
+    with pytest.raises(ConfigError, match=f"xt6.{legacy} is no longer supported.*xt6.fans"):
+        build_map_from_config(section, channels=_CHANNELS, temps=_TEMPS)
+
+
+@pytest.mark.parametrize(
+    ("fans", "match"),
+    [
+        (None, "xt6.fans is required"),
+        (["radiator"], "xt6.fans must be a mapping"),
+        ({"radiator": "pwm1", "intake": {"pwm": "pwm2"}}, "xt6.fans.radiator must be a mapping"),
+        (
+            {"radiator": {"rpm": "fan1"}, "intake": {"pwm": "pwm2"}},
+            "xt6.fans.radiator.pwm is required",
+        ),
+        (
+            {"radiator": {"pwm": "pwm1", "rmp": "fan1"}, "intake": {"pwm": "pwm2"}},
+            "unknown key\\(s\\) \\['rmp'\\]",
+        ),
+        ({"radiator": {"pwm": "fan1"}, "intake": {"pwm": "pwm2"}}, "xt6.fans.radiator.pwm must be"),
+        (
+            {"radiator": {"pwm": "pwm1", "rpm": "pwm1"}, "intake": {"pwm": "pwm2"}},
+            "xt6.fans.radiator.rpm must be",
+        ),
+        (
+            {"radiator": {"pwm": "pwm1", "rpm": 1}, "intake": {"pwm": "pwm2"}},
+            "xt6.fans.radiator.rpm must be",
+        ),
+        ({"radiator": {"pwm": "pwm1"}, "intake": {"pwm": "pwm1"}}, "same hwmon attribute 'pwm1'"),
+        (
+            {"radiator": {"pwm": "pwm1", "rpm": "fan1"}, "intake": {"pwm": "pwm2", "rpm": "fan1"}},
+            "same hwmon attribute 'fan1'",
+        ),
+    ],
+    ids=[
+        "missing",
+        "not_mapping",
+        "entry_is_bare_string",
+        "no_pwm",
+        "typo_in_key",
+        "pwm_names_a_tachometer",
+        "rpm_names_a_pwm",
+        "rpm_not_string",
+        "two_fans_one_pwm",
+        "two_fans_one_tachometer",
+    ],
+)
+def test_malformed_fans_entry_is_config_error(fans, match: str) -> None:
+    section = {k: v for k, v in _SECTION.items() if k != "fans"}
+    if fans is not None:
+        section["fans"] = fans
+    with pytest.raises(ConfigError, match=match):
+        build_map_from_config(section, channels=_CHANNELS, temps=_TEMPS)
+
+
+def test_temp_map_attribute_must_be_a_temp_input() -> None:
+    section = dict(_SECTION, temp_map={"coolant": "fan1", "air": "temp2"})
+    with pytest.raises(ConfigError, match="xt6.temp_map.coolant must be"):
+        build_map_from_config(section, channels=_CHANNELS, temps=_TEMPS)
 
 
 @pytest.mark.parametrize(
@@ -294,7 +394,7 @@ def test_build_map_rejects_temp_map_not_equal_to_mpc_temps(temp_map) -> None:
     startup error (section 3 gate rule 2)."""
     section = dict(_SECTION, temp_map=temp_map)
     with pytest.raises(ConfigError, match="xt6.temp_map"):
-        build_map_from_config(section, channels=("radiator", "intake"), temps=("coolant", "air"))
+        build_map_from_config(section, channels=_CHANNELS, temps=_TEMPS)
 
 
 @pytest.mark.parametrize(
@@ -302,10 +402,11 @@ def test_build_map_rejects_temp_map_not_equal_to_mpc_temps(temp_map) -> None:
     [
         {},
         {"hwmon_name": ""},
-        {"hwmon_name": "aquaero", "map": ["pwm1"]},
-        {"hwmon_name": "aquaero", "map": {"a": "pwm1", "b": "pwm1"}},
+        {"hwmon_name": "aquaero", "fans": ["pwm1"]},
+        {"hwmon_name": "aquaero", "fans": {"a": {"pwm": "pwm1"}, "b": {"pwm": "pwm1"}}},
+        {"hwmon_name": "aquaero", "fans": {"a": {"pwm": "pwm1"}}, "temp_map": ["temp1"]},
     ],
-    ids=["no_name", "empty_name", "map_not_mapping", "duplicate_target"],
+    ids=["no_name", "empty_name", "fans_not_mapping", "duplicate_target", "temp_map_not_mapping"],
 )
 def test_build_map_malformed_section_is_config_error(section) -> None:
     with pytest.raises(ConfigError):
@@ -328,7 +429,11 @@ def test_silently_unwritten_channel_is_caught_at_build_time(tmp_path: Path) -> N
     assert (dev / "pwm2").read_text() == "64"  # untouched: exactly what the check prevents
     with pytest.raises(ConfigError):
         build_map_from_config(
-            {"hwmon_name": "aquaero", "map": {"radiator": "pwm1"}, "temp_map": hmap.temp_map},
+            {
+                "hwmon_name": "aquaero",
+                "fans": {"radiator": {"pwm": "pwm1"}},
+                "temp_map": hmap.temp_map,
+            },
             channels=("radiator", "intake"),
             temps=("coolant", "air"),
         )

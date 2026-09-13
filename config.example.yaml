@@ -57,9 +57,9 @@ mpc:
 xt6:
   prefer: hwmon
   hwmon_name: aquaero    # /sys/class/hwmon/*/name to look for
-  map:                   # fan channel -> hwmon pwmN
-    radiator: pwm1
-    intake: pwm2
+  fans:                  # one entry per mpc.channels name: PWM attribute and optional tachometer
+    radiator: {pwm: pwm1, rpm: fan1}
+    intake:   {pwm: pwm2, rpm: fan2}
   temp_map:              # logical temperature -> hwmon tempN
     coolant: temp1
     air: temp2

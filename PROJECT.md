@@ -461,8 +461,8 @@ reading leaves it. After 10 ticks `diagnostics["fan_stall"][ch]` is
 at `pwm_max`, so it cannot wind up; the demand on a stalled channel
 saturates honestly; fallback would add no cooling (a stalled fan moves no
 air at `fallback_pwm` either) and would stop regulating the healthy
-channels. Stall detection needs `obs.rpm` keyed by channel name
-(`xt6.fan_map`, Track B).
+channels. Stall detection needs `obs.rpm` keyed by channel name: the
+`rpm` attribute of the channel's `xt6.fans` entry (Track B).
 
 **Bumpless transfer.** While `mode=fallback` the solver does not run, so
 neither the PI integral nor the MPC disturbance estimate updates (no
@@ -557,7 +557,9 @@ carry `policy: emergency` / `policy: shutdown`.
   `hwmonN` numbers are not stable across re-plugs. `pwm_map` values are
   bare `pwmN` (the read/write file, with a `pwmN_enable` sibling);
   `temp_map` / `fan_map` values are bare `tempN` / `fanN` and resolve to
-  the `*_input` file. Two logical names on one attribute are rejected.
+  the `*_input` file. Two logical names on one attribute are rejected,
+  and every `fan_map` key must be a `pwm_map` channel (RPM is consumed
+  per channel).
   `resolve(check_files=True)` raises for a missing attribute (startup
   check); the hot path resolves with `check_files=False`.
 - `hw/xt6.py`: `Xt6Adapter(hwmon_map, clock)` with
@@ -579,14 +581,31 @@ carry `policy: emergency` / `policy: shutdown`.
   - `release()` restores the remembered `pwmK_enable` values (§2; not
     called at exit).
 - `build_map_from_config(xt6, channels=mpc.channels, temps=mpc.temps)`:
-  `xt6.hwmon_name` is required; `xt6.map` keys must **equal**
-  `mpc.channels` and `xt6.temp_map` keys must **equal** `mpc.temps`, or
+  `xt6.hwmon_name` is required. Each fan is **one** `xt6.fans` entry
+  that names the channel once and carries both attributes:
+
+  ```yaml
+  xt6:
+    hwmon_name: aquaero
+    fans:
+      radiator: {pwm: pwm1, rpm: fan1}
+      intake:   {pwm: pwm2}          # rpm optional
+    temp_map:
+      coolant: temp1
+  ```
+
+  A PWM output and its tachometer therefore cannot drift apart into two
+  differently spelt channels. Only `pwm` and `rpm` are allowed inside an
+  entry (a typo such as `rmp:` is rejected); `pwm` must look like `pwmN`,
+  `rpm` like `fanN`, `temp_map` values like `tempN`. The former
+  `xt6.map` / `xt6.fan_map` keys are rejected with a pointer to
+  `xt6.fans`. `xt6.fans` keys must **equal** `mpc.channels` and
+  `xt6.temp_map` keys must **equal** `mpc.temps`, or
   the daemon exits with a `ConfigError` (code 2) before the loop starts.
   Without that check a channel missing from the map is silently never
   written, and a temperature missing from or extra in `temp_map` keeps
   the gate in permanent fallback with no visible error. Optional
-  `xt6.fan_map` (key it by channel name so stall detection sees it; the
-  example has none, so `obs.rpm` is empty) and `xt6.root`.
+  `xt6.root` (default `/sys/class/hwmon`).
 - Unit tests against a **fake hwmon tree** in a temp directory (CI, no
   Pi). `pytest.mark.hardware` only for the live device;
   `tests/conftest.py` skips those tests when no hwmon device named
@@ -1329,7 +1348,8 @@ exercised against a live broker or Home Assistant (§8).
       sensor + firmware timeout (see §2); then decide whether `release()` runs at exit
 - [x] `hw/xt6.py` read/apply, udev `0c70`, sysfs root injectable
 - [x] `hw/xt6.py`: `pwmK_enable` re-checked on every apply (re-plug)
-- [x] Startup rejection: `xt6.map` keys == `mpc.channels`, `xt6.temp_map` keys == `mpc.temps`
+- [x] Startup rejection: `xt6.fans` keys == `mpc.channels`, `xt6.temp_map` keys == `mpc.temps`
+- [x] `xt6.fans`: one entry per fan with `pwm` and optional `rpm`; legacy `map` / `fan_map` rejected
 - [x] `test_hw_map.py` / fake hwmon in CI
 - [ ] Confirm the hwmon ABI on the real device (`tempK_input` millidegrees, `pwmK` 0..255,
       `pwmK_enable` semantics) and that the udev rule makes `pwmK` / `pwmK_enable`
@@ -1620,8 +1640,9 @@ on a Zero W; the hardware steps are waiting for the aquaero.
    code is in place, it creates the directory, warns, skips the pip step,
    and finishes; rerun it after the rsync.
 6. Edit `/etc/aqua-bridge/config.yaml`: `mpc.channels` / `mpc.temps`,
-   `xt6.map` / `xt6.temp_map` with exactly the same keys (the daemon
-   exits 2 otherwise), optional `xt6.fan_map` keyed by channel, MQTT
+   `xt6.fans` (one `{pwm: pwmN, rpm: fanN}` entry per channel) and
+   `xt6.temp_map` with exactly the same keys (the daemon exits 2
+   otherwise), MQTT
    host and credentials, `http.enabled` / `mqtt.enabled`. Always pass
    `--config /etc/aqua-bridge/config.yaml`.
 7. USB: dwc2 host, powered hub, XT6 on USB, Quadro on aquabus only.

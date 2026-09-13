@@ -162,12 +162,12 @@ def test_build_io_xt6_constructs_adapter_without_touching_hardware(example_confi
 
 
 def test_xt6_map_not_matching_mpc_channels_exits_2(tmp_path, example_config_path, restore_signals):
-    """Review finding F4: a channel missing from xt6.map (or a temp_map key not in
+    """Review finding F4: a channel missing from xt6.fans (or a temp_map key not in
     mpc.temps) is a config error at startup, not a silently unwritten fan."""
     import yaml
 
     data = yaml.safe_load(example_config_path.read_text())
-    data["xt6"]["map"] = {"radiator": "pwm1"}
+    data["xt6"]["fans"] = {"radiator": {"pwm": "pwm1", "rpm": "fan1"}}
     bad = tmp_path / "bad_map.yaml"
     bad.write_text(yaml.safe_dump(data))
     assert main_mod.main(["--config", str(bad), "--source", "xt6"]) == 2

@@ -67,10 +67,12 @@ class HwmonMap:
         Logical temperature -> hwmon temp attribute name (e.g.
         ``{"coolant": "temp1"}``).
     fan_map:
-        Optional logical fan-speed-sensor name -> hwmon fan attribute
-        name (e.g. ``{"radiator": "fan1"}``). Defaults to empty: not
-        every deployment needs tachometer readback wired to a logical
-        name distinct from the pwm channel.
+        Optional fan channel -> hwmon tachometer attribute name (e.g.
+        ``{"radiator": "fan1"}``). Keys must be channels of ``pwm_map``:
+        RPM readings are consumed per channel (stall detection, Home
+        Assistant sensors), so a key outside ``pwm_map`` would be a reading
+        nobody looks at. Defaults to empty (no tachometer readback). The
+        config builds both maps from one ``xt6.fans`` entry per fan.
 
     Resolution happens on demand (:meth:`resolve`), never once at
     construction, so a device that reappears after a dropout (possibly
@@ -95,6 +97,11 @@ class HwmonMap:
             if not isinstance(mapping, dict):
                 raise TypeError(f"{label} must be a dict, got {type(mapping).__name__}")
             _check_no_duplicate_targets(label, mapping)
+        orphan_rpm = sorted(set(self.fan_map) - set(self.pwm_map))
+        if orphan_rpm:
+            raise ValueError(
+                f"fan_map keys {orphan_rpm} are not pwm_map channels {sorted(self.pwm_map)}"
+            )
 
     def find_device_dir(self) -> Path:
         """Locate the ``hwmonN`` directory whose ``name`` file matches.

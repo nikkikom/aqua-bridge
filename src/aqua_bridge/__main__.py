@@ -133,7 +133,7 @@ def build_io(
         builder = getattr(xt6, "build_map_from_config", None)
         if builder is None:
             raise RuntimeError("aqua_bridge.hw.xt6.build_map_from_config is missing")
-        # Cross-check xt6.map / xt6.temp_map against mpc.channels / mpc.temps
+        # Cross-check xt6.fans / xt6.temp_map against mpc.channels / mpc.temps
         # here, before the loop starts (ConfigError, exit code 2).
         hwmon_map = builder(app.section("xt6"), channels=app.mpc.channels, temps=app.mpc.temps)
         adapter = xt6.Xt6Adapter(hwmon_map, clock=clock)

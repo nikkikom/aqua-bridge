@@ -153,3 +153,14 @@ def test_hw_modules_do_not_import_control() -> None:
                     f"{path} imports {name!r}, hardware must not import control/mpc"
                 )
                 assert name != "aqua_bridge.control"
+
+
+def test_tachometer_without_a_pwm_channel_is_rejected() -> None:
+    """RPM is consumed per channel; a fan_map key outside pwm_map is a reading nobody sees."""
+    with pytest.raises(ValueError, match="fan_map keys \\['radaitor'\\] are not pwm_map channels"):
+        HwmonMap(
+            hwmon_name="aquaero",
+            pwm_map={"radiator": "pwm1"},
+            temp_map={},
+            fan_map={"radaitor": "fan1"},
+        )
