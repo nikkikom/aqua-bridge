@@ -1739,7 +1739,9 @@ class MpcConfig:
                     if o != t and sensors[o].zone == sp.zone and sensors[o].role == sp.role
                 ),
             )
-        window_ticks = max([2, *(p.ticks for p in stuck.values() if p.decimate == 1)])
+        # At least 3: the decimated windows take their median3 value from the newest
+        # three dense samples, so that value equals the one the gate checked.
+        window_ticks = max([3, *(p.ticks for p in stuck.values() if p.decimate == 1)])
         slow_samples: dict[int, int] = {}
         for p in stuck.values():
             if p.decimate > 1:
@@ -1806,7 +1808,7 @@ class MpcConfig:
     @property
     def window_ticks(self) -> int:
         """Length of ``MpcState.window``: ``stuck_ticks`` in legacy mode; with
-        ``topology`` the longest window of a sensor that is not decimated (>= 2)."""
+        ``topology`` the longest window of a sensor that is not decimated (>= 3)."""
         return self._derived.window_ticks
 
     @property

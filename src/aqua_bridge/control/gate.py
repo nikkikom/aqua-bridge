@@ -258,6 +258,15 @@ def stuck_pwm_lag(stuck_ticks: int) -> int:
     return max(0, min(stuck_ticks // 4, stuck_ticks - 2))
 
 
+def _slow_sample_ok(sample: object) -> bool:
+    """Structure of a stored decimated sample (values are read through ``_finite_or_none``)."""
+    return (
+        isinstance(sample, Mapping)
+        and isinstance(sample.get("t"), Mapping)
+        and isinstance(sample.get("p"), Mapping)
+    )
+
+
 def advance_slow_windows(
     slow: Mapping[str, Any] | None,
     window: Sequence[WindowSample],
@@ -281,6 +290,8 @@ def advance_slow_windows(
         key = str(k)
         old = slow.get(key) if isinstance(slow, Mapping) else None
         samples = list(old) if isinstance(old, list) else []
+        if not all(_slow_sample_ok(sample) for sample in samples):
+            samples = []  # corrupt memory: start the window over, as after a gap
         if window and seq >= 1 and (seq - 1) % k == 0:
             if newest is None:
                 last = window[-1]

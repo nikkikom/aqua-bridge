@@ -846,3 +846,91 @@ def test_stuck_proximal_sensor_faults_only_its_zone_through_step():
     assert cmd.diagnostics["zones_in_fault"] == ["za"]
     assert cmd.diagnostics["gate"]["reasons"]["prox_a2"] == [REASON_STUCK]
     assert "bay:a2:prox_a2=stuck" in cmd.diagnostics["zones"]["za"]["reasons"]
+
+
+class _RampSolver:
+    """Every channel rises by 0.02 per tick: net PWM evidence for the Stuck rule."""
+
+    name = "pi"
+
+    def initialise(self, cfg, req):
+        return {ch: 0.0 for ch in cfg.channels if ch not in req.fixed_channels}, {}
+
+    def solve(self, cfg, req):
+        pwm = {ch: min(1.0, req.prev_pwm[ch] + 0.02) for ch in cfg.channels}
+        pwm.update(req.fixed_channels)
+        integrator = {ch: 0.0 for ch in cfg.channels if ch not in req.fixed_channels}
+        return SolverResult(pwm=pwm, integrator=integrator)
+
+
+def test_median3_decimated_samples_store_the_value_the_gate_checked():
+    """With median3 the decimated windows must store the median3 value, even when every
+    sensor is decimated (the dense window would otherwise be too short for a median)."""
+    m = das_mapping()
+    m["median3"] = True
+    cfg = MpcConfig.from_mapping(m)
+    assert all(cfg.stuck_params(t).decimate > 1 for t in cfg.temps)
+    state = MpcState.cold()
+    checked: list[float] = []
+    for i in range(8):
+        value = 36.5 if i == 3 else 35.0  # a one-tick glitch the median hides
+        cmd, state = step(das_obs(cfg, float(i), air_b=value), cfg, state)
+        checked.append(cmd.diagnostics["gate"]["filtered"]["air_b"])
+    assert checked == [35.0] * 8
+    # factor 3 took the samples of ticks 0, 3 and 6
+    assert [s["t"]["air_b"] for s in state.solver_memory["stuck_slow"]["3"]] == [35.0] * 3
+
+
+def test_median3_hidden_glitches_do_not_hide_a_frozen_decimated_sensor():
+    """A frozen proximal sensor that glitches for one tick at every decimated sample: the
+    gate (median3) never sees the glitch, so the decimated Stuck run must not see it
+    either, and the sensor's zone faults."""
+    m = das_mapping()
+    m["median3"] = True
+    for name in m["sensors"]:
+        if name != "prox_a2":  # keep the dense window at its minimum
+            m["sensors"][name].setdefault("stuck_decimate", 3)
+    m["sensors"]["prox_a2"].update(stuck_s=30.0, stuck_decimate=3)
+    cfg = MpcConfig.from_mapping(m)
+    state = MpcState.cold()
+    cmd = None
+    for i in range(80):
+        glitch = 1.5 if i % 3 == 0 and i > 0 else 0.0
+        obs = das_obs(cfg, float(i), pwm=0.3, prox_a2=40.0 + glitch)
+        cmd, state = step(obs, cfg, state, solver=_RampSolver())
+        if cmd.mode is Mode.DEGRADED:
+            break
+    assert cmd is not None and cmd.mode is Mode.DEGRADED, cmd.diagnostics["gate"]["stuck"]
+    assert cmd.diagnostics["zones_in_fault"] == ["za"]
+    assert cmd.diagnostics["gate"]["reasons"]["prox_a2"] == [REASON_STUCK]
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    [
+        [1, 2, 3] * 30,
+        ["junk"] * 70,
+        [{}] * 70,
+        [{"t": 1, "p": {}}] * 70,
+        [{"t": {}, "p": None}] * 70,
+        [{"t": {"prox_a2": "hot"}, "p": {"fa1": "x"}}] * 70,
+        [None] * 70,
+    ],
+    ids=["ints", "strings", "empty", "t-not-mapping", "p-not-mapping", "bad-values", "nulls"],
+)
+def test_step_tolerates_malformed_decimated_windows_in_memory(garbage):
+    """``solver_memory`` is state like any other: a corrupt ``stuck_slow`` is dropped (like a
+    gap), never an exception out of ``step``."""
+    cfg = das_cfg()
+    state = MpcState.cold()
+    for i in range(5):
+        _, state = step(das_obs(cfg, float(i)), cfg, state)
+    mem = dict(state.solver_memory)
+    mem["stuck_slow"] = {k: list(garbage) for k in mem["stuck_slow"]}
+    bad = dataclasses.replace(state, solver_memory=mem)
+    cmd, nxt = step(das_obs(cfg, 5.0, pwm=state.last_cmd.pwm), cfg, bad)
+    assert cmd.mode is Mode.AUTO
+    for samples in nxt.solver_memory["stuck_slow"].values():
+        for sample in samples:
+            assert isinstance(sample["t"], Mapping) and isinstance(sample["p"], Mapping)
+    json.dumps(nxt.to_dict(), allow_nan=False)
