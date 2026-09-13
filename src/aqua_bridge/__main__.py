@@ -8,7 +8,18 @@ main thread then runs the section 9 stop path -- log, write ``fallback_pwm``,
 
 ``--source xt6`` (default) imports :mod:`aqua_bridge.hw.xt6` lazily -- the
 hardware adapter is the only place that knows sysfs. ``--source sim`` drives
-the RC plant from :mod:`aqua_bridge.sim.plant` instead, for a laptop or CI.
+a simulated plant instead, for a laptop or CI; ``--sim-plant`` picks it:
+
+* ``basic`` (default): the RC plant from :mod:`aqua_bridge.sim.plant`,
+  exactly as before the flag existed.
+* ``rich``: the same RC plant with one tick of actuator delay and 0.02 degC
+  sensor noise (a legacy config against a less ideal plant).
+* ``das``: the DAS truth plant from :mod:`aqua_bridge.sim.das`. It needs a
+  DAS topology. Until the zoned ``mpc`` config exists it is read from a
+  top-level ``sim.das`` section (``{topology?, preset?, seed?}``; without
+  ``topology`` the simulator's default topology is used), and every
+  ``mpc.temps`` / ``mpc.channels`` name must exist in that topology.
+  Missing section or names: :class:`ConfigError`, exit code 2.
 
 HTTP (``http.enabled``) and MQTT (``mqtt.enabled``) run next to the loop via
 :mod:`aqua_bridge.publishers.runtime`; both attach to the supervisor's
@@ -42,6 +53,7 @@ __all__ = [
     "build_io",
     "build_parser",
     "main",
+    "make_das_sim_plant",
     "make_sim_plant",
     "start_publishers",
     "stop_publishers",
@@ -62,12 +74,15 @@ except Exception:  # not installed (tests run from the source tree)
 # ---------------------------------------------------------------------------
 
 
-def make_sim_plant(cfg: MpcConfig, *, heat_w: float = 100.0, seed: int = 0) -> Any:
+def make_sim_plant(
+    cfg: MpcConfig, *, heat_w: float = 100.0, seed: int = 0, rich: bool = False
+) -> Any:
     """An RC plant whose channel and temperature names follow ``cfg``.
 
     Channels whose name contains ``"intake"`` move case air; every other
     channel is a radiator fan. The first temperature with a setpoint is the
-    coolant, the first other temperature (if any) the air.
+    coolant, the first other temperature (if any) the air. ``rich`` adds one
+    tick of actuator delay and 0.02 degC sensor noise.
     """
     from aqua_bridge.sim.plant import Plant, PlantParams
 
@@ -85,12 +100,62 @@ def make_sim_plant(cfg: MpcConfig, *, heat_w: float = 100.0, seed: int = 0) -> A
         heat_w=heat_w,
         radiator_fans=radiator,
         intake_fans=intake,
+        **({"delay_ticks": 1, "noise_sigma_c": 0.02} if rich else {}),
     )
     return Plant(params, initial_pwm=dict(cfg.fallback_pwm), seed=seed)
 
 
+SIM_PLANTS: tuple[str, ...] = ("basic", "rich", "das")
+
+
+def make_das_sim_plant(app: AppConfig) -> Any:
+    """A DAS truth plant from the top-level ``sim.das`` section (module docstring).
+
+    Raises :class:`ConfigError` with a clear message when the section is
+    missing or malformed, or the ``mpc`` names do not exist in the topology.
+    """
+    from aqua_bridge.sim.das import build_das_plant, default_topology
+
+    sim = app.section("sim")
+    das = sim.get("das") if isinstance(sim, dict) else None
+    if not isinstance(das, dict):
+        raise ConfigError(
+            "--sim-plant das needs a DAS topology: add a top-level section "
+            "'sim: {das: {topology: {zones, bays, fans, sensors}, preset: basic|rich, seed: 0}}' "
+            "(the zoned mpc config is not available yet)"
+        )
+    unknown = sorted(set(das) - {"topology", "preset", "seed"})
+    if unknown:
+        raise ConfigError(f"sim.das: unknown keys {unknown}")
+    topology = das.get("topology")
+    seed = das.get("seed", 0)
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ConfigError("sim.das.seed must be an integer")
+    cfg = app.mpc
+    try:
+        plant = build_das_plant(
+            default_topology() if topology is None else topology,
+            preset=str(das.get("preset", "basic")),
+            seed=seed,
+            dt=cfg.dt,
+            initial_pwm=dict(cfg.fallback_pwm),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"sim.das: {exc}") from exc
+    problems = []
+    missing_t = [t for t in cfg.temps if t not in plant.params.sensor_names]
+    missing_c = [c for c in cfg.channels if c not in plant.params.channels]
+    if missing_t:
+        problems.append(f"mpc.temps {missing_t}")
+    if missing_c:
+        problems.append(f"mpc.channels {missing_c}")
+    if problems:
+        raise ConfigError("sim.das topology does not provide " + "; ".join(problems))
+    return plant
+
+
 class PlantIO:
-    """Source and sink over one :class:`aqua_bridge.sim.plant.Plant`.
+    """Source and sink over one simulated plant (``sim.plant.Plant`` or ``sim.das.DasPlant``).
 
     ``read`` reports the plant's current observation restricted to
     ``cfg.temps``; ``apply`` feeds the command in and advances the plant one
@@ -119,11 +184,23 @@ class PlantIO:
 
 
 def build_io(
-    app: AppConfig, source: str, *, clock: Callable[[], float] = time.monotonic
+    app: AppConfig,
+    source: str,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    sim_plant: str = "basic",
 ) -> tuple[Source, Sink, Callable[[], None] | None]:
     """``(source, sink, release)`` for ``--source``; ``release`` runs at exit if not None."""
     if source == "sim":
-        io = PlantIO(make_sim_plant(app.mpc), app.mpc)
+        if sim_plant == "basic":
+            plant = make_sim_plant(app.mpc)
+        elif sim_plant == "rich":
+            plant = make_sim_plant(app.mpc, rich=True)
+        elif sim_plant == "das":
+            plant = make_das_sim_plant(app)
+        else:
+            raise RuntimeError(f"unknown sim plant {sim_plant!r}")
+        io = PlantIO(plant, app.mpc)
         return io, io, None
     if source == "xt6":
         try:
@@ -149,6 +226,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("xt6", "sim"),
         default="xt6",
         help="xt6: aquaero over hwmon (default); sim: RC plant simulator",
+    )
+    p.add_argument(
+        "--sim-plant",
+        choices=SIM_PLANTS,
+        default=None,
+        help="sim only: basic RC plant (default), rich RC plant, das truth plant",
     )
     p.add_argument("--once", action="store_true", help="one tick, print the command as JSON, exit")
     p.add_argument("--ticks", type=int, default=None, metavar="N", help="stop after N ticks")
@@ -183,6 +266,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--ticks must be >= 1")
     if args.sim_speed < 0:
         parser.error("--sim-speed must be >= 0")
+    if args.sim_plant is not None and args.source != "sim":
+        parser.error("--sim-plant needs --source sim")
 
     try:
         app = load_config(args.config)
@@ -192,7 +277,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg = app.mpc
 
     try:
-        source, sink, release = build_io(app, args.source)
+        source, sink, release = build_io(app, args.source, sim_plant=args.sim_plant or "basic")
     except ConfigError as exc:
         _LOG.error("config: %s", exc)
         return 2
