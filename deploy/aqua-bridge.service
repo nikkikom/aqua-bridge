@@ -18,6 +18,11 @@ SupplementaryGroups=dialout plugdev
 # interpreter running -m aqua_bridge directly, so the main PID is the
 # process that calls sd_notify (see PROJECT.md §9).
 ExecStart=/opt/aqua-bridge/.venv/bin/python -m aqua_bridge --config /etc/aqua-bridge/config.yaml
+# /var/lib/aqua-bridge, owned by User=, exported as $STATE_DIRECTORY: a DAS config keeps
+# its thermal model and SMART calibrations in $STATE_DIRECTORY/model.json (written
+# atomically every model_store_interval_s and at the clean stop). A legacy config ignores
+# it. Delete model.json for a clean prior (the calibrations go with it).
+StateDirectory=aqua-bridge
 Restart=always
 WatchdogSec=30
 # READY=1 is sent after the first tick whose command reached the device, so

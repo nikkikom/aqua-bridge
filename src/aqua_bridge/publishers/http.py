@@ -33,12 +33,14 @@ DAS views (plan sections 1 and 7), read from the snapshot, never computed here:
   correlation with their scores (confirm one with ``POST /api/bay {bay, serial}``).
 * ``GET /api/model`` -- ``{"thermal": {...}, "parameters": {kind: {unit, lo, hi, prior,
   identified_from}}, "calibration": {bay: {serial, calibrated, sigma_cal_c,
-  calibration}}}``: the zoned thermal model's identification summary of the last
+  calibration}}, "store": {...}}``: the zoned thermal model's identification summary of the last
   command (``diagnostics["thermal"]``: status, prediction error, per zone and bay the
   coefficients with their relative standard errors, see
   :mod:`aqua_bridge.control.thermal`; ``{"status": "off"}`` without
   ``model_shadow``), the static parameter table (units, bounds, priors) and the
-  estimator's SMART calibration per bay. The model store is a later milestone.
+  estimator's SMART calibration per bay, and what the model store loaded at start
+  (``diagnostics["store"]``: source ``fresh`` | ``stale`` | ``prior``, sections,
+  warnings; ``{"source": "off"}`` without a store, see :mod:`aqua_bridge.control.persist`).
 
 A legacy config answers all three with 404 and a reason.
 
@@ -195,6 +197,7 @@ async def _get_model(request: web.Request) -> web.Response:
                 }
                 for bay, info in seen.items()
             },
+            "store": diag.get("store") or {"source": "off"},
         }
     )
 

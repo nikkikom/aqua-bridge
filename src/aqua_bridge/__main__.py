@@ -40,6 +40,13 @@ and threaded through both: ``build_io`` gives it to ``--source hwmon``'s
 ``CompositeSource``, ``start_publishers`` wires ``POST /api/in/smart`` and
 the MQTT ``{node_id}/in/smart/+`` topic into it (plan section 1).
 
+Model store (:mod:`aqua_bridge.modelstore`): with a zoned DAS config the daemon loads
+``--model-store PATH``, else ``$STATE_DIRECTORY/model.json`` (systemd's
+``StateDirectory=aqua-bridge``), into the first state and keeps it current through a
+:class:`~aqua_bridge.modelstore.ModelPersister` on ``on_tick``, written once more at a
+clean stop. A legacy config ignores ``STATE_DIRECTORY``; ``--model-store`` with one is a
+configuration error (exit code 2).
+
 Exit codes: ``0`` clean stop, ``2`` bad arguments or config, ``3`` the
 source/sink could not be built.
 """
@@ -49,17 +56,20 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import signal
 import sys
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from aqua_bridge.config import AppConfig, ConfigError, load_config
 from aqua_bridge.control.loop import Loop, Sink, Source
 from aqua_bridge.control.supervisor import Supervisor
-from aqua_bridge.model import MpcCommand, MpcConfig, PlantObservation
+from aqua_bridge.model import MpcCommand, MpcConfig, MpcState, PlantObservation
+from aqua_bridge.modelstore import ModelPersister, initial_state, store_path
+from aqua_bridge.modelstore import load as load_model_store
 from aqua_bridge.publishers.inputs import SmartInbox, smart_topic_filter
 from aqua_bridge.recorder import DEFAULT_BACKUP_COUNT, DEFAULT_MAX_BYTES, Recorder, chain_on_tick
 from aqua_bridge.sdnotify import SdNotifier
@@ -67,6 +77,7 @@ from aqua_bridge.sdnotify import SdNotifier
 __all__ = [
     "PlantIO",
     "build_io",
+    "build_model_store",
     "build_parser",
     "build_recorder",
     "main",
@@ -293,6 +304,29 @@ def build_recorder(app: AppConfig, cfg: MpcConfig, cli_path: str | None) -> Reco
         raise ConfigError(f"record_max_bytes/record_backup_count must be integers: {exc}") from exc
 
 
+def build_model_store(
+    cfg: MpcConfig,
+    cli_path: str | None,
+    *,
+    env: Mapping[str, str] | None = None,
+    wall: Callable[[], float] = time.time,
+) -> tuple[MpcState | None, ModelPersister | None]:
+    """``(initial state, persister)`` for the model store, or ``(None, None)`` without one
+    (module docstring). Raises :class:`ConfigError` for ``--model-store`` with a legacy
+    config; a missing or unusable file is not an error (the controller starts on its
+    prior and the reason is logged)."""
+    path = store_path(cfg, cli_path, os.environ if env is None else env)
+    if path is None:
+        return None, None
+    result = load_model_store(path, cfg, now_wall=wall())
+    if result.missing:
+        _LOG.info("model store: %s does not exist yet; starting on the prior", path)
+    else:
+        age = "unknown" if result.age_s is None else f"{result.age_s / 86400.0:.2f} days"
+        _LOG.info("model store: %s is %s (age %s)", path, result.source, age)
+    return initial_state(result), ModelPersister(cfg, path, wall=wall)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="aqua_bridge", description=__doc__.split("\n\n")[0])
     p.add_argument("--config", required=True, help="path to config.yaml")
@@ -327,6 +361,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="record every tick as JSONL to PATH (overrides the config's record_path)",
     )
+    p.add_argument(
+        "--model-store",
+        metavar="PATH",
+        default=None,
+        help=(
+            "DAS configs: load and keep the thermal model and calibrations in PATH "
+            "(default $STATE_DIRECTORY/model.json when set)"
+        ),
+    )
     return p
 
 
@@ -357,6 +400,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         app = load_config(args.config)
         cfg = app.mpc
         recorder = build_recorder(app, cfg, args.record)
+        initial, persister = build_model_store(cfg, args.model_store)
     except ConfigError as exc:
         _LOG.error("config: %s", exc)
         return 2
@@ -381,10 +425,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     notifier = SdNotifier()
     supervisor = Supervisor(cfg, version=VERSION)
     sleep = _make_sleep(args.sim_speed) if args.source == "sim" else None
-    loop = Loop(source, sink, cfg, supervisor, clock=time.monotonic, notifier=notifier, sleep=sleep)
+    loop = Loop(
+        source,
+        sink,
+        cfg,
+        supervisor,
+        clock=time.monotonic,
+        notifier=notifier,
+        sleep=sleep,
+        state=initial,
+    )
 
     http_service, mqtt_service = start_publishers(app, supervisor, smart_inbox=smart_inbox)
-    hooks = [h.on_tick if h is not None else None for h in (mqtt_service, recorder)]
+    hooks = [h.on_tick if h is not None else None for h in (mqtt_service, recorder, persister)]
     if any(h is not None for h in hooks):
         loop.on_tick = chain_on_tick(*hooks)
 
@@ -449,6 +502,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         stop_publishers(http_service, mqtt_service)
         if recorder is not None:
             recorder.close()
+        if persister is not None:
+            persister.close()
     if len(signals_seen) > 1:
         _LOG.info("%d further signal(s) during shutdown ignored", len(signals_seen) - 1)
     _LOG.info("exit %d after %d ticks", exit_code, loop.tick_count)
