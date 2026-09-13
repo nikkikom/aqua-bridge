@@ -21,6 +21,13 @@ MQTT; this module owns their threads and their lifetime:
 Both services are optional (``http.enabled`` / ``mqtt.enabled`` in
 ``config.yaml``) and both swallow their own exceptions: a publisher bug or
 a dead broker must never touch ``read -> step -> apply``.
+
+``HttpService`` optionally takes ``smart_inbox`` (a
+:class:`~aqua_bridge.publishers.inputs.SmartInbox`) to wire ``POST
+/api/in/smart``; the MQTT side of the same inbox is wired by the caller
+(``__main__.start_publishers``) via ``MqttClient.add_topic_handler`` on the
+client this module already builds, not by this module -- one inbox, two
+transports, neither owned here.
 """
 
 from __future__ import annotations
@@ -57,10 +64,12 @@ class HttpService:
         surface: ControlSurface,
         app_cfg: AppConfig,
         *,
+        smart_inbox: Any = None,
         run: Callable[..., Any] | None = None,
     ) -> None:
         self._surface = surface
         self._app_cfg = app_cfg
+        self._smart_inbox = smart_inbox
         # Resolved at call time so tests can monkeypatch the module attribute.
         self._run = run if run is not None else run_http
         self._thread: threading.Thread | None = None
@@ -104,8 +113,14 @@ class HttpService:
         loop = asyncio.new_event_loop()
         self._loop = loop
         asyncio.set_event_loop(loop)
+        # Only passed when actually configured, so a caller-supplied ``run``
+        # with the old two-argument shape (tests, mainly) keeps working
+        # unchanged -- see test_http_service_start_failure_is_reported_not_raised.
+        kwargs = {} if self._smart_inbox is None else {"smart_inbox": self._smart_inbox}
         try:
-            self._runner = loop.run_until_complete(self._run(self._surface, self._app_cfg))
+            self._runner = loop.run_until_complete(
+                self._run(self._surface, self._app_cfg, **kwargs)
+            )
         except Exception as exc:  # bind failure etc.: report, never propagate
             self.error = f"{type(exc).__name__}: {exc}"
             self._started.set()

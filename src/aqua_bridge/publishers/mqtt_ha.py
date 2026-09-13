@@ -25,6 +25,11 @@ entities are only published to Discovery while the global mode is
 ``control_mode`` and the caller (the loop) is responsible for re-publishing
 Discovery (and, for HA, deleting the stale ones with an empty retained
 payload) whenever the mode changes into or out of ``manual``.
+
+A caller that needs one more inbound topic on this same connection (the DAS
+plan's SMART inbox, ``{node_id}/in/smart/+``, section 1) registers it with
+:meth:`MqttClient.add_topic_handler` instead of opening a second broker
+connection -- see that method's docstring.
 """
 
 from __future__ import annotations
@@ -57,6 +62,7 @@ __all__ = [
     "parse_command",
     "state_payload",
     "state_topic",
+    "topic_matches",
 ]
 
 _LOG = logging.getLogger(__name__)
@@ -87,6 +93,24 @@ def command_topics(node_id: str, cfg: MpcConfig) -> dict[str, str]:
     for ch in cfg.channels:
         topics[f"pwm/{ch}"] = f"{node_id}/cmd/pwm/{ch}"
     return topics
+
+
+def topic_matches(topic_filter: str, topic: str) -> bool:
+    """MQTT topic-filter matching (``+`` one level, trailing ``#`` many),
+    enough of the spec for :meth:`MqttClient.add_topic_handler` to route an
+    inbound message to the right handler without a broker in the loop
+    (pure, unit-tested directly rather than only through a fake client).
+    """
+    filter_parts = topic_filter.split("/")
+    topic_parts = topic.split("/")
+    for i, part in enumerate(filter_parts):
+        if part == "#":
+            return True  # matches this level and everything after
+        if i >= len(topic_parts):
+            return False
+        if part != "+" and part != topic_parts[i]:
+            return False
+    return len(filter_parts) == len(topic_parts)
 
 
 def _device_block(node_id: str) -> dict[str, Any]:
@@ -371,6 +395,10 @@ class MqttClient:
         self._on_intent = on_intent
         self._on_connection_change = on_connection_change
         self.connected = False
+        # topic filter -> handler, e.g. the SMART inbox on "{node_id}/in/smart/+"
+        # (add_topic_handler docstring); empty by default, so a client built
+        # without one behaves exactly as before.
+        self._extra_handlers: dict[str, Callable[[str, bytes], None]] = {}
         self.client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
             client_id=f"aqua-bridge-{node_id}",
@@ -411,6 +439,8 @@ class MqttClient:
     def _on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
         for topic in command_topics(self.node_id, self.cfg).values():
             client.subscribe(topic)
+        for topic_filter in self._extra_handlers:
+            client.subscribe(topic_filter)
         self.publish_availability(True)
         self._set_connected(True)
 
@@ -425,13 +455,41 @@ class MqttClient:
             except Exception:  # a listener bug must not kill the paho network thread
                 _LOG.exception("mqtt: on_connection_change failed")
 
+    def add_topic_handler(self, topic_filter: str, handler: Callable[[str, bytes], None]) -> None:
+        """Routes messages on ``topic_filter`` (an MQTT filter, ``+``/``#``
+        allowed) to ``handler(topic, payload)`` on this same connection --
+        one broker connection and one network thread for the whole daemon,
+        rather than every inbound data source opening its own (the DAS
+        plan's SMART inbox is the first user: ``smart_topic_filter(node_id)``
+        -> ``SmartInbox.on_message``). Subscribed immediately if already
+        connected, and on every future ``on_connect`` alongside the command
+        topics; call before :meth:`connect`/:meth:`connect_async` for a
+        topic that must be subscribed from the very first connection.
+        ``handler`` must not raise: :meth:`_on_message` does not catch
+        exceptions from it, matching the plan's requirement that a SMART
+        listener "never raises into the MQTT thread" -- the handler itself
+        (:meth:`aqua_bridge.publishers.inputs.SmartInbox.on_message`) is the
+        one that promises this, not this wrapper.
+        """
+        self._extra_handlers[topic_filter] = handler
+        if self.connected:
+            self.client.subscribe(topic_filter)
+
     def _on_message(self, client, userdata, msg) -> None:
         """Never raises: paho 2.x runs callbacks on its network thread with
         ``suppress_exceptions=False`` by default, so an exception here would
         end that thread (no more publishes; the LWT eventually flips to
         ``offline``). A rejected intent -- raw PWM while auto, an
         out-of-range setpoint -- is logged and dropped, mirroring the HTTP
-        4xx/409 path (section 6)."""
+        4xx/409 path (section 6). A message matching a filter registered via
+        :meth:`add_topic_handler` (and not a ``cmd/`` topic) is routed there
+        instead of through :func:`parse_command`."""
+        prefix = f"{self.node_id}/cmd/"
+        if not msg.topic.startswith(prefix):
+            for topic_filter, handler in self._extra_handlers.items():
+                if topic_matches(topic_filter, msg.topic):
+                    handler(msg.topic, msg.payload)
+                    return
         intent = parse_command(self.node_id, msg.topic, msg.payload)
         if intent is None or self._on_intent is None:
             return

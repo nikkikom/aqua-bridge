@@ -24,6 +24,7 @@ from aqua_bridge.publishers.mqtt_ha import (
     parse_command,
     state_payload,
     state_topic,
+    topic_matches,
 )
 
 NODE_ID = "aqua-bridge"
@@ -309,3 +310,89 @@ def test_publish_discovery_deletes_pwm_numbers_when_leaving_manual(cfg: MpcConfi
     assert deleted == pwm_topics
     kept = {t for t, p in published if p != ""}
     assert kept == manual_topics - pwm_topics
+
+
+# --- topic_matches (pure) ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("filter_", "topic", "expected"),
+    [
+        ("aqua-bridge/in/smart/+", "aqua-bridge/in/smart/S1", True),
+        ("aqua-bridge/in/smart/+", "aqua-bridge/in/smart/S1/extra", False),
+        ("aqua-bridge/in/smart/+", "aqua-bridge/in/smart", False),
+        ("aqua-bridge/cmd/mode", "aqua-bridge/cmd/mode", True),
+        ("aqua-bridge/cmd/mode", "aqua-bridge/cmd/preset", False),
+        ("aqua-bridge/#", "aqua-bridge/in/smart/S1", True),
+        ("aqua-bridge/#", "aqua-bridge", True),  # MQTT spec: "#" also matches its parent level
+        ("aqua-bridge/#", "aqua-bridgex", False),
+        ("other-node/in/smart/+", "aqua-bridge/in/smart/S1", False),
+    ],
+)
+def test_topic_matches(filter_: str, topic: str, expected: bool) -> None:
+    assert topic_matches(filter_, topic) is expected
+
+
+# --- add_topic_handler (the SMART inbox's MQTT wiring, milestone smart-agent) -----------
+
+
+def test_add_topic_handler_is_subscribed_on_connect(cfg: MpcConfig) -> None:
+    client = _client(cfg)
+    seen: list[tuple[str, bytes]] = []
+    client.add_topic_handler("aqua-bridge/in/smart/+", lambda t, p: seen.append((t, p)))
+
+    class _Paho:
+        def __init__(self) -> None:
+            self.subscribed: list[str] = []
+
+        def subscribe(self, topic):
+            self.subscribed.append(topic)
+
+        def publish(self, topic, payload=None, qos=0, retain=False):
+            pass
+
+    fake = _Paho()
+    client.client = fake
+    client._on_connect(fake, None, {}, 0)
+    assert "aqua-bridge/in/smart/+" in fake.subscribed
+    assert set(command_topics(NODE_ID, cfg).values()) <= set(fake.subscribed)
+
+
+def test_add_topic_handler_routes_matching_messages_there_not_to_parse_command(
+    cfg: MpcConfig,
+) -> None:
+    client = _client(cfg)
+    seen: list[tuple[str, bytes]] = []
+    client.add_topic_handler("aqua-bridge/in/smart/+", lambda t, p: seen.append((t, p)))
+
+    client._on_message(client.client, None, _Msg("aqua-bridge/in/smart/S1", b'{"x": 1}'))
+
+    assert seen == [("aqua-bridge/in/smart/S1", b'{"x": 1}')]
+
+
+def test_cmd_topics_still_go_through_parse_command_when_a_handler_is_registered(
+    cfg: MpcConfig,
+) -> None:
+    sup = Supervisor(cfg)
+    client = _client(cfg, on_intent=sup.submit)
+    client.add_topic_handler("aqua-bridge/in/smart/+", lambda t, p: None)
+
+    client._on_message(client.client, None, _Msg(f"{NODE_ID}/cmd/mode", b"manual"))
+    assert sup.control_mode is ControlMode.MANUAL
+
+
+def test_add_topic_handler_subscribes_immediately_if_already_connected(cfg: MpcConfig) -> None:
+    client = _client(cfg)
+
+    class _Paho:
+        def __init__(self) -> None:
+            self.subscribed: list[str] = []
+
+        def subscribe(self, topic):
+            self.subscribed.append(topic)
+
+    fake = _Paho()
+    client.client = fake
+    client.connected = True
+    client.add_topic_handler("aqua-bridge/in/smart/+", lambda t, p: None)
+    assert fake.subscribed == ["aqua-bridge/in/smart/+"]

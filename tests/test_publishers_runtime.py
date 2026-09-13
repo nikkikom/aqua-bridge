@@ -66,6 +66,35 @@ def test_http_service_start_failure_is_reported_not_raised(cfg: MpcConfig):
     service.stop()
 
 
+def test_http_service_omits_smart_inbox_kwarg_when_not_configured(cfg: MpcConfig):
+    """A caller-supplied run() with the plain two-argument shape (like the
+    fixture above, or a test using an older signature) must keep working:
+    smart_inbox defaults to None on HttpService and is then not passed at
+    all, never as an explicit None keyword."""
+    seen: dict[str, object] = {}
+
+    async def fake_run(surface, app_cfg, **kwargs):
+        seen["kwargs"] = kwargs
+        raise OSError(98, "address in use")
+
+    service = HttpService(Supervisor(cfg), _app(cfg), run=fake_run)
+    service.start(timeout_s=5.0)
+    assert seen["kwargs"] == {}
+
+
+def test_http_service_forwards_smart_inbox_when_configured(cfg: MpcConfig):
+    marker = object()
+    seen: dict[str, object] = {}
+
+    async def fake_run(surface, app_cfg, **kwargs):
+        seen["kwargs"] = kwargs
+        raise OSError(98, "address in use")
+
+    service = HttpService(Supervisor(cfg), _app(cfg), smart_inbox=marker, run=fake_run)
+    service.start(timeout_s=5.0)
+    assert seen["kwargs"] == {"smart_inbox": marker}
+
+
 # --- MqttService --------------------------------------------------------------------------
 
 

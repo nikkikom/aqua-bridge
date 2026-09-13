@@ -171,6 +171,27 @@ def test_build_io_hwmon_constructs_composite_without_touching_hardware(example_c
     assert release is None  # no onewire.sensors in config.example.yaml -> nothing to stop
 
 
+def test_build_io_hwmon_forwards_smart_into_the_composite(example_config_path):
+    """milestone smart-agent: build_io's smart= reaches CompositeSource.smart
+    (and so PlantObservation.inputs["smart"]) for --source hwmon."""
+    pytest.importorskip("aqua_bridge.hw.sources")
+    from aqua_bridge.publishers.inputs import SmartInbox
+
+    app = load_config(example_config_path)
+    smart = SmartInbox()
+    src, _sink, _release = main_mod.build_io(app, "hwmon", smart=smart)
+    assert src.smart is smart
+
+
+def test_build_io_sim_ignores_smart(example_config_path):
+    """sim/xt6 have no inputs concept; smart= is accepted but has no effect."""
+    from aqua_bridge.publishers.inputs import SmartInbox
+
+    app = load_config(example_config_path)
+    src, sink, release = main_mod.build_io(app, "sim", smart=SmartInbox())
+    assert src is sink and release is None
+
+
 def test_hwmon_source_missing_binding_exits_2(tmp_path, example_config_path, restore_signals):
     """The same F4-style guarantee as xt6, now enforced across the whole device fleet."""
     import yaml
@@ -212,7 +233,11 @@ class _FakeMqttClient:
         self.calls: list[str] = []
         self.states: list[dict] = []
         self.discovery: list[object] = []
+        self.extra_handlers: dict[str, object] = {}
         _FakeMqttClient.instances.append(self)
+
+    def add_topic_handler(self, topic_filter, handler):
+        self.extra_handlers[topic_filter] = handler
 
     def connect_async(self):
         self.calls.append("connect_async")
@@ -254,6 +279,9 @@ def test_main_wires_mqtt_when_enabled(tmp_path, example_config_path, restore_sig
     assert len(client.states) == 3  # one retained state blob per tick
     assert client.states[-1]["cmd"]["pwm"].keys() == {"radiator", "intake"}
     assert client.discovery  # Discovery published once connected
+    # milestone smart-agent: the SMART inbox is wired onto this same client.
+    (topic_filter,) = client.extra_handlers
+    assert topic_filter == f"{data['mqtt']['node_id']}/in/smart/+"
 
 
 def test_main_wires_http_when_enabled(tmp_path, example_config_path, restore_signals, monkeypatch):
@@ -269,9 +297,10 @@ def test_main_wires_http_when_enabled(tmp_path, example_config_path, restore_sig
         async def cleanup(self):
             started["cleaned"] = True
 
-    async def fake_run(surface, app_cfg):
+    async def fake_run(surface, app_cfg, **kwargs):
         started["surface"] = surface
         started["port"] = app_cfg.section("http").get("port")
+        started["kwargs"] = kwargs
         return _Runner()
 
     monkeypatch.setattr(runtime, "run_http", fake_run)
@@ -286,6 +315,10 @@ def test_main_wires_http_when_enabled(tmp_path, example_config_path, restore_sig
     assert started["port"] == data["http"]["port"]
     assert hasattr(started["surface"], "submit") and hasattr(started["surface"], "snapshot")
     assert started.get("cleaned") is True
+    # milestone smart-agent: main() always builds a SmartInbox and hands it to HttpService.
+    from aqua_bridge.publishers.inputs import SmartInbox
+
+    assert isinstance(started["kwargs"]["smart_inbox"], SmartInbox)
 
 
 def test_main_keeps_controlling_when_a_publisher_fails_to_start(

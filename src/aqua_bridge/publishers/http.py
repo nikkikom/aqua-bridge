@@ -14,6 +14,14 @@ its exceptions into the right HTTP status.
 No authentication in v1: bind is LAN-only (``0.0.0.0:8080`` by default,
 see ``config.example.yaml``). Section 6: "No auth on the local network in
 MVP; add a bearer token before exposing the API further."
+
+``POST /api/in/smart`` (the DAS plan, section 1 "SMART path") is the
+non-MQTT twin of the PC-side SMART agent: same JSON body
+(``{serial, model, temp_c, ts_wall}``), fed into the same
+:class:`~aqua_bridge.publishers.inputs.SmartInbox` the MQTT client feeds.
+It is only registered when ``create_app`` is given ``smart_inbox``; a
+malformed body is a 400 (matching every other POST route here), never a
+5xx, and ``SmartInbox.record`` itself never raises.
 """
 
 from __future__ import annotations
@@ -43,6 +51,7 @@ _INDEX_HTML = _STATIC_DIR / "index.html"
 
 _SURFACE_KEY = web.AppKey("surface", ControlSurface)
 _CFG_KEY: web.AppKey[Any] = web.AppKey("cfg")
+_SMART_KEY: web.AppKey[Any] = web.AppKey("smart_inbox")
 
 # URL tail -> intent kind (identical today, kept separate so the route table
 # and aqua_bridge.control.intents.INTENT_KINDS can diverge later).
@@ -99,6 +108,24 @@ async def _get_health(request: web.Request) -> web.Response:
     return web.json_response(snapshot.health_payload())
 
 
+async def _post_in_smart(request: web.Request) -> web.Response:
+    inbox = request.app.get(_SMART_KEY)
+    if inbox is None:
+        return _error(404, "smart inbox not configured")
+    try:
+        body = await _read_json_body(request)
+    except IntentInvalid as exc:
+        return _error(400, str(exc))
+    try:
+        ok = inbox.record(body)
+    except Exception:  # SmartInbox.record promises not to raise; belt and braces
+        _LOG.exception("smart: inbox.record raised")
+        return _error(400, "invalid SMART payload")
+    if not ok:
+        return _error(400, "invalid SMART payload")
+    return web.json_response({"ok": True})
+
+
 async def _get_index(request: web.Request) -> web.Response:
     try:
         text = _INDEX_HTML.read_text(encoding="utf-8")
@@ -108,23 +135,32 @@ async def _get_index(request: web.Request) -> web.Response:
     return web.Response(text=text, content_type="text/html")
 
 
-def create_app(surface: ControlSurface, cfg: AppConfig | None = None) -> web.Application:
+def create_app(
+    surface: ControlSurface, cfg: AppConfig | None = None, *, smart_inbox: Any = None
+) -> web.Application:
     """Build the aiohttp application. ``cfg`` is accepted for parity with
     :func:`run_http` and future per-instance config; today the app needs
-    nothing from it beyond what ``surface`` already carries.
+    nothing from it beyond what ``surface`` already carries. ``smart_inbox``
+    (a :class:`~aqua_bridge.publishers.inputs.SmartInbox`, duck-typed --
+    only ``.record(dict) -> bool`` is used) wires ``POST /api/in/smart``;
+    left ``None`` that route answers 404, never a 5xx.
     """
     app = web.Application()
     app[_SURFACE_KEY] = surface
     app[_CFG_KEY] = cfg
+    app[_SMART_KEY] = smart_inbox
     app.router.add_get("/api/state", _get_state)
     app.router.add_get("/api/health", _get_health)
     app.router.add_get("/", _get_index)
     for kind in _POST_KINDS:
         app.router.add_post(f"/api/{kind}", _make_intent_handler(kind))
+    app.router.add_post("/api/in/smart", _post_in_smart)
     return app
 
 
-async def run_http(surface: ControlSurface, cfg: AppConfig) -> web.AppRunner:
+async def run_http(
+    surface: ControlSurface, cfg: AppConfig, *, smart_inbox: Any = None
+) -> web.AppRunner:
     """Start the HTTP server per ``cfg.http`` (``bind``/``port``).
 
     Returns the started :class:`aiohttp.web.AppRunner`; the caller owns its
@@ -133,7 +169,7 @@ async def run_http(surface: ControlSurface, cfg: AppConfig) -> web.AppRunner:
     http_cfg = cfg.section("http")
     bind = http_cfg.get("bind", "0.0.0.0")
     port = int(http_cfg.get("port", 8080))
-    app = create_app(surface, cfg)
+    app = create_app(surface, cfg, smart_inbox=smart_inbox)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, bind, port)

@@ -244,6 +244,70 @@ def test_missing_rom_at_startup_does_not_block_the_build(tmp_path: Path) -> None
         release()
 
 
+# --- CompositeSource: SMART wiring (plan section 1, milestone smart-agent) --------------
+
+
+class _FakeSmart:
+    def __init__(self, data: dict) -> None:
+        self._data = data
+
+    def snapshot(self) -> dict:
+        return self._data
+
+
+def test_read_has_no_inputs_key_when_smart_is_not_configured(tmp_path: Path) -> None:
+    root = tmp_path / "hwmon"
+    dev = _make_hwmon_device(root, "hwmon0", "aquaero", {"temp1_input": "35000", "pwm1": "128"})
+    adapter = _adapter(dev, root, "aquaero", {"radiator": "pwm1"}, {"air_z0": "temp1"})
+    composite = CompositeSource([adapter], clock=_FakeClock())
+    obs = composite.read()
+    assert obs.inputs == {}
+    assert composite.smart is None
+
+
+def test_read_puts_smart_snapshot_into_inputs(tmp_path: Path) -> None:
+    root = tmp_path / "hwmon"
+    dev = _make_hwmon_device(root, "hwmon0", "aquaero", {"temp1_input": "35000", "pwm1": "128"})
+    adapter = _adapter(dev, root, "aquaero", {"radiator": "pwm1"}, {"air_z0": "temp1"})
+    smart = _FakeSmart({"WD-ABC123": {"temp_c": 34.0, "age_s": 5.0, "model": "WDC WD40"}})
+    composite = CompositeSource([adapter], smart=smart, clock=_FakeClock())
+
+    obs = composite.read()
+
+    assert obs.inputs == {
+        "smart": {"WD-ABC123": {"temp_c": 34.0, "age_s": 5.0, "model": "WDC WD40"}}
+    }
+
+
+def test_read_reflects_an_empty_smart_snapshot(tmp_path: Path) -> None:
+    root = tmp_path / "hwmon"
+    dev = _make_hwmon_device(root, "hwmon0", "aquaero", {"temp1_input": "35000", "pwm1": "128"})
+    adapter = _adapter(dev, root, "aquaero", {"radiator": "pwm1"}, {"air_z0": "temp1"})
+    composite = CompositeSource([adapter], smart=_FakeSmart({}), clock=_FakeClock())
+    obs = composite.read()
+    assert obs.inputs == {"smart": {}}
+
+
+def test_build_composite_from_config_passes_smart_through(tmp_path: Path) -> None:
+    root = tmp_path / "hwmon"
+    _make_hwmon_device(root, "hwmon0", "aquaero", {"temp1_input": "35000", "pwm1": "128"})
+    section = dict(_XT6_SECTION, root=str(root))
+    smart = _FakeSmart({"S1": {"temp_c": 30.0, "age_s": 1.0, "model": None}})
+    composite, _release = build_composite_from_config(
+        hwmon_section=(),
+        xt6_section=section,
+        onewire_section={},
+        channels=("radiator",),
+        temps=("air_z0",),
+        dt=5.0,
+        smart=smart,
+    )
+    assert composite.smart is smart
+    assert composite.read().inputs == {
+        "smart": {"S1": {"temp_c": 30.0, "age_s": 1.0, "model": None}}
+    }
+
+
 def test_no_device_configured_is_config_error() -> None:
     with pytest.raises(ConfigError, match="no hwmon device configured"):
         build_composite_from_config(

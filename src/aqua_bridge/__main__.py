@@ -30,7 +30,11 @@ CI; ``--sim-plant`` picks it:
 HTTP (``http.enabled``) and MQTT (``mqtt.enabled``) run next to the loop via
 :mod:`aqua_bridge.publishers.runtime`; both attach to the supervisor's
 ``ControlSurface``. A publisher that fails to start (port in use, broker
-down) is logged and the daemon keeps controlling the fans without it.
+down) is logged and the daemon keeps controlling the fans without it. One
+:class:`~aqua_bridge.publishers.inputs.SmartInbox` is built here every run
+and threaded through both: ``build_io`` gives it to ``--source hwmon``'s
+``CompositeSource``, ``start_publishers`` wires ``POST /api/in/smart`` and
+the MQTT ``{node_id}/in/smart/+`` topic into it (plan section 1).
 
 Exit codes: ``0`` clean stop, ``2`` bad arguments or config, ``3`` the
 source/sink could not be built.
@@ -52,6 +56,7 @@ from aqua_bridge.config import AppConfig, ConfigError, load_config
 from aqua_bridge.control.loop import Loop, Sink, Source
 from aqua_bridge.control.supervisor import Supervisor
 from aqua_bridge.model import MpcCommand, MpcConfig, PlantObservation
+from aqua_bridge.publishers.inputs import SmartInbox, smart_topic_filter
 from aqua_bridge.sdnotify import SdNotifier
 
 __all__ = [
@@ -195,8 +200,18 @@ def build_io(
     *,
     clock: Callable[[], float] = time.monotonic,
     sim_plant: str = "basic",
+    smart: Any = None,
 ) -> tuple[Source, Sink, Callable[[], None] | None]:
-    """``(source, sink, release)`` for ``--source``; ``release`` runs at exit if not None."""
+    """``(source, sink, release)`` for ``--source``; ``release`` runs at exit if not None.
+
+    ``smart`` (a :class:`~aqua_bridge.publishers.inputs.SmartInbox` or
+    ``None``) is only meaningful for ``--source hwmon``, where it becomes
+    ``CompositeSource.smart`` and so shows up in ``PlantObservation.inputs
+    ["smart"]`` every tick; the ``sim``/``xt6`` sources have no ``inputs``
+    concept and silently ignore it (SMART data with no drive-adjacent DAS
+    hardware to correlate it against is a later milestone's problem, not a
+    reason to error here).
+    """
     if source == "sim":
         if sim_plant == "basic":
             plant = make_sim_plant(app.mpc)
@@ -233,6 +248,7 @@ def build_io(
             channels=app.mpc.channels,
             temps=app.mpc.temps,
             dt=app.mpc.dt,
+            smart=smart,
             clock=clock,
         )
         return composite, composite, release
@@ -300,8 +316,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     cfg = app.mpc
 
+    # Built regardless of --source: the MQTT/HTTP inbound side (below) works
+    # the same whichever plant is behind the loop, and only --source hwmon's
+    # CompositeSource actually reads it into PlantObservation.inputs (the
+    # module docstring on build_io).
+    smart_inbox = SmartInbox()
+
     try:
-        source, sink, release = build_io(app, args.source, sim_plant=args.sim_plant or "basic")
+        source, sink, release = build_io(
+            app, args.source, sim_plant=args.sim_plant or "basic", smart=smart_inbox
+        )
     except ConfigError as exc:
         _LOG.error("config: %s", exc)
         return 2
@@ -314,7 +338,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     sleep = _make_sleep(args.sim_speed) if args.source == "sim" else None
     loop = Loop(source, sink, cfg, supervisor, clock=time.monotonic, notifier=notifier, sleep=sleep)
 
-    http_service, mqtt_service = start_publishers(app, supervisor)
+    http_service, mqtt_service = start_publishers(app, supervisor, smart_inbox=smart_inbox)
     if mqtt_service is not None:
         loop.on_tick = mqtt_service.on_tick
 
@@ -390,18 +414,24 @@ def _signal_name(signum: int) -> str:
         return str(signum)
 
 
-def start_publishers(app: AppConfig, supervisor: Supervisor) -> tuple[Any, Any]:
+def start_publishers(
+    app: AppConfig, supervisor: Supervisor, *, smart_inbox: Any = None
+) -> tuple[Any, Any]:
     """``(http_service | None, mqtt_service | None)`` per ``http.enabled`` / ``mqtt.enabled``.
 
     Every failure is logged and leaves that publisher off; the control loop
-    must start regardless.
+    must start regardless. ``smart_inbox`` (optional) is wired into both:
+    ``HttpService`` gets it directly (``POST /api/in/smart``), and the MQTT
+    client gets ``add_topic_handler(smart_topic_filter(node_id), ...)`` on
+    the same connection it already builds for commands (one broker
+    connection for the whole daemon).
     """
     http_service = mqtt_service = None
     if app.section("http").get("enabled") is True:
         try:
             from aqua_bridge.publishers.runtime import HttpService
 
-            service = HttpService(supervisor, app)
+            service = HttpService(supervisor, app, smart_inbox=smart_inbox)
             if service.start():
                 http_service = service
         except Exception:
@@ -411,6 +441,18 @@ def start_publishers(app: AppConfig, supervisor: Supervisor) -> tuple[Any, Any]:
             from aqua_bridge.publishers.runtime import MqttService
 
             mqtt_service = MqttService.from_config(app, supervisor)
+            if smart_inbox is not None:
+                # Its own try/except: a client that does not support extra
+                # topic handlers (a test fake, some future alternate
+                # implementation) must not take the whole MQTT service down
+                # with it -- commands/state still matter without SMART.
+                try:
+                    node_id = str(app.mqtt.get("node_id", "aqua-bridge"))
+                    mqtt_service.client.add_topic_handler(
+                        smart_topic_filter(node_id), smart_inbox.on_message
+                    )
+                except Exception:
+                    _LOG.exception("mqtt: smart inbox wiring failed")
             mqtt_service.start()
             _LOG.info("mqtt: connecting to %s:%s", app.mqtt.get("host"), app.mqtt.get("port", 1883))
         except Exception:

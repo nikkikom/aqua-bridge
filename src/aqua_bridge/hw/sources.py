@@ -44,13 +44,13 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from aqua_bridge.hw.onewire import W1Source, build_onewire_from_config
 from aqua_bridge.hw.xt6 import Xt6Adapter, build_map_from_config
 from aqua_bridge.model import ConfigError, MpcCommand, PlantObservation
 
-__all__ = ["CompositeSink", "CompositeSource", "build_composite_from_config"]
+__all__ = ["CompositeSink", "CompositeSource", "SmartSource", "build_composite_from_config"]
 
 _LOG = logging.getLogger("aqua_bridge.hw.sources")
 
@@ -58,15 +58,22 @@ _LOG = logging.getLogger("aqua_bridge.hw.sources")
 _DEFAULT_MAX_AGE_DT_FACTOR = 1.5
 
 
-class CompositeSource:
-    """Merges several :class:`Xt6Adapter` hwmon devices and one optional
-    :class:`~aqua_bridge.hw.onewire.W1Source` into one :class:`PlantObservation`;
-    applies a command by writing each channel to whichever device's map
-    claims it.
+@runtime_checkable
+class SmartSource(Protocol):
+    """What :class:`CompositeSource` needs from a SMART inbox (duck-typed so
+    this module never imports :mod:`aqua_bridge.publishers`, matching the
+    layering every other ``hw/`` module already keeps -- see the "must not
+    import" note above)."""
 
-    ``SmartInbox`` (MQTT-fed SMART readings) is a later milestone and is not
-    wired in here -- ``PlantObservation.inputs`` does not exist yet either
-    (plan section 7, "contract changes", is milestone 4 ``estimator``).
+    def snapshot(self) -> Mapping[str, Mapping[str, Any]]: ...
+
+
+class CompositeSource:
+    """Merges several :class:`Xt6Adapter` hwmon devices, one optional
+    :class:`~aqua_bridge.hw.onewire.W1Source` and one optional SMART inbox
+    (:class:`~aqua_bridge.publishers.inputs.SmartInbox`, duck-typed as
+    :class:`SmartSource`) into one :class:`PlantObservation`; applies a
+    command by writing each channel to whichever device's map claims it.
     """
 
     def __init__(
@@ -74,16 +81,19 @@ class CompositeSource:
         hwmon: Sequence[Xt6Adapter],
         onewire: W1Source | None = None,
         *,
+        smart: SmartSource | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not hwmon:
             raise ValueError("CompositeSource needs at least one hwmon device")
         self.hwmon: list[Xt6Adapter] = list(hwmon)
         self.onewire = onewire
+        self.smart = smart
         self._clock = clock
 
     def read(self) -> PlantObservation:
-        """Reads every hwmon device, then the latest 1-Wire samples.
+        """Reads every hwmon device, then the latest 1-Wire samples, then
+        (if configured) the latest SMART snapshot into ``inputs["smart"]``.
 
         A hwmon device that has vanished (``DeviceUnavailable``) propagates
         exactly as it does for a single-device ``xt6`` source today: the
@@ -91,7 +101,9 @@ class CompositeSource:
         fallback runs (safe direction -- fans ramp toward ``fallback_pwm``,
         never down). A 1-Wire sensor's own loss is finer-grained and never
         escalates here: :meth:`W1Source.read` already reports ``None`` for
-        the sensor(s) it affects, which the gate handles per sensor.
+        the sensor(s) it affects, which the gate handles per sensor. SMART
+        is never gated at all (plan section 1): a stale or empty inbox just
+        means ``inputs["smart"]`` is empty or missing that serial this tick.
         """
         temps: dict[str, float | None] = {}
         rpm: dict[str, float | None] = {}
@@ -103,7 +115,10 @@ class CompositeSource:
             pwm.update(obs.pwm)
         if self.onewire is not None:
             temps.update(self.onewire.read())
-        return PlantObservation(temps=temps, rpm=rpm, pwm=pwm, ts=self._clock())
+        inputs: dict[str, Any] = {}
+        if self.smart is not None:
+            inputs["smart"] = dict(self.smart.snapshot())
+        return PlantObservation(temps=temps, rpm=rpm, pwm=pwm, ts=self._clock(), inputs=inputs)
 
     def apply(self, cmd: MpcCommand) -> None:
         """Writes ``cmd`` to every hwmon device in turn.
@@ -178,6 +193,7 @@ def build_composite_from_config(
     channels: Sequence[str],
     temps: Sequence[str],
     dt: float,
+    smart: SmartSource | None = None,
     clock: Callable[[], float] = time.monotonic,
 ) -> tuple[CompositeSource, Callable[[], None] | None]:
     """Builds the composite source/sink from raw config sections.
@@ -187,6 +203,13 @@ def build_composite_from_config(
     accepted as exactly one more device when non-empty, so an existing
     single-aquaero config needs no rewrite to gain a 1-Wire bus. At least
     one device (from either) is required.
+
+    ``smart`` is an already-built :class:`SmartSource` (typically a
+    :class:`~aqua_bridge.publishers.inputs.SmartInbox` shared with the MQTT/
+    HTTP publishers, whose lifetime they own) or ``None`` when SMART is not
+    wired up; it is not built here since it has no ``config.yaml`` section
+    of its own yet and its wiring spans the MQTT client and the HTTP app,
+    not just hardware (``__main__.build_io`` passes it through).
 
     Returns ``(composite, release)`` where ``release`` stops the 1-Wire
     reader threads (``None`` when there is no 1-Wire source) -- the caller
@@ -223,7 +246,7 @@ def build_composite_from_config(
     _check_bound_exactly(temp_owner, temps, "mpc.temps", "a hwmon temp_map or onewire.sensors")
     _check_bound_exactly(pwm_owner, channels, "mpc.channels", "a hwmon fans map")
 
-    composite = CompositeSource(devices, onewire_source, clock=clock)
+    composite = CompositeSource(devices, onewire_source, smart=smart, clock=clock)
     release: Callable[[], None] | None = None
     if onewire_source is not None:
         onewire_source.start()
