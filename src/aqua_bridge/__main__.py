@@ -21,11 +21,15 @@ CI; ``--sim-plant`` picks it:
 * ``rich``: the same RC plant with one tick of actuator delay and 0.02 degC
   sensor noise (a legacy config against a less ideal plant).
 * ``das``: the DAS truth plant from :mod:`aqua_bridge.sim.das`. It needs a
-  DAS topology. Until the zoned ``mpc`` config exists it is read from a
-  top-level ``sim.das`` section (``{topology?, preset?, seed?}``; without
-  ``topology`` the simulator's default topology is used), and every
-  ``mpc.temps`` / ``mpc.channels`` name must exist in that topology.
-  Missing section or names: :class:`ConfigError`, exit code 2.
+  DAS topology: an optional top-level ``sim.das`` section
+  (``{topology?, preset?, seed?}``) gives one explicitly; without
+  ``sim.das.topology`` a zoned ``mpc`` config (``mpc.topology``) supplies
+  the structure (:func:`aqua_bridge.sim.das.topology_from_config`, so
+  ``config.example-das.yaml`` runs as it is), and a legacy ``mpc`` config
+  with a ``sim.das`` section gets the simulator's default topology. Every
+  ``mpc.temps`` / ``mpc.channels`` name must exist in that topology. A
+  legacy config without ``sim.das``, or missing names: :class:`ConfigError`,
+  exit code 2.
 
 HTTP (``http.enabled``) and MQTT (``mqtt.enabled``) run next to the loop via
 :mod:`aqua_bridge.publishers.runtime`; both attach to the supervisor's
@@ -120,15 +124,18 @@ SIM_PLANTS: tuple[str, ...] = ("basic", "rich", "das")
 
 
 def make_das_sim_plant(app: AppConfig) -> Any:
-    """A DAS truth plant from the top-level ``sim.das`` section (module docstring).
+    """A DAS truth plant from ``sim.das`` and / or the zoned ``mpc`` config (module docstring).
 
-    Raises :class:`ConfigError` with a clear message when the section is
-    missing or malformed, or the ``mpc`` names do not exist in the topology.
+    Raises :class:`ConfigError` with a clear message when no topology is
+    available, the section is malformed, or the ``mpc`` names do not exist in
+    the topology.
     """
-    from aqua_bridge.sim.das import build_das_plant, default_topology
+    from aqua_bridge.sim.das import build_das_plant, default_topology, topology_from_config
 
     sim = app.section("sim")
     das = sim.get("das") if isinstance(sim, dict) else None
+    if das is None and app.mpc.is_das:
+        das = {}
     if not isinstance(das, dict):
         raise ConfigError(
             "--sim-plant das needs a DAS topology: add a top-level section "
@@ -145,7 +152,9 @@ def make_das_sim_plant(app: AppConfig) -> Any:
     cfg = app.mpc
     try:
         plant = build_das_plant(
-            default_topology() if topology is None else topology,
+            (topology_from_config(cfg) if cfg.is_das else default_topology())
+            if topology is None
+            else topology,
             preset=str(das.get("preset", "basic")),
             seed=seed,
             dt=cfg.dt,

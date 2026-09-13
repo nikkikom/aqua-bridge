@@ -1,0 +1,226 @@
+# Zoned DAS example: 4 zones, 15 hot-swap bays, 8 PWM outputs (aquaero 6 XT
+# xt1-xt4 + Quadro qd1-qd4, 1-2 fans per output), 25 sensors (8 thermistors on
+# the aquaero inputs, 17 DS18B20 on 1-Wire). Copy to config.yaml on the Pi and
+# replace the names, hwmon attributes and ROM ids with your own.
+#
+# Run it with --source hwmon (hwmon: + onewire: below) or, without hardware,
+# with --source sim --sim-plant das (the DAS truth simulator built from the
+# topology below).
+#
+# DAS mode: with mpc.topology and no mpc.setpoints the "pi" solver regulates
+# the drives' margins (PI-like DAS form): per output, the worst drive of the
+# zones it serves decides. Drive temperatures are estimated from the proximal
+# and zone-air sensors; the limits come from drive_classes. Runtime changes go
+# through POST /api/limit {bay|class, limit_c} (MQTT {node_id}/cmd/limit/<bay>
+# and {node_id}/cmd/limit/class/<class>); a runtime limit can only be at or
+# below the one written here. Presets: quiet = comfort band -2 degC and noise
+# weight x2, cool = comfort band +2 degC and noise weight x0.5.
+
+mqtt:
+  enabled: false
+  host: mqtt.local
+  port: 1883
+  username: ""
+  password: ""
+  discovery_prefix: homeassistant
+  node_id: aqua-bridge
+
+host:
+  interval_s: 5
+
+mpc:
+  solver: pi             # PI-like DAS solver (margin deficit per output)
+  dt: 5.0                # seconds per tick; drive time constants are minutes
+  horizon: 20            # prediction steps (used by the DAS MPC milestone)
+  temps:                 # every sensor the gate checks; keys of sensors below
+    - inlet_a
+    - inlet_b
+    - air_z0
+    - air_z1
+    - air_z2
+    - air_z3
+    - prox_b01
+    - prox_b02
+    - prox_b03
+    - prox_b03b
+    - prox_b04
+    - prox_b05
+    - prox_b06
+    - prox_b07
+    - prox_b08
+    - prox_b09
+    - prox_b10
+    - prox_b10b
+    - prox_b11
+    - prox_b12
+    - prox_b13
+    - prox_b14
+    - prox_b15
+    - exhaust_z0
+    - exhaust_z2
+  setpoints: {}          # not used in DAS mode: drives are regulated to their class limits
+  channel_temps: {}      # must stay empty with topology
+  weights: {}
+  weight_pwm: 0.0
+  weight_dpwm: 0.05
+  mpc_tau_s: 120.0       # legacy MPC model only
+  mpc_gain_c_per_pwm: 8.0
+  mpc_estimator_gain: 0.1
+  pi_kp: 0.02            # PWM per degC of margin deficit (> 0)
+  pi_ki: 0.0001          # PWM per (degC * s); integral time pi_kp / pi_ki = 200 s
+  pwm_min: 0.2
+  pwm_max: 1.0
+  d_pwm_max: 0.1         # max |delta pwm| per tick
+  fallback_pwm:          # HIGH cooling on a zone fault; keys exactly channels
+    xt1: 0.8
+    xt2: 0.8
+    xt3: 0.8
+    xt4: 0.8
+    qd1: 0.8
+    qd2: 0.8
+    qd3: 0.8
+    qd4: 0.8
+  fallback_hold_s: 30    # hold the last command this long in a zone fault, then ramp high
+  confirm_s: 15          # consecutive trusted seconds before a zone returns; >= 2*dt, <= hold
+  dT_max_c_per_s: 1.0    # gate slew limit, degC/s
+  temp_min_c: -20.0
+  temp_max_c: 120.0
+  median3: false
+  stuck_s: 600           # legacy global Stuck window; DAS sensors use the per-role values
+  stuck_eps_c: 0.1
+  stuck_pwm_net: 0.15
+  stuck_sibling_dT_c: 1.0
+  solver_max_iter: 50
+  channels: [xt1, xt2, xt3, xt4, qd1, qd2, qd3, qd4]
+
+  topology:
+    zones:               # channels: every output whose fans move air through the zone
+      z0: {channels: [xt1, qd1], coupled_to: [z1]}
+      z1: {channels: [xt2, qd1, qd2], coupled_to: [z0, z2]}
+      z2: {channels: [xt3, qd2, qd3], coupled_to: [z1, z3]}
+      z3: {channels: [xt4, qd3, qd4], coupled_to: [z2]}
+    # occupied: auto (unknown until an estimator decides; constrained like an
+    # occupied bay). Declare class: ssd_sata / nvme per bay once you know what
+    # sits where; a bay without class uses default_class (the strictest, hdd).
+    # limit_c tightens the class limit for one bay.
+    bays:
+      b01: {zone: z0}
+      b02: {zone: z0}
+      b03: {zone: z0}
+      b04: {zone: z0}
+      b05: {zone: z1}
+      b06: {zone: z1}
+      b07: {zone: z1}
+      b08: {zone: z1}
+      b09: {zone: z2}
+      b10: {zone: z2}
+      b11: {zone: z2}
+      b12: {zone: z2}
+      b13: {zone: z3}
+      b14: {zone: z3}
+      b15: {zone: z3}
+    default_class: hdd
+
+  sensors:               # keys exactly temps; quant_c 0.01 = aquaero thermistor, 0.0625 = DS18B20
+    inlet_a: {role: inlet, quant_c: 0.01}
+    inlet_b: {role: inlet, quant_c: 0.0625, redundant: true}
+    air_z0: {role: zone_air, zone: z0, quant_c: 0.01}
+    air_z1: {role: zone_air, zone: z1, quant_c: 0.01}
+    air_z2: {role: zone_air, zone: z2, quant_c: 0.01}
+    air_z3: {role: zone_air, zone: z3, quant_c: 0.01}
+    prox_b01: {role: drive_proximal, zone: z0, bay: b01, tau_s: 15}
+    prox_b02: {role: drive_proximal, zone: z0, bay: b02, tau_s: 15}
+    prox_b03: {role: drive_proximal, zone: z0, bay: b03, tau_s: 15}
+    prox_b03b: {role: drive_proximal, zone: z0, bay: b03, quant_c: 0.01, redundant: true}
+    prox_b04: {role: drive_proximal, zone: z0, bay: b04, tau_s: 15}
+    prox_b05: {role: drive_proximal, zone: z1, bay: b05, tau_s: 15}
+    prox_b06: {role: drive_proximal, zone: z1, bay: b06, tau_s: 15}
+    prox_b07: {role: drive_proximal, zone: z1, bay: b07, tau_s: 15}
+    prox_b08: {role: drive_proximal, zone: z1, bay: b08, tau_s: 15}
+    prox_b09: {role: drive_proximal, zone: z2, bay: b09, tau_s: 15}
+    prox_b10: {role: drive_proximal, zone: z2, bay: b10, tau_s: 15}
+    prox_b10b: {role: drive_proximal, zone: z2, bay: b10, redundant: true}
+    prox_b11: {role: drive_proximal, zone: z2, bay: b11, tau_s: 15}
+    prox_b12: {role: drive_proximal, zone: z2, bay: b12, tau_s: 15}
+    prox_b13: {role: drive_proximal, zone: z3, bay: b13, tau_s: 15}
+    prox_b14: {role: drive_proximal, zone: z3, bay: b14, tau_s: 15}
+    prox_b15: {role: drive_proximal, zone: z3, bay: b15, tau_s: 15}
+    exhaust_z0: {role: exhaust, zone: z0, quant_c: 0.01}
+    exhaust_z2: {role: exhaust, zone: z2, quant_c: 0.01}
+
+  drive_classes:         # owner decision: limit / comfort band / drive time constant
+    hdd: {limit_c: 50.0, comfort_c: 5.0, tau_d_s: 720.0}
+    ssd_sata: {limit_c: 65.0, comfort_c: 10.0, tau_d_s: 200.0}
+    nvme: {limit_c: 70.0, comfort_c: 10.0, tau_d_s: 120.0}
+
+  fans:                  # keys exactly channels; count = fans on the output (splitter: 2)
+    xt1: {model: case120, count: 2}
+    xt2: {model: case120, count: 2}
+    xt3: {model: case120, count: 1}
+    xt4: {model: case120, count: 1}
+    qd1: {model: case120, count: 1}
+    qd2: {model: case120, count: 1}
+    qd3: {model: case120, count: 1}
+    qd4: {model: case120, count: 1}
+  fan_models:
+    case120: {rpm_max: 1500, deadband: 0.1, exponent: 1.0, noise_db_at_max: 30.0}
+  zones: {trust_rule: strict, fault_coupling: declared}
+  noise: {exponent: 5.0, weight_noise: 1.0, band_hysteresis: 0.02}
+
+# Hardware bindings for --source hwmon: every mpc.temps name bound exactly once
+# across the hwmon temp_maps and onewire.sensors, every channel by one fans map.
+hwmon:
+  - name: aquaero
+    fans:
+      xt1: {pwm: pwm1, rpm: fan1}
+      xt2: {pwm: pwm2, rpm: fan2}
+      xt3: {pwm: pwm3, rpm: fan3}
+      xt4: {pwm: pwm4, rpm: fan4}
+    temp_map:            # the 8 thermistor inputs
+      inlet_a: temp1
+      air_z0: temp2
+      air_z1: temp3
+      air_z2: temp4
+      air_z3: temp5
+      prox_b03b: temp6
+      exhaust_z0: temp7
+      exhaust_z2: temp8
+  - name: quadro         # its own USB port if its PWM is not writable through the aquaero
+    fans:
+      qd1: {pwm: pwm1, rpm: fan1}
+      qd2: {pwm: pwm2, rpm: fan2}
+      qd3: {pwm: pwm3, rpm: fan3}
+      qd4: {pwm: pwm4, rpm: fan4}
+    temp_map: {}         # bind Quadro inputs only once they show up in hwmon
+
+onewire:
+  resolution_bits: 12
+  max_age_s: 7.5         # 1.5 * dt
+  sensors:               # logical name -> DS18B20 ROM id (tools/w1_commission.py --identify)
+    inlet_b: 28-000000000001
+    prox_b01: 28-000000000002
+    prox_b02: 28-000000000003
+    prox_b03: 28-000000000004
+    prox_b04: 28-000000000005
+    prox_b05: 28-000000000006
+    prox_b06: 28-000000000007
+    prox_b07: 28-000000000008
+    prox_b08: 28-000000000009
+    prox_b09: 28-00000000000a
+    prox_b10: 28-00000000000b
+    prox_b10b: 28-00000000000c
+    prox_b11: 28-00000000000d
+    prox_b12: 28-00000000000e
+    prox_b13: 28-00000000000f
+    prox_b14: 28-000000000010
+    prox_b15: 28-000000000011
+
+http:
+  bind: 0.0.0.0
+  port: 8080
+  enabled: false
+
+digole:
+  device: /dev/serial0
+  baud: 9600
+  enabled: false

@@ -4,7 +4,7 @@ This is the *truth* that later milestones (estimator, zoned fallback, PI-DAS,
 MPC-DAS, identification) are tested against. It is deliberately richer than
 any controller model: the controller never sees these parameters, only the
 observations. It shares nothing with :class:`aqua_bridge.model.MpcConfig`
-beyond the observation types; a later milestone maps its zoned config onto
+beyond the observation types, except :func:`topology_from_config`, which maps a zoned config onto
 the plain topology dict accepted by :func:`build_das_params`.
 
 Physics (SI: W, J/K, W/K, degC, s)
@@ -104,6 +104,7 @@ __all__ = [
     "build_das_params",
     "build_das_plant",
     "default_topology",
+    "topology_from_config",
     "quantise",
     "run_das_closed_loop",
 ]
@@ -535,6 +536,66 @@ def default_topology() -> dict[str, Any]:
         "qd3": {"zones": {"z2": 0.3, "z3": 0.7}},
         "qd4": {"zone": "z3", "tach": False},
     }
+    return {"zones": zones, "bays": bays, "fans": fans, "sensors": sensors}
+
+
+#: A sensor with ``quant_c`` at or below this is simulated as a thermistor, else a DS18B20.
+THERMISTOR_MAX_QUANT_C = 0.02
+
+
+def topology_from_config(cfg: MpcConfig) -> dict[str, Any]:
+    """The plain topology dict for :func:`build_das_params` from a zoned ``MpcConfig``.
+
+    Truth parameters stay the simulator's (nominal, or drawn by the ``rich``
+    preset); the config only supplies the structure: zones and their declared
+    couplings, bays with their class (``default_class`` when undeclared; an
+    ``occupied: auto`` bay holds a drive, ``false`` is empty), one output per
+    channel spread evenly over the zones that list it with ``count`` fans and
+    its fan model's ``rpm_max`` / ``deadband`` / ``exponent`` /
+    ``noise_db_at_max``, and one sensor per temperature with its role, zone and
+    bay (a ``quant_c`` of at most 0.02 degC is a thermistor, anything coarser a
+    DS18B20). Raises ``ValueError`` for a config without ``topology``.
+    """
+    topo = cfg.topology
+    if topo is None:
+        raise ValueError("topology_from_config needs a zoned config (mpc.topology)")
+    zones = {z: {"coupled_to": list(spec.coupled_to)} for z, spec in topo.zones.items()}
+    bays: dict[str, Any] = {}
+    for b, bay in topo.bays.items():
+        entry: dict[str, Any] = {"zone": bay.zone, "occupied": bay.occupied is not False}
+        drive_class = cfg.bay_class(b)
+        entry["class"] = drive_class if drive_class in DRIVE_CLASSES else "hdd"
+        if bay.serial is not None:
+            entry["serial"] = bay.serial
+        bays[b] = entry
+    fans: dict[str, Any] = {}
+    for ch in cfg.channels:
+        listed = [z for z, spec in topo.zones.items() if ch in spec.channels]
+        entry = {"zones": {z: 1.0 / len(listed) for z in listed}}
+        spec = cfg.fans.get(ch)
+        if spec is not None:
+            entry["count"] = spec.count
+            model = cfg.fan_models.get(spec.model)
+            if model is not None:
+                entry.update(
+                    rpm_max=model.rpm_max,
+                    deadband=model.deadband,
+                    exponent=model.exponent,
+                    noise_db_at_max=model.noise_db_at_max,
+                )
+        fans[ch] = entry
+    sensors: dict[str, Any] = {}
+    for name in cfg.temps:
+        sp = cfg.sensors[name]
+        entry = {
+            "role": sp.role,
+            "type": "thermistor" if sp.quant_c <= THERMISTOR_MAX_QUANT_C else "ds18b20",
+        }
+        if sp.zone is not None:
+            entry["zone"] = sp.zone
+        if sp.bay is not None:
+            entry["bay"] = sp.bay
+        sensors[name] = entry
     return {"zones": zones, "bays": bays, "fans": fans, "sensors": sensors}
 
 
