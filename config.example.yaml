@@ -80,6 +80,15 @@ mpc:
   model_converged_rel_se: 0.25 # relative standard error of every fan gain for "converged", (0, 1)
   model_max_pred_err_c: 1.0    # one-window prediction error allowed for "converged", degC, > 0
   model_use_rpm: false   # true (needs topology): airflow from the tachometer where one reports
+  # DAS MPC (control/solver_das.py: solver "mpc" with topology and no setpoints); inert in legacy mode.
+  mpc_pred_dt_s: 30.0    # prediction step, seconds (> 0; >= dt with topology); horizon counts these steps
+  mpc_blocks: []         # move blocks summing to horizon; [] = [1, 1, 2, 4, 6, 6] cut to horizon
+  mpc_every_ticks: 1     # solve every n-th tick, replay the plan in between (>= 1)
+  rho_soft: 40.0         # penalty per degC^2 above a drive's soft target (> 0)
+  rho_hard: 4000.0       # penalty per degC^2 above its hard target (>= rho_soft)
+  solver_outer_max: 4    # active-piece iterations per solve (>= 1)
+  model_max_drift_c_per_min: 0.5  # validity gate: model drift at the estimate, degC/min (> 0)
+  model_accept_prior: false  # true (needs topology): the MPC may act on a model that has not converged
 
 xt6:
   prefer: hwmon

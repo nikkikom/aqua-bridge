@@ -29,9 +29,9 @@ host:
   interval_s: 5
 
 mpc:
-  solver: pi             # PI-like DAS solver (margin deficit per output)
+  solver: pi             # pi: PI-like DAS solver (margin deficit per output); mpc: DAS MPC
   dt: 5.0                # seconds per tick; drive time constants are minutes
-  horizon: 20            # prediction steps (used by the DAS MPC milestone)
+  horizon: 20            # DAS MPC prediction steps of mpc_pred_dt_s (10 minutes)
   temps:                 # every sensor the gate checks; keys of sensors below
     - inlet_a
     - inlet_b
@@ -62,7 +62,7 @@ mpc:
   channel_temps: {}      # must stay empty with topology
   weights: {}
   weight_pwm: 0.0
-  weight_dpwm: 0.05
+  weight_dpwm: 1.0       # DAS MPC: penalty per PWM^2 between move blocks (damps the plan)
   mpc_tau_s: 120.0       # legacy MPC model only
   mpc_gain_c_per_pwm: 8.0
   mpc_estimator_gain: 0.1
@@ -196,6 +196,19 @@ mpc:
   model_converged_rel_se: 0.25  # every fan gain's relative standard error below this ...
   model_max_pred_err_c: 1.0     # ... and the one-window prediction error below this: converged
   model_use_rpm: false   # airflow from the tachometer instead of the PWM curve where one reports
+  # DAS MPC (solver: mpc; control/solver_das.py): least modelled fan noise with every drive
+  # under its targets, planned over horizon steps of mpc_pred_dt_s. It acts only on a model
+  # that passes its validity gate (a converged thermal model, finite bounded parameters,
+  # stable dynamics, a gain on every drive, prediction error and drift in bounds) and
+  # otherwise regulates exactly like solver: pi, with mode staying auto.
+  mpc_pred_dt_s: 30.0    # prediction step, seconds (>= dt)
+  mpc_blocks: [1, 1, 2, 4, 6, 6]  # move blocks, sum = horizon
+  mpc_every_ticks: 2     # solve every 2nd tick (Zero W budget at dt = 5 s); replay the plan between
+  rho_soft: 40.0         # penalty per degC^2 above a drive's soft target (limit - comfort - k sigma)
+  rho_hard: 4000.0       # penalty per degC^2 above its hard target (limit - k sigma)
+  solver_outer_max: 4    # active-piece iterations per solve
+  model_max_drift_c_per_min: 0.5  # validity gate: the model's drive drift at the estimate
+  model_accept_prior: false  # true: act on the prior model (or what shadow learning has so far)
 
 # Hardware bindings for --source hwmon: every mpc.temps name bound exactly once
 # across the hwmon temp_maps and onewire.sensors, every channel by one fans map.

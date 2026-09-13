@@ -59,10 +59,12 @@ choice for cooling:
   When ``setpoints`` is not empty every channel must control at least one.
   An empty ``setpoints`` is DAS limit regulation
   (:attr:`MpcConfig.regulates_drive_limits`): the ``pi`` solver regulates
-  the margin deficit of the drives (``aqua_bridge.control.solver_pi``); the
-  legacy ``mpc`` solver cannot compute a demand without a setpoint, raises,
-  and every zone it drives stays in fallback (high cooling), visible as
-  ``solver_error``, until the DAS MPC milestone.
+  the margin deficit of the drives (``aqua_bridge.control.solver_pi``) and
+  the ``mpc`` solver is the DAS MPC (``aqua_bridge.control.solver_das``:
+  least modelled fan noise with every drive under its targets). A zoned
+  config that keeps ``setpoints`` runs the legacy ``mpc`` solver, which
+  cannot plan beside a zone in fault and turns such a fault into a fault of
+  every zone it drives (high cooling).
 * ``topology.bays.<bay>.limit_c`` can only tighten the bay's class limit
   (:meth:`MpcConfig.bay_limit` is the minimum of both).
 * A ``topology.bays.<bay>.serial`` may be declared on one bay only.
@@ -78,6 +80,17 @@ choice for cooling:
   always and inert in legacy mode, and ``model_window_s >= 2 * dt`` is checked
   only with ``model_shadow`` so a default never invalidates a legacy config with
   a long ``dt``.
+* The DAS MPC keys (``mpc_pred_dt_s``, ``mpc_blocks``, ``mpc_every_ticks``,
+  ``rho_soft``, ``rho_hard``, ``solver_outer_max``, ``model_max_drift_c_per_min``,
+  ``model_accept_prior``; ``aqua_bridge.control.solver_das``) are flat keys too,
+  validated always and inert in legacy mode. ``mpc_pred_dt_s >= dt`` is checked
+  only with ``topology``; ``mpc_blocks`` empty (the default) means the plan's
+  blocks ``[1, 1, 2, 4, 6, 6]`` for ``horizon: 20`` and the same doubling
+  pattern cut to ``horizon`` otherwise (:meth:`MpcConfig.blocks`), so the legacy
+  horizon never invalidates a config. With ``topology``, no ``setpoints`` and
+  ``solver: mpc`` the legacy MPC weight rules do not apply (the DAS MPC tracks
+  no setpoint); ``noise.weight_noise + weight_dpwm > 0`` is required instead.
+  ``model_accept_prior: true`` needs ``topology``.
 """
 
 from __future__ import annotations
@@ -1396,6 +1409,14 @@ class MpcConfig:
       learning on/off, regression window, RLS forgetting per window, covariance trace
       bound, relative standard error and prediction error for ``converged``, and fan
       airflow from the tachometer instead of the PWM curve.
+    * ``mpc_pred_dt_s`` / ``mpc_blocks`` / ``mpc_every_ticks`` / ``rho_soft`` / ``rho_hard``
+      / ``solver_outer_max`` / ``model_max_drift_c_per_min`` / ``model_accept_prior`` --
+      the DAS MPC (``control/solver_das.py``, ``solver: mpc`` with ``topology`` and no
+      ``setpoints``): prediction step (``horizon`` counts these steps), move blocks
+      (:meth:`blocks`), solve every n-th tick, soft / hard penalty weights, cap on the
+      active-piece iterations, the validity gate's equilibrium drift limit and whether
+      a thermal model that has not converged (its prior or what it learnt so far) may
+      drive the fans. Inert in legacy mode.
     * ``topology`` / ``sensors`` / ``drive_classes`` / ``fans`` / ``fan_models`` /
       ``zones`` / ``noise`` / ``estimator`` -- the zoned DAS layout (module
       docstring, *DAS layout*); all absent is legacy mode. With ``topology`` the
@@ -1450,6 +1471,14 @@ class MpcConfig:
     model_converged_rel_se: float = 0.25
     model_max_pred_err_c: float = 1.0
     model_use_rpm: bool = False
+    mpc_pred_dt_s: float = 30.0
+    mpc_blocks: tuple[int, ...] = ()
+    mpc_every_ticks: int = 1
+    rho_soft: float = 40.0
+    rho_hard: float = 4000.0
+    solver_outer_max: int = 4
+    model_max_drift_c_per_min: float = 0.5
+    model_accept_prior: bool = False
 
     # -- construction -------------------------------------------------------
 
@@ -1508,7 +1537,7 @@ class MpcConfig:
         s(self, "mpc_tau_s", _cfg_num("mpc_tau_s", self.mpc_tau_s))
         s(self, "mpc_gain_c_per_pwm", _cfg_num("mpc_gain_c_per_pwm", self.mpc_gain_c_per_pwm))
         s(self, "mpc_estimator_gain", _cfg_num("mpc_estimator_gain", self.mpc_estimator_gain))
-        for name in ("model_shadow", "model_use_rpm"):
+        for name in ("model_shadow", "model_use_rpm", "model_accept_prior"):
             _cfg_bool(name, getattr(self, name))
         for name in (
             "model_window_s",
@@ -1516,8 +1545,16 @@ class MpcConfig:
             "model_p_trace_max",
             "model_converged_rel_se",
             "model_max_pred_err_c",
+            "mpc_pred_dt_s",
+            "rho_soft",
+            "rho_hard",
+            "model_max_drift_c_per_min",
         ):
             s(self, name, _cfg_num(name, getattr(self, name)))
+        s(self, "mpc_every_ticks", _cfg_int("mpc_every_ticks", self.mpc_every_ticks))
+        s(self, "solver_outer_max", _cfg_int("solver_outer_max", self.solver_outer_max))
+        blocks = _cfg_list("mpc_blocks", self.mpc_blocks)
+        s(self, "mpc_blocks", tuple(_cfg_int(f"mpc_blocks[{i}]", b) for i, b in enumerate(blocks)))
         self._coerce_das()
 
     def _coerce_das(self) -> None:
@@ -1695,7 +1732,16 @@ class MpcConfig:
             raise ConfigError(
                 f"mpc.mpc_estimator_gain must be in (0, 1], got {self.mpc_estimator_gain}"
             )
-        if self.solver is SolverKind.MPC:
+        if self.solver is SolverKind.MPC and self.regulates_drive_limits:
+            # The DAS MPC (control/solver_das.py) tracks no setpoint: its QP is strictly
+            # convex through the noise surrogate or the move penalty.
+            assert self.noise is not None
+            if self.noise.weight_noise + self.weight_dpwm <= 0:
+                raise ConfigError(
+                    "mpc.noise.weight_noise + mpc.weight_dpwm must be > 0 with solver 'mpc' "
+                    "in DAS mode"
+                )
+        elif self.solver is SolverKind.MPC:
             # The QP is strictly convex only through the effort / move penalties
             # (with more channels than temperatures the tracking term alone is
             # singular), and a cost without any tracking weight regulates nothing.
@@ -1732,8 +1778,10 @@ class MpcConfig:
                     )
 
     def _validate_model_keys(self) -> None:
-        """Rules for the ``model_*`` keys of the thermal model's identification."""
-        for name in ("model_shadow", "model_use_rpm"):
+        """Rules for the ``model_*`` keys of the thermal model's identification and the
+        DAS MPC keys (module docstring)."""
+        self._validate_das_mpc_keys()
+        for name in ("model_shadow", "model_use_rpm", "model_accept_prior"):
             if getattr(self, name) and self.topology is None:
                 raise ConfigError(f"mpc.{name}: true requires mpc.topology (DAS layout)")
         if self.model_window_s <= 0 or self.model_window_s > 600:
@@ -1754,6 +1802,38 @@ class MpcConfig:
         if self.model_max_pred_err_c <= 0:
             raise ConfigError(
                 f"mpc.model_max_pred_err_c must be > 0, got {self.model_max_pred_err_c}"
+            )
+
+    def _validate_das_mpc_keys(self) -> None:
+        """Plan section 7 rules for the DAS MPC keys (inert in legacy mode)."""
+        if self.mpc_pred_dt_s <= 0:
+            raise ConfigError(f"mpc.mpc_pred_dt_s must be > 0, got {self.mpc_pred_dt_s}")
+        if self.topology is not None and self.mpc_pred_dt_s < self.dt:
+            raise ConfigError(
+                f"mpc.mpc_pred_dt_s must be >= dt ({self.dt}), got {self.mpc_pred_dt_s}"
+            )
+        if any(b < 1 for b in self.mpc_blocks):
+            raise ConfigError(f"mpc.mpc_blocks entries must be >= 1, got {list(self.mpc_blocks)}")
+        if self.mpc_blocks and sum(self.mpc_blocks) != self.horizon:
+            raise ConfigError(
+                f"mpc.mpc_blocks must sum to horizon ({self.horizon}), got "
+                f"{list(self.mpc_blocks)} (sum {sum(self.mpc_blocks)})"
+            )
+        if self.mpc_every_ticks < 1:
+            raise ConfigError(f"mpc.mpc_every_ticks must be >= 1, got {self.mpc_every_ticks}")
+        if self.rho_soft <= 0 or self.rho_hard <= 0:
+            raise ConfigError(
+                f"mpc.rho_soft and mpc.rho_hard must be > 0, got {self.rho_soft}, {self.rho_hard}"
+            )
+        if self.rho_hard < self.rho_soft:
+            raise ConfigError(
+                f"mpc.rho_hard ({self.rho_hard}) must be >= mpc.rho_soft ({self.rho_soft})"
+            )
+        if self.solver_outer_max < 1:
+            raise ConfigError(f"mpc.solver_outer_max must be >= 1, got {self.solver_outer_max}")
+        if self.model_max_drift_c_per_min <= 0:
+            raise ConfigError(
+                f"mpc.model_max_drift_c_per_min must be > 0, got {self.model_max_drift_c_per_min}"
             )
 
     def _validate_das(self) -> None:
@@ -2182,6 +2262,28 @@ class MpcConfig:
                 t for t in self.temps if t in self.setpoints and self.sensors[t].zone in zones
             )
         return tuple(t for t in self.temps if t in self.setpoints)
+
+    def blocks(self) -> tuple[int, ...]:
+        """The DAS MPC's move blocks: ``mpc_blocks``, else the default for ``horizon``.
+
+        The default is the plan's ``(1, 1, 2, 4, 6, 6)`` cut to ``horizon`` steps
+        (repeating 6 beyond 20): blocks are taken while they fit and the remainder
+        becomes the last block, so ``horizon: 8`` gives ``(1, 1, 2, 4)`` and
+        ``horizon: 12`` gives ``(1, 1, 2, 4, 4)``.
+        """
+        if self.mpc_blocks:
+            return tuple(self.mpc_blocks)
+        out: list[int] = []
+        left = self.horizon
+        pattern = (1, 1, 2, 4, 6, 6)
+        i = 0
+        while left > 0:
+            b = pattern[i] if i < len(pattern) else 6
+            b = min(b, left)
+            out.append(b)
+            left -= b
+            i += 1
+        return tuple(out)
 
     def weight_for(self, temp: str) -> float:
         """Tracking weight for a temperature; 1.0 when not listed in ``weights``."""
