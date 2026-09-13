@@ -95,6 +95,12 @@ the lagging sensors' transient into the endpoint values, which biased the fan
 gains 10-15 % low on the truth simulator. The effective length of the weighted
 window is about half of ``T_w``, hence the default 120 s (the plan's 60 s
 rectangle).
+A closing window is used only when its samples resolve the weight: the trapezoid
+sums over the actual sample times must give ``int w = T_w / 2`` within
+:data:`WINDOW_MASS_TOL` and ``int dw = int d2w = 0`` within :data:`WINDOW_SUM_TOL`
+of their scales (exact for uniform sampling). A window of a few ticks spanned by a
+missed tick fails that and is dropped: its row would otherwise carry the absolute
+temperature through the ``dw`` / ``d2w`` sums, or divide by a weight of ~0.
 
 **Sensor lag.** Every sensor is modelled as a first-order lag of its node,
 ``X = X_sensor + tau dX_sensor/dt`` (``tau`` from ``sensors.<name>.tau_s``, else
@@ -203,7 +209,7 @@ Memory (plain JSON)::
      "bays": {bay: block}}
     block = {"theta": [...], "P": [[...]], "s2": float, "n": excited windows,
              "w": windows, "m": [...], "S": [[...]], "fm": [...] | None, "pe": float,
-             "rel": [...] | None, "acc": {"x", "y", "h", "fan", "t0"} | None}
+             "rel": [...] | None, "acc": {"x", "y", "h", "fan", "t0", "c"} | None}
 
 A memory that does not match the config's structure, or is malformed in any way,
 starts over (never an exception).
@@ -307,6 +313,10 @@ FAN_MEAN_ALPHA = 0.1
 PRED_ERR_ALPHA = 0.1
 #: Longest interval between two samples of a window, in ticks.
 GAP_TICKS = 3.0
+#: A closing window's sampled ``int w`` within this fraction of ``T / 2``, and its
+#: sampled ``int dw`` / ``int d2w`` within this fraction of their scales, else dropped.
+WINDOW_MASS_TOL = 0.05
+WINDOW_SUM_TOL = 0.01
 _EPS = 1e-12
 
 
@@ -1224,16 +1234,24 @@ def _parse_block(raw: object, spec: _BlockSpec, n_fan: int) -> dict[str, Any]:
         "fm": None if fm is None else _checked(fm, (n_fan,)),
         "pe": _num(raw.get("pe", 0.0)),
         "rel": rel,
-        "acc": None if acc is None else _parse_acc(acc, n),
+        "acc": None if acc is None else _parse_acc(acc, n, n_fan),
     }
 
 
-def _parse_acc(raw: object, n: int) -> dict[str, Any]:
+def _parse_acc(raw: object, n: int, n_fan: int) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise TypeError("accumulator")
     x = [_num(v) for v in _checked(raw["x"], (n,))]
-    fan = [_num(v) for v in raw["fan"]]
-    return {"x": x, "y": _num(raw["y"]), "h": _num(raw["h"]), "fan": fan, "t0": _num(raw["t0"])}
+    fan = [_num(v) for v in _checked(raw["fan"], (n_fan,))]
+    sums = [_num(v) for v in _checked(raw["c"], (2,))]
+    return {
+        "x": x,
+        "y": _num(raw["y"]),
+        "h": _num(raw["h"]),
+        "fan": fan,
+        "t0": _num(raw["t0"]),
+        "c": sums,
+    }
 
 
 def _parse_sample(raw: object) -> dict[str, Any] | None:
@@ -1339,7 +1357,27 @@ def _channel_phi(
 
 
 def _fresh_acc(n: int, n_fan: int, t0: float) -> dict[str, Any]:
-    return {"x": [0.0] * n, "y": 0.0, "h": 0.0, "fan": [0.0] * n_fan, "t0": t0}
+    return {"x": [0.0] * n, "y": 0.0, "h": 0.0, "fan": [0.0] * n_fan, "t0": t0, "c": [0.0, 0.0]}
+
+
+def _window_sampled(acc: Mapping[str, Any], mass: float, window_s: float) -> bool:
+    """Whether a closing window's samples resolve its weight (module docstring).
+
+    Analytically ``int w = T / 2`` and ``int dw = int d2w = 0`` over the window. The
+    trapezoid sums of the actual sample times reproduce that exactly for uniform
+    sampling at any interval dividing ``T``; an interval that spans most of a short
+    window (allowed: up to ``GAP_TICKS`` ticks against a window of 2 ``dt``) does not,
+    and its row then carries the absolute temperature through the ``dw`` / ``d2w``
+    sums, or divides by a weight of ~0. Such a window is dropped, never learned.
+    """
+    k = math.pi / window_s
+    half_t = 0.5 * window_s
+    c_dw, c_ddw = acc["c"]
+    return (
+        abs(mass - half_t) <= WINDOW_MASS_TOL * half_t
+        and abs(c_dw) <= WINDOW_SUM_TOL * k * half_t
+        and abs(c_ddw) <= WINDOW_SUM_TOL * 2.0 * k * k * half_t
+    )
 
 
 def _weights(t: float, window_s: float) -> tuple[float, float, float]:
@@ -1455,7 +1493,12 @@ def update(
             )
             acc["fan"][0] += weight * qn
             acc["h"] += h
+            acc["c"][0] += half * (dw0 + dw1)
+            acc["c"][1] += half * (ddw0 + ddw1)
             if ts - acc["t0"] + 1e-9 < window_s:
+                continue
+            if not _window_sampled(acc, acc["x"][0], window_s):
+                block["acc"] = None
                 continue
             # rows stay in kelvin (a change of the sensor target mid-window weighs 1)
             fan = np.array(acc["fan"]) / acc["x"][0]
@@ -1514,9 +1557,14 @@ def update(
         for j, i in enumerate(strong):
             acc["fan"][j] += weight * group_phi[i]
         acc["h"] += h
+        acc["c"][0] += half * (dw0 + dw1)
+        acc["c"][1] += half * (ddw0 + ddw1)
         if ts - acc["t0"] + 1e-9 < window_s:
             continue
         norm = -acc["x"][-1]
+        if not _window_sampled(acc, norm, window_s):
+            block["acc"] = None
+            continue
         x = np.array(acc["x"]) / norm
         fan = np.array(acc["fan"]) / norm
         residual, excited = _rls_window(block, zone_specs[z], x, acc["y"] / norm, fan, cfg)

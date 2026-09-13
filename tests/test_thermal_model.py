@@ -541,6 +541,39 @@ def test_steady_data_never_winds_up_the_covariance(small):
     assert out.summary["status"] == "prior"
 
 
+@pytest.mark.parametrize("ticks", [[0, 1, 2, 3, 6, 9, 10, 11, 12, 13], [0, 1, 2, 3, 5, 7, 9]])
+def test_a_window_without_weight_mass_is_dropped_not_learned(ticks, monkeypatch):
+    """A window as short as the rules allow (2 dt) spanned by one allowed interval (up to
+    ``GAP_TICKS`` dt) has only its zero-weight endpoints: its row carries no information
+    and must never reach the RLS (normalised by a weight of ~1e-32 it was a 1e36 row),
+    must not raise and must leave finite JSON."""
+    c = das_cfg(model_shadow=True, model_window_s=2.0)
+    rows: list[tuple[str, np.ndarray, float]] = []
+    real = thermal._rls_window
+
+    def spy(block, spec, x, y, fan, cc):
+        rows.append((spec.keys[-1], np.array(x), float(y)))
+        return real(block, spec, x, y, fan, cc)
+
+    monkeypatch.setattr(thermal, "_rls_window", spy)
+    ok = set(c.zone_layout.zones)
+    u = dict.fromkeys(c.channels, 0.6)
+    mem = None
+    for ts in ticks:
+        temps = _temps(c, float(ts), ripple=1.0)
+        with np.errstate(all="raise"):
+            out = thermal.update(mem, c, temps=temps, u=u, ts=float(ts), zones_ok=ok)
+        mem = out.memory
+        json.dumps(mem, allow_nan=False)
+        assert_no_non_finite(out.summary, "thermal summary")
+    assert rows  # the well-sampled windows did close
+    for key, x, y in rows:
+        assert np.all(np.abs(x) < 1e3) and abs(y) < 1e3, (key, x, y)
+        if key.startswith("k."):
+            # the weight mass of a well-sampled window is int sin^2 = T / 2
+            assert x[0] == pytest.approx(0.5 * c.model_window_s, rel=0.1), (key, x)
+
+
 def test_windows_restart_when_a_zone_is_not_ok(small):
     u = dict.fromkeys(small.channels, 0.6)
     all_ok = set(small.zone_layout.zones)
