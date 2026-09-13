@@ -41,7 +41,10 @@ DAS mode also publishes the zoned thermal model's identification
 (``value_json.cmd.diagnostics.thermal``, :mod:`aqua_bridge.control.thermal`): sensors
 ``model_status`` (``prior`` | ``learning`` | ``converged`` | ``suspect`` | ``error``,
 ``off`` without ``model_shadow``) and ``model_pred_err_c`` (the worst zone's
-one-window prediction error, degC; ``None`` until a window has closed).
+one-window prediction error, degC; ``None`` until a window has closed), and the
+fan noise index ``noise_db`` (``value_json.cmd.diagnostics.noise.db_index``,
+:mod:`aqua_bridge.control.noise`: energetic total from the fans' speed; an index,
+absolute only with datasheet ``noise_db_at_max`` values).
 
 Discovery config topics follow the standard
 ``{discovery_prefix}/{component}/{node_id}/{object_id}/config``.
@@ -352,6 +355,16 @@ def build_discovery_entities(
                 name="Thermal model prediction error",
                 value_template=f"{{{{ {thermal}.pred_err_c | default(None) }}}}",
                 unit="°C",
+            )
+        )
+        entities.append(
+            _sensor(
+                discovery_prefix=discovery_prefix,
+                node_id=node_id,
+                object_id="noise_db",
+                name="Fan noise index",
+                value_template=("{{ value_json.cmd.diagnostics.noise.db_index | default(None) }}"),
+                unit="dB",
             )
         )
 
