@@ -6,6 +6,14 @@ the other sections (``mqtt``, ``host``, ``xt6``, ``http``, ``digole``,
 ``onewire``) are handed to their owners as plain dicts. Unknown keys
 *inside* ``mpc`` are an error; unknown top-level sections are kept in
 ``AppConfig.extra`` so a typo there is visible without being fatal.
+
+``hwmon`` is the one section shaped as a *list* rather than a mapping (one
+entry per hwmon device, plan section 12 Q1: the Quadro possibly needing its
+own USB port and hwmon device alongside the aquaero) and so is parsed
+separately from the ``mapping`` sections below; it defaults to an empty
+tuple and its entries are handed to ``hw/sources.py`` unvalidated (that is
+where the DAS plan's binding check against ``mpc.temps``/``mpc.channels``
+lives, section 1).
 """
 
 from __future__ import annotations
@@ -38,6 +46,25 @@ def _section(name: str, value: object) -> dict[str, Any]:
     return dict(value)
 
 
+def _hwmon_section(value: object) -> tuple[dict[str, Any], ...]:
+    """``hwmon:`` must be a list of mappings (or absent/null -> empty tuple)."""
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ConfigError(f"config section 'hwmon' must be a list, got {type(value).__name__}")
+    devices: list[dict[str, Any]] = []
+    for i, entry in enumerate(value):
+        if not isinstance(entry, Mapping):
+            raise ConfigError(
+                f"config section 'hwmon'[{i}] must be a mapping, got {type(entry).__name__}"
+            )
+        for key in entry:
+            if not isinstance(key, str):
+                raise ConfigError(f"config section 'hwmon'[{i}] has a non-string key: {key!r}")
+        devices.append(dict(entry))
+    return tuple(devices)
+
+
 @dataclass(frozen=True)
 class AppConfig:
     """The whole ``config.yaml``: a validated ``mpc`` plus raw sections."""
@@ -49,11 +76,16 @@ class AppConfig:
     http: dict[str, Any] = field(default_factory=dict)
     digole: dict[str, Any] = field(default_factory=dict)
     onewire: dict[str, Any] = field(default_factory=dict)
+    hwmon: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     extra: dict[str, Any] = field(default_factory=dict)
     source: str | None = None
 
     def section(self, name: str) -> dict[str, Any]:
-        """Raw dict for any section by name (``{}`` when absent)."""
+        """Raw dict for any *mapping* section by name (``{}`` when absent).
+
+        ``hwmon`` is list-shaped, not a mapping -- read ``AppConfig.hwmon``
+        directly for it.
+        """
         if name in KNOWN_SECTIONS:
             return getattr(self, name)
         return self.extra.get(name, {})
@@ -67,12 +99,13 @@ class AppConfig:
             raise ConfigError("config is missing the required 'mpc' section")
         mpc = MpcConfig.from_mapping(_section("mpc", data["mpc"]))
         sections = {name: _section(name, data.get(name)) for name in KNOWN_SECTIONS}
+        hwmon = _hwmon_section(data.get("hwmon"))
         extra = {
             str(name): value
             for name, value in data.items()
-            if name != "mpc" and name not in KNOWN_SECTIONS
+            if name != "mpc" and name != "hwmon" and name not in KNOWN_SECTIONS
         }
-        return cls(mpc=mpc, extra=extra, source=source, **sections)
+        return cls(mpc=mpc, hwmon=hwmon, extra=extra, source=source, **sections)
 
 
 def load_config(path: str | os.PathLike[str]) -> AppConfig:
