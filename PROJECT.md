@@ -1,8 +1,14 @@
 # aqua-bridge
 
-Bridge and **MPC fan controller** on a Raspberry Pi for Aqua Computer
-**aquaero 6 XT** + **Quadro** (aquabus), **Digole** (touch) as the display,
-telemetry to **Home Assistant**. Direct DS18B20 sensors come last.
+**Fan controller** on a Raspberry Pi for an air-cooled **DAS enclosure**
+(direct-attached storage): up to 15 hot-swap drives in zones, cooled by
+an air stream from 8–10 fans. The goal is the **quietest fan setting that
+keeps every drive within its temperature limit**. Fans are driven and
+read through Aqua Computer **aquaero 6 XT** + **Quadro** (aquabus), many
+temperature sensors sit next to the drives and in the air stream
+(aquaero/Quadro inputs and DS18B20 on the Pi's 1-Wire bus), SMART
+temperatures from the PC the DAS is attached to are optional, **Digole**
+(touch) is the display, telemetry goes to **Home Assistant**.
 
 Develop on a desktop or laptop. The Pi is runtime and hardware.
 
@@ -12,18 +18,49 @@ issues, and PR descriptions.
 Hosts, usernames, and LAN details belong in `private.md` (gitignored), not
 in this file.
 
+**Premise correction.** Earlier revisions of this document described a
+watercooling loop (a coolant setpoint, radiator and intake fans). That was
+never the target; the plant is the DAS described in §1 and §2. The safety
+core that is already implemented is plant-agnostic and stays: sensor gate,
+hold-then-high fallback, rate limit and clamp, supervisor, loop, hwmon
+adapter, HTTP/MQTT, deploy. Four things still carry the old premise, and
+§3–§7 describe them as the code is today:
+
+- the example names `coolant`, `air`, `radiator`, `intake` in
+  `config.example.yaml`, the tests and the HTTP/MQTT examples;
+- the simulator, a two-node coolant/air RC plant;
+- the objective: tracking one temperature setpoint, instead of minimising
+  fan noise under per-drive limits;
+- the gate's whole-tick trust with one global fallback, instead of trust
+  and fallback per zone.
+
+They are replaced by the items under §8 **Track A2 — DAS target**.
+
 ---
 
 ## 1. Purpose
 
 | Priority | What |
 |----------|------|
-| 1 | Controller sets fan PWM: PI or small linear MPC, same API (`mpc.solver`) |
-| 2 | Digole + touch: pages, override, diagnostics |
-| 3 | MQTT + HA discovery: sensors, temperatures, Pi health, setpoint (not raw PWM in Auto) |
-| 4 | HTTP: view state and control (setpoint, mode, manual PWM, preset) |
-| later | DS18B20 on GPIO |
+| 1 | Keep every drive below its temperature limit with the least fan noise: 8–10 fans in groups, controlled per zone (PI or small linear MPC today, `mpc.solver`; noise-minimising model-based control is the target, §8 Track A2) |
+| 2 | Drive temperatures from sensors that touch or sit next to each drive, plus inlet and zone air sensors (aquaero/Quadro inputs, DS18B20 on 1-Wire); the controller works on an estimate with an uncertainty margin; SMART from the PC calibrates it when available |
+| 3 | Digole + touch: pages, override, diagnostics |
+| 4 | MQTT + HA discovery: drive and air temperatures, fan speeds, zone status, Pi health (not raw PWM in Auto) |
+| 5 | HTTP: view state and control (limits or setpoints, mode, manual PWM, preset) |
 | upgrade | same codebase on Zero 2 W |
+
+The plant:
+
+- **Drives:** up to 15, hot-swap, mixed HDDs and SSDs; heat output varies a
+  lot between drives and with activity, some SSDs run very hot. Bays can be
+  empty.
+- **Zones:** drives and fans are grouped into zones. Inside a zone they
+  influence each other strongly, between zones weakly. Some fans work on
+  the same air path and act as one group.
+- **Fans:** 8–10. Most report RPM, not all. More fans than PWM outputs
+  means some fans share an output through a splitter.
+- **Noise:** there is no microphone; noise is modelled from fan speed
+  (fan laws), per fan model.
 
 Aquaero and Quadro run autonomously. The Pi is the controller. If the
 daemon dies, fans must not stay pinned at the last USB PWM. XT6 firmware
@@ -36,23 +73,35 @@ measure it.
 ## 2. Hardware and topology
 
 ```
-XT6 sensors + Quadro sensors (aquabus)
-                 │
-                 ▼
-         USB HID: XT6 only
-                 │
-            Raspberry Pi
-         (MPC → PWM setpoints)
-                 │
-                 ▼
-         USB → XT6 → aquabus → Quadro fans
-                 │
-        ┌────────┼────────┐
-        ▼        ▼        ▼
-     Digole    MQTT/HA   (DS18B20 later)
-     touch
+            DAS enclosure: zones of hot-swap drives and fans
+   sensors next to drives, zone air, inlet ── fans (PWM, most with RPM)
+          │                         │                   ▲
+          ▼                         ▼                   │
+  aquaero 6 XT + Quadro      DS18B20 sensors            │
+  temperature inputs,        1-Wire, GPIO4              │
+  fan PWM and RPM                   │                   │
+          │ USB, XT6 only           │                   │
+          ▼                         ▼                   │
+  ┌─────────────────────── Raspberry Pi ───────────────────────┐
+  │ estimate drive temperatures, per-zone trust and fallback,  │
+  │ quietest fan groups under drive limits → PWM via XT6       │
+  └────────────────────────────────────────────────────────────┘
+          ▲                 │               │             │
+          │                 ▼               ▼             ▼
+  PC with the DAS:        Digole         MQTT/HA       HTTP API
+  optional SMART          touch
+  temperatures (network)
 ```
 
+- **The Pi does not see the drives.** Drive temperatures come from
+  sensors that touch a drive or sit next to it; they are never glued on,
+  because the drives are hot-swap. A sensor next to an empty bay reads
+  air. SMART temperatures are an optional second source, sent by an agent
+  on the PC the DAS is attached to; reading them must never wake a drive
+  from standby.
+- **Fan controller:** aquaero 6 XT + Quadro, 4 + 4 PWM outputs, fans beyond
+  eight on splitters. This is the working assumption and still to be
+  confirmed.
 - **Quadro on aquabus**, master is **XT6**. Only XT6 is on USB to the Pi
   (`lsusb`: vendor `0c70`, product `f001`). Quadro (`f00d`) is not needed
   on the Pi.
@@ -66,7 +115,10 @@ XT6 sensors + Quadro sensors (aquabus)
 - Digole: UART `/dev/serial0` (= `ttyAMA0`), plus I2C/SPI if wired that
   way. Bluetooth is off (`dtoverlay=disable-bt`); serial console is
   removed from UART.
-- DS18B20: GPIO4 + 4.7 kΩ, `dtoverlay=w1-gpio` — **last**.
+- DS18B20: GPIO4 + 4.7 kΩ, `dtoverlay=w1-gpio`. With "very many"
+  sensors planned at every useful point, the 1-Wire bus is a primary
+  source of drive-proximal and air temperatures, not an afterthought;
+  each sensor is bound to a zone, bay and role by its ROM id.
 - Zero 2 W upgrade: same 32-bit userland or 64-bit Lite, no `armv6` in
   the code. USB OTG is unchanged.
 
@@ -98,8 +150,8 @@ If (3) fails, a **software** watchdog inside the daemon (ramp to
 `fallback_pwm`) only covers faults the process can still act on. It does
 **not** survive SIGKILL, OOM-kill, USB-hub dropout that takes the write
 path with it, or **Pi power loss**. Residual risk, state it plainly: PWM
-can sit at a **low** last value; then the PC load rises and nothing ramps
-the fans. Mitigations that still run on the Pi:
+can sit at a **low** last value; then drive activity rises (hot SSDs heat
+up in minutes) and nothing ramps the fans. Mitigations that still run on the Pi:
 
 - a dead sensor path is a gate fault like any other: hold, then ramp
   high (§3); the loop keeps applying that command (§3 Glue)
@@ -538,7 +590,10 @@ carry `policy: emergency` / `policy: shutdown`.
 - RC thermal plant in the simulator (`aqua_bridge.sim.plant`): lumped
   coolant and case air, radiator fans move heat coolant → air, intake
   fans air → ambient; actuator delay, stalled channels and Gaussian
-  sensor noise are parameters; deterministic for a seed.
+  sensor noise are parameters; deterministic for a seed. This two-node
+  plant is a leftover of the old premise and exercises the safety core
+  only; a DAS truth simulator (zones, drives, hot swap, sensor placement)
+  replaces it as the reference plant (§8 Track A2).
   `run_closed_loop(..., observe_hook=...)` injects lies.
 - PI and MPC both exist behind the same contract; the example config
   stays on `pi` until both are tuned on the real loop (§8).
@@ -925,7 +980,7 @@ Loop / glue (`tests/test_loop.py`, still no HID):
 
 `tests/test_mpc_sensor_faults.py`
 
-Watercooling sensors lie. The controller must **not** chase a lie to
+Temperature sensors lie. The controller must **not** chase a lie to
 `pwm_max` in a few ticks (`d_pwm_max` is necessary but not sufficient).
 
 Inject on top of an otherwise nominal closed-loop:
@@ -1085,9 +1140,10 @@ Navigation: bottom bar or swipe. Debounce touch; hit-test rectangles.
 [ Overview ] [ Temps ] [ Fans ] [ MPC ] [ Host ]
 ```
 
-1. **Overview** — coolant T, air T, max PWM, control mode, MQTT.
-   Tap T → Temps, tap % → Fans.
-2. **Temps** — XT6/Quadro/(later 1-wire). Tap — 1–2 min RAM buffer.
+1. **Overview** — hottest drive and its margin to the limit, inlet air,
+   loudest fan group, control mode, MQTT. Tap T → Temps, tap % → Fans.
+2. **Temps** — drives by zone and bay, air sensors (XT6/Quadro/1-Wire).
+   Tap — 1–2 min RAM buffer.
 3. **Fans** — XT6+Quadro channels: RPM+PWM. Tap — override slider.
    “Auto” clears override.
 4. **MPC** — target T, Quiet/Normal/Cool presets, solver status
@@ -1340,6 +1396,17 @@ exercised against a live broker or Home Assistant (§8).
 - [x] Small linear MPC (numpy) behind the same `Solver` protocol; every core suite runs for `pi` and `mpc`
 - [ ] Tune `pi_kp` / `pi_ki` and the MPC model (`mpc_tau_s`, `mpc_gain_c_per_pwm`, weights) on the real loop; decide `solver: pi` vs `mpc` in `config.example.yaml` (needs the aquaero)
 
+### Track A2 — DAS target (dev machine; replaces the watercooling leftovers)
+
+- [ ] Config schema for the DAS: zones, bays, fans and fan groups (shared air path, shared PWM output), sensors with role (inlet, zone air, drive-proximal, exhaust), drive temperature limit classes (HDD, SATA SSD, NVMe)
+- [ ] Rename the legacy example names (`coolant`, `air`, `radiator`, `intake`) in config, tests and HTTP/MQTT examples as part of that schema
+- [ ] DAS truth simulator: zones, drives with activity-dependent heat, hot swap and empty bays, sensor placement offsets, per-sensor quantisation
+- [ ] Per-zone trust and per-zone fallback, so one bad sensor does not force every fan to `fallback_pwm`; a fault never lowers a fan that cools the affected zone or a zone coupled to it
+- [ ] Drive temperature estimator from drive-proximal and air sensors, with uncertainty turned into a margin; optional SMART calibration from a PC agent
+- [ ] Objective: minimise modelled fan noise (fan laws, per fan model; PWM→RPM curve for fans without a tachometer) subject to per-drive limits; a simple per-zone PI-style controller stays as the fallback solver
+- [ ] DS18B20 commissioning: bind each ROM id to zone, bay and role; read timing for many sensors within `dt`
+- [ ] Physics-informed zoned thermal model with identification (offline, online, bounded experiments); a stale persisted model is re-confirmed in shadow mode before it acts
+
 ### Track B — hardware (Pi USB; fake sysfs anywhere)
 
 - [ ] USB host: `dtoverlay=dwc2,dr_mode=host` (`deploy/host-usb.sh`), powered hub
@@ -1377,7 +1444,7 @@ exercised against a live broker or Home Assistant (§8).
 - [ ] HTTP HTML Host section: `/api/state` carries no host metrics, so it shows dashes
 - [x] Tests: HTTP talks to the command sink, not hwmon; Auto rejects raw PWM; fuzz JSON → 4xx
 - [ ] Digole: protocol, pages, touch, hit-test
-- [ ] DS18B20 + `w1-gpio` last
+- [ ] DS18B20 + `w1-gpio`: primary drive-proximal and air sensors (Track A2)
 - [ ] README: bring-up on a **fresh** Pi (checklist §10)
 
 ### Upgrade
@@ -1485,7 +1552,7 @@ When USB host is needed (`deploy/host-usb.sh` adds it idempotently):
 dtoverlay=dwc2,dr_mode=host
 ```
 
-When DS18B20 is added:
+For the DS18B20 sensors:
 
 ```text
 dtoverlay=w1-gpio
@@ -1820,6 +1887,9 @@ prints a `@reproduce_failure` blob in the log.
    §8).
 6. Hardware bring-up: spike, hwmon permissions, `-m hardware`, enable
    the service, tune and choose the solver, MQTT/HA live check.
-7. Digole + touch.
-8. DS18B20.
+7. DAS target (§8 Track A2): zoned config, DAS simulator, per-zone trust
+   and fallback, DS18B20 commissioning, drive estimator, noise objective,
+   then the identified zoned model. Everything up to commissioning can
+   start in simulation before the hardware is wired.
+8. Digole + touch.
 9. Zero 2 W with no API change.

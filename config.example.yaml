@@ -1,4 +1,9 @@
 # Copy to config.yaml on the Pi. Channel names are logical, not hwmon pwmN.
+#
+# The names below (coolant, air, radiator, intake) are placeholders left from
+# an earlier watercooling draft. The target plant is a zoned DAS enclosure
+# (PROJECT.md §1-§2); its zones/bays/sensors schema replaces them
+# (PROJECT.md §8 Track A2). Until then, map them to your own sensors and fans.
 
 mqtt:
   enabled: false         # MQTT Discovery for Home Assistant (section 7); LWT on {node_id}/status
