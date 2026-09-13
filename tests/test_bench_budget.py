@@ -15,15 +15,19 @@ Two gates on ``mpc.step`` in a closed loop, timed like ``tools/bench_step.py``:
   is at most :data:`BUDGET_MS` (the plan's hard per-tick gate at ``dt = 5 s``, 10 % of
   the tick). Run it there with ``pytest tests/test_bench_budget.py -m pi``.
 
-The plan also names a line for the gate with 30 sensors against the solver-free step;
-the gate's own cost is part of both steps measured here, and ``tests/test_gate.py``
-checks that the decimated Stuck windows stay bounded.
+The plan's second relative line (the gate with 30 sensors within 3x the solver-free step)
+is not a separate test here: the gate is part of both steps measured above, a gate alone
+is always cheaper than a step that contains it, and ``tests/test_gate.py`` checks that the
+decimated Stuck windows keep their storage bounded. ``tools/bench_step.py --sim-plant das``
+prints the same numbers for both DAS solvers.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import gc
+import importlib.util
+import json
 import platform
 import time
 
@@ -34,7 +38,7 @@ from aqua_bridge.control.mpc import step
 from aqua_bridge.model import MpcConfig, MpcState, SolverKind
 from aqua_bridge.sim.das import SENSOR_TYPES, build_das_plant, topology_from_config
 from aqua_bridge.sim.plant import Plant, PlantParams
-from conftest import EXAMPLE_CONFIG, EXAMPLE_DAS_CONFIG
+from conftest import EXAMPLE_CONFIG, EXAMPLE_DAS_CONFIG, REPO_ROOT
 
 #: Plan section 9: DAS step p99 <= 12x the legacy MPC step p99.
 RELATIVE_FACTOR = 12.0
@@ -123,3 +127,19 @@ def test_das_mpc_step_p99_within_the_relative_budget():
 def test_das_mpc_step_p99_within_budget_ms_on_the_pi():
     times = das_mpc_times(das_mpc_config(), ticks=200)
     assert p99(times) <= BUDGET_MS, f"DAS MPC step p99 {p99(times):.0f} ms > {BUDGET_MS} ms"
+
+
+def test_bench_tool_runs_both_das_solvers_on_the_das_plant(capsys):
+    spec = importlib.util.spec_from_file_location(
+        "bench_step", REPO_ROOT / "tools" / "bench_step.py"
+    )
+    assert spec is not None and spec.loader is not None
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    assert tool.main(["--sim-plant", "das", "--ticks", "12"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["sim_plant"] == "das" and set(report["results"]) == {"pi", "mpc"}
+    mpc = report["results"]["mpc"]
+    assert mpc["model_active_fraction"] == 1.0 and mpc["solve_ticks"] >= 6
+    assert mpc["budget_ms"] == BUDGET_MS and report["results"]["pi"]["solve_ticks"] == 0
+    assert tool.BUDGET_MS == BUDGET_MS
