@@ -1,1 +1,1 @@
-"""Simulation: RC thermal plant used by closed-loop tests and benchmarks."""
+"""Simulation: RC thermal plant (``plant``) and the DAS truth plant (``das``)."""
