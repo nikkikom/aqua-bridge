@@ -3,8 +3,8 @@
 ``mpc.step`` owns the gate, the fault timer, the fallback policy, the rate
 limit and the clamp. A :class:`Solver` only turns trusted temperatures
 into an *unconstrained demand* per channel plus its own next memory. That
-keeps the solver swappable: the MPC (``solver_mpc.py``) implements the same
-protocol and ``step`` does not change.
+keeps the solver swappable: the MPC (``solver_mpc.py``) and the DAS MPC
+(``solver_das.py``) implement the same protocol and ``step`` does not change.
 
 Contract every solver must honour (checked by ``step``, violations become
 a ``solver`` fault, never an exception out of ``step``):
@@ -54,8 +54,8 @@ channel's air too, so the channel works for them as well; drives of unknown
 occupancy count. The formula is the plan's as written, and it counts
 ``k * sigma`` twice (once inside ``soft``, once added to ``t``), so the
 drive settles ``2 k sigma`` below ``limit - comfort``. That errs toward more
-cooling; whether the DAS MPC keeps the single count of its soft rows is
-for that milestone.
+cooling; the DAS MPC (``solver_das.py``) counts ``k * sigma`` once (its soft rows
+are ``T_d <= soft``), so its model fallback to this form is louder, never hotter.
 
 Two edge cases, both documented choices:
 
@@ -123,6 +123,14 @@ class SolverRequest:
     * ``occupancy``      -- bay -> ``occupied`` | ``unknown`` | ``empty`` as the estimator
       sees it this tick; a bay missing here falls back to its declaration
       (``occupied: false`` is empty, anything else constrained)
+    * ``ts``             -- ``obs.ts`` of the tick (with zones; ``None`` in legacy mode)
+    * ``thermal``        -- the thermal model's memory as the previous tick left it
+      (``solver_memory["thermal"]``, read-only; ``None`` without ``model_shadow`` or in
+      legacy mode), for the DAS MPC's model (``aqua_bridge.control.solver_das``)
+    * ``plant``          -- the estimator's state for the DAS MPC's prediction, every
+      zone including those in fault: ``{"zones": {zone: {"t_air", "d_air", "t_in"}},
+      "bays": {bay: {"occupancy", "class", "since_ts", "t"?, "q_w"?}}}`` (``t`` / ``q_w``
+      only for a bay with an estimate); empty in legacy mode and for the other solvers
     """
 
     temps: dict[str, float]
@@ -133,6 +141,9 @@ class SolverRequest:
     zone_trust: dict[str, bool] = field(default_factory=dict)
     estimates: dict[str, dict[str, Any]] = field(default_factory=dict)
     occupancy: dict[str, str] = field(default_factory=dict)
+    ts: float | None = None
+    thermal: Mapping[str, Any] | None = None
+    plant: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

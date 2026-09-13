@@ -92,9 +92,10 @@ Order inside :func:`step`
    occupancy, class and accepted sensor map per bay; its memory is
    ``solver_memory["thermal"]`` and ``diagnostics["thermal"]`` its summary
    (status, prediction error, coefficients). Any exception resets the memory to
-   the prior with ``status: error`` (never a raise, never a fault: nothing
-   depends on it yet). Without ``model_shadow`` nothing runs and neither key
-   exists.
+   the prior with ``status: error`` (never a raise, never a fault; the DAS MPC,
+   which reads this memory on the next tick, falls back to its PI-like DAS
+   form on a model in error). Without ``model_shadow`` nothing runs and
+   neither key exists.
 
 Zones and the global fields
 ---------------------------
@@ -115,14 +116,20 @@ zone: ``t_c``, ``sigma_c``, ``margin_c``, ``soft_c``, ``hard_c``, ``limit_c``,
 class, serial association, calibration, association candidates; see
 :class:`~aqua_bridge.control.estimator.EstimatorUpdate`) and ``estimator``
 (``status`` ``ok`` | ``error``, ``error``, per zone air estimate, SMART
-counters); ``policy`` becomes ``mixed`` when channels differ. Without
-``setpoints`` the ``pi`` solver regulates the margin deficit of the drives
-(PI-like DAS form, :mod:`aqua_bridge.control.solver_pi`). A zoned config
-that still declares setpoints keeps the per-zone setpoint regulation: ``pi``
-skips the fixed channels and runs per zone; the legacy ``mpc`` has one coupled
-problem over every channel and raises on fixed channels, so with zones it
-turns any zone fault into a fault of every zone it drives (whole-enclosure
-fallback, never less cooling) until the DAS MPC milestone.
+counters) and ``noise`` (:func:`aqua_bridge.control.noise.noise_diagnostics`:
+``db_index`` from the fans' speed, ``db_index_cmd`` at the new command, per channel
+rpm and its source); ``policy`` becomes ``mixed`` when channels differ. Without
+``setpoints`` (:attr:`~aqua_bridge.model.MpcConfig.regulates_drive_limits`) the solver
+comes from :data:`DAS_SOLVERS`: ``pi`` regulates the margin deficit of the drives
+(PI-like DAS form, :mod:`aqua_bridge.control.solver_pi`) and ``mpc`` is the DAS MPC
+(:mod:`aqua_bridge.control.solver_das`), which plans beside zones in fault with
+their channels as known inputs. Its request also carries ``ts``, the estimator's
+zones and bays (``plant``) and, with ``model_shadow``, the thermal memory of the
+previous tick (``thermal``). A zoned config that still declares setpoints keeps
+the per-zone setpoint regulation: ``pi`` skips the fixed channels and runs per zone;
+the legacy ``mpc`` has one coupled problem over every channel and raises on fixed
+channels, so with zones it turns any zone fault into a fault of every zone it drives
+(whole-enclosure fallback, never less cooling).
 
 Time policy (documented conservative choices; section 4.3 "ts")
 ---------------------------------------------------------------
@@ -169,13 +176,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from aqua_bridge.control import estimates, estimator, thermal, zones
+from aqua_bridge.control import estimates, estimator, noise, thermal, zones
 from aqua_bridge.control.gate import (
     GateResult,
     advance_slow_windows,
     evaluate_gate,
     push_window,
 )
+from aqua_bridge.control.solver_das import DasMpcSolver
 from aqua_bridge.control.solver_mpc import MpcSolver
 from aqua_bridge.control.solver_pi import PiSolver, Solver, SolverRequest, SolverResult
 from aqua_bridge.model import (
@@ -190,12 +198,14 @@ from aqua_bridge.model import (
 )
 
 __all__ = [
+    "DAS_SOLVERS",
     "GAP_TICKS_MAX",
     "SOLVERS",
     "STALL_TICKS",
     "SolverFault",
     "obs_pwm_usable",
     "resolve_prev",
+    "solver_for",
     "step",
 ]
 
@@ -206,6 +216,20 @@ STALL_TICKS = 10
 
 #: Solver registry by ``cfg.solver`` (section 3: "first step may be PI; swap in MPC later").
 SOLVERS: dict[SolverKind, Solver] = {SolverKind.PI: PiSolver(), SolverKind.MPC: MpcSolver()}
+#: Registry for a zoned config that regulates drive limits (``cfg.regulates_drive_limits``):
+#: ``pi`` is the same PI solver in its margin-deficit form, ``mpc`` the DAS MPC.
+DAS_SOLVERS: dict[SolverKind, Solver] = {
+    SolverKind.PI: SOLVERS[SolverKind.PI],
+    SolverKind.MPC: DasMpcSolver(),
+}
+
+
+def solver_for(cfg: MpcConfig) -> Solver | None:
+    """The registered solver of ``cfg.solver``: :data:`DAS_SOLVERS` when the config
+    regulates drive limits, else :data:`SOLVERS` (legacy and zoned setpoint configs)."""
+    registry = DAS_SOLVERS if cfg.regulates_drive_limits else SOLVERS
+    return registry.get(cfg.solver)
+
 
 _EPS = 1e-12
 
@@ -528,7 +552,7 @@ def step(
     integrator: dict[str, float] = dict(state.integrator)
     if das:  # a channel under fallback policy re-initialises bumplessly when released
         integrator = {ch: v for ch, v in integrator.items() if ch not in fixed_pre}
-    solver_obj = SOLVERS.get(cfg.solver) if solver is None else solver
+    solver_obj = solver_for(cfg) if solver is None else solver
     solver_name = getattr(solver_obj, "name", str(cfg.solver.value)) if solver_obj else "none"
     solver_mem: dict[str, Any] = dict(mem.get(solver_name) or {})
     result_pwm: dict[str, float] | None = None
@@ -578,6 +602,9 @@ def step(
                     if est_update is None
                     else {b: info["occupancy"] for b, info in est_update.bays.items()}
                 ),
+                ts=obs.ts,
+                thermal=mem.get("thermal") if cfg.model_shadow else None,
+                plant=_plant_view(est_block, est_update),
             )
         else:
             temps = {name: float(gate.filtered[name]) for name in cfg.temps}  # type: ignore[arg-type]
@@ -783,6 +810,7 @@ def step(
         }
         if thermal_summary is not None:
             diagnostics["thermal"] = thermal_summary
+        diagnostics["noise"] = noise.noise_diagnostics(cfg, prev=prev, pwm=pwm, rpm=obs.rpm)
     cmd = MpcCommand(pwm=pwm, mode=mode, diagnostics=diagnostics)
 
     # 9. next state (gate rule 5: raw values and cmd.pwm always go into the window)
@@ -874,6 +902,37 @@ def _thermal_shadow(
         return thermal.summary(memory, cfg, occupancy=occupancy)
     mem["thermal"] = result.memory
     return result.summary
+
+
+def _plant_view(
+    block: Mapping[str, Mapping[str, Any]], update: estimator.EstimatorUpdate | None
+) -> dict[str, Any]:
+    """``SolverRequest.plant``: the estimator's zones and bays for the DAS MPC's model
+    (every zone, faulted ones included; ``solver_pi.SolverRequest``)."""
+    if update is None:
+        return {}
+    zones_out: dict[str, Any] = {}
+    for zone, info in update.zones.items():
+        if not info.get("initialised"):
+            continue
+        zones_out[zone] = {
+            "t_air": info["t_air_c"],
+            "d_air": info["d_air_c_per_s"],
+            "t_in": info["t_in_c"],
+        }
+    bays_out: dict[str, Any] = {}
+    for bay, info in update.bays.items():
+        entry: dict[str, Any] = {
+            "occupancy": info["occupancy"],
+            "class": info["class"],
+            "since_ts": info["since_ts"],
+        }
+        est = block.get(bay)
+        if est is not None:
+            entry["t"] = est["t"]
+            entry["q_w"] = est.get("q_w", 0.0)
+        bays_out[bay] = entry
+    return {"zones": zones_out, "bays": bays_out}
 
 
 def _estimate_diagnostics(

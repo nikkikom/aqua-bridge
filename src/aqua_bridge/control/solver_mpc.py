@@ -312,12 +312,21 @@ def solve_box_qp(
     x0: np.ndarray,
     L: float,
     max_iter: int,
+    *,
+    step_tol: float = _STEP_TOL,
+    lambda_tol: float = _LAMBDA_TOL,
 ) -> BoxQpResult:
     """``min 0.5 x^T H x + f^T x`` s.t. ``lo <= x <= hi`` (``H`` positive definite).
 
     Primal active-set method (module docstring). Exact and finite; the
     iteration count is the number of active-set changes, ``converged`` is
     False when ``max_iter`` was reached first.
+
+    ``step_tol`` (a Newton step this small is zero) and ``lambda_tol`` (a multiplier
+    this negative releases its bound) default to the legacy MPC's constants. A caller
+    whose Hessian is ill-conditioned passes a larger ``step_tol``: a step below the
+    rounding of ``H^-1 g`` never reaches the default and each such step costs an
+    iteration (the DAS MPC, ``solver_das``, normalises its problem and uses 1e-9 PWM).
     """
     n = f.shape[0]
     x = np.clip(np.asarray(x0, dtype=float), lo, hi)
@@ -342,14 +351,14 @@ def solve_box_qp(
         p = np.zeros(n)
         if free.size:
             p[free] = np.linalg.solve(H[np.ix_(free, free)], -g[free])
-        if free.size == 0 or float(np.max(np.abs(p))) <= _STEP_TOL:
+        if free.size == 0 or float(np.max(np.abs(p))) <= step_tol:
             fixed = np.flatnonzero(side != 0)
             if fixed.size == 0:
                 return BoxQpResult(x=x, g=g, side=side, iterations=iterations, converged=True)
             # Multiplier of an active bound: the gradient must point outward.
             lam = np.where(side[fixed] < 0, g[fixed], -g[fixed])
             j = int(np.argmin(lam))
-            if lam[j] >= -_LAMBDA_TOL:
+            if lam[j] >= -lambda_tol:
                 return BoxQpResult(x=x, g=g, side=side, iterations=iterations, converged=True)
             # Release every wrongly active bound at once (few iterations when many rail);
             # fall back to the textbook single release -- guaranteed to move inward --
@@ -359,7 +368,7 @@ def solve_box_qp(
                 side[fixed[j]] = 0
                 released[fixed[j]] = True
             else:
-                drop = fixed[lam < -_LAMBDA_TOL]
+                drop = fixed[lam < -lambda_tol]
                 side[drop] = 0
                 released[drop] = True
             continue

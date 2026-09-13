@@ -4,9 +4,11 @@ Pure: every function here is a function of its arguments. :func:`update` keeps
 its state in plain JSON (``solver_memory["thermal"]``), reads no clock, does no
 I/O and draws no random numbers. ``mpc.step`` calls it only with
 ``model_shadow: true`` and after the command of the tick is final, so the
-model *learns and predicts without acting*: nothing here feeds a PWM value. The
-DAS MPC milestone consumes :func:`jacobians`, :func:`discretise` and
-:func:`model_params`.
+model *learns and predicts without acting*: nothing here feeds a PWM value
+directly. The DAS MPC (:mod:`aqua_bridge.control.solver_das`) reads the identified
+parameters of the previous tick's memory through :func:`current_model` and
+linearises with :func:`model_params`, :func:`derivatives`, :func:`jacobians` and
+:func:`discretise`.
 
 Model structure (SI units: W, J/K, W/K, degC, s)
 ------------------------------------------------
@@ -224,6 +226,7 @@ import json
 import math
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any
 
 import numpy as np
@@ -264,6 +267,8 @@ __all__ = [
     "Structure",
     "ThermalParams",
     "ThermalUpdate",
+    "cached_structure",
+    "current_model",
     "derivatives",
     "discretise",
     "fresh_memory",
@@ -446,15 +451,16 @@ class Structure:
     bays: dict[str, BayStruct]
     fingerprint: str
 
-    @property
+    # cached: the index helpers below run in the per-tick loops of the model
+    @cached_property
     def n_zones(self) -> int:
         return len(self.zones)
 
-    @property
+    @cached_property
     def n_bays(self) -> int:
         return len(self.bays)
 
-    @property
+    @cached_property
     def n_states(self) -> int:
         return self.n_zones + 2 * self.n_bays
 
@@ -913,9 +919,15 @@ def discretise(a: np.ndarray, b: np.ndarray, c: np.ndarray, h: float) -> Discret
     except np.linalg.LinAlgError:
         imag_ok = cond_ok = False
     if imag_ok and cond_ok:
+        try:
+            # repeated eigenvalues (identical bays) can come back as a conjugate pair
+            # with ~0 imaginary parts whose eigenvectors' real parts are singular
+            vi = np.linalg.inv(v.real)
+        except np.linalg.LinAlgError:
+            imag_ok = False
+    if imag_ok and cond_ok:
         lam = w.real
         vr = v.real
-        vi = np.linalg.inv(vr)
         ex = np.exp(lam * h)
         small = np.abs(lam * h) < 1e-8
         safe = np.where(small, 1.0, lam)
@@ -1737,8 +1749,35 @@ def _advance_status(
 
 
 # ---------------------------------------------------------------------------
-# summary (diagnostics, GET /api/model)
+# summary (diagnostics, GET /api/model) and the model the DAS MPC reads
 # ---------------------------------------------------------------------------
+
+
+def cached_structure(cfg: MpcConfig) -> Structure:
+    """:func:`structure` of ``cfg``, memoised like :func:`update`'s (same result, cheaper)."""
+    return _derived(cfg).st
+
+
+def current_model(memory: object, cfg: MpcConfig) -> tuple[str, dict[str, float]]:
+    """``(status, theta)`` of a thermal memory, for the DAS MPC's validity gate.
+
+    ``status`` is the model's overall status (:func:`overall_status`) and ``theta``
+    every identified parameter (:func:`prior_theta` layout) as the blocks hold it.
+    ``None`` (no ``model_shadow``) reads ``("off", prior)``; a memory that does not
+    match the config's structure, or is malformed, reads as the fresh prior
+    (``"prior"``), exactly as :func:`update` would start over from it.
+    """
+    d = _derived(cfg)
+    theta = dict(d.prior)
+    if memory is None:
+        return "off", theta
+    mem = _load(memory, cfg, d.st)
+    for z, zone in d.st.zones.items():
+        theta.update(zip(zone.air_keys, mem["zones"][z]["air"]["theta"], strict=True))
+    for b, bay in d.st.bays.items():
+        theta.update(zip(bay.keys, mem["bays"][b]["theta"], strict=True))
+    status = overall_status([zm["status"] for zm in mem["zones"].values()])
+    return status, {k: float(v) for k, v in theta.items()}
 
 
 def overall_status(zone_statuses: Collection[str]) -> str:
