@@ -104,6 +104,23 @@ def test_install_script_triggers_udev_for_an_already_attached_device():
     assert "udevadm trigger" in text and "subsystem-match=hwmon" in text
 
 
+# --- SMART agent example unit (milestone smart-agent) -----------------------------------
+
+
+def test_smart_agent_unit_is_a_user_unit_example_not_installed_by_install_pi():
+    unit_text = (DEPLOY / "aqua-bridge-smart-agent.service").read_text()
+    values = _unit_values(unit_text)
+    (exec_start,) = values["ExecStart"]
+    assert "smart_agent.py" in exec_start
+    assert "--mqtt" in exec_start and "--node-id" in exec_start
+    assert "WantedBy" in values  # has an [Install] section like any enable-able unit
+    # Not the Pi's system-level daemon unit: no User=/SupplementaryGroups= (those are
+    # a systemd *system* unit concept; this is meant for `systemctl --user`).
+    assert "User" not in values
+    install_text = (DEPLOY / "install-pi.sh").read_text()
+    assert "aqua-bridge-smart-agent" not in install_text
+
+
 @pytest.mark.parametrize("script", ["install-pi.sh", "host-usb.sh"])
 def test_shell_scripts_parse(script):
     bash = shutil.which("bash")

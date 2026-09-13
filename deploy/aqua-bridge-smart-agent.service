@@ -1,0 +1,38 @@
+# Example systemd *user* unit for tools/smart_agent.py (the DAS plan,
+# section 1 "SMART path" / section 10 "How to run"). This runs on the PC
+# that has the drives attached, NOT on the Pi -- it is not installed by
+# deploy/install-pi.sh and there is no corresponding system-level unit.
+#
+# Install (as the PC user that can read /dev/disk/by-id and /dev/nvme*,
+# i.e. usually a member of the "disk" group):
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/aqua-bridge-smart-agent.service ~/.config/systemd/user/
+#   # edit the paths and --mqtt host below for your checkout first
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now aqua-bridge-smart-agent.service
+#   loginctl enable-linger "$USER"   # so it also runs when nobody is logged in
+#
+# smartctl itself typically needs root (raw ATA/NVMe passthrough ioctls);
+# either run this unit as root's user instance, or grant the CAP_SYS_RAWIO/
+# CAP_SYS_ADMIN capabilities to smartctl (e.g. via setcap), or add a
+# narrowly-scoped sudoers rule for smartctl only. Left to the installer:
+# the requirement depends on the distro's smartmontools packaging.
+
+[Unit]
+Description=aqua-bridge SMART temperature agent (PC side, not the Pi)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust both paths (checkout location, venv with paho-mqtt installed) and
+# the --mqtt / --node-id values for your setup; --node-id must match the
+# aqua-bridge daemon's mqtt.node_id in config.yaml so readings land under
+# the topic it expects ({node_id}/in/smart/<serial>).
+ExecStart=%h/aqua-bridge/.venv/bin/python %h/aqua-bridge/tools/smart_agent.py --mqtt broker.example.lan --node-id aqua-bridge --interval 60
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
