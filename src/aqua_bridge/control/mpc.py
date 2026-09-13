@@ -84,6 +84,17 @@ Order inside :func:`step`
    is active); ``degraded`` while some but not all zones are; ``saturated``
    when a channel's demand exceeds ``pwm_max`` *and* the emitted PWM sits
    at ``pwm_max`` (honest: pinned at the rail); ``auto`` otherwise.
+8b. With zones and ``model_shadow: true``, the thermal model's online
+   identification (:func:`aqua_bridge.control.thermal.update`) runs after the
+   command is final, so it learns and predicts without acting: it reads this
+   tick's gate-trusted temperatures, ``prev``, ``obs.rpm``, the zones that are
+   trusted and not in fault (only their windows accumulate) and the estimator's
+   occupancy, class and accepted sensor map per bay; its memory is
+   ``solver_memory["thermal"]`` and ``diagnostics["thermal"]`` its summary
+   (status, prediction error, coefficients). Any exception resets the memory to
+   the prior with ``status: error`` (never a raise, never a fault: nothing
+   depends on it yet). Without ``model_shadow`` nothing runs and neither key
+   exists.
 
 Zones and the global fields
 ---------------------------
@@ -157,7 +168,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from aqua_bridge.control import estimates, estimator, zones
+from aqua_bridge.control import estimates, estimator, thermal, zones
 from aqua_bridge.control.gate import (
     GateResult,
     advance_slow_windows,
@@ -687,6 +698,15 @@ def step(
             only.ticks,
         )
 
+    # 8b. thermal model identification in shadow (zones only; module docstring)
+    thermal_summary: dict[str, Any] | None = None
+    if das and cfg.model_shadow:
+        thermal_summary = _thermal_shadow(
+            mem, obs, cfg, trusted_temps, prev, est_update, verdicts, faulted
+        )
+    else:
+        mem.pop("thermal", None)
+
     # fan stall bookkeeping
     stall_counts = mem.get("stall_ticks")
     stall_ticks = _stall_update(
@@ -760,6 +780,8 @@ def step(
             "zones": {} if est_update is None else est_update.zones,
             **({} if est_update is None else est_update.summary),
         }
+        if thermal_summary is not None:
+            diagnostics["thermal"] = thermal_summary
     cmd = MpcCommand(pwm=pwm, mode=mode, diagnostics=diagnostics)
 
     # 9. next state (gate rule 5: raw values and cmd.pwm always go into the window)
@@ -806,6 +828,51 @@ def step(
         ),
     )
     return cmd, new_state
+
+
+def _thermal_shadow(
+    mem: dict[str, Any],
+    obs: PlantObservation,
+    cfg: MpcConfig,
+    trusted_temps: Mapping[str, float],
+    prev: Mapping[str, float],
+    est_update: estimator.EstimatorUpdate | None,
+    verdicts: Mapping[str, zones.ZoneTrust],
+    faulted: list[str],
+) -> dict[str, Any]:
+    """Step 8b: advance ``mem["thermal"]`` in place and return its summary (module docstring)."""
+    occupancy: dict[str, str] | None = None
+    classes: dict[str, str] | None = None
+    maps: dict[str, tuple[float, float]] = {}
+    if est_update is not None:
+        occupancy = {b: info["occupancy"] for b, info in est_update.bays.items()}
+        classes = {b: info["class"] for b, info in est_update.bays.items()}
+        for b, info in est_update.bays.items():
+            cal = info.get("calibration")
+            if info.get("serial") is not None and cal is not None and cal.get("accepted_once"):
+                maps[b] = (float(cal["slope"]), float(cal["offset_c"]))
+    faulted_set = set(faulted)
+    zones_ok = {z for z, v in verdicts.items() if v.trusted and z not in faulted_set}
+    try:
+        result = thermal.update(
+            mem.get("thermal"),
+            cfg,
+            temps=trusted_temps,
+            u=prev,
+            ts=obs.ts,
+            zones_ok=zones_ok,
+            occupancy=occupancy,
+            maps=maps,
+            classes=classes,
+            rpm=obs.rpm,
+        )
+    except Exception as exc:  # identification never raises out of step and never faults
+        error = f"{type(exc).__name__}: {exc}"[:200]
+        memory = thermal.fresh_memory(cfg, status="error", error=error)
+        mem["thermal"] = memory
+        return thermal.summary(memory, cfg, occupancy=occupancy)
+    mem["thermal"] = result.memory
+    return result.summary
 
 
 def _estimate_diagnostics(
