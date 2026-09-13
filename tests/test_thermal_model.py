@@ -593,6 +593,29 @@ def test_windows_restart_when_a_zone_is_not_ok(small):
     assert all(b["acc"] is None for b in mem["bays"].values())
 
 
+@pytest.mark.parametrize(
+    "bad", [(float("nan"), -2.1), (0.7, float("inf")), (0.0, -2.1), (-0.5, -2.1), ("x", 1.0)]
+)
+def test_an_unusable_sensor_map_falls_back_to_the_prior_map(small, bad):
+    """A sensor map that is not a finite slope in (0, 1] and a finite offset never puts a
+    non-finite value into the memory or the summary (the state must stay finite JSON):
+    the bay is identified on the prior map instead."""
+    ok = set(small.zone_layout.zones)
+    u = dict.fromkeys(small.channels, 0.6)
+    mem = ref = None
+    for k in range(12):
+        temps = _temps(small, float(k), ripple=1.0)
+        out = thermal.update(
+            mem, small, temps=temps, u=u, ts=float(k), zones_ok=ok, maps={"a1": bad}
+        )
+        mem = out.memory
+        json.dumps(mem, allow_nan=False)
+        assert_no_non_finite(out.summary, "thermal summary")
+        ref = thermal.update(ref, small, temps=temps, u=u, ts=float(k), zones_ok=ok).memory
+    assert mem == ref
+    assert mem["bays"]["a1"]["w"] > 0
+
+
 def test_an_empty_bay_learns_nothing(small):
     occupancy = {"a1": "occupied", "a2": "empty", "b1": "occupied", "c1": "empty"}
     out = _drive(small, 1, seed=0)
@@ -783,3 +806,27 @@ def test_a_thermal_exception_is_status_error_and_never_touches_the_command(
     assert run.records[12].state.solver_memory["thermal"]["error"]
     assert run.records[-1].cmd.diagnostics["thermal"]["status"] in ("error", "learning", "prior")
     assert run.records[-1].cmd.diagnostics["thermal"]["error"] == broken["error"]
+
+
+def test_malformed_estimator_bay_info_never_raises_out_of_step(das_example_cfg, monkeypatch):
+    """Step 8b reads the estimator's per-bay occupancy, class and calibration map. Like
+    everything else of the shadow update, a surprise there is ``status: error``, never a
+    raise out of ``step`` and never a change of the command."""
+    from aqua_bridge.control import estimator
+
+    on_cfg = dataclasses.replace(das_example_cfg, model_shadow=True)
+    reference = _closed_loop(das_example_cfg, 12)
+    real = estimator.update
+
+    def odd(*args, **kwargs):
+        out = real(*args, **kwargs)
+        bays = {b: dict(info) for b, info in out.bays.items()}
+        bays["b01"]["serial"] = "S1"
+        bays["b01"]["calibration"] = {"accepted_once": True, "slope": None, "offset_c": 0.0}
+        return dataclasses.replace(out, bays=bays)
+
+    monkeypatch.setattr(estimator, "update", odd)
+    run = _closed_loop(on_cfg, 12)
+    assert [r.cmd.pwm for r in run.records] == [r.cmd.pwm for r in reference.records]
+    last = run.records[-1].cmd.diagnostics["thermal"]
+    assert last["status"] == "error" and "TypeError" in last["error"]

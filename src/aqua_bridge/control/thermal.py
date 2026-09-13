@@ -630,7 +630,8 @@ def model_params(
 ) -> ThermalParams:
     """:class:`ThermalParams` from identified ``theta`` (default: the prior), the
     estimator's occupancy (``empty`` freezes the drive; default: declared), sensor
-    maps ``(s, b)`` (default: the prior map) and drive classes (default: declared)."""
+    maps ``(s, b)`` (default, or not a finite slope in ``(0, 1]`` with a finite offset:
+    the prior map) and drive classes (default: declared)."""
     d = _derived(cfg)
     st = d.st if st is None else st
     base = dict(d.prior) if st is d.st else prior_theta(cfg, st)
@@ -647,8 +648,7 @@ def model_params(
         occupied[bay] = (occ != EMPTY) if occ is not None else topo.bays[bay].constrained
         cls = (classes or {}).get(bay) or cfg.bay_class(bay)
         c_drive[bay] = drive_capacity(cfg, cls)
-        s_map, b_map = (maps or {}).get(bay, (1.0 - PRIOR_BETA, PRIOR_OFFSET_C))
-        s[bay], b[bay] = float(s_map), float(b_map)
+        s[bay], b[bay] = _sensor_map((maps or {}).get(bay))
     fan = {}
     for ch in st.channels:
         model = cfg.fan_models[cfg.fans[ch].model]
@@ -663,6 +663,18 @@ def model_params(
         occupied=occupied,
         fan=fan,
     )
+
+
+def _sensor_map(raw: object) -> tuple[float, float]:
+    """A bay's sensor map ``(s, b)``: a finite slope in ``(0, 1]`` and a finite offset, else
+    the prior map (a non-finite or zero slope would put NaN into the model and the state)."""
+    prior = (1.0 - PRIOR_BETA, PRIOR_OFFSET_C)
+    if not isinstance(raw, tuple | list) or len(raw) != 2:
+        return prior
+    s_map, b_map = raw
+    if not (_finite(s_map) and _finite(b_map) and 0.0 < float(s_map) <= 1.0):
+        return prior
+    return float(s_map), float(b_map)
 
 
 def phi(u: float, deadband: float, exponent: float) -> float:

@@ -843,18 +843,18 @@ def _thermal_shadow(
 ) -> dict[str, Any]:
     """Step 8b: advance ``mem["thermal"]`` in place and return its summary (module docstring)."""
     occupancy: dict[str, str] | None = None
-    classes: dict[str, str] | None = None
-    maps: dict[str, tuple[float, float]] = {}
-    if est_update is not None:
-        occupancy = {b: info["occupancy"] for b, info in est_update.bays.items()}
-        classes = {b: info["class"] for b, info in est_update.bays.items()}
-        for b, info in est_update.bays.items():
-            cal = info.get("calibration")
-            if info.get("serial") is not None and cal is not None and cal.get("accepted_once"):
-                maps[b] = (float(cal["slope"]), float(cal["offset_c"]))
-    faulted_set = set(faulted)
-    zones_ok = {z for z, v in verdicts.items() if v.trusted and z not in faulted_set}
     try:
+        classes: dict[str, str] | None = None
+        maps: dict[str, tuple[float, float]] = {}
+        if est_update is not None:
+            occupancy = {b: str(info["occupancy"]) for b, info in est_update.bays.items()}
+            classes = {b: str(info["class"]) for b, info in est_update.bays.items()}
+            for b, info in est_update.bays.items():
+                cal = info.get("calibration")
+                if info.get("serial") is not None and cal is not None and cal.get("accepted_once"):
+                    maps[b] = (float(cal["slope"]), float(cal["offset_c"]))
+        faulted_set = set(faulted)
+        zones_ok = {z for z, v in verdicts.items() if v.trusted and z not in faulted_set}
         result = thermal.update(
             mem.get("thermal"),
             cfg,
