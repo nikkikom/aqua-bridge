@@ -186,6 +186,16 @@ mpc:
     associate_window_s: 3600      # serial -> bay association by correlation (no SES)
     associate_min_corr: 0.8
     associate_margin: 0.15
+  # Thermal model identification (control/thermal.py). model_shadow: true learns the
+  # zoned model online and reports it (GET /api/model, HA model_status and
+  # model_pred_err_c) without acting on the fans; nothing uses the model for control yet.
+  model_shadow: false
+  model_window_s: 120.0  # sin^2-weighted regression window (effective length about half), >= 2 * dt
+  model_lambda: 0.9995   # RLS forgetting per excited window
+  model_p_trace_max: 100.0
+  model_converged_rel_se: 0.25  # every fan gain's relative standard error below this ...
+  model_max_pred_err_c: 1.0     # ... and the one-window prediction error below this: converged
+  model_use_rpm: false   # airflow from the tachometer instead of the PWM curve where one reports
 
 # Hardware bindings for --source hwmon: every mpc.temps name bound exactly once
 # across the hwmon temp_maps and onewire.sensors, every channel by one fans map.

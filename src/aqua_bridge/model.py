@@ -71,6 +71,13 @@ choice for cooling:
 * ``estimator`` (the per-zone Kalman filter, occupancy, SMART calibration and
   association of ``aqua_bridge.control.estimator``) is DAS-only as well and
   defaults to :data:`ESTIMATOR_DEFAULTS` with ``topology``.
+* The ``model_*`` keys configure the zoned thermal model's online identification
+  (``aqua_bridge.control.thermal``). They are flat keys like the plan's table.
+  ``model_shadow: true`` (learn and predict without acting) and
+  ``model_use_rpm: true`` need ``topology``; the numeric keys are validated
+  always and inert in legacy mode, and ``model_window_s >= 2 * dt`` is checked
+  only with ``model_shadow`` so a default never invalidates a legacy config with
+  a long ``dt``.
 """
 
 from __future__ import annotations
@@ -1383,6 +1390,12 @@ class MpcConfig:
       controlled temperature drops when one of its channels goes +1.0 PWM,
       and the per-tick gain of the offset-free disturbance estimator. Ignored
       by the ``pi`` solver.
+    * ``model_shadow`` / ``model_window_s`` / ``model_lambda`` / ``model_p_trace_max`` /
+      ``model_converged_rel_se`` / ``model_max_pred_err_c`` / ``model_use_rpm`` -- the
+      zoned thermal model's online identification (``control/thermal.py``): shadow
+      learning on/off, regression window, RLS forgetting per window, covariance trace
+      bound, relative standard error and prediction error for ``converged``, and fan
+      airflow from the tachometer instead of the PWM curve.
     * ``topology`` / ``sensors`` / ``drive_classes`` / ``fans`` / ``fan_models`` /
       ``zones`` / ``noise`` / ``estimator`` -- the zoned DAS layout (module
       docstring, *DAS layout*); all absent is legacy mode. With ``topology`` the
@@ -1430,6 +1443,13 @@ class MpcConfig:
     zones: ZonePolicy | None = None
     noise: NoiseSpec | None = None
     estimator: EstimatorSpec | None = None
+    model_shadow: bool = False
+    model_window_s: float = 120.0
+    model_lambda: float = 0.9995
+    model_p_trace_max: float = 100.0
+    model_converged_rel_se: float = 0.25
+    model_max_pred_err_c: float = 1.0
+    model_use_rpm: bool = False
 
     # -- construction -------------------------------------------------------
 
@@ -1488,6 +1508,16 @@ class MpcConfig:
         s(self, "mpc_tau_s", _cfg_num("mpc_tau_s", self.mpc_tau_s))
         s(self, "mpc_gain_c_per_pwm", _cfg_num("mpc_gain_c_per_pwm", self.mpc_gain_c_per_pwm))
         s(self, "mpc_estimator_gain", _cfg_num("mpc_estimator_gain", self.mpc_estimator_gain))
+        for name in ("model_shadow", "model_use_rpm"):
+            _cfg_bool(name, getattr(self, name))
+        for name in (
+            "model_window_s",
+            "model_lambda",
+            "model_p_trace_max",
+            "model_converged_rel_se",
+            "model_max_pred_err_c",
+        ):
+            s(self, name, _cfg_num(name, getattr(self, name)))
         self._coerce_das()
 
     def _coerce_das(self) -> None:
@@ -1677,6 +1707,8 @@ class MpcConfig:
                     "with solver 'mpc'"
                 )
 
+        self._validate_model_keys()
+
         if self.topology is None:
             for name in ("sensors", "drive_classes", "fans", "fan_models"):
                 if getattr(self, name):
@@ -1698,6 +1730,31 @@ class MpcConfig:
                         "mpc.topology a channel controls the setpoint sensors of its zones "
                         f"{list(self._derived.layout.channel_zones[ch])}"
                     )
+
+    def _validate_model_keys(self) -> None:
+        """Rules for the ``model_*`` keys of the thermal model's identification."""
+        for name in ("model_shadow", "model_use_rpm"):
+            if getattr(self, name) and self.topology is None:
+                raise ConfigError(f"mpc.{name}: true requires mpc.topology (DAS layout)")
+        if self.model_window_s <= 0 or self.model_window_s > 600:
+            raise ConfigError(f"mpc.model_window_s must be in (0, 600], got {self.model_window_s}")
+        if self.model_shadow and self.model_window_s < 2 * self.dt:
+            raise ConfigError(
+                f"mpc.model_window_s must be >= 2 * dt ({2 * self.dt}) with model_shadow, "
+                f"got {self.model_window_s}"
+            )
+        if not 0.99 < self.model_lambda <= 1.0:
+            raise ConfigError(f"mpc.model_lambda must be in (0.99, 1], got {self.model_lambda}")
+        if self.model_p_trace_max <= 0:
+            raise ConfigError(f"mpc.model_p_trace_max must be > 0, got {self.model_p_trace_max}")
+        if not 0.0 < self.model_converged_rel_se < 1.0:
+            raise ConfigError(
+                f"mpc.model_converged_rel_se must be in (0, 1), got {self.model_converged_rel_se}"
+            )
+        if self.model_max_pred_err_c <= 0:
+            raise ConfigError(
+                f"mpc.model_max_pred_err_c must be > 0, got {self.model_max_pred_err_c}"
+            )
 
     def _validate_das(self) -> None:
         """Section 7 rules for ``topology``, ``sensors``, ``drive_classes``, ``fans``,
