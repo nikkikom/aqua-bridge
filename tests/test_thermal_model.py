@@ -594,6 +594,39 @@ def test_windows_restart_when_a_zone_is_not_ok(small):
 
 
 @pytest.mark.parametrize(
+    ("dropped", "restarts", "keeps"),
+    [
+        ("prox_a1b", {"a1", "air"}, {"a2"}),  # a redundant proximal sensor: its bay and the air
+        ("air_a2", {"a1", "a2", "air"}, set()),  # a redundant zone-air sensor: the whole zone
+    ],
+)
+def test_a_window_restarts_when_the_sensors_behind_a_mean_change(small, dropped, restarts, keeps):
+    """Module docstring: a window accumulates only while every sensor its regression reads
+    stays trusted. Redundant sensors disagree by their placement offsets (1 degC here), so
+    averaging one tick without one of them is a step in the mean, and the sensor-lag
+    correction ``tau (X_k - X_k-1)`` turns that step into a spike of ``tau`` times the offset
+    inside the window. The window restarts instead."""
+    ok = set(small.zone_layout.zones)
+    u = dict.fromkeys(small.channels, 0.6)
+    mem = None
+    for k in range(3):
+        temps = _temps(small, float(k))
+        temps.update(prox_a1=33.0, prox_a1b=34.0, air_a=26.0, air_a2=27.0)
+        if k == 2:
+            del temps[dropped]
+        mem = thermal.update(mem, small, temps=temps, u=u, ts=float(k), zones_ok=ok).memory
+
+    def t0(name: str) -> float | None:
+        block = mem["zones"]["za"]["air"] if name == "air" else mem["bays"][name]
+        return None if block["acc"] is None else block["acc"]["t0"]
+
+    for name in restarts:
+        assert t0(name) in (None, 2.0), name  # nothing from before the change is kept
+    for name in keeps:
+        assert t0(name) == 0.0, name
+
+
+@pytest.mark.parametrize(
     "bad", [(float("nan"), -2.1), (0.7, float("inf")), (0.0, -2.1), (-0.5, -2.1), ("x", 1.0)]
 )
 def test_an_unusable_sensor_map_falls_back_to_the_prior_map(small, bad):

@@ -80,8 +80,11 @@ step, so the count grows with the stiffness; conservative deviation).
 Identification (plan section 5)
 -------------------------------
 Two windowed integral regressions per zone. A window accumulates over contiguous
-ticks on which the zone is trusted and not in fault and every sensor its
-regression reads is gate-trusted (any other tick restarts it); the command
+ticks on which the zone is trusted and not in fault and the set of gate-trusted
+sensors its regression reads (all members of each averaged group that are trusted)
+stays the same, with at least one per group (any other tick restarts it: redundant
+sensors disagree by their placement offsets, and the lag correction below would turn
+the step of a mean over a different set into a spike); the command
 ``u = prev`` is held over each interval and the temperatures follow the trapezoid
 rule. It closes after ``model_window_s``.
 
@@ -1279,6 +1282,7 @@ def _parse_sample(raw: object) -> dict[str, Any] | None:
         "nb": {str(k): _opt_num(v) for k, v in dict(raw.get("nb") or {}).items()},
         "prox": {str(k): _opt_num(v) for k, v in dict(raw.get("prox") or {}).items()},
         "occ": [str(b) for b in raw.get("occ") or []],
+        "src": [str(t) for t in raw.get("src") or []],
     }
 
 
@@ -1366,6 +1370,34 @@ def _channel_phi(
             value = u.get(ch)
             out[ch] = phi(float(value), model.deadband, model.exponent) if _finite(value) else 0.0  # type: ignore[arg-type]
     return out
+
+
+def _zone_sensors(st: Structure, zone: ZoneStruct) -> tuple[str, ...]:
+    """Every sensor a zone's regressions can read, in a fixed order."""
+    names = [*zone.air, *zone.inlet]
+    for other in zone.coupled:
+        names.extend(st.zones[other].air)
+    for b in zone.bays:
+        names.extend(st.bays[b].sensors)
+    return tuple(dict.fromkeys(names))
+
+
+def _air_block_sensors(st: Structure, zone: ZoneStruct, occ: Collection[str]) -> tuple[str, ...]:
+    names = [*zone.air, *zone.inlet]
+    for other in zone.coupled:
+        names.extend(st.zones[other].air)
+    for b in occ:
+        names.extend(st.bays[b].sensors)
+    return tuple(names)
+
+
+def _sources_changed(
+    prev: Mapping[str, Any], sample: Mapping[str, Any], names: Collection[str]
+) -> bool:
+    """Whether the trusted members among ``names`` differ between two samples: redundant
+    sensors disagree by their placement offsets, so a mean over a different set steps."""
+    before, now = set(prev["src"]), set(sample["src"])
+    return any((n in before) != (n in now) for n in names)
 
 
 def _fresh_acc(n: int, n_fan: int, t0: float) -> dict[str, Any]:
@@ -1459,6 +1491,8 @@ def update(
                 b: _mean([temps[t] for t in st.bays[b].sensors if t in temps]) for b in zone.bays
             },
             "occ": [b for b in zone.bays if params.occupied[b]],
+            # the sensors behind those means: a change restarts the windows that read them
+            "src": [t for t in _zone_sensors(st, zone) if t in temps],
         }
         prev = zm["prev"]
         zm["prev"] = sample
@@ -1479,7 +1513,12 @@ def update(
         for b in zone.bays:
             block = mem["bays"][b]
             p0, p1 = prev["prox"].get(b), sample["prox"][b]
-            if not params.occupied[b] or b not in prev["occ"] or None in (p0, p1, ta0, ta1):
+            if (
+                not params.occupied[b]
+                or b not in prev["occ"]
+                or None in (p0, p1, ta0, ta1)
+                or _sources_changed(prev, sample, (*st.bays[b].sensors, *zone.air))
+            ):
                 block["acc"] = None
                 continue
             assert p0 is not None and p1 is not None and ta0 is not None and ta1 is not None
@@ -1530,6 +1569,7 @@ def update(
             or None in nb0
             or None in nb1
             or any(prev["prox"].get(b) is None or sample["prox"][b] is None for b in occ)
+            or _sources_changed(prev, sample, _air_block_sensors(st, zone, occ))
         ):
             block["acc"] = None
             continue
