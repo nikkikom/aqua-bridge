@@ -1,0 +1,50 @@
+# Copy to config.yaml on the Pi. Channel names are logical, not hwmon pwmN.
+
+mqtt:
+  host: mqtt.local
+  port: 1883
+  username: ""
+  password: ""
+  discovery_prefix: homeassistant
+  node_id: aqua-bridge
+
+host:
+  interval_s: 5
+
+mpc:
+  dt: 2.0
+  horizon: 8
+  setpoints:
+    coolant: 35.0
+  pwm_min: 0.15
+  pwm_max: 1.0
+  d_pwm_max: 0.1
+  fallback_hold_s: 10
+  confirm_ticks: 3
+  dT_max: 5.0
+  fallback_pwm:
+    radiator: 0.8
+    intake: 0.8
+  channels:
+    - radiator
+    - intake
+
+xt6:
+  prefer: hwmon
+  map:
+    radiator: pwm1
+    intake: pwm2
+
+http:
+  bind: 0.0.0.0
+  port: 8080
+  enabled: false
+
+digole:
+  device: /dev/serial0
+  baud: 9600
+  enabled: false
+
+onewire:
+  enabled: false
+  sensors: []
