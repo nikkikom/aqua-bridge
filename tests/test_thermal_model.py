@@ -353,9 +353,9 @@ def test_proximal_window_matches_a_hand_computation(small, monkeypatch):
     rows: list[tuple[tuple[str, ...], np.ndarray, float]] = []
     real = thermal._rls_window
 
-    def spy(block, spec, x, y, fan, c):
+    def spy(block, spec, x, y, fan, c, **kwargs):
         rows.append((spec.keys, np.array(x), float(y)))
-        return real(block, spec, x, y, fan, c)
+        return real(block, spec, x, y, fan, c, **kwargs)
 
     monkeypatch.setattr(thermal, "_rls_window", spy)
     c = small
@@ -551,9 +551,9 @@ def test_a_window_without_weight_mass_is_dropped_not_learned(ticks, monkeypatch)
     rows: list[tuple[str, np.ndarray, float]] = []
     real = thermal._rls_window
 
-    def spy(block, spec, x, y, fan, cc):
+    def spy(block, spec, x, y, fan, cc, **kwargs):
         rows.append((spec.keys[-1], np.array(x), float(y)))
-        return real(block, spec, x, y, fan, cc)
+        return real(block, spec, x, y, fan, cc, **kwargs)
 
     monkeypatch.setattr(thermal, "_rls_window", spy)
     ok = set(c.zone_layout.zones)

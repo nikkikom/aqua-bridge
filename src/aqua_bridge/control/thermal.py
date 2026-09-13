@@ -277,6 +277,7 @@ __all__ = [
     "sensor_lag_s",
     "structure",
     "summary",
+    "theta_from_memory",
     "update",
 ]
 
@@ -588,6 +589,24 @@ def prior_theta(cfg: MpcConfig, st: Structure | None = None) -> dict[str, float]
         out[g0_key] = G0_W_PER_K
         out[k_key] = K_W_PER_K
     return out
+
+
+def theta_from_memory(
+    cfg: MpcConfig, memory: Mapping[str, Any], *, st: Structure | None = None
+) -> dict[str, float]:
+    """Every identified parameter's current value: the prior, overridden by whatever
+    ``memory`` (a live ``solver_memory["thermal"]`` or a loaded ``model.json``) holds
+    for each zone air block and bay block -- the same merge :func:`update` does
+    internally before it linearises. Raises the same way :func:`structure` does on a
+    legacy config; a malformed ``memory`` (wrong shape, missing keys) raises
+    ``KeyError``/``ValueError``/``TypeError``, same as any other malformed input here."""
+    st = structure(cfg) if st is None else st
+    theta = prior_theta(cfg, st)
+    for z, zone in st.zones.items():
+        theta.update(zip(zone.air_keys, memory["zones"][z]["air"]["theta"], strict=True))
+    for b, bay in st.bays.items():
+        theta.update(zip(bay.keys, memory["bays"][b]["theta"], strict=True))
+    return theta
 
 
 def project(theta: Mapping[str, float]) -> dict[str, float]:
@@ -1004,9 +1023,19 @@ def _rls_window(
     y: float,
     fan: np.ndarray,
     cfg: MpcConfig,
+    *,
+    learn: bool = True,
 ) -> tuple[float, bool]:
     """One window of the constrained RLS (module docstring). Returns the a-priori
-    residual (row units) and whether the window was excited. Mutates ``block``."""
+    residual (row units) and whether the window was excited. Mutates ``block``.
+
+    ``learn=False`` (:func:`update`'s hold-out mode) still advances every piece of
+    per-window bookkeeping (the residual, the excitation and PE-monitor state, the
+    window counters) but leaves ``theta``/``P`` exactly as given, so the returned
+    residual is a genuine a-priori prediction from parameters the window played no
+    part in fitting -- a windowed replay of the same recording with ``learn=True``
+    fits and predicts on the same data, which is not a hold-out check.
+    """
     theta = np.array(block["theta"], dtype=float)
     p = np.array(block["P"], dtype=float)
     psi = theta / spec.scale
@@ -1025,34 +1054,37 @@ def _rls_window(
         excited = bool(rel.size and float(rel.max()) > EXCITATION_MIN)
         fm_arr = (1.0 - FAN_MEAN_ALPHA) * fm_arr + FAN_MEAN_ALPHA * fan
 
-    for i in np.flatnonzero(spec.const):
-        p[i, i] += _CONST_WALK[_kind(spec.keys[i])] ** 2
+    if learn:
+        for i in np.flatnonzero(spec.const):
+            p[i, i] += _CONST_WALK[_kind(spec.keys[i])] ** 2
 
-    before = psi.copy()
-    eye = np.eye(len(psi))
-    if excited:
-        p = p / cfg.model_lambda
-        psi, p = _joseph(psi, p, xs, r_clip, 1.0, eye)
-        for i in np.flatnonzero(spec.ridge):
-            psi, p = _joseph(psi, p, eye[i], spec.prior[i] / spec.scale[i] - psi[i], RIDGE_VAR, eye)
-    else:
-        # Constant only (Schmidt "consider" update): the full row, a gain on the
-        # constant alone, Joseph form so P stays positive semi-definite.
-        mask = spec.const.astype(float)
-        psi, p = _joseph(psi, p, xs, r_clip, 1.0, eye, mask=mask)
-    p = 0.5 * (p + p.T)
-    trace = float(np.trace(p))
-    if trace > cfg.model_p_trace_max:
-        p *= cfg.model_p_trace_max / trace
-    step = psi - before
-    limit = TRUST_REGION * np.maximum(np.abs(before), 1.0)
-    step = np.where(spec.const, step, np.clip(step, -limit, limit))
-    theta = np.clip((before + step) * spec.scale, spec.lo, spec.hi)
-    if not (np.all(np.isfinite(theta)) and np.all(np.isfinite(p))):
-        raise FloatingPointError(f"thermal: non-finite RLS state in {spec.keys[-1]!r}")
+        before = psi.copy()
+        eye = np.eye(len(psi))
+        if excited:
+            p = p / cfg.model_lambda
+            psi, p = _joseph(psi, p, xs, r_clip, 1.0, eye)
+            for i in np.flatnonzero(spec.ridge):
+                psi, p = _joseph(
+                    psi, p, eye[i], spec.prior[i] / spec.scale[i] - psi[i], RIDGE_VAR, eye
+                )
+        else:
+            # Constant only (Schmidt "consider" update): the full row, a gain on the
+            # constant alone, Joseph form so P stays positive semi-definite.
+            mask = spec.const.astype(float)
+            psi, p = _joseph(psi, p, xs, r_clip, 1.0, eye, mask=mask)
+        p = 0.5 * (p + p.T)
+        trace = float(np.trace(p))
+        if trace > cfg.model_p_trace_max:
+            p *= cfg.model_p_trace_max / trace
+        step = psi - before
+        limit = TRUST_REGION * np.maximum(np.abs(before), 1.0)
+        step = np.where(spec.const, step, np.clip(step, -limit, limit))
+        theta = np.clip((before + step) * spec.scale, spec.lo, spec.hi)
+        if not (np.all(np.isfinite(theta)) and np.all(np.isfinite(p))):
+            raise FloatingPointError(f"thermal: non-finite RLS state in {spec.keys[-1]!r}")
+        block["theta"] = theta.tolist()
+        block["P"] = p.tolist()
 
-    block["theta"] = theta.tolist()
-    block["P"] = p.tolist()
     block["s2"] = (1.0 - RESIDUAL_ALPHA) * float(block["s2"]) + RESIDUAL_ALPHA * min(
         residual**2, (HUBER_SIGMAS * sigma) ** 2
     )
@@ -1445,6 +1477,7 @@ def update(
     maps: Mapping[str, tuple[float, float]] | None = None,
     classes: Mapping[str, str] | None = None,
     rpm: Mapping[str, Any] | None = None,
+    learn: bool = True,
 ) -> ThermalUpdate:
     """One identification tick (module docstring).
 
@@ -1455,9 +1488,15 @@ def update(
     declared class); ``rpm`` is ``obs.rpm`` (read with ``model_use_rpm``). Raises
     only on a numerical failure (non-finite RLS state), which ``step`` turns into
     ``status: error``.
+
+    ``learn=False`` (used offline by ``tools/replay.py`` and ``tools/fit_model.py``'s
+    hold-out pass, never by ``mpc.step``) still tracks windows, excitation and the
+    PE monitor, and still returns a genuine a-priori residual per closing window, but
+    never moves ``theta``/``P``: a frozen-parameter prediction check on data the
+    parameters were not fitted from.
     """
     d = _derived(cfg)
-    st, prior, zone_specs, bay_specs = d.st, d.prior, d.zone_specs, d.bay_specs
+    st, zone_specs, bay_specs = d.st, d.zone_specs, d.bay_specs
     mem = _load(memory, cfg, st)
     maps = dict(maps or {})
     ts = float(ts)
@@ -1467,11 +1506,7 @@ def update(
     window_s = cfg.model_window_s
 
     # current snapshot of the coefficients (for H_z and Qn)
-    theta = dict(prior)
-    for z, zone in st.zones.items():
-        theta.update(zip(zone.air_keys, mem["zones"][z]["air"]["theta"], strict=True))
-    for b, bay in st.bays.items():
-        theta.update(zip(bay.keys, mem["bays"][b]["theta"], strict=True))
+    theta = theta_from_memory(cfg, mem, st=st)
     params = model_params(cfg, theta, st=st, occupancy=occupancy, maps=maps, classes=classes)
     phis = _channel_phi(cfg, st, u, rpm)
     closed: dict[str, list[tuple[float, bool]]] = {}  # zone -> (residual degC, excited)
@@ -1554,7 +1589,7 @@ def update(
             # rows stay in kelvin (a change of the sensor target mid-window weighs 1)
             fan = np.array(acc["fan"]) / acc["x"][0]
             x = np.array(acc["x"])
-            residual, excited = _rls_window(block, bay_specs[b], x, acc["y"], fan, cfg)
+            residual, excited = _rls_window(block, bay_specs[b], x, acc["y"], fan, cfg, learn=learn)
             closed.setdefault(z, []).append((residual, excited))
             block["acc"] = None
 
@@ -1619,7 +1654,9 @@ def update(
             continue
         x = np.array(acc["x"]) / norm
         fan = np.array(acc["fan"]) / norm
-        residual, excited = _rls_window(block, zone_specs[z], x, acc["y"] / norm, fan, cfg)
+        residual, excited = _rls_window(
+            block, zone_specs[z], x, acc["y"] / norm, fan, cfg, learn=learn
+        )
         conductance = q_flow + theta[f"leak.{z}"]
         conductance += sum(theta[f"kappa.{z}.{o}"] for o in zone.coupled)
         conductance += sum(theta[f"g0.{b}"] + theta[f"k.{b}"] * qn for b in occ)
