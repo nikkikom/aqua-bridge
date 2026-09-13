@@ -74,7 +74,8 @@ Solver: active-piece SQP on ``solve_box_qp``
 With the currently violated rows ``V``: ``H = H0 + 2 sum_(r in V) rho_r s_r s_r^T``,
 ``f = f0 + 2 sum_(r in V) rho_r (y0_r - t_r) s_r``; solve the box QP warm-started
 (:func:`~aqua_bridge.control.solver_mpc.solve_box_qp`, the legacy MPC's exact primal
-active-set method, on the piece normalised by its Gershgorin bound and with a Newton-step
+active-set method, warm-started by a few projected Newton iterations
+(:func:`projected_newton`), on the piece normalised by its Gershgorin bound and with a Newton-step
 tolerance of :data:`QP_STEP_TOL` PWM: with penalty rows the Hessian's condition number
 reaches ~1e7, the rounding of a zero Newton step then exceeds the legacy 1e-12 and the
 method spent hundreds of iterations on rounding), then backtrack on the true penalised
@@ -128,7 +129,12 @@ On every solve tick the model must pass (:func:`check_model`):
   constrained bays is at most ``model_max_drift_c_per_min``.
 
 Bays within ``estimator.bay_settle_s`` of an occupancy change are left out of the last
-two checks (a hot swap's transient is real, not a model error). A failure switches to
+two checks (a hot swap's transient is real, not a model error), and so are bays within
+``bay_settle_s`` of a tick on which the estimator's own drive variance exceeded
+:data:`SETTLE_DRIVE_VAR_C2` (an addition: a drive pulled and another pushed in within
+``empty_confirm_s`` never passes through ``empty``; the estimator's fast-swap rule follows
+it as a jump with a wide variance, and on the truth simulator that insert tripped both
+checks and held the fallback for 20 minutes). A failure switches to
 the **PI-like DAS solver on the same estimates** (``solver_pi``, margin-deficit form):
 ``mode`` stays ``auto``, ``diagnostics["solver_diag"]["model"]`` says ``active: pi_das``
 and why. The MPC comes back only after the checks have passed with the numeric limits
@@ -201,12 +207,14 @@ __all__ = [
     "MODEL_DWELL_S",
     "MODEL_HYSTERESIS",
     "PRED_ERR_ALPHA",
+    "PN_ITER",
     "PRIOR_STATUSES",
     "QP_STEP_TOL",
     "QUANT_T_C",
     "QUANT_U",
     "REL_DECREASE_TOL",
     "RIDGE",
+    "SETTLE_DRIVE_VAR_C2",
     "DasMpcSolver",
     "ModelCheck",
     "PenaltyQp",
@@ -216,6 +224,7 @@ __all__ = [
     "check_model",
     "gradient",
     "objective",
+    "projected_newton",
     "snap_bands",
     "solve_penalty_qp",
     "zoh",
@@ -244,9 +253,14 @@ RIDGE = 1e-9
 #: Box QP: a Newton step below this (PWM) is zero; the rounding of ``H^-1 g`` on the
 #: penalised Hessians (condition numbers up to ~1e7) is ~1e-10.
 QP_STEP_TOL = 1e-9
+#: Projected Newton warm-start iterations per box QP (:func:`projected_newton`).
+PN_ITER = 12
 #: SQP stops: relative decrease, backtracking halvings.
 REL_DECREASE_TOL = 1e-8
 _HALVINGS = 30
+#: A bay whose estimator drive variance (``sigma^2 - sigma_cal^2``) exceeds this, degC^2, is
+#: settling (module docstring, validity gate).
+SETTLE_DRIVE_VAR_C2 = 1.0
 #: Low-pass of the estimator's disturbances for the prediction, seconds (module docstring).
 DIST_TAU_RISE_S = 30.0
 DIST_TAU_FALL_S = 120.0
@@ -342,7 +356,8 @@ class SqpResult:
     ``g`` is the true gradient at ``x``, ``h_diag`` the diagonal of the last piece's
     Hessian, ``side`` -1 / +1 / 0 per variable at its lower / upper bound / free,
     ``history`` the objective after every accepted outer iteration (first: at the
-    start point), ``iterations`` the largest box-QP iteration count and ``stop`` one of
+    start point), ``iterations`` the largest box-QP iteration count (``warm_iterations`` the
+    projected-Newton warm-start iterations, in total) and ``stop`` one of
     ``unchanged`` | ``small_decrease`` | ``no_descent`` | ``outer_max`` | ``qp_cap``.
     """
 
@@ -357,6 +372,45 @@ class SqpResult:
     converged: bool
     stop: str
     history: tuple[float, ...]
+    warm_iterations: int = 0
+
+
+def projected_newton(
+    h: np.ndarray, f: np.ndarray, lo: np.ndarray, hi: np.ndarray, x0: np.ndarray
+) -> tuple[np.ndarray, int]:
+    """Warm start for :func:`solve_box_qp` on ``min 1/2 x^T h x + f^T x``, ``lo <= x <= hi``:
+    at most :data:`PN_ITER` projected Newton iterations (Bertsekas): the bounds whose
+    gradient points outward are held, a Newton step on the rest, projected backtracking
+    with an Armijo test. Returns ``(x, iterations)``; the cost never increases.
+
+    ``solve_box_qp`` adds one bound per blocked step, so from a poor start on 48 variables
+    it needed 40-70 iterations (more than the default ``solver_max_iter`` of 50) on the
+    penalised pieces of a hot enclosure; from this warm start it finishes in 1-7.
+    """
+    x = np.clip(np.asarray(x0, dtype=float), lo, hi)
+    cost = 0.5 * float(x @ (h @ x)) + float(f @ x)
+    for k in range(PN_ITER):
+        g = h @ x + f
+        held = ((x <= lo) & (g > 0.0)) | ((x >= hi) & (g < 0.0))
+        free = np.flatnonzero(~held)
+        if free.size == 0:
+            return x, k
+        p = np.zeros_like(x)
+        p[free] = np.linalg.solve(h[np.ix_(free, free)], -g[free])
+        alpha = 1.0
+        accepted = False
+        x_new, cost_new = x, cost
+        for _ in range(_HALVINGS):
+            x_new = np.clip(x + alpha * p, lo, hi)
+            cost_new = 0.5 * float(x_new @ (h @ x_new)) + float(f @ x_new)
+            if cost_new <= cost + 1e-4 * float(g @ (x_new - x)):
+                accepted = True
+                break
+            alpha *= 0.5
+        if not accepted or float(np.max(np.abs(x_new - x))) <= QP_STEP_TOL:
+            return x, k + 1
+        x, cost = x_new, cost_new
+    return x, PN_ITER
 
 
 def solve_penalty_qp(qp: PenaltyQp, x0: np.ndarray, *, max_iter: int, outer_max: int) -> SqpResult:
@@ -367,6 +421,7 @@ def solve_penalty_qp(qp: PenaltyQp, x0: np.ndarray, *, max_iter: int, outer_max:
     history = [fval]
     it_max = 0
     it_total = 0
+    pn_total = 0
     outer = 0
     stop = "outer_max"
     converged = True
@@ -375,7 +430,10 @@ def solve_penalty_qp(qp: PenaltyQp, x0: np.ndarray, *, max_iter: int, outer_max:
         # Normalised by its Gershgorin bound (>= lambda_max), so the multiplier tolerance
         # is relative; the Newton step tolerance is in PWM (module docstring).
         lip = max(float(np.max(np.sum(np.abs(h), axis=1))), 1e-12)
-        res = solve_box_qp(h / lip, f / lip, qp.lo, qp.hi, x, 1.0, max_iter, step_tol=QP_STEP_TOL)
+        hn, fn = h / lip, f / lip
+        warm, pn_iter = projected_newton(hn, fn, qp.lo, qp.hi, x)
+        pn_total += pn_iter
+        res = solve_box_qp(hn, fn, qp.lo, qp.hi, warm, 1.0, max_iter, step_tol=QP_STEP_TOL)
         it_max = max(it_max, res.iterations)
         it_total += res.iterations
         if not res.converged:
@@ -425,6 +483,7 @@ def solve_penalty_qp(qp: PenaltyQp, x0: np.ndarray, *, max_iter: int, outer_max:
         converged=converged,
         stop=stop,
         history=tuple(history),
+        warm_iterations=pn_total,
     )
 
 
@@ -765,6 +824,7 @@ def _fresh_memory() -> dict[str, Any]:
         "status": None,
         "fresh": None,
         "dist": {"q": {}, "d": {}, "since": {}},
+        "settle": {},
     }
 
 
@@ -843,6 +903,7 @@ def _parse(raw: object, cfg: MpcConfig) -> dict[str, Any]:
     mem["checks"] = dict(checks) if isinstance(checks, Mapping) else {}
     status = raw.get("status")
     mem["status"] = status if isinstance(status, str) else None
+    mem["settle"] = _num_map(raw.get("settle", {}))
     dist = raw.get("dist")
     if dist is not None:
         since = dist.get("since", {})
@@ -953,7 +1014,8 @@ class DasMpcSolver:
         fixed = {ch: float(v) for ch, v in req.fixed_channels.items()}
         free = [ch for ch in cfg.channels if ch not in fixed]
         self._decay_bias(mem, ts, free)
-        self._score_prediction(cfg, req, mem, ts)
+        settling = self._settling_bays(cfg, req, mem, ts)
+        self._score_prediction(cfg, req, mem, ts, settling)
         self._filter_disturbances(req, mem, ts)
 
         rows = self._rows(cfg, req)
@@ -971,7 +1033,7 @@ class DasMpcSolver:
         switched = False
         model: _Model | None = None
         if solve_now:
-            model = self._model(cfg, req, rows, mem["dist"], ts)
+            model = self._model(cfg, req, rows, mem["dist"], settling)
             self._store_prediction(mem, model, prev, ts)
             switched = self._decide(cfg, mem, model, ts)
             mem["tick"] = 0
@@ -1085,8 +1147,9 @@ class DasMpcSolver:
             out.append(bay)
         return out
 
+    @staticmethod
     def _score_prediction(
-        self, cfg: MpcConfig, req: SolverRequest, mem: dict[str, Any], ts: float
+        cfg: MpcConfig, req: SolverRequest, mem: dict[str, Any], ts: float, settling: set[str]
     ) -> None:
         """Compare a pending one-step prediction with the estimator's drives when due."""
         pending = mem["pred"]
@@ -1104,7 +1167,7 @@ class DasMpcSolver:
             info = bays.get(bay)
             if not isinstance(info, Mapping) or not _finite(info.get("t")):
                 continue
-            if self._settling(cfg, info, ts):
+            if bay in settling:
                 continue
             errs.append(abs(float(info["t"]) - predicted))
         if not errs:
@@ -1165,10 +1228,30 @@ class DasMpcSolver:
         }
 
     @staticmethod
-    def _settling(cfg: MpcConfig, info: Mapping[str, Any], ts: float) -> bool:
-        since = info.get("since_ts")
+    def _settling_bays(
+        cfg: MpcConfig, req: SolverRequest, mem: dict[str, Any], ts: float
+    ) -> set[str]:
+        """Bays left out of the prediction-error and drift checks (module docstring): within
+        ``estimator.bay_settle_s`` of an occupancy change, or of the last tick on which the
+        estimator's own drive uncertainty exceeded :data:`SETTLE_DRIVE_VAR_C2` (a swap it
+        followed as a jump without passing through ``empty``). Updates ``mem["settle"]``."""
         assert cfg.estimator is not None
-        return _finite(since) and ts - float(since) < cfg.estimator.bay_settle_s
+        window = cfg.estimator.bay_settle_s
+        bays = req.plant.get("bays", {}) if isinstance(req.plant, Mapping) else {}
+        marks = {b: t for b, t in mem["settle"].items() if b in bays and 0.0 <= ts - t < window}
+        out: set[str] = set()
+        for bay, info in bays.items():
+            if not isinstance(info, Mapping):
+                continue
+            sigma, cal = info.get("sigma"), info.get("sigma_cal")
+            wide = _finite(sigma) and _finite(cal)
+            if wide and float(sigma) ** 2 - float(cal) ** 2 > SETTLE_DRIVE_VAR_C2:
+                marks[bay] = ts
+            since = info.get("since_ts")
+            if (_finite(since) and 0.0 <= ts - float(since) < window) or bay in marks:
+                out.add(bay)
+        mem["settle"] = marks
+        return out
 
     def _model(
         self,
@@ -1176,7 +1259,7 @@ class DasMpcSolver:
         req: SolverRequest,
         rows: list[str],
         dist: Mapping[str, Any],
-        ts: float,
+        settling: set[str],
     ) -> _Model:
         """Model inputs from the request and, when possible, the prediction."""
         st = thermal.cached_structure(cfg)
@@ -1188,7 +1271,7 @@ class DasMpcSolver:
             return model
         model = _Model(st, status, theta, rows, {}, {})
         try:
-            self._build(cfg, req, model, dist, ts)
+            self._build(cfg, req, model, dist, settling)
         except Exception as exc:  # numerical failure of the model: a model fallback
             model.pred = None
             model.error = f"{type(exc).__name__}: {exc}"[:120]
@@ -1196,7 +1279,11 @@ class DasMpcSolver:
 
     @staticmethod
     def _build(
-        cfg: MpcConfig, req: SolverRequest, model: _Model, dist: Mapping[str, Any], ts: float
+        cfg: MpcConfig,
+        req: SolverRequest,
+        model: _Model,
+        dist: Mapping[str, Any],
+        settling: set[str],
     ) -> None:
         st = model.st
         plant = req.plant if isinstance(req.plant, Mapping) else {}
@@ -1259,13 +1346,7 @@ class DasMpcSolver:
             raise FloatingPointError("non-finite operating point")
         model.pred, model.hit, model.c, model.x0 = pred, hit, c, x0
         model.x_air, model.x_drive = x_air, x_drive
-        drifts = [
-            abs(float(f[st.i_drive(b)])) * 60.0
-            for b in model.rows
-            if not DasMpcSolver._settling(
-                cfg, bays_in.get(b) if isinstance(bays_in.get(b), Mapping) else {}, ts
-            )
-        ]
+        drifts = [abs(float(f[st.i_drive(b)])) * 60.0 for b in model.rows if b not in settling]
         model.drift = max(drifts) if drifts else None
 
     def _decide(self, cfg: MpcConfig, mem: dict[str, Any], model: _Model, ts: float) -> bool:
@@ -1460,6 +1541,7 @@ class DasMpcSolver:
             "converged": True,
             "iterations": res.iterations,
             "iterations_total": res.total_iterations,
+            "warm_iterations": res.warm_iterations,
             "outer": res.outer,
             "stop": res.stop,
             "objective": res.objective,

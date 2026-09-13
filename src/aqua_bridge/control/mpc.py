@@ -931,6 +931,8 @@ def _plant_view(
         if est is not None:
             entry["t"] = est["t"]
             entry["q_w"] = est.get("q_w", 0.0)
+            entry["sigma"] = est["sigma"]
+            entry["sigma_cal"] = est.get("sigma_cal", est["sigma"])
         bays_out[bay] = entry
     return {"zones": zones_out, "bays": bays_out}
 

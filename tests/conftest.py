@@ -101,6 +101,9 @@ class SolverCase(StrEnum):
     * ``pi`` / ``mpc`` -- the legacy config (``config.example.yaml``) with that solver
     * ``pi_das``       -- the zoned DAS config (``config.example-das.yaml``) with the
       ``pi`` solver in its margin-deficit form (plan section 4)
+    * ``mpc_das``      -- the same DAS config with the ``mpc`` solver, i.e. the DAS MPC
+      (``control/solver_das.py``); the DAS suites run it with ``model_accept_prior: true``
+      so its MPC path acts rather than its PI-like fallback
 
     A ``SolverCase`` is a ``str``, so ``dataclasses.replace(cfg, solver=case)`` works
     for the legacy cases; :attr:`kind` is the ``SolverKind`` of every case.
@@ -109,18 +112,19 @@ class SolverCase(StrEnum):
     PI = "pi"
     MPC = "mpc"
     PI_DAS = "pi_das"
+    MPC_DAS = "mpc_das"
 
     @property
     def kind(self) -> SolverKind:
-        return SolverKind.MPC if self is SolverCase.MPC else SolverKind.PI
+        return SolverKind.MPC if self in (SolverCase.MPC, SolverCase.MPC_DAS) else SolverKind.PI
 
     @property
     def das(self) -> bool:
-        return self is SolverCase.PI_DAS
+        return self in (SolverCase.PI_DAS, SolverCase.MPC_DAS)
 
 
 LEGACY_SOLVER_CASES: tuple[SolverCase, ...] = (SolverCase.PI, SolverCase.MPC)
-DAS_SOLVER_CASES: tuple[SolverCase, ...] = (SolverCase.PI_DAS,)
+DAS_SOLVER_CASES: tuple[SolverCase, ...] = (SolverCase.PI_DAS, SolverCase.MPC_DAS)
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:

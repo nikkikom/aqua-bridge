@@ -129,8 +129,8 @@ class SolverRequest:
       legacy mode), for the DAS MPC's model (``aqua_bridge.control.solver_das``)
     * ``plant``          -- the estimator's state for the DAS MPC's prediction, every
       zone including those in fault: ``{"zones": {zone: {"t_air", "d_air", "t_in"}},
-      "bays": {bay: {"occupancy", "class", "since_ts", "t"?, "q_w"?}}}`` (``t`` / ``q_w``
-      only for a bay with an estimate); empty in legacy mode and for the other solvers
+      "bays": {bay: {"occupancy", "class", "since_ts", "t"?, "q_w"?, "sigma"?, "sigma_cal"?}}}``
+      (the last four only for a bay with an estimate); empty in legacy mode
     """
 
     temps: dict[str, float]

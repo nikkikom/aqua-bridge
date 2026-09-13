@@ -1,6 +1,6 @@
 """Core suites on the zoned DAS config (plan section 9, "core suites via solver_kind").
 
-Every ``solver_kind`` DAS case (``pi_das`` today) runs the section 4.1 invariants
+Every ``solver_kind`` DAS case (``pi_das`` and ``mpc_das``) runs the section 4.1 invariants
 on ``config.example-das.yaml``: first-tick ``prev`` rules, determinism and JSON
 state, no step toward ``pwm_min`` because of a fault, honest saturation, random
 per-zone lies, and closed loops on the DAS truth plant (:mod:`aqua_bridge.sim.das`)
@@ -36,11 +36,11 @@ from aqua_bridge.sim.das import (
     run_das_closed_loop,
     topology_from_config,
 )
-from conftest import EXAMPLE_DAS_CONFIG
+from conftest import EXAMPLE_DAS_CONFIG, SolverCase
 from das_fixtures import das_obs
 from invariants import TOL, assert_no_non_finite, checked_step
 
-pytestmark = pytest.mark.solver_cases("pi_das")
+pytestmark = pytest.mark.solver_cases("pi_das", "mpc_das")
 
 GOLDEN_DIR = Path(__file__).resolve().parent / "golden"
 REGEN_ENV = "AQUA_BRIDGE_REGEN_GOLDEN"
@@ -50,9 +50,14 @@ GOLDEN_TEMP_ATOL = 1e-4
 
 @pytest.fixture
 def cfg(das_example_cfg: MpcConfig, solver_kind) -> MpcConfig:
-    """The DAS example config with the case's solver."""
+    """The DAS example config with the case's solver (``mpc_das``: accepting the prior
+    thermal model, so the MPC acts; ``conftest.SolverCase``)."""
     assert solver_kind.das
-    return dataclasses.replace(das_example_cfg, solver=solver_kind.kind)
+    return dataclasses.replace(
+        das_example_cfg,
+        solver=solver_kind.kind,
+        model_accept_prior=solver_kind is SolverCase.MPC_DAS,
+    )
 
 
 def prox_for(t_drive: float, t_air: float = 35.0) -> float:
@@ -164,15 +169,23 @@ def test_same_inputs_same_outputs_and_json_round_trip(cfg):
 # ---------------------------------------------------------------------------
 
 
+def flicker_air(cfg: MpcConfig, i: int) -> dict[str, float]:
+    """Zone air flickering by two LSBs, as a live thermistor does (a frozen reading next
+    to fans that move is Stuck, and the DAS MPC moves them further than the PI)."""
+    return {f"air_{z}": 35.0 + 0.02 * (i % 2) for z in cfg.zone_layout.zones}
+
+
 def test_zone_fault_never_lowers_its_reach_and_the_rest_regulates(cfg):
     state = MpcState.cold()
     cool = all_prox(cfg, prox_for(30.0))
     for i in range(4):
-        _, state = checked_step(das_obs(cfg, i * cfg.dt, pwm=0.7, **cool), cfg, state)
+        obs = das_obs(cfg, i * cfg.dt, pwm=0.7, **cool, **flicker_air(cfg, i))
+        _, state = checked_step(obs, cfg, state)
     last = state.last_cmd
     reach = set(cfg.zone_layout.reach["z3"])
     for i in range(4, 40):
-        obs = das_obs(cfg, i * cfg.dt, pwm=last.pwm, **{**cool, "air_z3": None})
+        temps = {**cool, **flicker_air(cfg, i), "air_z3": None}
+        obs = das_obs(cfg, i * cfg.dt, pwm=last.pwm, **temps)
         cmd, state = checked_step(obs, cfg, state)
         assert cmd.mode is Mode.DEGRADED
         for ch in cfg.channels:
@@ -189,9 +202,9 @@ def test_saturation_pins_at_pwm_max_and_reports_it(cfg):
     state = MpcState.cold()
     modes = []
     for i in range(120):  # the slow integral (pi_ki) walks the demand past the rail
-        # zone air flickers by two LSBs, as a live thermistor does (a frozen one is Stuck)
-        air = {f"air_{z}": 35.0 + 0.02 * (i % 2) for z in cfg.zone_layout.zones}
-        obs = das_obs(cfg, i * cfg.dt, pwm=0.5, **all_prox(cfg, prox_for(60.0)), **air)
+        obs = das_obs(
+            cfg, i * cfg.dt, pwm=0.5, **all_prox(cfg, prox_for(60.0)), **flicker_air(cfg, i)
+        )
         cmd, state = checked_step(obs, cfg, state)
         modes.append(cmd.mode)
         # honest per channel: a channel reported saturated sits at the rail (the zones'
@@ -205,6 +218,7 @@ def test_saturation_pins_at_pwm_max_and_reports_it(cfg):
     assert all(v <= cfg.pwm_max + TOL for v in state.integrator.values())
 
 
+@pytest.mark.solver_cases("pi_das")
 def test_drives_at_their_target_hold_the_output(cfg):
     """soft 42 for hdd at sigma 1.5, e = t + 3 - 42 = 0 at t = 39. The estimator's sigma
     starts a little above its settled value (the transient part of the drive variance

@@ -40,7 +40,8 @@ markers = [
   "fuzzy: Hypothesis property tests; may be slow, still required in CI",
   "slow: long-running test (closed-loop sims, long fuzz runs)",
   "nightly: heavy sweeps and long simulations; excluded from PR/main CI, run by nightly-fuzz",
-  "solver_cases(*cases): restrict the solver_kind parametrisation (pi, mpc, pi_das)",
+  "solver_cases(*cases): restrict the solver_kind parametrisation (pi, mpc, pi_das, mpc_das)",
+  "pi: runs only on the Raspberry Pi (armv6l), e.g. the absolute step budget; skipped elsewhere",
 ]
 
 [tool.ruff]
