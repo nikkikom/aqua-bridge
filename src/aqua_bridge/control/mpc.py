@@ -155,7 +155,8 @@ stop regulating the healthy channels.
 ``fault_ticks`` (int, consecutive ticks in fault), ``stall_ticks`` (dict
 channel -> int), ``stuck_latch`` (dict temperature -> band reference in
 degrees C, only latched temperatures; gate rule 3), with decimated Stuck
-windows ``stuck_slow`` and ``stuck_seq`` (gate module docstring) and one
+windows ``stuck_slow`` and ``stuck_seq`` (gate module docstring), with zones
+``estimator`` (step 3c) and, with ``model_shadow``, ``thermal`` (step 8b), and one
 sub-dict per solver under ``solver.name``.
 """
 
