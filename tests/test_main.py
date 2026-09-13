@@ -161,6 +161,27 @@ def test_build_io_xt6_constructs_adapter_without_touching_hardware(example_confi
     assert hasattr(src, "read") and hasattr(sink, "apply")
 
 
+def test_build_io_hwmon_constructs_composite_without_touching_hardware(example_config_path):
+    """The example config's xt6: section alone (no hwmon:/onewire.sensors) is a valid
+    single-device composite -- the DAS plan section 12 Q1 generalisation of xt6."""
+    pytest.importorskip("aqua_bridge.hw.sources")
+    app = load_config(example_config_path)
+    src, sink, release = main_mod.build_io(app, "hwmon")
+    assert hasattr(src, "read") and hasattr(sink, "apply")
+    assert release is None  # no onewire.sensors in config.example.yaml -> nothing to stop
+
+
+def test_hwmon_source_missing_binding_exits_2(tmp_path, example_config_path, restore_signals):
+    """The same F4-style guarantee as xt6, now enforced across the whole device fleet."""
+    import yaml
+
+    data = yaml.safe_load(example_config_path.read_text())
+    data["xt6"]["fans"] = {"radiator": {"pwm": "pwm1", "rpm": "fan1"}}
+    bad = tmp_path / "bad_map.yaml"
+    bad.write_text(yaml.safe_dump(data))
+    assert main_mod.main(["--config", str(bad), "--source", "hwmon"]) == 2
+
+
 def test_xt6_map_not_matching_mpc_channels_exits_2(tmp_path, example_config_path, restore_signals):
     """Review finding F4: a channel missing from xt6.fans (or a temp_map key not in
     mpc.temps) is a config error at startup, not a silently unwritten fan."""

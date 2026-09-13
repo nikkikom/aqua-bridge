@@ -7,8 +7,14 @@ main thread then runs the section 9 stop path -- log, write ``fallback_pwm``,
 ``STOPPING=1``), and ticks at ``cfg.dt`` on ``time.monotonic``.
 
 ``--source xt6`` (default) imports :mod:`aqua_bridge.hw.xt6` lazily -- the
-hardware adapter is the only place that knows sysfs. ``--source sim`` drives
-a simulated plant instead, for a laptop or CI; ``--sim-plant`` picks it:
+hardware adapter is the only place that knows sysfs. ``--source hwmon``
+imports :mod:`aqua_bridge.hw.sources` instead and builds the DAS composite
+source/sink (several hwmon devices from ``hwmon:``/``xt6:`` plus an optional
+1-Wire bus from ``onewire:``, plan section 1 and section 12 Q1); it is a
+separate choice rather than a generalisation of ``xt6`` so a config without
+the new sections drives ``--source xt6`` bit for bit as today ("legacy
+mode"). ``--source sim`` drives a simulated plant instead, for a laptop or
+CI; ``--sim-plant`` picks it:
 
 * ``basic`` (default): the RC plant from :mod:`aqua_bridge.sim.plant`,
   exactly as before the flag existed.
@@ -215,6 +221,21 @@ def build_io(
         hwmon_map = builder(app.section("xt6"), channels=app.mpc.channels, temps=app.mpc.temps)
         adapter = xt6.Xt6Adapter(hwmon_map, clock=clock)
         return adapter, adapter, None
+    if source == "hwmon":
+        try:
+            from aqua_bridge.hw import sources as hw_sources
+        except ImportError as exc:
+            raise RuntimeError(f"hardware adapter unavailable: {exc}") from exc
+        composite, release = hw_sources.build_composite_from_config(
+            hwmon_section=app.hwmon,
+            xt6_section=app.section("xt6"),
+            onewire_section=app.section("onewire"),
+            channels=app.mpc.channels,
+            temps=app.mpc.temps,
+            dt=app.mpc.dt,
+            clock=clock,
+        )
+        return composite, composite, release
     raise RuntimeError(f"unknown source {source!r}")
 
 
@@ -223,9 +244,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", required=True, help="path to config.yaml")
     p.add_argument(
         "--source",
-        choices=("xt6", "sim"),
+        choices=("xt6", "hwmon", "sim"),
         default="xt6",
-        help="xt6: aquaero over hwmon (default); sim: RC plant simulator",
+        help=(
+            "xt6: single aquaero over hwmon (default); hwmon: the DAS composite "
+            "(hwmon: devices + onewire:); sim: RC plant simulator"
+        ),
     )
     p.add_argument(
         "--sim-plant",
