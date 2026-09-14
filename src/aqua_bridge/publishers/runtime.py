@@ -6,9 +6,10 @@ MQTT; this module owns their threads and their lifetime:
 * :class:`HttpService` -- the aiohttp app from
   :func:`aqua_bridge.publishers.http.run_http` on its own asyncio event loop
   in a daemon thread. ``start()`` blocks until the server listens or fails;
-  a failure (port in use, bind denied) is logged and reported, never raised
-  into the control path: the daemon keeps controlling the fans without the
-  API rather than restarting in a loop.
+  a failure (invalid ``http:`` settings, a missing or unreadable TLS
+  certificate, key or credentials file, port in use, bind denied) is logged
+  and reported, never raised into the control path: the daemon keeps
+  controlling the fans without the API rather than restarting in a loop.
 * :class:`MqttService` -- a :class:`~aqua_bridge.publishers.mqtt_ha.MqttClient`
   connected asynchronously (paho's network thread, automatic reconnects) plus
   a per-tick publisher: ``on_tick`` (the loop's hook) publishes the retained
@@ -101,12 +102,11 @@ class HttpService:
         if not self._started.wait(timeout_s):
             self.error = f"http server did not start within {timeout_s} s"
         if self.error is not None:
-            _LOG.error("http: not started: %s", self.error)
+            _LOG.error(
+                "http: HTTPS API not started (fan control continues without it): %s", self.error
+            )
             return False
-        http_cfg = self._app_cfg.section("http")
-        _LOG.info(
-            "http: listening on %s:%s", http_cfg.get("bind", "0.0.0.0"), http_cfg.get("port", 8080)
-        )
+        _LOG.info("http: HTTPS API listening on %s", self.addresses)
         return True
 
     def _main(self) -> None:

@@ -247,10 +247,11 @@ async def _smart_client(smart_inbox: Any):
     from aiohttp.test_utils import TestClient, TestServer
 
     from aqua_bridge.publishers.http import create_app
+    from http_fixtures import client_auth, make_authenticator
 
-    app = create_app(_StubSurface(), cfg=None, smart_inbox=smart_inbox)
+    app = create_app(_StubSurface(), cfg=None, auth=make_authenticator(), smart_inbox=smart_inbox)
     server = TestServer(app)
-    client = TestClient(server)
+    client = TestClient(server, **client_auth())
     await client.start_server()
     return client
 

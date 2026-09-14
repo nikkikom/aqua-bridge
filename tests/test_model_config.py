@@ -62,7 +62,7 @@ def test_example_config_loads_and_validates(example_config_path):
     assert app.mpc.temps == ("coolant", "air")
     assert app.mpc.solver is SolverKind.PI
     assert app.xt6["hwmon_name"] == "aquaero"
-    assert app.section("http")["port"] == 8080
+    assert "port" in app.section("http")  # validated in tests/test_http_auth.py
     assert app.source == str(example_config_path)
 
 

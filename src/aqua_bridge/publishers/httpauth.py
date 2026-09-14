@@ -1,0 +1,537 @@
+"""HTTPS and HTTP basic auth for the API and the page (PROJECT.md section 6).
+
+Everything here is stdlib only (no aiohttp), so ``tools/http_user.py`` can use
+it without the HTTP stack:
+
+* :class:`HttpSettings` -- the ``http:`` config section, parsed and validated.
+  It is validated when the HTTP service starts, not when ``config.yaml`` is
+  loaded: a bad ``http:`` section keeps the API off and never stops the fans.
+* The credentials file: one ``user:hash`` line per user (``#`` comments and
+  blank lines allowed). ``hash`` is ``pbkdf2_sha256$<iterations>$<salt>$<key>``
+  with the salt and derived key in unpadded URL-safe base64; every user has
+  their own random salt and the iteration count travels with the hash, so
+  raising ``http.hash_iterations`` only affects users written afterwards.
+  :func:`hash_password`, :func:`verify_password`, :func:`parse_credentials`,
+  :func:`update_credentials_text`, :func:`load_credentials`.
+* :func:`build_ssl_context` -- the TLS server context (TLS 1.2 or newer) from
+  ``http.tls_cert`` / ``http.tls_key``.
+* :class:`BasicAuthenticator` -- checks an ``Authorization`` header: a cache of
+  verified credentials (``http.auth_cache_s``, so the page's 2 s poll does not
+  run PBKDF2 each time), a per-client backoff after ``http.auth_fail_limit``
+  consecutive failures (``http.auth_backoff_s`` doubling up to
+  ``http.auth_backoff_max_s``), and a reload of the credentials file whenever
+  it changes on disk (a missing or invalid file then denies everyone).
+
+The private files (key, credentials) must not be readable by others nor
+writable by the group: ``0640 root:<service user>`` is the intended mode.
+"""
+
+from __future__ import annotations
+
+import base64
+import binascii
+import hashlib
+import hmac
+import logging
+import math
+import os
+import re
+import secrets
+import ssl
+import stat
+import threading
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, fields
+from pathlib import Path
+from typing import Any
+
+__all__ = [
+    "HASH_SCHEME",
+    "MIN_HASH_ITERATIONS",
+    "AuthDecision",
+    "BasicAuthenticator",
+    "HttpSettings",
+    "HttpSetupError",
+    "build_ssl_context",
+    "check_private_file",
+    "hash_password",
+    "load_credentials",
+    "parse_authorization",
+    "parse_credentials",
+    "parse_hash",
+    "update_credentials_text",
+    "valid_username",
+    "verify_password",
+]
+
+_LOG = logging.getLogger(__name__)
+
+HASH_SCHEME = "pbkdf2_sha256"
+# Format constants of the hash string, not operator settings.
+_SALT_BYTES = 16
+_KEY_BYTES = 32
+# Validation floor for http.hash_iterations (a smaller count is a mistake).
+MIN_HASH_ITERATIONS = 1000
+
+_USERNAME = re.compile(r"^[A-Za-z0-9._@+-]{1,64}$")
+# A realm is quoted into WWW-Authenticate: printable ASCII without quote or backslash.
+_REALM = re.compile(r"^[\x20-\x21\x23-\x5b\x5d-\x7e]{1,64}$")
+
+
+class HttpSetupError(ValueError):
+    """The HTTP service cannot start: bad settings, TLS files or credentials."""
+
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HttpSettings:
+    """The ``http:`` section. Every default is documented in PROJECT.md section 6."""
+
+    #: Must be ``true`` for the daemon to start the service.
+    enabled: bool = False
+    #: Listen address.
+    bind: str = "0.0.0.0"
+    #: TLS port (there is no plain-HTTP listener).
+    port: int = 8443
+    #: PEM certificate (chain) served to clients.
+    tls_cert: str = "/etc/aqua-bridge/tls/cert.pem"
+    #: PEM private key of ``tls_cert``; mode 0640 root:<service user>.
+    tls_key: str = "/etc/aqua-bridge/tls/key.pem"
+    #: ``user:hash`` lines; mode 0640 root:<service user>.
+    credentials_file: str = "/etc/aqua-bridge/http-users"
+    #: Basic-auth realm shown by browsers.
+    realm: str = "aqua-bridge"
+    #: PBKDF2-HMAC-SHA256 iterations for hashes written by tools/http_user.py.
+    hash_iterations: int = 100_000
+    #: Seconds a verified user:password stays cached (0 = verify every request).
+    auth_cache_s: float = 300.0
+    #: Consecutive failed logins from one client before the backoff starts (0 = no backoff).
+    auth_fail_limit: int = 5
+    #: First backoff after the limit, doubled with every further failure.
+    auth_backoff_s: float = 1.0
+    #: Longest backoff; a client's failure count is forgotten after this long without failures.
+    auth_backoff_max_s: float = 300.0
+
+    @classmethod
+    def from_section(cls, section: Mapping[str, Any] | None) -> HttpSettings:
+        """Parse and validate the raw ``http:`` mapping. Raises :class:`HttpSetupError`."""
+        data = dict(section or {})
+        known = {f.name for f in fields(cls)}
+        unknown = sorted(str(k) for k in data if k not in known)
+        if unknown:
+            raise HttpSetupError(f"http: unknown key(s): {', '.join(unknown)}")
+        defaults = cls()
+        values: dict[str, Any] = {}
+
+        def get(name: str) -> Any:
+            return data.get(name, getattr(defaults, name))
+
+        enabled = get("enabled")
+        if not isinstance(enabled, bool):
+            raise HttpSetupError("http.enabled must be true or false")
+        values["enabled"] = enabled
+        for name in ("bind", "tls_cert", "tls_key", "credentials_file"):
+            value = get(name)
+            if not isinstance(value, str) or not value.strip():
+                raise HttpSetupError(f"http.{name} must be a non-empty string")
+            values[name] = value
+        realm = get("realm")
+        if not isinstance(realm, str) or not _REALM.match(realm):
+            raise HttpSetupError(
+                "http.realm must be 1-64 printable ASCII characters without '\"' or '\\'"
+            )
+        values["realm"] = realm
+        port = get("port")
+        if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+            raise HttpSetupError("http.port must be an integer in [0, 65535]")
+        values["port"] = port
+        iterations = get("hash_iterations")
+        if (
+            isinstance(iterations, bool)
+            or not isinstance(iterations, int)
+            or iterations < MIN_HASH_ITERATIONS
+        ):
+            raise HttpSetupError(
+                f"http.hash_iterations must be an integer >= {MIN_HASH_ITERATIONS}"
+            )
+        values["hash_iterations"] = iterations
+        fail_limit = get("auth_fail_limit")
+        if isinstance(fail_limit, bool) or not isinstance(fail_limit, int) or fail_limit < 0:
+            raise HttpSetupError("http.auth_fail_limit must be an integer >= 0")
+        values["auth_fail_limit"] = fail_limit
+        for name in ("auth_cache_s", "auth_backoff_s", "auth_backoff_max_s"):
+            value = get(name)
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise HttpSetupError(f"http.{name} must be a number")
+            value = float(value)
+            if not math.isfinite(value) or value < 0.0:
+                raise HttpSetupError(f"http.{name} must be a finite number >= 0")
+            values[name] = value
+        if values["auth_backoff_max_s"] < values["auth_backoff_s"]:
+            raise HttpSetupError("http.auth_backoff_max_s must be >= http.auth_backoff_s")
+        return cls(**values)
+
+
+# ---------------------------------------------------------------------------
+# Hashes and the credentials file
+# ---------------------------------------------------------------------------
+
+
+def _b64encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64decode(text: str) -> bytes:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", text):
+        raise ValueError("not unpadded URL-safe base64")
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def _derive(password: str, salt: bytes, iterations: int) -> bytes:
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, iterations, dklen=_KEY_BYTES
+    )
+
+
+def hash_password(password: str, iterations: int, *, salt: bytes | None = None) -> str:
+    """``pbkdf2_sha256$<iterations>$<salt>$<key>`` with a fresh random salt."""
+    if isinstance(iterations, bool) or not isinstance(iterations, int) or iterations < 1:
+        raise ValueError("iterations must be a positive integer")
+    if salt is None:
+        salt = secrets.token_bytes(_SALT_BYTES)
+    key = _derive(password, salt, iterations)
+    return f"{HASH_SCHEME}${iterations}${_b64encode(salt)}${_b64encode(key)}"
+
+
+def parse_hash(encoded: str) -> tuple[int, bytes, bytes]:
+    """``(iterations, salt, key)`` of a hash string. Raises :class:`ValueError`."""
+    parts = encoded.split("$")
+    if len(parts) != 4 or parts[0] != HASH_SCHEME:
+        raise ValueError(f"hash is not {HASH_SCHEME}$<iterations>$<salt>$<key>")
+    if not parts[1].isdigit() or parts[1].startswith("0"):
+        raise ValueError("hash iteration count is not a positive integer")
+    iterations = int(parts[1])
+    salt = _b64decode(parts[2])
+    key = _b64decode(parts[3])
+    if len(salt) < _SALT_BYTES:
+        raise ValueError(f"hash salt is shorter than {_SALT_BYTES} bytes")
+    if len(key) != _KEY_BYTES:
+        raise ValueError(f"hash key is not {_KEY_BYTES} bytes")
+    return iterations, salt, key
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    """Constant-time check of ``password`` against a hash string (``False`` if malformed)."""
+    try:
+        iterations, salt, key = parse_hash(encoded)
+    except ValueError:
+        return False
+    return hmac.compare_digest(_derive(password, salt, iterations), key)
+
+
+def valid_username(user: str) -> bool:
+    return isinstance(user, str) and bool(_USERNAME.match(user))
+
+
+def _credential_lines(text: str) -> list[tuple[int, str, str | None, str | None]]:
+    """``(line number, raw line, user | None, hash | None)``; ``None`` for comments/blank."""
+    out = []
+    for number, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            out.append((number, raw, None, None))
+            continue
+        user, sep, encoded = line.partition(":")
+        if not sep:
+            raise ValueError(f"line {number}: expected user:hash")
+        out.append((number, raw, user, encoded))
+    return out
+
+
+def parse_credentials(text: str) -> dict[str, str]:
+    """``{user: hash}`` of a credentials file's text. Raises :class:`ValueError`."""
+    users: dict[str, str] = {}
+    for number, _raw, user, encoded in _credential_lines(text):
+        if user is None or encoded is None:
+            continue
+        if not valid_username(user):
+            raise ValueError(f"line {number}: invalid user name (allowed: A-Z a-z 0-9 . _ @ + -)")
+        if user in users:
+            raise ValueError(f"line {number}: duplicate user {user!r}")
+        try:
+            parse_hash(encoded)
+        except ValueError as exc:
+            raise ValueError(f"line {number} ({user}): {exc}") from None
+        users[user] = encoded
+    return users
+
+
+def update_credentials_text(text: str, user: str, encoded: str) -> str:
+    """``text`` with ``user``'s line replaced (or appended); comments are kept."""
+    if not valid_username(user):
+        raise ValueError(f"invalid user name {user!r} (allowed: A-Z a-z 0-9 . _ @ + -)")
+    parse_hash(encoded)
+    parse_credentials(text)  # refuse to rewrite a file that is already invalid
+    lines: list[str] = []
+    replaced = False
+    for _number, raw, line_user, _hash in _credential_lines(text):
+        if line_user == user:
+            lines.append(f"{user}:{encoded}")
+            replaced = True
+        else:
+            lines.append(raw)
+    if not replaced:
+        lines.append(f"{user}:{encoded}")
+    result = "\n".join(lines) + "\n"
+    parse_credentials(result)
+    return result
+
+
+def check_private_file(path: str | os.PathLike[str], what: str) -> os.stat_result:
+    """A regular file, not readable by others and not writable by the group or others."""
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        raise HttpSetupError(f"{what} {path}: {exc.strerror or exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise HttpSetupError(f"{what} {path} is not a regular file")
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & 0o027:
+        raise HttpSetupError(
+            f"{what} {path} has mode {mode:04o}; it must not be readable by others or "
+            "writable by the group (chmod 0640, owner root, group the service user)"
+        )
+    return st
+
+
+def load_credentials(path: str | os.PathLike[str]) -> dict[str, str]:
+    """Read, permission-check and parse the credentials file. Raises :class:`HttpSetupError`."""
+    check_private_file(path, "credentials file")
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise HttpSetupError(f"credentials file {path}: {exc}") from exc
+    try:
+        users = parse_credentials(text)
+    except ValueError as exc:
+        raise HttpSetupError(f"credentials file {path}: {exc}") from exc
+    if not users:
+        raise HttpSetupError(
+            f"credentials file {path} has no users; create one with tools/http_user.py"
+        )
+    return users
+
+
+# ---------------------------------------------------------------------------
+# TLS
+# ---------------------------------------------------------------------------
+
+
+def build_ssl_context(settings: HttpSettings) -> ssl.SSLContext:
+    """Server context from ``tls_cert`` / ``tls_key``. Raises :class:`HttpSetupError`."""
+    cert = Path(settings.tls_cert)
+    try:
+        if not cert.is_file():
+            raise HttpSetupError(f"TLS certificate {cert} does not exist or is not a file")
+    except OSError as exc:
+        raise HttpSetupError(f"TLS certificate {cert}: {exc}") from exc
+    check_private_file(settings.tls_key, "TLS key")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        ctx.load_cert_chain(certfile=str(cert), keyfile=settings.tls_key)
+    except (OSError, ssl.SSLError) as exc:
+        raise HttpSetupError(
+            f"cannot load TLS certificate {cert} with key {settings.tls_key}: {exc}"
+        ) from exc
+    return ctx
+
+
+# ---------------------------------------------------------------------------
+# Authorization header and the authenticator
+# ---------------------------------------------------------------------------
+
+
+def parse_authorization(header: str | None) -> tuple[str, str] | None:
+    """``(user, password)`` of a ``Basic`` header, ``None`` when absent or malformed."""
+    if not isinstance(header, str):
+        return None
+    scheme, _, token = header.strip().partition(" ")
+    if scheme.lower() != "basic":
+        return None
+    token = token.strip()
+    if not token or not token.isascii():
+        return None
+    try:
+        raw = base64.b64decode(token, validate=True)
+        text = raw.decode("utf-8")
+    except (binascii.Error, ValueError):
+        return None
+    user, sep, password = text.partition(":")
+    if not sep or not valid_username(user):
+        return None
+    return user, password
+
+
+@dataclass(frozen=True)
+class AuthDecision:
+    """``ok`` with ``user``; otherwise ``retry_after_s`` is set while the client backs off."""
+
+    ok: bool
+    user: str | None = None
+    retry_after_s: float | None = None
+
+
+class BasicAuthenticator:
+    """Basic-auth checks with a cache, per-client backoff and credentials reload.
+
+    Thread-safe. :meth:`fast` answers without PBKDF2 (a cache hit, a missing or
+    malformed header, a client backing off) or returns ``None``; :meth:`verify`
+    then does the full check and may run PBKDF2 (serialised, one at a time).
+    """
+
+    def __init__(
+        self,
+        settings: HttpSettings,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.settings = settings
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._verify_lock = threading.Lock()
+        self._cache_key = secrets.token_bytes(32)
+        self._cache: dict[bytes, tuple[str, float]] = {}
+        self._failures: dict[str, tuple[int, float]] = {}
+        self._dummy_hash: str | None = None
+        self._signature: tuple[int, int, int, int] | None = None
+        self._users: dict[str, str] = {}
+        self._reload_error: str | None = None
+        # Refuse to start without a valid file: raises HttpSetupError.
+        self._users = load_credentials(settings.credentials_file)
+        self._signature = self._stat_signature()
+
+    @property
+    def users(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._users))
+
+    def _stat_signature(self) -> tuple[int, int, int, int] | None:
+        try:
+            st = os.stat(self.settings.credentials_file)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size, st.st_ino, st.st_mode)
+
+    def _refresh_locked(self) -> None:
+        signature = self._stat_signature()
+        if signature == self._signature and signature is not None:
+            return
+        self._signature = signature
+        self._cache.clear()
+        try:
+            self._users = load_credentials(self.settings.credentials_file)
+        except HttpSetupError as exc:
+            self._users = {}
+            message = str(exc)
+            if message != self._reload_error:
+                _LOG.error("http: credentials unusable, denying every request: %s", message)
+            self._reload_error = message
+            return
+        if self._reload_error is not None:
+            _LOG.info("http: credentials file readable again (%d users)", len(self._users))
+        self._reload_error = None
+        _LOG.info("http: credentials reloaded (%d users)", len(self._users))
+
+    def _cache_digest(self, user: str, password: str) -> bytes:
+        msg = user.encode("utf-8") + b"\0" + password.encode("utf-8", "surrogatepass")
+        return hmac.new(self._cache_key, msg, hashlib.sha256).digest()
+
+    def _backoff_locked(self, client: str, now: float) -> float | None:
+        """Seconds the client still has to wait, or ``None``."""
+        limit = self.settings.auth_fail_limit
+        entry = self._failures.get(client)
+        if limit <= 0 or entry is None:
+            return None
+        count, last = entry
+        if count < limit:
+            return None
+        wait = min(
+            self.settings.auth_backoff_s * 2.0 ** min(count - limit, 64),
+            self.settings.auth_backoff_max_s,
+        )
+        remaining = last + wait - now
+        return remaining if remaining > 0.0 else None
+
+    def _record_failure_locked(self, client: str, now: float) -> None:
+        horizon = self.settings.auth_backoff_max_s
+        for key, (_count, last) in list(self._failures.items()):
+            if now - last > horizon:
+                del self._failures[key]
+        count, _last = self._failures.get(client, (0, now))
+        self._failures[client] = (count + 1, now)
+
+    def fast(self, header: str | None, client: str) -> AuthDecision | None:
+        """A decision that needs no key derivation, or ``None`` (call :meth:`verify`)."""
+        now = self._clock()
+        with self._lock:
+            self._refresh_locked()
+            wait = self._backoff_locked(client, now)
+            if wait is not None:
+                return AuthDecision(False, retry_after_s=wait)
+            creds = parse_authorization(header)
+            if creds is None:
+                if header is not None:
+                    self._record_failure_locked(client, now)
+                return AuthDecision(False)
+            if self.settings.auth_cache_s > 0.0:
+                hit = self._cache.get(self._cache_digest(*creds))
+                if hit is not None and hit[1] > now and hit[0] in self._users:
+                    self._failures.pop(client, None)
+                    return AuthDecision(True, user=creds[0])
+        return None
+
+    def verify(self, header: str | None, client: str) -> AuthDecision:
+        """The full check (may run PBKDF2). Never raises."""
+        decision = self.fast(header, client)
+        if decision is not None:
+            return decision
+        creds = parse_authorization(header)
+        if creds is None:  # pragma: no cover - fast() answered already
+            return AuthDecision(False)
+        user, password = creds
+        with self._verify_lock:
+            with self._lock:
+                wait = self._backoff_locked(client, self._clock())
+                if wait is not None:
+                    return AuthDecision(False, retry_after_s=wait)
+                encoded = self._users.get(user)
+                signature = self._signature
+            if encoded is None:
+                # Same cost as a real user, so a probe cannot tell names apart.
+                if self._dummy_hash is None:
+                    self._dummy_hash = hash_password("", self.settings.hash_iterations)
+                verify_password(password, self._dummy_hash)
+                ok = False
+            else:
+                ok = verify_password(password, encoded)
+        now = self._clock()
+        with self._lock:
+            if ok and self._signature == signature and user in self._users:
+                self._failures.pop(client, None)
+                if self.settings.auth_cache_s > 0.0:
+                    for key, (_u, expiry) in list(self._cache.items()):
+                        if expiry <= now:
+                            del self._cache[key]
+                    self._cache[self._cache_digest(user, password)] = (
+                        user,
+                        now + self.settings.auth_cache_s,
+                    )
+                return AuthDecision(True, user=user)
+            self._record_failure_locked(client, now)
+            return AuthDecision(False)

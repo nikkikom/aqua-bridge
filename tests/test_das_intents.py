@@ -331,8 +331,9 @@ async def _post_all(sup: Supervisor, posts: list[tuple[str, Any]]) -> list[tuple
     from aiohttp.test_utils import TestClient, TestServer
 
     from aqua_bridge.publishers.http import create_app
+    from http_fixtures import client_auth, make_authenticator
 
-    client = TestClient(TestServer(create_app(sup)))
+    client = TestClient(TestServer(create_app(sup, auth=make_authenticator())), **client_auth())
     await client.start_server()
     out = []
     try:

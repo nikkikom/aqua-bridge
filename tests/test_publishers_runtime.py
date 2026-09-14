@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 import socket
-import urllib.request
 from typing import Any
 
 import pytest
@@ -37,22 +35,8 @@ def _app(cfg: MpcConfig, **sections: dict[str, Any]) -> AppConfig:
 # --- HttpService -------------------------------------------------------------------------
 
 
-@needs_bind
-def test_http_service_serves_state_and_stops(cfg: MpcConfig):
-    sup = Supervisor(cfg)
-    service = HttpService(sup, _app(cfg, http={"bind": "127.0.0.1", "port": 0, "enabled": True}))
-    assert service.start(timeout_s=10.0) is True
-    try:
-        assert service.running
-        (host, port, *_rest) = service.addresses[0]
-        with urllib.request.urlopen(f"http://{host}:{port}/api/health", timeout=5) as resp:
-            body = json.loads(resp.read())
-        assert body["solver"] == "fault"  # no tick yet
-        assert body["mqtt_connected"] is None
-    finally:
-        service.stop()
-    assert not service.running
-    service.stop()  # idempotent
+# Serving over TLS with auth and the startup refusals (no certificate, key or
+# credentials): tests/test_http_auth.py.
 
 
 def test_http_service_start_failure_is_reported_not_raised(cfg: MpcConfig):

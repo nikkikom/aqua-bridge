@@ -5,7 +5,12 @@
 # daemon writing?) must be confirmed manually first.
 #
 # Usage:
-#   deploy/install-pi.sh --user <account>
+#   deploy/install-pi.sh --user <account> [--tls-days <days>]
+#
+# --tls-days: validity of the self-signed HTTPS certificate created when
+# /etc/aqua-bridge/tls/ has none (default 3650). Existing TLS files and the
+# HTTP credentials file are never overwritten; users are not created (the
+# script prints the tools/http_user.py command).
 #
 # Run this from the checked-out repo on the Pi (e.g. after
 # `rsync -az ./ USER@PI-HOST:/opt/aqua-bridge/`, see PROJECT.md §11) with
@@ -23,11 +28,17 @@ UDEV_RULE_DST="/etc/udev/rules.d/99-aquacomputer.rules"
 UNIT_SRC="$SCRIPT_DIR/aqua-bridge.service"
 UNIT_DST="/etc/systemd/system/aqua-bridge.service"
 PACKAGES_FILE="$SCRIPT_DIR/packages-rpi.txt"
+# Must match the http: defaults in src/aqua_bridge/publishers/httpauth.py
+# (HttpSettings; tests/test_deploy.py checks it).
+TLS_DIR="$CONFIG_DIR/tls"
+TLS_CERT="$TLS_DIR/cert.pem"
+TLS_KEY="$TLS_DIR/key.pem"
+TLS_DAYS=3650
 
 USER_ACCOUNT=""
 
 usage() {
-  echo "Usage: $0 --user <account>" >&2
+  echo "Usage: $0 --user <account> [--tls-days <days>]" >&2
   exit 2
 }
 
@@ -36,6 +47,12 @@ while [[ $# -gt 0 ]]; do
     --user)
       [[ $# -ge 2 ]] || usage
       USER_ACCOUNT="$2"
+      shift 2
+      ;;
+    --tls-days)
+      [[ $# -ge 2 ]] || usage
+      [[ "$2" =~ ^[1-9][0-9]*$ ]] || usage
+      TLS_DAYS="$2"
       shift 2
       ;;
     *)
@@ -114,6 +131,33 @@ else
   echo "already present, left untouched: $CONFIG_DIR/config.yaml"
 fi
 
+echo "== HTTPS certificate =="
+sudo install -d -m 755 "$TLS_DIR"
+if sudo test -e "$TLS_CERT" || sudo test -e "$TLS_KEY"; then
+  # Never overwrite: an owner-provided certificate or a previous run's key stays.
+  if ! sudo test -e "$TLS_CERT" || ! sudo test -e "$TLS_KEY"; then
+    echo "warning: only one of $TLS_CERT / $TLS_KEY exists; left untouched," \
+      "the HTTPS API will not start until both are present" >&2
+  else
+    echo "already present, left untouched: $TLS_CERT, $TLS_KEY"
+  fi
+else
+  tls_host="$(hostname)"
+  # umask 077 in the subshell: the key is never world-readable, not even briefly.
+  (
+    umask 077
+    sudo openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+      -days "$TLS_DAYS" -subj "/CN=$tls_host" \
+      -addext "subjectAltName=DNS:$tls_host,DNS:$tls_host.local" \
+      -keyout "$TLS_KEY" -out "$TLS_CERT"
+  )
+  sudo chown root:"$USER_ACCOUNT" "$TLS_KEY"
+  sudo chmod 640 "$TLS_KEY"
+  sudo chown root:root "$TLS_CERT"
+  sudo chmod 644 "$TLS_CERT"
+  echo "created self-signed certificate: $TLS_CERT (key $TLS_KEY, $TLS_DAYS days)"
+fi
+
 echo "== udev rule =="
 sudo install -m 644 "$UDEV_RULE_SRC" "$UDEV_RULE_DST"
 sudo udevadm control --reload-rules
@@ -138,5 +182,11 @@ started. Before "systemctl enable --now aqua-bridge":
      its own curve once the Pi stops writing.
   2. Edit $CONFIG_DIR/config.yaml (host, MQTT credentials, channel
      names) to match this Pi.
-  3. Then: sudo systemctl enable --now aqua-bridge
+  3. For the HTTPS API (http.enabled: true), create a user; the password
+     is prompted for, never passed on the command line:
+       sudo $INSTALL_DIR/.venv/bin/python $INSTALL_DIR/tools/http_user.py \\
+         --config $CONFIG_DIR/config.yaml --group $USER_ACCOUNT <name>
+     A certificate this script created is self-signed: browsers warn
+     until you trust $TLS_CERT.
+  4. Then: sudo systemctl enable --now aqua-bridge
 EOF

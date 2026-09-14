@@ -55,9 +55,14 @@ DAS views (plan sections 1 and 7), read from the snapshot, never computed here:
 
 A legacy config answers all three with 404 and a reason.
 
-No authentication in v1: bind is LAN-only (``0.0.0.0:8080`` by default,
-see ``config.example.yaml``). Section 6: "No auth on the local network in
-MVP; add a bearer token before exposing the API further."
+HTTPS and basic auth (section 6, :mod:`aqua_bridge.publishers.httpauth`):
+:func:`run_http` listens only with a TLS context (``http.tls_cert`` /
+``http.tls_key``); there is no plain-HTTP listener. ``create_app`` requires a
+:class:`~aqua_bridge.publishers.httpauth.BasicAuthenticator` and puts every
+route behind it, ``GET /`` and unknown paths included: no or wrong credentials
+answer ``401`` with ``WWW-Authenticate: Basic realm=...``, a client backing off
+after repeated failures answers ``429`` with ``Retry-After``. A credentials
+check that needs PBKDF2 runs in a worker thread so the event loop keeps serving.
 
 ``POST /api/in/smart`` (the DAS plan, section 1 "SMART path") is the
 non-MQTT twin of the PC-side SMART agent: same JSON body
@@ -70,8 +75,10 @@ malformed body is a 400 (matching every other POST route here), never a
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +93,11 @@ from aqua_bridge.control.intents import (
     parse_intent,
 )
 from aqua_bridge.control.thermal import PARAMETERS
+from aqua_bridge.publishers.httpauth import (
+    BasicAuthenticator,
+    HttpSettings,
+    build_ssl_context,
+)
 
 __all__ = ["create_app", "run_http"]
 
@@ -97,6 +109,7 @@ _INDEX_HTML = _STATIC_DIR / "index.html"
 _SURFACE_KEY = web.AppKey("surface", ControlSurface)
 _CFG_KEY: web.AppKey[Any] = web.AppKey("cfg")
 _SMART_KEY: web.AppKey[Any] = web.AppKey("smart_inbox")
+_AUTH_KEY = web.AppKey("auth", BasicAuthenticator)
 
 # URL tail -> intent kind (identical today, kept separate so the route table
 # and aqua_bridge.control.intents.INTENT_KINDS can diverge later).
@@ -120,6 +133,31 @@ async def _read_json_body(request: web.Request) -> Any:
         return json.loads(text)
     except json.JSONDecodeError as exc:
         raise IntentInvalid(f"body is not valid JSON: {exc}") from exc
+
+
+@web.middleware
+async def _auth_middleware(request: web.Request, handler: Any) -> web.StreamResponse:
+    """Every route, ``GET /`` and unknown paths included, needs valid credentials."""
+    auth: BasicAuthenticator = request.app[_AUTH_KEY]
+    header = request.headers.get("Authorization")
+    client = request.remote or ""
+    decision = auth.fast(header, client)
+    if decision is None:
+        decision = await asyncio.to_thread(auth.verify, header, client)
+    if decision.ok:
+        return await handler(request)
+    if decision.retry_after_s is not None:
+        return web.json_response(
+            {"error": "too many failed logins; retry later"},
+            status=429,
+            headers={"Retry-After": str(max(1, math.ceil(decision.retry_after_s)))},
+        )
+    realm = auth.settings.realm
+    return web.json_response(
+        {"error": "authentication required"},
+        status=401,
+        headers={"WWW-Authenticate": f'Basic realm="{realm}", charset="UTF-8"'},
+    )
 
 
 def _make_intent_handler(kind: str):
@@ -242,16 +280,24 @@ async def _get_index(request: web.Request) -> web.Response:
 
 
 def create_app(
-    surface: ControlSurface, cfg: AppConfig | None = None, *, smart_inbox: Any = None
+    surface: ControlSurface,
+    cfg: AppConfig | None = None,
+    *,
+    auth: BasicAuthenticator,
+    smart_inbox: Any = None,
 ) -> web.Application:
     """Build the aiohttp application. ``cfg`` is accepted for parity with
     :func:`run_http` and future per-instance config; today the app needs
-    nothing from it beyond what ``surface`` already carries. ``smart_inbox``
+    nothing from it beyond what ``surface`` already carries. ``auth`` is
+    required: there is no unauthenticated app. ``smart_inbox``
     (a :class:`~aqua_bridge.publishers.inputs.SmartInbox`, duck-typed --
     only ``.record(dict) -> bool`` is used) wires ``POST /api/in/smart``;
     left ``None`` that route answers 404, never a 5xx.
     """
-    app = web.Application()
+    if not isinstance(auth, BasicAuthenticator):
+        raise TypeError("create_app needs a BasicAuthenticator")
+    app = web.Application(middlewares=[_auth_middleware])
+    app[_AUTH_KEY] = auth
     app[_SURFACE_KEY] = surface
     app[_CFG_KEY] = cfg
     app[_SMART_KEY] = smart_inbox
@@ -270,17 +316,25 @@ def create_app(
 async def run_http(
     surface: ControlSurface, cfg: AppConfig, *, smart_inbox: Any = None
 ) -> web.AppRunner:
-    """Start the HTTP server per ``cfg.http`` (``bind``/``port``).
+    """Start the HTTPS server per ``cfg.http``.
 
+    Validates the section (:class:`~aqua_bridge.publishers.httpauth.HttpSettings`),
+    loads the TLS certificate and key and the credentials file first; any
+    problem raises :class:`~aqua_bridge.publishers.httpauth.HttpSetupError`
+    before a socket is opened, so nothing ever listens without TLS and auth.
     Returns the started :class:`aiohttp.web.AppRunner`; the caller owns its
     lifetime and must ``await runner.cleanup()`` on shutdown.
     """
-    http_cfg = cfg.section("http")
-    bind = http_cfg.get("bind", "0.0.0.0")
-    port = int(http_cfg.get("port", 8080))
-    app = create_app(surface, cfg, smart_inbox=smart_inbox)
+    settings = HttpSettings.from_section(cfg.section("http"))
+    ssl_context = build_ssl_context(settings)
+    auth = BasicAuthenticator(settings)
+    app = create_app(surface, cfg, auth=auth, smart_inbox=smart_inbox)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, bind, port)
-    await site.start()
+    try:
+        site = web.TCPSite(runner, settings.bind, settings.port, ssl_context=ssl_context)
+        await site.start()
+    except BaseException:
+        await runner.cleanup()
+        raise
     return runner

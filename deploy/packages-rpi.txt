@@ -27,6 +27,8 @@ libgpiod-dev
 gpiod
 minicom
 lm-sensors
+# HTTPS API: install-pi.sh creates a self-signed certificate
+openssl
 
 # USB / MQTT / MPC via apt so a venv --system-site-packages can import them.
 # Do not pip-install numpy on Zero W.

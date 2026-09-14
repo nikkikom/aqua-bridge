@@ -119,9 +119,30 @@ xt6:
     air: temp2
 
 http:
-  bind: 0.0.0.0
-  port: 8080
+  # HTTPS with basic auth only; there is no plain-HTTP listener (PROJECT.md section 6).
+  # With enabled: true but a missing or invalid certificate, key or credentials
+  # file the API stays off (logged) and the daemon keeps controlling the fans.
   enabled: false
+  bind: 0.0.0.0
+  port: 8443
+  # PEM certificate and key; deploy/install-pi.sh creates a self-signed pair if absent.
+  # The key must be mode 0640 root:<service user>.
+  tls_cert: /etc/aqua-bridge/tls/cert.pem
+  tls_key: /etc/aqua-bridge/tls/key.pem
+  # One user:pbkdf2_sha256$... line per user, mode 0640 root:<service user>;
+  # create users with tools/http_user.py. Reread when it changes.
+  credentials_file: /etc/aqua-bridge/http-users
+  realm: aqua-bridge
+  # PBKDF2-HMAC-SHA256 iterations for newly written hashes (tools/http_user.py);
+  # each uncached check costs this many iterations of CPU on the Pi.
+  hash_iterations: 100000
+  # Seconds a verified user:password is cached (the page polls every 2 s); 0 = no cache.
+  auth_cache_s: 300
+  # After auth_fail_limit consecutive failed logins a client gets 429 for
+  # auth_backoff_s, doubling per further failure up to auth_backoff_max_s; 0 = off.
+  auth_fail_limit: 5
+  auth_backoff_s: 1
+  auth_backoff_max_s: 300
 
 digole:
   device: /dev/serial0

@@ -132,6 +132,31 @@ def test_smart_agent_unit_is_a_user_unit_example_not_installed_by_install_pi():
     assert "aqua-bridge-smart-agent" not in install_text
 
 
+def test_install_script_creates_a_self_signed_certificate_but_never_overwrites_or_adds_users():
+    from aqua_bridge.publishers.httpauth import HttpSettings
+
+    text = (DEPLOY / "install-pi.sh").read_text()
+    defaults = HttpSettings()
+    tls_dir = Path(defaults.tls_cert).parent
+    assert Path(defaults.tls_key).parent == tls_dir
+    config_dir = re.search(r'^CONFIG_DIR="([^"]+)"$', text, re.MULTILINE)
+    assert config_dir is not None
+    assert 'TLS_DIR="$CONFIG_DIR/tls"' in text
+    assert tls_dir == Path(config_dir.group(1)) / "tls"
+    assert Path(defaults.credentials_file).parent == Path(config_dir.group(1))
+    assert f'TLS_CERT="$TLS_DIR/{Path(defaults.tls_cert).name}"' in text
+    assert f'TLS_KEY="$TLS_DIR/{Path(defaults.tls_key).name}"' in text
+    assert "openssl req -x509" in text
+    # Guarded: nothing is generated when either file exists.
+    assert 'if sudo test -e "$TLS_CERT" || sudo test -e "$TLS_KEY"; then' in text
+    assert 'sudo chown root:"$USER_ACCOUNT" "$TLS_KEY"' in text
+    assert 'sudo chmod 640 "$TLS_KEY"' in text
+    # Users are never created by the script; it prints the tool's command instead.
+    assert "tools/http_user.py" in text
+    assert "--stdin" not in text and "http-users" not in text
+    assert "openssl" in (DEPLOY / "packages-rpi.txt").read_text().split()
+
+
 @pytest.mark.parametrize("script", ["install-pi.sh", "host-usb.sh"])
 def test_shell_scripts_parse(script):
     bash = shutil.which("bash")

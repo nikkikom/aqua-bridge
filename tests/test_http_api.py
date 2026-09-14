@@ -36,6 +36,7 @@ from aqua_bridge.control.intents import (
 )
 from aqua_bridge.model import FaultReason, Mode, MpcCommand, MpcConfig, PlantObservation
 from aqua_bridge.publishers.http import create_app
+from http_fixtures import client_auth, make_authenticator
 
 _EXAMPLE_CFG = load_config(Path(__file__).resolve().parent.parent / "config.example.yaml").mpc
 
@@ -141,9 +142,9 @@ def _run(coro):
 
 
 async def _client(surface: StubSurface) -> TestClient:
-    app = create_app(surface, cfg=None)
+    app = create_app(surface, cfg=None, auth=make_authenticator())
     server = TestServer(app)
-    client = TestClient(server)
+    client = TestClient(server, **client_auth())
     await client.start_server()
     return client
 
@@ -544,7 +545,9 @@ def test_fuzz_setpoint_never_5xx_and_never_leaks_bad_value(
 
 
 async def _post_real(surface: Any, posts: list[tuple[str, Any]]) -> list[tuple[int, Any]]:
-    client = TestClient(TestServer(create_app(surface, cfg=None)))
+    client = TestClient(
+        TestServer(create_app(surface, cfg=None, auth=make_authenticator())), **client_auth()
+    )
     await client.start_server()
     out = []
     try:

@@ -457,6 +457,39 @@ def test_main_keeps_controlling_when_a_publisher_fails_to_start(
     assert len(recorded_applies) == 3  # 2 ticks + shutdown: the loop ran regardless
 
 
+def test_main_keeps_controlling_when_https_has_no_certificate_or_credentials(
+    tmp_path, example_config_path, restore_signals, recorded_applies, caplog
+):
+    """http.enabled with a missing certificate, key and credentials file (the real
+    run_http, nothing monkeypatched): the API stays off with a clear error and the
+    loop runs regardless (section 6)."""
+    import logging
+
+    import yaml
+
+    data = yaml.safe_load(example_config_path.read_text())
+    data["http"].update(
+        enabled=True,
+        bind="127.0.0.1",
+        port=0,
+        tls_cert=str(tmp_path / "missing-cert.pem"),
+        tls_key=str(tmp_path / "missing-key.pem"),
+        credentials_file=str(tmp_path / "missing-users"),
+    )
+    conf = tmp_path / "https.yaml"
+    conf.write_text(yaml.safe_dump(data))
+    with caplog.at_level(logging.ERROR):
+        rc = main_mod.main(
+            ["--config", str(conf), "--source", "sim", "--ticks", "2", "--sim-speed", "0"]
+        )
+    assert rc == 0
+    assert len(recorded_applies) == 3  # 2 ticks + shutdown
+    assert any(
+        "HTTPS API not started" in r.getMessage() and "missing-cert.pem" in r.getMessage()
+        for r in caplog.records
+    )
+
+
 # --- SIGTERM stop path (section 9) ------------------------------------------------------
 
 
