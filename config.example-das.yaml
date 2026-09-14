@@ -210,10 +210,17 @@ mpc:
   # zones: trust_rule strict (a zone faults when a required sensor group has no
   # trusted member) or sigma (a zone faults when a bay's drive sigma or its air
   # sigma passes estimator.sigma_fault_c / sigma_air_fault_c: a lost sensor widens
-  # the margin first and its zone's fans never fall while it is lost; not with two
-  # proximal sensors on a bay at different placements); fault_coupling declared (a zone fault also reaches the outputs of
+  # the margin first; not with two proximal sensors on a bay at different
+  # placements); fault_coupling declared (a zone fault also reaches the outputs of
   # the zones in its coupled_to) or none (strictly per zone).
   zones: {trust_rule: strict, fault_coupling: declared}
+  # Soft sigma floor (trust_rule sigma only), defaults shown: when a zone loses its
+  # air sensor or a bay's proximal sensors, its outputs stay at least at the command
+  # before the loss until sigma_floor_hold_s (s, >= 0) has passed or the sigma of
+  # every lost sensor group has grown by sigma_floor_growth_c (degC, > 0); then that
+  # floor falls by sigma_floor_release_per_min (PWM per minute, > 0) until it is gone.
+  #   zones: {trust_rule: sigma, fault_coupling: declared, sigma_floor_hold_s: 1800,
+  #           sigma_floor_growth_c: 1.0, sigma_floor_release_per_min: 0.0025}
   noise: {exponent: 5.0, weight_noise: 1.0, band_hysteresis: 0.02}
   estimator:             # drive temperature estimator (per-zone Kalman filter), defaults shown
     k_sigma: 2.0         # margin = k_sigma * sigma; sigma >= 1.5 degC until SMART calibrates a bay

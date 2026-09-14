@@ -67,15 +67,22 @@ Order inside :func:`step`
    fault-free or on its ``confirm_ticks``-th consecutive trusted tick with a
    confirmed trusted member in every required group its trust rule checks
    (``sigma``: the setpoint groups only).
-4b. Sigma floor (``zones.trust_rule: sigma`` only): an eligible zone whose
-   required sensor groups (the ``strict`` groups) are not all held by a
-   gate-trusted, confirmed member runs on the estimator's growing sigma; while
-   it does, the solver's demand on every channel of its reach is raised to at
-   least ``prev`` (``diagnostics["sigma_floor_channels"]``). The estimator
-   cannot see the heat a lost sensor would have shown, and ``k * sigma`` grows
-   slowly, so without the floor a solver that had followed the measured warming
-   (the DAS MPC) lowers the fans the moment the sensor goes (PROJECT.md
-   section 3 per-zone trust). The floor is released with the sensor.
+4b. Soft sigma floor (``zones.trust_rule: sigma`` only,
+   :func:`aqua_bridge.control.zones.advance_sigma_floor`, memory
+   ``solver_memory["sigma_floor"]``): a zone with a zone-air or bay group (the
+   ``strict`` groups the estimator replaces) that has no gate-trusted, confirmed member
+   runs on the estimator's growing sigma. The estimator cannot see the heat a lost sensor
+   would have shown and ``k * sigma`` grows slowly, so without a floor a solver that had
+   followed the measured warming (the DAS MPC) lowers the fans the moment the sensor goes
+   (PROJECT.md section 3 per-zone trust). On the tick of the loss the zone's episode
+   opens with a floor at ``prev`` on every channel of its reach; the floor holds until
+   ``zones.sigma_floor_hold_s`` has passed or the sigma of every lost group has grown by
+   ``zones.sigma_floor_growth_c``, then falls by ``zones.sigma_floor_release_per_min``
+   and is gone at ``pwm_min``; the episode closes when the groups are held again. The
+   solver's demand on a channel of an eligible zone's reach is raised to that floor
+   (``diagnostics["sigma_floor_channels"]``, per zone ``diagnostics["sigma_floor"]``).
+   The floor is a fixed level, not ``prev`` on every tick, so a solver that swings its
+   command is not ratcheted up.
 5. Solver -- only when some zone is eligible. The channels of the zones
    that stay in fault (and, with ``fault_coupling: declared``, of the zones
    coupled to them) are under fallback policy: they reach the solver as
@@ -603,15 +610,24 @@ def step(
             )
         )
     ]
-    # 4b. sigma floor (``trust_rule: sigma``; module docstring): an eligible zone with a
-    # required sensor group that has no confirmed trusted member keeps the channels of its
-    # reach at or above ``prev`` while the solver drives them
-    sigma_floor: set[str] = set()
-    if das and trust_rule == "sigma":
-        degraded = [
-            z for z in eligible if not zones.groups_confirmed(z, gate, confirming, cfg, "strict")
-        ]
-        sigma_floor = set(zones.fallback_channels(degraded, cfg))
+    # 4b. soft sigma floor (``zones.trust_rule: sigma``; module docstring): a zone with a
+    # lost zone-air or bay group keeps a held, then released floor under the solver's
+    # demand on the channels of its reach
+    sigma_floor: dict[str, float] = {}
+    floor_zones: dict[str, dict[str, Any]] = {}
+    if das and cfg.zones is not None and cfg.zones.trust_rule == "sigma":
+        soft = zones.advance_sigma_floor(
+            mem.get("sigma_floor"),
+            cfg,
+            lost={z: zones.lost_groups(z, gate, confirming, cfg) for z in zone_names},
+            estimator=est_update,
+            prev=prev,
+            eligible=eligible,
+        )
+        sigma_floor, floor_zones = soft.floor, soft.zones
+        mem["sigma_floor"] = soft.memory
+    else:
+        mem.pop("sigma_floor", None)
     # Zones that stay in fault whatever the solver does, and their channels.
     remaining = [z for z in zone_names if z not in eligible]
     fixed_pre = set(zones.fallback_channels(remaining, cfg))
@@ -746,8 +762,8 @@ def step(
             )
         elif result_pwm is not None:
             want = result_pwm[ch]
-            if ch in sigma_floor:  # never below what is already on the fans (step 4b)
-                want = max(want, prev[ch])
+            if ch in sigma_floor:  # not below the soft sigma floor (step 4b)
+                want = max(want, sigma_floor[ch])
             target[ch], policy_by_channel[ch] = want, "solver"
         else:  # unreachable: a channel outside fallback policy had a solver result; hold
             target[ch], policy_by_channel[ch] = prev[ch], "hold"
@@ -875,6 +891,7 @@ def step(
         diagnostics["sigma_floor_channels"] = [
             ch for ch in cfg.channels if ch in sigma_floor and policy_by_channel[ch] == "solver"
         ]
+        diagnostics["sigma_floor"] = floor_zones
         diagnostics["trust_rule"] = trust_rule
         diagnostics["sensor_confirm"] = dict(confirming)
         diagnostics["estimates"] = _estimate_diagnostics(est_block, verdicts, faulted)

@@ -148,6 +148,7 @@ __all__ = [
     "MpcState",
     "NoiseSpec",
     "PlantObservation",
+    "SIGMA_FLOOR_DEFAULTS",
     "SensorSpec",
     "SolverKind",
     "StuckParams",
@@ -1114,6 +1115,16 @@ class FanModel:
         }
 
 
+#: ``zones`` soft sigma floor defaults (PROJECT.md section 3 per-zone trust): how long the
+#: floor holds at most, the sigma growth that ends the hold earlier, and how fast the floor
+#: is released afterwards (PWM per minute).
+SIGMA_FLOOR_DEFAULTS: dict[str, float] = {
+    "sigma_floor_hold_s": 1800.0,
+    "sigma_floor_growth_c": 1.0,
+    "sigma_floor_release_per_min": 0.0025,
+}
+
+
 @dataclass(frozen=True)
 class ZonePolicy:
     """``zones``: how a zone's trust is decided and how far a zone fault reaches.
@@ -1124,25 +1135,45 @@ class ZonePolicy:
     * ``fault_coupling`` -- ``declared`` (a zone fault also puts the channels of
       the zones in its ``coupled_to`` under fallback policy) or ``none``
       (strictly per zone)
+    * ``sigma_floor_hold_s`` / ``sigma_floor_growth_c`` / ``sigma_floor_release_per_min``
+      -- the soft sigma floor (``trust_rule: sigma`` only, ``zones.advance_sigma_floor``):
+      a zone that loses a sensor group keeps the reach's command of the tick before the
+      loss as a floor until the hold has lasted ``sigma_floor_hold_s`` (``>= 0``) or the
+      sigma of every lost group has grown by ``sigma_floor_growth_c`` degC (``> 0``),
+      then lowers that floor by at most ``sigma_floor_release_per_min`` PWM per minute
+      (``> 0``) until it is gone
     """
 
     trust_rule: str = "strict"
     fault_coupling: str = "declared"
+    sigma_floor_hold_s: float = SIGMA_FLOOR_DEFAULTS["sigma_floor_hold_s"]
+    sigma_floor_growth_c: float = SIGMA_FLOOR_DEFAULTS["sigma_floor_growth_c"]
+    sigma_floor_release_per_min: float = SIGMA_FLOOR_DEFAULTS["sigma_floor_release_per_min"]
 
     @classmethod
     def coerce(cls, data: object) -> ZonePolicy:
         if isinstance(data, ZonePolicy):
             return data
-        raw = _section_keys("zones", data, optional=("trust_rule", "fault_coupling"))
+        raw = _section_keys(
+            "zones", data, optional=("trust_rule", "fault_coupling", *SIGMA_FLOOR_DEFAULTS)
+        )
         return cls(
             trust_rule=_choice("zones.trust_rule", raw.get("trust_rule", "strict"), TRUST_RULES),
             fault_coupling=_choice(
                 "zones.fault_coupling", raw.get("fault_coupling", "declared"), FAULT_COUPLINGS
             ),
+            **{
+                key: _cfg_num(f"zones.{key}", raw.get(key, default))
+                for key, default in SIGMA_FLOOR_DEFAULTS.items()
+            },
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {"trust_rule": self.trust_rule, "fault_coupling": self.fault_coupling}
+        return {
+            "trust_rule": self.trust_rule,
+            "fault_coupling": self.fault_coupling,
+            **{key: getattr(self, key) for key in SIGMA_FLOOR_DEFAULTS},
+        }
 
 
 #: ``noise`` defaults (plan section 7): fan affinity exponent, weight of the noise
@@ -2249,6 +2280,13 @@ class MpcConfig:
             raise ConfigError(f"mpc.zones.trust_rule must be one of {list(TRUST_RULES)}")
         if policy.fault_coupling not in FAULT_COUPLINGS:
             raise ConfigError(f"mpc.zones.fault_coupling must be one of {list(FAULT_COUPLINGS)}")
+        if policy.sigma_floor_hold_s < 0:
+            raise ConfigError(
+                f"mpc.zones.sigma_floor_hold_s must be >= 0, got {policy.sigma_floor_hold_s}"
+            )
+        for key in ("sigma_floor_growth_c", "sigma_floor_release_per_min"):
+            if not getattr(policy, key) > 0:
+                raise ConfigError(f"mpc.zones.{key} must be > 0, got {getattr(policy, key)}")
         if (
             policy.trust_rule == "sigma"
             and isinstance(self.estimator, EstimatorSpec)
