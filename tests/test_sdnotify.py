@@ -18,6 +18,7 @@ from aqua_bridge.sdnotify import (
     notify_watchdog,
     resolve_notify_socket,
     sd_notify,
+    watchdog_seconds,
 )
 
 
@@ -180,3 +181,12 @@ def test_real_socket_module_functions_with_env_override(listener):
     assert srv.recv(64) == b"WATCHDOG=1"
     assert sd_notify("STATUS=hello\nWATCHDOG=1", env=env) is True
     assert srv.recv(64) == b"STATUS=hello\nWATCHDOG=1"
+
+
+def test_watchdog_seconds_from_the_systemd_environment():
+    assert watchdog_seconds({}) is None
+    assert watchdog_seconds({"WATCHDOG_USEC": "30000000"}) == 30.0
+    assert watchdog_seconds({"WATCHDOG_USEC": "30000000", "WATCHDOG_PID": "42"}, pid=42) == 30.0
+    assert watchdog_seconds({"WATCHDOG_USEC": "30000000", "WATCHDOG_PID": "7"}, pid=42) is None
+    for bad in ("", "0", "-5", "30s", "3.5"):
+        assert watchdog_seconds({"WATCHDOG_USEC": bad}) is None

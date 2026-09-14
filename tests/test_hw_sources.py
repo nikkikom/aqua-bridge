@@ -276,25 +276,25 @@ def test_two_devices_of_one_kind_need_distinct_serials() -> None:
     with pytest.raises(ConfigError, match="can both open the same aquaero"):
         _build(
             aquacomputer_section=(
-                dict(_XT6_SECTION, serial="12345-67890"),
-                dict(second, serial="12345-67890"),
+                dict(_XT6_SECTION, serial="12345-54321"),
+                dict(second, serial="12345-54321"),
             ),
             **kwargs,
         )
     with pytest.raises(ConfigError, match="can both open the same aquaero"):
         _build(
-            aquacomputer_section=(dict(second, serial="12345-67890"),),
+            aquacomputer_section=(dict(second, serial="12345-54321"),),
             xt6_section=_XT6_SECTION,
             **kwargs,
         )
     composite, _ = _build(
         aquacomputer_section=(
-            dict(_XT6_SECTION, serial="12345-67890"),
+            dict(_XT6_SECTION, serial="12345-54321"),
             dict(second, serial="00000-00001"),
         ),
         **kwargs,
     )
-    assert [d.binding.serial for d in composite.devices] == ["12345-67890", "00000-00001"]
+    assert [d.binding.serial for d in composite.devices] == ["12345-54321", "00000-00001"]
 
 
 def test_onewire_fills_remaining_temps_and_release_stops_it(tmp_path: Path) -> None:
@@ -332,6 +332,25 @@ def test_build_composite_from_config_passes_smart_clock_sleep_and_opener_through
     obs = composite.read()
     assert obs.inputs == {"smart": {"S1": {"temp_c": 30.0, "age_s": 1.0, "model": None}}}
     assert obs.ts == 7.0 and bus.opened == [device.node]
+
+
+def test_build_checks_the_summed_worst_case_against_the_watchdog() -> None:
+    from aqua_bridge.hw.aquacomputer_adapter import AquacomputerTiming
+
+    total = (
+        AquacomputerTiming.for_kind(AQUAERO).worst_case_tick_s()
+        + AquacomputerTiming.for_kind(QUADRO).worst_case_tick_s()
+    )
+    kwargs = dict(
+        aquacomputer_section=(dict(_XT6_SECTION), _QUADRO_ENTRY),
+        channels=("radiator", "exhaust"),
+        temps=("air_z0", "air_z1"),
+    )
+    with pytest.raises(ConfigError, match="aquacomputer\\[0\\] .*aquacomputer\\[1\\]"):
+        _build(watchdog_s=total, **kwargs)
+    _build(watchdog_s=total + 0.5, **kwargs)
+    shorter = (dict(_XT6_SECTION, ctrl_budget_s=4.0), _QUADRO_ENTRY)  # a smaller budget fits
+    _build(watchdog_s=total, **dict(kwargs, aquacomputer_section=shorter))
 
 
 def test_no_device_configured_is_config_error() -> None:

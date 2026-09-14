@@ -28,6 +28,7 @@ __all__ = [
     "notify_watchdog",
     "resolve_notify_socket",
     "sd_notify",
+    "watchdog_seconds",
 ]
 
 SocketFactory = Callable[[], socket.socket]
@@ -49,6 +50,27 @@ def resolve_notify_socket(env: Mapping[str, str] | None = None) -> str | None:
     if raw.startswith("/"):
         return raw
     return None
+
+
+def watchdog_seconds(env: Mapping[str, str] | None = None, pid: int | None = None) -> float | None:
+    """The systemd watchdog period (``WatchdogSec=``) this process must notify within,
+    from ``$WATCHDOG_USEC``, or ``None`` without one.
+
+    systemd sets ``$WATCHDOG_USEC`` (and ``$WATCHDOG_PID``) for the service's main
+    process when the unit has a watchdog, as ``sd_watchdog_enabled(3)`` reads them.
+    A ``$WATCHDOG_PID`` naming another process, or a value that is not a positive
+    integer, means no watchdog applies here.
+    """
+    env = os.environ if env is None else env
+    watchdog_pid = env.get("WATCHDOG_PID")
+    if watchdog_pid:
+        own = os.getpid() if pid is None else pid
+        if watchdog_pid.strip() != str(own):
+            return None
+    raw = env.get("WATCHDOG_USEC", "").strip()
+    if not raw.isdigit() or int(raw) <= 0:
+        return None
+    return int(raw) / 1_000_000
 
 
 def _default_socket() -> socket.socket:

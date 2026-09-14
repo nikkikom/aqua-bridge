@@ -14,7 +14,7 @@ read-only)::
         fans: {radiator: {pwm: pwm1, rpm: fan1}}
         temp_map: {air_z0: temp1}
       - device: quadro             # on its own USB port
-        serial: "12345-67890"      # only needed with several of one kind
+        serial: "12345-54321"      # only needed with several of one kind
         fans: {exhaust: {pwm: pwm1}}
         temp_map: {air_z1: temp2}
     xt6:                           # still accepted as exactly one more device
@@ -52,6 +52,7 @@ from aqua_bridge.hw.aquacomputer_adapter import (
     AquacomputerAdapter,
     DeviceBinding,
     Opener,
+    check_watchdog,
     parse_device_section,
 )
 from aqua_bridge.hw.hidraw import DeviceUnavailable
@@ -226,6 +227,7 @@ def build_composite_from_config(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     opener: Opener | None = None,
+    watchdog_s: float | None = None,
 ) -> tuple[CompositeSource, Callable[[], None] | None]:
     """Builds the composite source/sink from raw config sections.
 
@@ -235,7 +237,10 @@ def build_composite_from_config(
     config needs no rewrite to gain a 1-Wire bus. At least one device (from
     either) is required. Nothing is opened here: each adapter opens its device
     on its first ``read()`` / ``apply()``. ``sleep`` and ``opener`` reach every
-    adapter (tests inject fakes).
+    adapter (tests inject fakes). ``watchdog_s`` is the systemd watchdog period
+    (``None`` without one): the devices' summed worst-case blocking per tick
+    must stay below it (:func:`~aqua_bridge.hw.aquacomputer_adapter.check_watchdog`),
+    or the build fails with a ``ConfigError``.
 
     ``smart`` is an already-built :class:`SmartSource` (typically a
     :class:`~aqua_bridge.publishers.inputs.SmartInbox` shared with the MQTT/
@@ -272,6 +277,7 @@ def build_composite_from_config(
         _claim(pwm_owner, binding.pwm_map, holder, "mpc.channels")
         bindings.append((holder, binding))
     _check_distinct_devices(bindings)
+    check_watchdog([(holder, binding.timing) for holder, binding in bindings], watchdog_s)
 
     onewire_source = build_onewire_from_config(
         onewire_section or {}, default_max_age_s=_DEFAULT_MAX_AGE_DT_FACTOR * dt, clock=clock
