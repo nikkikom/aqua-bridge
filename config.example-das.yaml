@@ -1,20 +1,37 @@
-# Zoned DAS example: 4 zones, 15 hot-swap bays, 8 PWM outputs (aquaero 6 XT
-# xt1-xt4 + Quadro qd1-qd4, 1-2 fans per output), 25 sensors (8 thermistors on
-# the aquaero inputs, 17 DS18B20 on 1-Wire). Copy to config.yaml on the Pi and
+# Zoned DAS example (PROJECT.md): 4 zones, 15 hot-swap bays, 8 PWM outputs
+# (aquaero 6 XT xt1-xt4 + Quadro qd1-qd4, 1-2 fans per output, one tach per
+# output), 25 sensors (8 thermistors on the aquaero inputs, 17 DS18B20 on
+# 1-Wire; the Quadro's inputs are not bound: how many are usable is known only
+# once it is connected). Copy to /etc/aqua-bridge/config.yaml on the Pi and
 # replace the names, hwmon attributes and ROM ids with your own.
 #
-# Run it with --source hwmon (hwmon: + onewire: below) or, without hardware,
-# with --source sim --sim-plant das (the DAS truth simulator built from the
-# topology below).
+# Run it with --source hwmon (hwmon: + onewire: below; the systemd unit needs
+# a drop-in for that, PROJECT.md section 10) or, without hardware, with
+# --source sim --sim-plant das (the DAS truth simulator built from the topology
+# below; an optional top-level "sim: {das: {preset: basic|rich, seed: 0}}"
+# section tunes it). --record PATH (or a top-level record_path, with
+# record_max_bytes / record_backup_count) records every tick for
+# tools/fit_model.py, tools/fit_fans.py and tools/replay.py.
 #
-# DAS mode: with mpc.topology and no mpc.setpoints the "pi" solver regulates
-# the drives' margins (PI-like DAS form): per output, the worst drive of the
-# zones it serves decides. Drive temperatures are estimated from the proximal
-# and zone-air sensors; the limits come from drive_classes. Runtime changes go
-# through POST /api/limit {bay|class, limit_c} (MQTT {node_id}/cmd/limit/<bay>
-# and {node_id}/cmd/limit/class/<class>); a runtime limit can only be at or
-# below the one written here. Presets: quiet = comfort band -2 degC and noise
-# weight x2, cool = comfort band +2 degC and noise weight x0.5.
+# DAS mode: mpc.topology present and mpc.setpoints empty. Each sensor is gated
+# on its own; a zone is trusted while every required sensor group (its zone
+# air, the proximal sensors of each occupied or unknown bay) has a trusted
+# member. A zone in fault holds, then ramps high, every output that moves air
+# through it or through a zone coupled to it (mode "degraded"; "fallback" when
+# every zone is in fault); the other outputs keep regulating. A fault never
+# reduces cooling.
+#
+# Solvers: "pi" regulates the drives' margins (PI-like DAS form): per output,
+# the worst drive of the zones it serves decides. "mpc" is the DAS MPC: least
+# modelled fan noise with every drive under its targets, acting only on a
+# model that passes its validity gate, else regulating exactly like "pi".
+# Drive temperatures are estimated from the proximal and zone-air sensors
+# (per-zone Kalman filter, margin k_sigma * sigma); the limits come from
+# drive_classes. Runtime changes go through POST /api/limit {bay|class,
+# limit_c} (MQTT {node_id}/cmd/limit/<bay> and {node_id}/cmd/limit/class/<class>);
+# a runtime limit can only be at or below the one written here. POST /api/bay
+# declares a bay's occupancy, class or serial. Presets: quiet = comfort band
+# -2 degC and noise weight x2, cool = comfort band +2 degC and noise weight x0.5.
 
 mqtt:
   enabled: false
@@ -99,9 +116,12 @@ mpc:
       z1: {channels: [xt2, qd1, qd2], coupled_to: [z0, z2]}
       z2: {channels: [xt3, qd2, qd3], coupled_to: [z1, z3]}
       z3: {channels: [xt4, qd3, qd4], coupled_to: [z2]}
-    # occupied: auto (unknown until an estimator decides; constrained like an
-    # occupied bay). Declare class: ssd_sata / nvme per bay once you know what
-    # sits where; a bay without class uses default_class (the strictest, hdd).
+    # occupied: auto (the default: unknown until the estimator decides from
+    # proximal minus zone air and SMART; constrained like an occupied bay).
+    # A bay without class uses default_class (the strictest, hdd); a SMART
+    # model matching drive_classes.<c>.models can set it, or declare class /
+    # serial per bay here or with POST /api/bay. Without SES the estimator
+    # associates SMART serials with bays by correlation; a declared serial wins.
     # limit_c tightens the class limit for one bay.
     bays:
       b01: {zone: z0}
@@ -121,7 +141,13 @@ mpc:
       b15: {zone: z3}
     default_class: hdd
 
-  sensors:               # keys exactly temps; quant_c 0.01 = aquaero thermistor, 0.0625 = DS18B20
+  # sensors: keys exactly temps. role inlet | zone_air | drive_proximal | exhaust.
+  # quant_c 0.01 = thermistor, 0.0625 = DS18B20 (default). The Stuck rule is sized
+  # per sensor: stuck_s defaults per role (proximal 1800 s, zone air 180 s, inlet /
+  # exhaust 600 s), stuck_eps_c to 1.5 * quant_c, long windows decimated
+  # (stuck_decimate). redundant: true marks a backup member of its group (one
+  # trusted member is enough). tau_s: sensor lag, seconds.
+  sensors:
     inlet_a: {role: inlet, quant_c: 0.01}
     inlet_b: {role: inlet, quant_c: 0.0625, redundant: true}
     air_z0: {role: zone_air, zone: z0, quant_c: 0.01}
@@ -148,12 +174,17 @@ mpc:
     exhaust_z0: {role: exhaust, zone: z0, quant_c: 0.01}
     exhaust_z2: {role: exhaust, zone: z2, quant_c: 0.01}
 
-  drive_classes:         # owner decision: limit / comfort band / drive time constant
+  drive_classes:         # owner decision: limit / comfort band / drive time constant; models: [regex] on the SMART model
     hdd: {limit_c: 50.0, comfort_c: 5.0, tau_d_s: 720.0}
     ssd_sata: {limit_c: 65.0, comfort_c: 10.0, tau_d_s: 200.0}
     nvme: {limit_c: 70.0, comfort_c: 10.0, tau_d_s: 120.0}
 
-  fans:                  # keys exactly channels; count = fans on the output (splitter: 2)
+  # fans: keys exactly channels; count = fans on the output (splitter: 2, only
+  # the first drives the tach). Optional: group (outputs sharing an air path; the
+  # model and the experiments treat a group as one unit), noise_weight (penalise a
+  # fan near the listening position), forbidden_pwm: [[lo, hi]] (resonance bands,
+  # width <= 0.2; the DAS MPC snaps out of them upward).
+  fans:
     xt1: {model: case120, count: 2}
     xt2: {model: case120, count: 2}
     xt3: {model: case120, count: 1}
@@ -162,13 +193,16 @@ mpc:
     qd2: {model: case120, count: 1}
     qd3: {model: case120, count: 1}
     qd4: {model: case120, count: 1}
-  fan_models:
+  fan_models:            # PWM -> RPM curve and noise at full speed; tools/fit_fans.py fits the curve
     case120: {rpm_max: 1500, deadband: 0.1, exponent: 1.0, noise_db_at_max: 30.0}
+  # zones: trust_rule strict (sigma is accepted but applies strict for now);
+  # fault_coupling declared (a zone fault also reaches the outputs of the zones
+  # in its coupled_to) or none (strictly per zone).
   zones: {trust_rule: strict, fault_coupling: declared}
   noise: {exponent: 5.0, weight_noise: 1.0, band_hysteresis: 0.02}
   estimator:             # drive temperature estimator (per-zone Kalman filter), defaults shown
     k_sigma: 2.0         # margin = k_sigma * sigma; sigma >= 1.5 degC until SMART calibrates a bay
-    sigma_fault_c: 4.0   # thresholds of zones.trust_rule: sigma (not used by strict)
+    sigma_fault_c: 4.0   # reserved for zones.trust_rule: sigma (not evaluated yet)
     sigma_air_fault_c: 2.0
     q_t_air: 1.0e-4      # process noise per tick: air, air disturbance, drive, sensor node, heat
     q_d_air: 4.0e-7
@@ -187,8 +221,11 @@ mpc:
     associate_min_corr: 0.8
     associate_margin: 0.15
   # Thermal model identification (control/thermal.py). model_shadow: true learns the
-  # zoned model online and reports it (GET /api/model, HA model_status and
-  # model_pred_err_c) without acting on the fans; nothing uses the model for control yet.
+  # zoned model online after each tick's command is final and reports it (GET
+  # /api/model, HA model_status and model_pred_err_c); the learning never moves a fan
+  # itself. The DAS MPC (solver: mpc) plans on the model once it has converged, which
+  # needs identification experiments (ident_* below): regulation alone never excites
+  # the fan groups apart.
   model_shadow: false
   model_window_s: 120.0  # sin^2-weighted regression window (effective length about half), >= 2 * dt
   model_lambda: 0.9995   # RLS forgetting per excited window
@@ -219,8 +256,10 @@ mpc:
   model_store_max_age_days: 30.0
   model_reconfirm_s: 3600.0
   # Active identification experiments (control/ident.py): POST /api/ident {"action": "start",
-  # "group": ...} steps one fan group, then each of its channels, between two PWM levels
-  # while every drive the group cools stays within its envelope. Explicit start only.
+  # "group": ...} (or MQTT cmd/ident start:group:<g>) steps one fan group, then each of its
+  # channels, between two PWM levels while every drive the group cools stays within its
+  # envelope (estimate + k sigma <= soft + ident_max_over_c, <= hard, < limit - 1 degC).
+  # Explicit start only; any fallback or degraded tick, a human intent or stop aborts it.
   ident_enabled: false   # true: allow POST /api/ident and MQTT cmd/ident to start one
   ident_amplitude: 0.15  # PWM step, (0, 0.3]
   ident_levels: above    # above: never less cooling than the solver's level at start
@@ -257,9 +296,13 @@ hwmon:
       qd4: {pwm: pwm4, rpm: fan4}
     temp_map: {}         # bind Quadro inputs only once they show up in hwmon
 
+# 1-Wire: two w1-gpio buses (dtoverlay=w1-gpio,gpiopin=4 and gpiopin=17 in
+# config.txt); bus masters are discovered under root (default /sys/bus/w1/devices).
+# Bind ROM ids with tools/w1_commission.py --list / --identify and verify the
+# bindings, cycle time and CRC error rate with --check --config this file.
 onewire:
-  resolution_bits: 12
-  max_age_s: 7.5         # 1.5 * dt
+  resolution_bits: 12    # 9..12; 11 halves the conversion time
+  max_age_s: 7.5         # 1.5 * dt: an older sample reads as missing
   sensors:               # logical name -> DS18B20 ROM id (tools/w1_commission.py --identify)
     inlet_b: 28-000000000001
     prox_b01: 28-000000000002

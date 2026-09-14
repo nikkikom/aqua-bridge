@@ -1,9 +1,10 @@
 # Copy to config.yaml on the Pi. Channel names are logical, not hwmon pwmN.
 #
-# The names below (coolant, air, radiator, intake) are placeholders left from
-# an earlier watercooling draft. The target plant is a zoned DAS enclosure
-# (PROJECT.md §1-§2); its zones/bays/sensors schema replaces them
-# (PROJECT.md §8 Track A2). Until then, map them to your own sensors and fans.
+# Legacy mode (no mpc.topology): one implicit zone, one setpoint tracked by PI or
+# a small linear MPC. The names below (coolant, air, radiator, intake) are
+# placeholders from an earlier watercooling draft; this file stays as it is
+# because legacy mode must behave bit for bit as before (PROJECT.md, header).
+# The target plant is the zoned DAS enclosure: start from config.example-das.yaml.
 
 mqtt:
   enabled: false         # MQTT Discovery for Home Assistant (section 7); LWT on {node_id}/status
