@@ -486,7 +486,8 @@ skipped in legacy mode):
 3. Sensor gate, fed the Stuck latch from `solver_memory["stuck_latch"]`
    (DAS: the decimated Stuck windows are advanced first).
    - 3b. Zone trust (`control/zones.py`); legacy mode is one implicit zone
-     whose verdict is exactly the whole-tick gate verdict.
+     whose verdict is exactly the whole-tick gate verdict. DAS: sensor
+     confirmation first (below).
    - 3b'. DAS, first tick only: apply a model loaded from the store
      (`control/persist.py`).
    - 3c. DAS: the estimator (`control/estimator.py`), every tick, fault
@@ -533,6 +534,28 @@ holds:
 - `sigma`: accepted by the config, but the rule on the estimator's
   uncertainty is not implemented yet; `strict` applies and the
   diagnostics report `trust_rule: strict` (§8).
+
+**Sensor confirmation** (DAS, `zones.advance_confirmation`). A sensor whose
+present value the gate rejects (`range`, `slew`, `stuck`: a Jump, a Spike,
+a frozen reading leaving its band) is *confirming* until it has been
+gate-trusted on `confirm_ticks` consecutive time-valid ticks, the same
+count a zone needs to leave a fault. A dropout (`missing`, `null`,
+`non_finite`) starts nothing, since the value that returns is gated against
+the last good one; a dropout or a time fault while confirming restarts the
+count. A confirming sensor is not fused by the estimator, not in the
+solver's `temps`, not written into `last_good_obs` and not seen by the
+thermal identification. For zone trust it counts as a trusted group member
+only while its zone is already in fault, so a sole member costs
+`confirm_ticks` once (the zone's own confirmation runs beside it); a
+fault-free zone with a group whose only trusted members are confirming
+faults, and a zone in fault returns only when every required group also has
+a confirmed trusted member. A Jump on a redundant member (a second proximal
+sensor on a bay, a second zone-air sensor) or on a sensor outside every
+group (an inlet, an exhaust) therefore stays out of the estimator until it
+confirms, its group stays trusted through the other members, and the zone
+does not fault. The counts are `solver_memory["sensor_confirm"]` (sensor →
+consecutive trusted ticks, confirming sensors only) and
+`diagnostics["sensor_confirm"]`; legacy mode has neither.
 
 `F` is the set of zones in fault; the closure `F* = F ∪ {coupled_to of
 every zone in F}` uses the **declared** topology, never identified
@@ -723,7 +746,10 @@ PWM):
   tick** is trusted `confirm_ticks` times, `last_good_obs := obs`.
   A Jump on one of two sensors makes that tick untrusted until that
   channel confirms; the other channel does not get a partial last-good
-  update.
+  update. DAS: a Jump on a sensor whose zone keeps trusting its group
+  (a redundant member, an inlet) confirms per sensor over the same
+  `confirm_ticks` before the estimator fuses it (sensor confirmation,
+  above).
 - **With `median3 = true`:** a single Spike is removed by the median
   and produces **zero** untrusted ticks; a Jump surfaces one tick later
   and confirms one tick later. §4.4 rows state the default (`false`);
@@ -1972,6 +1998,7 @@ Inject on top of an otherwise nominal closed-loop:
 | Idle bay beside a busy bay (DAS) | an idle bay's DS18B20 on one code for longer than `stuck_s` while a neighbouring bay's reading climbs 3 °C and the fans answer a little; zone air warming against more airflow; zone channels moved apart; a one-tick fan dip | stays trusted, no zone fault (`tests/test_gate.py`; `rich` truth-sim runs in `tests/test_stuck_sim.py`, §3 Stuck sizing) |
 | Frozen sensor (DAS) | a sensor frozen for its whole (decimated) window while its zone's relative airflow moved net by more than `stuck_airflow_net` | Stuck within `max(t0 + stuck_s, t1 + stuck_s / 2)` plus two decimation intervals, DS18B20 and thermistor alike; **only its zone** faults (hold, then high on its reach), other zones keep regulating (`degraded`); a redundant member's flag faults nothing; a frozen value hidden behind median3 glitches is still flagged (`tests/test_gate.py`, `tests/test_stuck_sim.py`) |
 | Lie in one zone (DAS) | any row above on a sensor of one zone | only that zone (and its declared neighbours' channels) under fallback policy; a Flicker there never resets another zone's streak; a dropout inside a redundant group is no fault (`tests/test_mpc_zone_fallback.py`) |
+| Jump on a redundant member (DAS) | a second proximal sensor on a bay, a second zone-air sensor or an inlet steps +15 °C and stays | no zone fault; the member is excluded from the estimator, the solver and `last_good_obs` until its `confirm_ticks`-th trusted tick, then fused; a sole member still confirms in `confirm_ticks`; losing the confirmed member while the other confirms faults the zone (`tests/test_sensor_confirm.py`) |
 | Swapped proximal sensors (DAS) | ROM ids of two bays exchanged | a Jump on both at onset (their zones hold), confirmed like any Jump; caught at commissioning, not by the gate (§3) |
 
 The **sensor gate** is explicit (`control/gate.py`) and uses the
@@ -2181,6 +2208,7 @@ tests carry the `nightly` marker.
 |------|--------|-------|
 | `tests/test_zones.py` | DAS config parsing, defaults and rejections; `strict` trust per group; closure `F*` with `declared` / `none`; per-zone timers and confirmation; `degraded` vs `fallback`; legacy = one implicit zone; per-channel `compose`; per-role Stuck sizing; the DEGRADED banner and health field | PR |
 | `tests/test_mpc_zone_fallback.py` | a fault in zone A never lowers any channel of its reach below `prev` (hold, then `max(prev, fallback_pwm)`); channels outside keep regulating; the solver request never carries faulted-zone sensors and healthy commands do not depend on their values; per-zone recovery is bumpless; Flicker in one zone never resets another; a dropout in a redundant group is no fault; solver faults; legacy `mpc` turns a zone fault into whole fallback | PR (one sweep nightly) |
+| `tests/test_sensor_confirm.py` | sensor confirmation (§3): a jumping redundant member (proximal, zone air, inlet) is not fused until it confirms and the zone does not fault, the estimates of the DAS example config match a run without the member until then; a real level change is fused after `confirm_ticks`; restart on a new jump or a dropout; a sole member costs `confirm_ticks` once; a zone in fault waits for a confirmed member in every group; malformed memory; JSON and determinism; legacy keeps no state | PR |
 | `tests/test_das_core.py` | the core invariants, closed loops and DAS goldens for `pi_das` and `mpc_das` (§4.2) | PR |
 | `tests/test_pi_das.py`, `tests/test_estimates.py`, `tests/test_das_config.py` | the margin-deficit PI (served zones, unconstrained channels, fixed channels, occupancy), the estimates block and prior map, `noise` / `limit_c` / served-zone config | PR |
 | `tests/test_estimator.py` | exact discretisation and Joseph form (random sequences keep P symmetric PSD); first tick and constant readings; σ grows while a bay is unobserved and shrinks back; redundant members; the occupancy machine incl. "never empty while zone air is unobserved"; SMART calibration acceptance, rejection, serial change and expiry after `calibration_max_age_days`; a guessed serial never relaxes a class; determinism, JSON round trip, malformed memory | PR |
@@ -2694,8 +2722,10 @@ them as "§8 item N".
 7. **Done:** `install-pi.sh --das` installs `config.example-das.yaml` and the `deploy/aqua-bridge-das.conf` systemd drop-in (`ExecStart=` with `--source hwmon`); without `--das` the legacy path is unchanged.
 8. `zones.trust_rule: sigma` (zone trust from the estimator's σ); the
    config accepts it, `strict` applies today.
-9. A Jump on a redundant group member is accepted after one tick without
-   `confirm_ticks`.
+9. **Done:** A Jump on a redundant group member is accepted after one tick without
+   `confirm_ticks`; a sensor whose value the gate rejects now confirms over
+   `confirm_ticks` on its own (§3 Sensor confirmation) and stays out of the
+   estimator until then, while its group stays trusted through the others.
 10. The drift check's hysteresis can hold the PI-DAS model fallback for
     tens of minutes after a load step (return threshold 0.25 °C/min against
     0.26–0.29 °C/min physical transients); tune it.
