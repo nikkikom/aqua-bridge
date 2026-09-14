@@ -27,6 +27,24 @@ status is ``first`` / ``ok``, ``obs.temps`` has no key outside
   sensor on a bay) therefore only matter as "one of them is enough".
   Sensors outside every group (inlet, exhaust, the proximal sensor of an
   ``occupied: false`` bay) are still gated but never fault a zone.
+* **Sensor confirmation** (zones only, :func:`advance_confirmation`). A
+  sensor whose value the gate rejects (``range``, ``slew``, ``stuck``: a
+  Jump, a Spike, a frozen reading leaving its band) is *confirming* until it
+  has been gate-trusted on ``confirm_ticks`` consecutive time-valid ticks,
+  exactly the count a zone needs to leave a fault. A dropout (``missing``,
+  ``null``, ``non_finite``) starts nothing: the value that returns is gated
+  against the last good one. A confirming sensor is not fused by the
+  estimator, not handed to the solver and not a last good value. For zone
+  trust it counts as a trusted member only while its zone is already in
+  fault (the zone's own confirmation runs beside it, so a sole member costs
+  ``confirm_ticks`` once, not twice); a fault-free zone whose group has no
+  confirmed trusted member faults. A zone in fault is eligible for the
+  solver only when every required group also has a confirmed trusted member
+  (:func:`groups_confirmed`). A redundant member that jumps therefore stays
+  out of the estimator until it confirms while its group stays trusted
+  through the other members, and the zone does not fault. The counts live in
+  ``solver_memory["sensor_confirm"]`` (sensor -> consecutive trusted ticks,
+  confirming sensors only); legacy mode has no such key.
 * ``sigma`` -- the estimator's per-drive and zone-air uncertainty below
   thresholds. The rule is a later milestone: ``step`` does not pass
   ``estimates`` yet, so the ``strict`` rule applies (more faults, never
@@ -62,21 +80,27 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from aqua_bridge.control.gate import GateResult
+from aqua_bridge.control.gate import REASON_RANGE, REASON_SLEW, REASON_STUCK, GateResult
 from aqua_bridge.model import MpcConfig
 
 __all__ = [
+    "CONFIRM_REASONS",
     "ZoneTrust",
+    "advance_confirmation",
     "channel_fallback_elapsed",
     "closure",
     "effective_trust_rule",
     "evaluate",
     "fallback_channels",
     "fallback_target",
+    "groups_confirmed",
 ]
 
 #: Time statuses of ``mpc.step`` under which a sample may be trusted.
 _TIME_OK = ("first", "ok")
+
+#: Gate reasons that reject a present value and start a sensor's confirmation.
+CONFIRM_REASONS = frozenset({REASON_RANGE, REASON_SLEW, REASON_STUCK})
 
 
 @dataclass(frozen=True)
@@ -98,20 +122,83 @@ def effective_trust_rule(cfg: MpcConfig, estimates: Mapping[str, Any] | None = N
     return rule
 
 
+def advance_confirmation(
+    counts: object, gate: GateResult, time_status: str, cfg: MpcConfig
+) -> dict[str, int]:
+    """Confirming sensors after this tick: sensor -> consecutive trusted ticks (module docstring).
+
+    ``counts`` is the previous tick's ``solver_memory["sensor_confirm"]``; a malformed
+    count reads as zero and one at or above ``confirm_ticks`` as ``confirm_ticks - 1``
+    (neither can come from this function). A gate rejection
+    of a present value (:data:`CONFIRM_REASONS`) sets the count to 0; a gate-trusted
+    value on a time-valid tick adds one, and the sensor leaves the map on reaching
+    ``cfg.confirm_ticks``; any other tick of a confirming sensor (a dropout, a time
+    fault) restarts its count. Legacy mode: always empty.
+    """
+    if cfg.zone_layout.implicit:
+        return {}
+    old = counts if isinstance(counts, Mapping) else {}
+    time_ok = time_status in _TIME_OK
+    out: dict[str, int] = {}
+    for name in cfg.temps:
+        if CONFIRM_REASONS.intersection(gate.reasons.get(name, ())):
+            out[name] = 0
+            continue
+        if name not in old:
+            continue
+        raw = old[name]
+        valid = isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0
+        n = min(raw, cfg.confirm_ticks - 1) if valid else 0  # a confirmed sensor is never stored
+        if gate.per_temp.get(name, False) and time_ok:
+            n += 1
+            if n >= cfg.confirm_ticks:
+                continue
+        else:
+            n = 0
+        out[name] = n
+    return out
+
+
+def _member_trusted(
+    name: str, gate: GateResult, confirming: Mapping[str, int], counts_confirming: bool
+) -> bool:
+    """A group member counts: gate-trusted, and confirmed unless confirming members count."""
+    if not gate.per_temp.get(name, False):
+        return False
+    return counts_confirming or name not in confirming
+
+
+def groups_confirmed(
+    zone: str, gate: GateResult, confirming: Mapping[str, int], cfg: MpcConfig
+) -> bool:
+    """Whether every required group of ``zone`` has a gate-trusted member that is not confirming."""
+    return all(
+        any(_member_trusted(name, gate, confirming, False) for name in members)
+        for _label, members in cfg.zone_layout.required_groups[zone]
+    )
+
+
 def evaluate(
     gate: GateResult,
     time_status: str,
     cfg: MpcConfig,
     estimates: Mapping[str, Any] | None = None,
+    *,
+    confirming: Mapping[str, int] | None = None,
+    in_fault: Iterable[str] = (),
 ) -> dict[str, ZoneTrust]:
     """Per-zone trust for this tick, keyed and ordered like ``cfg.zone_layout.zones``.
 
     ``estimates`` is the estimator's block; it is accepted so the ``sigma``
     rule has its interface, and ignored until that rule exists (module
-    docstring). Legacy mode: the implicit zone is trusted iff the gate's
+    docstring). ``confirming`` is :func:`advance_confirmation` for this tick and
+    ``in_fault`` the zones in fault before it: a confirming member counts only for
+    a zone in fault. Legacy mode: the implicit zone is trusted iff the gate's
     whole-tick verdict is and the time status is ``first`` / ``ok``.
     """
     layout = cfg.zone_layout
+    pending: Mapping[str, int] = {} if confirming is None else confirming
+    faulted = set(in_fault)
     common: list[str] = []
     if time_status not in _TIME_OK:
         common.append(f"time:{time_status}")
@@ -120,15 +207,21 @@ def evaluate(
     out: dict[str, ZoneTrust] = {}
     for zone in layout.zones:
         reasons = list(common)
+        counts_confirming = zone in faulted
         for label, members in layout.required_groups[zone]:
-            if any(gate.per_temp.get(name, False) for name in members):
+            if any(_member_trusted(name, gate, pending, counts_confirming) for name in members):
                 continue
-            detail = ",".join(
-                f"{name}={'/'.join(gate.reasons.get(name, ())) or 'untrusted'}" for name in members
-            )
+            detail = ",".join(f"{name}={_member_detail(name, gate, pending)}" for name in members)
             reasons.append(f"{label}:{detail}")
         out[zone] = ZoneTrust(trusted=not reasons, reasons=tuple(reasons))
     return out
+
+
+def _member_detail(name: str, gate: GateResult, confirming: Mapping[str, int]) -> str:
+    """Why a member does not count, for the zone's reasons."""
+    if gate.per_temp.get(name, False) and name in confirming:
+        return "confirming"
+    return "/".join(gate.reasons.get(name, ())) or "untrusted"
 
 
 def closure(faulted: Iterable[str], cfg: MpcConfig) -> tuple[str, ...]:

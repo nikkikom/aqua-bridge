@@ -22,6 +22,14 @@ Order inside :func:`step`
    decimated Stuck windows are advanced first and dropped on a gap, too.)
 3b. Zone trust (:func:`aqua_bridge.control.zones.evaluate`). Legacy mode is
    one implicit zone whose verdict is exactly the whole-tick gate verdict.
+   With zones, a sensor whose value the gate rejected (``range``, ``slew``,
+   ``stuck``) first confirms over ``confirm_ticks`` consecutive trusted ticks
+   (:func:`aqua_bridge.control.zones.advance_confirmation`, counts in
+   ``solver_memory["sensor_confirm"]``, ``diagnostics["sensor_confirm"]``): a
+   confirming sensor is not fused by the estimator, not in the solver's
+   ``temps``, not a last good value, and counts toward its group's trust only
+   while its zone is already in fault, so a redundant member that jumps stays
+   out while its group stays trusted through the others.
 3b'. With zones, a model loaded from the store (``solver_memory["store_seed"]``, put
    into the initial state by :mod:`aqua_bridge.modelstore`) is applied once, on the
    first zoned tick, by :func:`aqua_bridge.control.persist.apply_seed` with this tick's
@@ -32,8 +40,8 @@ Order inside :func:`step`
    prior with a warning.
 3c. With zones, the estimator (:func:`aqua_bridge.control.estimator.update`,
    plan section 6 step 5a) runs every tick, fault ticks included, on the
-   gate-trusted temperatures of this tick (none on a tick whose time status
-   is not ``first`` / ``ok``), the command ``prev`` and
+   gate-trusted, confirmed temperatures of this tick (none on a tick whose time
+   status is not ``first`` / ``ok``), the command ``prev`` and
    ``obs.inputs["smart"]``; its memory is ``solver_memory["estimator"]`` and
    its estimates block feeds the solver and the diagnostics. It is not an
    input of zone trust (``zones.evaluate`` gets ``estimates=None``, so the
@@ -52,7 +60,8 @@ Order inside :func:`step`
    the zone's fault is active -- Flicker must not reset the hold). A
    trusted tick while in fault only counts toward ``confirm_ticks``. A
    zone is *eligible* for the solver when it is trusted and either
-   fault-free or on its ``confirm_ticks``-th consecutive trusted tick.
+   fault-free or on its ``confirm_ticks``-th consecutive trusted tick with a
+   confirmed trusted member in every required group.
 5. Solver -- only when some zone is eligible. The channels of the zones
    that stay in fault (and, with ``fault_coupling: declared``, of the zones
    coupled to them) are under fallback policy: they reach the solver as
@@ -172,9 +181,10 @@ stop regulating the healthy channels.
 channel -> int), ``stuck_latch`` (dict temperature -> band reference in
 degrees C, only latched temperatures; gate rule 3), with decimated Stuck
 windows ``stuck_slow`` and ``stuck_seq`` (gate module docstring), with zones
-``estimator`` (step 3c) and, with ``model_shadow``, ``thermal`` (step 8b), with a model
-store ``store`` and ``fan_curves`` (step 3b'), and one sub-dict per solver under
-``solver.name``.
+``estimator`` (step 3c), ``sensor_confirm`` (dict temperature -> consecutive
+trusted ticks, confirming sensors only; step 3b) and, with ``model_shadow``,
+``thermal`` (step 8b), with a model store ``store`` and ``fan_curves`` (step
+3b'), and one sub-dict per solver under ``solver.name``.
 """
 
 from __future__ import annotations
@@ -499,14 +509,23 @@ def step(
     )
     trusted = gate.trusted and time_status in ("ok", "first")
 
-    # 3b. zone trust (legacy: the implicit zone's verdict is exactly ``trusted``)
-    verdicts = zones.evaluate(gate, time_status, cfg)
+    # 3b. zone trust (legacy: the implicit zone's verdict is exactly ``trusted``); with
+    # zones a sensor whose value the gate rejected confirms first (module docstring)
+    books = _read_books(state, mem, cfg)
+    confirming = zones.advance_confirmation(mem.get("sensor_confirm"), gate, time_status, cfg)
+    verdicts = zones.evaluate(
+        gate,
+        time_status,
+        cfg,
+        confirming=confirming,
+        in_fault=[z for z in zone_names if books[z].since is not None],
+    )
     trusted_temps: dict[str, float] = {}
     if das:
         trusted_temps = {
             name: float(gate.filtered[name])  # type: ignore[arg-type]
             for name in cfg.temps
-            if gate.per_temp[name] and time_status in ("ok", "first")
+            if gate.per_temp[name] and time_status in ("ok", "first") and name not in confirming
         }
 
     # 3b'. a model loaded from the store, applied once (zones only; module docstring)
@@ -542,7 +561,6 @@ def step(
             )
 
     # 4. fault bookkeeping per zone
-    books = _read_books(state, mem, cfg)
     for zone in zone_names:
         book = books[zone]
         if verdicts[zone].trusted:
@@ -557,7 +575,14 @@ def step(
     eligible = [
         z
         for z in zone_names
-        if verdicts[z].trusted and (books[z].since is None or books[z].streak >= cfg.confirm_ticks)
+        if verdicts[z].trusted
+        and (
+            books[z].since is None
+            or (
+                books[z].streak >= cfg.confirm_ticks
+                and zones.groups_confirmed(z, gate, confirming, cfg)
+            )
+        )
     ]
     # Zones that stay in fault whatever the solver does, and their channels.
     remaining = [z for z in zone_names if z not in eligible]
@@ -593,6 +618,7 @@ def step(
                 name: float(gate.filtered[name])  # type: ignore[arg-type]
                 for name in cfg.temps
                 if gate.per_temp[name]
+                and name not in confirming
                 and (layout.sensor_zone[name] is None or layout.sensor_zone[name] in usable_zones)
             }
             elapsed_pre = {
@@ -816,6 +842,7 @@ def step(
         diagnostics["fallback_channels"] = [ch for ch in cfg.channels if ch in ch_elapsed]
         diagnostics["policy_by_channel"] = policy_by_channel
         diagnostics["trust_rule"] = zones.effective_trust_rule(cfg)
+        diagnostics["sensor_confirm"] = dict(confirming)
         diagnostics["estimates"] = _estimate_diagnostics(est_block, verdicts, faulted)
         diagnostics["bays"] = {} if est_update is None else est_update.bays
         diagnostics["estimator"] = {
@@ -836,6 +863,10 @@ def step(
     mem["fault_ticks"] = fault_ticks
     mem["stall_ticks"] = stall_ticks
     mem["stuck_latch"] = dict(gate.stuck_latch)
+    if das:
+        mem["sensor_confirm"] = dict(confirming)
+    else:
+        mem.pop("sensor_confirm", None)
     if cfg.slow_window_samples:
         mem["stuck_slow"] = slow_windows
         mem["stuck_seq"] = stuck_seq + 1
@@ -849,7 +880,9 @@ def step(
     mem[solver_name] = solver_mem
     if das:
         integrator = {ch: v for ch, v in integrator.items() if ch not in ch_elapsed}
-    good_obs = _next_good_obs(obs, cfg, state, gate, trusted, fault_since, faulted, time_status)
+    good_obs = _next_good_obs(
+        obs, cfg, state, gate, trusted, fault_since, faulted, time_status, confirming
+    )
     new_state = MpcState(
         last_cmd=cmd,
         last_good_obs=good_obs,
@@ -1000,6 +1033,7 @@ def _next_good_obs(
     fault_since: float | None,
     faulted: list[str],
     time_status: str,
+    confirming: Mapping[str, int],
 ) -> PlantObservation | None:
     """``last_good_obs`` for the next state.
 
@@ -1010,8 +1044,9 @@ def _next_good_obs(
 
     With zones: per temperature. A gate-trusted value on a time-valid tick
     replaces the old one when its zone is not in fault (a sensor without a
-    zone: when some zone is not in fault); every other temperature keeps its
-    last good value. Nothing usable keeps the old observation as a whole.
+    zone: when some zone is not in fault) and the sensor is not confirming; every
+    other temperature keeps its last good value. Nothing usable keeps the old
+    observation as a whole.
     """
     layout = cfg.zone_layout
     if layout.implicit:
@@ -1031,6 +1066,7 @@ def _next_good_obs(
         name
         for name in cfg.temps
         if gate.per_temp[name]
+        and name not in confirming
         and (
             some_zone_ok
             if layout.sensor_zone[name] is None
