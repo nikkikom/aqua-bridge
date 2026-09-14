@@ -66,6 +66,20 @@ Timing
 tick overruns, the schedule restarts from "now" instead of bursting to
 catch up. ``READY=1`` is sent once, after the first tick whose command was
 applied successfully.
+
+Step budget alarm
+------------------
+Every tick, ``self.clock()`` brackets the call to ``step`` (only -- ``step``
+stays pure, so this is timed outside it). ``step_ms_last`` is that elapsed
+time and ``step_ms_max`` the largest ever seen; both are reported through
+``ControlSnapshot.health_payload()`` and so the MQTT state blob. A step past
+``cfg.budget_ms`` counts in ``budget_warn_count`` and logs a warning; past
+``cfg.budget_alarm_ms`` it also counts in ``budget_alarm_count`` and logs an
+error instead. Both counters are cumulative for the process lifetime; the log
+line itself is rate limited to at most one per ``cfg.budget_log_interval_s``
+per severity and names how many exceedances of that severity happened since
+the previous line. A tick whose ``step`` raised is not measured (the
+controller-error path already logs).
 """
 
 from __future__ import annotations
@@ -194,6 +208,16 @@ class Loop:
         #: publisher must never touch read -> step -> apply.
         self.on_tick = on_tick
 
+        # Step budget alarm (module docstring "Step budget alarm").
+        self.step_ms_last = 0.0
+        self.step_ms_max = 0.0
+        self.budget_warn_count = 0
+        self.budget_alarm_count = 0
+        self._budget_warn_since_log = 0
+        self._budget_alarm_since_log = 0
+        self._budget_warn_logged_at: float | None = None
+        self._budget_alarm_logged_at: float | None = None
+
     # -- helpers ----------------------------------------------------------
 
     def _blank_obs(self) -> PlantObservation:
@@ -246,7 +270,10 @@ class Loop:
         controller_error: str | None = None
         try:
             prev = self._prev_pwm(obs, cfg)
+            t0 = self.clock()
             mpc_cmd, new_state = step(obs, cfg, self._state_for_step(plan))
+            t1 = self.clock()
+            self._record_step_budget((t1 - t0) * 1e3, cfg, now=t1)
             cmd = self.supervisor.compose(mpc_cmd, plan, prev)
         except Exception as exc:  # controller bug: safe command, state untouched, no watchdog
             controller_error = f"{type(exc).__name__}: {exc}"
@@ -296,6 +323,10 @@ class Loop:
                 "read_error": read_error,
                 "apply_error": apply_error,
                 "controller_error": controller_error,
+                "step_ms_last": self.step_ms_last,
+                "step_ms_max": self.step_ms_max,
+                "budget_warn_count": self.budget_warn_count,
+                "budget_alarm_count": self.budget_alarm_count,
             },
             ts=obs.ts,
         )
@@ -305,6 +336,50 @@ class Loop:
             except Exception:  # publishers are observers; they never fail the tick
                 _LOG.exception("tick %d: on_tick hook failed", index)
         return result
+
+    def _record_step_budget(self, step_ms: float, cfg: MpcConfig, *, now: float) -> None:
+        """Update the step-time counters and log per the module docstring."""
+        self.step_ms_last = step_ms
+        if step_ms > self.step_ms_max:
+            self.step_ms_max = step_ms
+        over_warn = step_ms > cfg.budget_ms
+        over_alarm = step_ms > cfg.budget_alarm_ms
+        if over_warn:
+            self.budget_warn_count += 1
+            self._budget_warn_since_log += 1
+        if over_alarm:
+            self.budget_alarm_count += 1
+            self._budget_alarm_since_log += 1
+        if over_alarm:
+            due = (
+                self._budget_alarm_logged_at is None
+                or now - self._budget_alarm_logged_at >= cfg.budget_log_interval_s
+            )
+            if due:
+                _LOG.error(
+                    "step %.1f ms exceeded the alarm budget %.1f ms (%d exceedance(s) "
+                    "since the last line)",
+                    step_ms,
+                    cfg.budget_alarm_ms,
+                    self._budget_alarm_since_log,
+                )
+                self._budget_alarm_logged_at = now
+                self._budget_alarm_since_log = 0
+        elif over_warn:
+            due = (
+                self._budget_warn_logged_at is None
+                or now - self._budget_warn_logged_at >= cfg.budget_log_interval_s
+            )
+            if due:
+                _LOG.warning(
+                    "step %.1f ms exceeded the budget %.1f ms (%d exceedance(s) "
+                    "since the last line)",
+                    step_ms,
+                    cfg.budget_ms,
+                    self._budget_warn_since_log,
+                )
+                self._budget_warn_logged_at = now
+                self._budget_warn_since_log = 0
 
     def _apply(self, cmd: MpcCommand) -> tuple[bool, str | None]:
         try:

@@ -83,6 +83,10 @@ mpc:
   mpc_tau_s: 120.0       # legacy MPC model only
   mpc_gain_c_per_pwm: 8.0
   mpc_estimator_gain: 0.1
+  budget_ms: 600.0        # runtime alarm + CI/Pi bench gate: warn past this step() time, ms (> 0);
+                           # §8.1 owner decision 2026-09-14, measured DAS MPC p99 507-552 ms on the Zero W
+  budget_alarm_ms: 750.0  # error instead past this, ms (> budget_ms)
+  budget_log_interval_s: 60.0  # rate limit for both budget log lines, seconds (> 0)
   pi_kp: 0.02            # PWM per degC of margin deficit (> 0)
   pi_ki: 0.0001          # PWM per (degC * s); integral time pi_kp / pi_ki = 200 s
   pwm_min: 0.2

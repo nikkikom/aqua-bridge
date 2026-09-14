@@ -470,6 +470,12 @@ class Supervisor:
                 extra["experiment"] = ident.status(
                     self._experiment, self._ident_last, self._effective
                 )
+            # Step budget alarm (control/loop.py): loop-reported via record_tick's
+            # extra, promoted to dedicated ControlSnapshot fields, not duplicated here.
+            step_ms_last = extra.pop("step_ms_last", 0.0)
+            step_ms_max = extra.pop("step_ms_max", 0.0)
+            budget_warn_count = extra.pop("budget_warn_count", 0)
+            budget_alarm_count = extra.pop("budget_alarm_count", 0)
             return ControlSnapshot(
                 obs=self._obs,
                 last_cmd=self._last_cmd,
@@ -491,6 +497,10 @@ class Supervisor:
                 extra=extra,
                 limits=self._limits_in_force(),
                 bays=self._bays_in_force(),
+                step_ms_last=step_ms_last,
+                step_ms_max=step_ms_max,
+                budget_warn_count=budget_warn_count,
+                budget_alarm_count=budget_alarm_count,
             )
 
     # -- intents ----------------------------------------------------------

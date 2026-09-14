@@ -211,6 +211,10 @@ def test_get_health_shape(surface: StubSurface) -> None:
             "fault_since_ts",
             "uptime_s",
             "version",
+            "step_ms_last",
+            "step_ms_max",
+            "budget_warn_count",
+            "budget_alarm_count",
         }
         assert body["solver"] == SolverStatus.FAULT.value  # no last_cmd yet
 

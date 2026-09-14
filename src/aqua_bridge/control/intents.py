@@ -400,6 +400,12 @@ class ControlSnapshot:
     while an experiment runs and ``overrides`` lists only human overrides: the
     experiment's levels are overrides of the supervisor itself, shown in
     ``extra["experiment"]["overrides"]``.
+
+    ``step_ms_last`` / ``step_ms_max`` / ``budget_warn_count`` / ``budget_alarm_count``
+    are the loop's step budget alarm (``control/loop.py``, ``mpc.budget_ms`` /
+    ``mpc.budget_alarm_ms``): the last and largest ``step()`` wall time in
+    milliseconds, and the cumulative count of ticks past each threshold since the
+    process started. All zero before the loop has run a tick.
     """
 
     obs: PlantObservation | None
@@ -422,6 +428,10 @@ class ControlSnapshot:
     extra: dict[str, Any] = field(default_factory=dict)  # host stats etc., JSON-serialisable
     limits: dict[str, Any] = field(default_factory=dict)
     bays: dict[str, Any] = field(default_factory=dict)
+    step_ms_last: float = 0.0
+    step_ms_max: float = 0.0
+    budget_warn_count: int = 0
+    budget_alarm_count: int = 0
 
     @staticmethod
     def solver_status_for(cmd: MpcCommand | None) -> SolverStatus:
@@ -455,7 +465,8 @@ class ControlSnapshot:
         return out
 
     def health_payload(self) -> dict[str, Any]:
-        """``GET /api/health``: USB present, MQTT, solver ok/degraded/fallback/fault, uptime."""
+        """``GET /api/health``: USB present, MQTT, solver ok/degraded/fallback/fault, uptime,
+        step budget alarm (class docstring)."""
         return {
             "usb_present": self.usb_present,
             "mqtt_connected": self.mqtt_connected,
@@ -464,6 +475,10 @@ class ControlSnapshot:
             "fault_since_ts": self.fault_since_ts,
             "uptime_s": self.uptime_s,
             "version": self.version,
+            "step_ms_last": self.step_ms_last,
+            "step_ms_max": self.step_ms_max,
+            "budget_warn_count": self.budget_warn_count,
+            "budget_alarm_count": self.budget_alarm_count,
         }
 
     def to_dict(self) -> dict[str, Any]:

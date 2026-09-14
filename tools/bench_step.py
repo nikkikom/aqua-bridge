@@ -26,8 +26,10 @@ sensor type's white noise, activity bursts in three bays and an inlet step): the
 MPC path is timed rather than its PI-like fallback (``model_active_fraction``
 reports the share of ticks the MPC drove the fans). The step then includes the
 estimator; ``solve_p99_ms`` is the p99 over the ticks on which the MPC solved
-(``mpc_every_ticks``), ``budget_ms`` / ``budget_alarm_ms`` the plan's per-tick gate
-at ``dt = 5 s`` (a runtime-side budget, not enforced in ``step``).
+(``mpc_every_ticks``), ``budget_ms`` / ``budget_alarm_ms`` the config's per-tick
+gate (``mpc.budget_ms`` / ``mpc.budget_alarm_ms``, at ``dt = 5 s`` in the DAS
+example) -- read from the loaded config, same as the runtime alarm in
+``control/loop.py``, and not enforced in ``step`` itself.
 """
 
 from __future__ import annotations
@@ -50,10 +52,6 @@ from aqua_bridge.model import Mode, MpcConfig, MpcState, SolverKind
 from aqua_bridge.sim.plant import Plant, PlantParams
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-#: Plan section 4: hard per-tick gate at dt = 5 s (10 % of the tick) and its alarm.
-BUDGET_MS = 600.0  # owner decision 2026-09-14 after the Zero W measurement (was 500)
-BUDGET_ALARM_MS = 750.0
 
 
 def percentile(samples: list[float], q: float) -> float:
@@ -180,8 +178,8 @@ def bench_das_solver(cfg: MpcConfig, ticks: int, *, seed: int) -> dict[str, obje
         "worst_true_margin_c": worst_margin,
         "final_pwm": dict(state.last_cmd.pwm) if state.last_cmd else None,
         "budget_fraction_of_dt_p99": p99 / (cfg.dt * 1e3),
-        "budget_ms": BUDGET_MS,
-        "budget_alarm_ms": BUDGET_ALARM_MS,
+        "budget_ms": cfg.budget_ms,
+        "budget_alarm_ms": cfg.budget_alarm_ms,
     }
 
 

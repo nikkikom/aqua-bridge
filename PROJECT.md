@@ -332,6 +332,9 @@ Lists become tuples; ints are accepted for floats.
 | `mpc_tau_s` | `120.0` | legacy MPC model time constant, seconds; > 0 |
 | `mpc_gain_c_per_pwm` | `8.0` | legacy MPC model: steady-state °C drop per +1.0 PWM on one channel; > 0 |
 | `mpc_estimator_gain` | `0.1` | legacy MPC disturbance estimator gain per tick; in `(0, 1]` |
+| `budget_ms` | `600.0` | runtime alarm (`control/loop.py`) and CI/Pi bench gate: `step()` wall time past this logs a warning, ms; > 0 and < `budget_alarm_ms` |
+| `budget_alarm_ms` | `750.0` | as above, logs an error instead, ms; > 0 |
+| `budget_log_interval_s` | `60.0` | rate limit for both budget log lines, seconds; > 0 |
 
 With `solver: mpc` in legacy mode the config also needs `weight_pwm +
 weight_dpwm > 0` (strictly convex QP) and at least one setpoint
@@ -413,9 +416,10 @@ long `dt`):
 | `ident_start_band_c` / `ident_max_over_c` | 1.0 / 3.0 | > 0 |
 | `ident_seed` | 1 | int ≥ 0 |
 
-There are no `budget_ms` keys: the per-tick budget (600 ms, alarm
-750 ms at `dt = 5 s`) is a benchmark gate (`tools/bench_step.py`,
-`tests/test_bench_budget.py`), not a runtime check.
+`budget_ms` / `budget_alarm_ms` (600 ms / 750 ms default, at `dt = 5 s` in the
+DAS example) gate both the benchmark (`tools/bench_step.py`,
+`tests/test_bench_budget.py`) and the runtime alarm (`control/loop.py`, §4.3
+"Loop / glue"); both read the config, never a hardcoded literal.
 
 Derived tick quantities are properties, never YAML keys:
 
@@ -1858,6 +1862,12 @@ Loop / glue (`tests/test_loop.py`, still no HID):
   `None`
 - `step` / `compose` raise → emergency ramp, state untouched, no
   `WATCHDOG=1`
+- step budget alarm: `step()` wall time (a monotonic clock outside
+  `step`, which stays pure) past `mpc.budget_ms` logs a warning, past
+  `mpc.budget_alarm_ms` an error instead, each rate limited to one line per
+  `mpc.budget_log_interval_s` naming the exceedances since the last line;
+  `step_ms_last`, `step_ms_max` and both cumulative counters reach
+  `/api/health` and the MQTT state blob (an injected clock drives the test)
 
 ### 4.4 Lying sensors (fault injection)
 
@@ -2012,7 +2022,9 @@ sandboxes); CI runners allow it.
   and DAS presets in `tests/test_das_intents.py`.
 - `tests/test_loop.py` — §4.3 loop cases, READY/WATCHDOG/STOPPING,
   overrides and bumpless release through the loop, an override on frozen
-  temperatures tripping Stuck, run scheduling, the `on_tick` hook, sim
+  temperatures tripping Stuck, run scheduling, the `on_tick` hook, the
+  step budget alarm (injected clock: tracking, warn/error thresholds,
+  log rate limiting, `/api/health` and the MQTT state blob), sim
   closed loops (`slow`).
 - `tests/test_main.py` — CLI parsing, exit codes, `--once`, sim wiring
   (`--sim-plant basic|rich|das`), xt6 map mismatch → exit 2, `--source
@@ -2072,7 +2084,7 @@ tests carry the `nightly` marker.
 | `tests/test_thermal_ident.py` | identifiability with group experiments on the truth sim: in-zone `E` within 15 % (PR seed), per-bay `k` within 25 %, `leak` / `κ` at prior, convergence; regulation only never converges; the seed sweep (bound 25 %), sensor offsets, the rich preset | PR: 4 cases; nightly: sweeps |
 | `tests/test_solver_das.py` | active-piece SQP vs a projected-gradient reference, monotone objective, iteration cap, forbidden-band snap and hysteresis, zero-order hold, prediction vs thermal Jacobians, noise index and surrogate, bumpless offset, fixed channels, validity gate and model fallback with dwell, a clock stepped back, horizon and block extremes | PR |
 | `tests/test_noise_regression.py` | calibrated DAS MPC noise ≤ 0.8× the quietest uniform curve at equal or better worst true margin (measured 0.31–0.48×); uncalibrated bound 2.0 (0.30–0.69×); rich preset bound 1.3 (up to 1.21×); MPC vs PI-DAS reported, not asserted (PI-DAS has not settled within the window on several seeds) | PR: 2 seeds; nightly: 8-seed sweeps |
-| `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× the legacy MPC p99 in the same process; `bench_step.py` runs both DAS solvers; absolute p99 ≤ 600 ms only on `armv6l` | PR / Pi |
+| `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× (named constant) the legacy MPC p99, the 75th percentile of several interleaved, warm-up-discarded repeats (§8 item 6); `bench_step.py` runs both DAS solvers; absolute p99 ≤ `mpc.budget_ms` only on `armv6l` | PR / Pi |
 | `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise | PR |
 | `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes; legacy refuses | PR |
 | `tests/test_sim_das.py` | the truth plant: energy balance through transients and hot swap, steady state, more airflow never warms anything, dead band and exponent, quantisation per sensor type, lags, SMART cadence, determinism per seed | PR |
@@ -2209,6 +2221,12 @@ seconds, the last result and abort reason).
   earliest zone fault)
 - `uptime_s` — seconds since the supervisor started (monotonic)
 - `version` — package version
+- `step_ms_last` / `step_ms_max` — the last and largest `step()` wall time in
+  milliseconds, measured outside `step` (`control/loop.py`); 0 before the loop
+  has run a tick
+- `budget_warn_count` / `budget_alarm_count` — cumulative ticks whose `step()`
+  exceeded `mpc.budget_ms` / `mpc.budget_alarm_ms` since the process started
+  (`control/loop.py` module docstring, "Step budget alarm")
 
 JSON is the API. HTML is a thin, view-only client: it polls `/api/state`
 and `/api/health` every 2 s (no websockets until 2W) and shows the five
@@ -3171,9 +3189,10 @@ sweeps). The nightly job keeps only `hardware` out. Keep PR runs under
 about 11 minutes of the 15-minute job timeout: a new heavy sweep or long
 simulation gets the `nightly` marker, with a cheap PR-sized case next to
 it. The **budget gate** in PR CI is relative: `tests/test_bench_budget.py`
-asserts the DAS MPC step p99 ≤ 12× the legacy MPC p99 measured in the
-same process, which a shared runner can check; the absolute 600 ms gate
-(marker `pi`) runs only on the Pi.
+asserts the DAS MPC step p99 is at most 12× the legacy MPC p99 (§8 item 6:
+the 75th percentile of several interleaved, warm-up-discarded repeats, not a
+single measurement, so a shared runner's hiccup does not flake it); the
+absolute `mpc.budget_ms` gate (marker `pi`) runs only on the Pi.
 
 The ruff pin in `pyproject.toml` `[dev]` and in the workflow move
 together. `shellcheck` is present on the runners, so `tests/test_deploy.py`

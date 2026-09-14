@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import logging
 import threading
 from collections.abc import Callable
 
@@ -81,6 +83,25 @@ class FakeClock:
         return self.t
 
 
+class ScriptedClock:
+    """Returns each value of ``values`` in order, then repeats the last one.
+
+    Used to inject an exact ``step()`` wall time: ``Loop`` reads the clock once
+    before and once after ``step`` (module docstring "Step budget alarm"), so two
+    values per tick set that tick's elapsed step time deterministically, without
+    depending on how fast ``step`` actually runs on the machine running the test.
+    """
+
+    def __init__(self, values: list[float]) -> None:
+        self.values = list(values)
+        self.calls = 0
+
+    def __call__(self) -> float:
+        i = min(self.calls, len(self.values) - 1)
+        self.calls += 1
+        return self.values[i]
+
+
 def good_source(cfg, *, pwm=0.5, wobble_c=0.05):
     """Trusted observations at the setpoint.
 
@@ -101,11 +122,12 @@ def good_source(cfg, *, pwm=0.5, wobble_c=0.05):
     return src
 
 
-def make_loop(cfg, source, sink=None, notifier=None, **kw):
+def make_loop(cfg, source, sink=None, notifier=None, clock=None, **kw):
     sink = FakeSink() if sink is None else sink
     notifier = FakeNotifier() if notifier is None else notifier
+    clock = FakeClock() if clock is None else clock
     sup = Supervisor(cfg, clock=lambda: 0.0)
-    loop = Loop(source, sink, cfg, sup, clock=FakeClock(), notifier=notifier, **kw)
+    loop = Loop(source, sink, cfg, sup, clock=clock, notifier=notifier, **kw)
     return loop, sink, notifier, sup
 
 
@@ -586,3 +608,84 @@ def test_initial_state_can_be_injected(fast_cfg):
     state = MpcState.cold()
     loop, *_ = make_loop(fast_cfg, good_source(fast_cfg), state=state)
     assert loop.state is state
+
+
+# --- step budget alarm (module docstring "Step budget alarm") ---------------------
+
+
+def test_step_budget_tracks_last_and_max_and_reaches_health(fast_cfg):
+    cfg = dataclasses.replace(fast_cfg, budget_ms=1000.0, budget_alarm_ms=2000.0)
+    # 3 ticks, elapsed step times 80 ms, 10 ms, 5 ms: max is not the last tick's value.
+    clock = ScriptedClock([0.000, 0.080, 0.080, 0.090, 0.090, 0.095])
+    loop, _sink, _notifier, sup = make_loop(cfg, good_source(cfg), clock=clock)
+    for _ in range(3):
+        loop.tick()
+    assert loop.step_ms_last == pytest.approx(5.0)
+    assert loop.step_ms_max == pytest.approx(80.0)
+    assert loop.budget_warn_count == 0
+    assert loop.budget_alarm_count == 0
+    health = sup.snapshot().health_payload()
+    assert health["step_ms_last"] == pytest.approx(5.0)
+    assert health["step_ms_max"] == pytest.approx(80.0)
+    assert health["budget_warn_count"] == 0
+    assert health["budget_alarm_count"] == 0
+
+
+def test_step_budget_exceedance_not_measured_when_step_raises(fast_cfg, monkeypatch):
+    """A tick whose ``step`` raises leaves the counters untouched (module docstring)."""
+    cfg = dataclasses.replace(fast_cfg, budget_ms=1000.0, budget_alarm_ms=2000.0)
+    clock = ScriptedClock([0.0, 5.0])  # would be a 5000 ms step, well past both thresholds
+    loop, _sink, _notifier, _sup = make_loop(cfg, good_source(cfg), clock=clock)
+    monkeypatch.setattr(
+        "aqua_bridge.control.loop.step", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x"))
+    )
+    result = loop.tick()
+    assert result.controller_error is not None
+    assert loop.step_ms_last == 0.0 and loop.budget_warn_count == 0
+
+
+def test_step_budget_warns_past_budget_ms_and_errors_past_budget_alarm_ms(fast_cfg, caplog):
+    cfg = dataclasses.replace(
+        fast_cfg, budget_ms=50.0, budget_alarm_ms=100.0, budget_log_interval_s=5.0
+    )
+    # Ticks 1-3 warn only (60, 70, 80 ms); tick 4 alarms (150 ms). "now" (the clock
+    # value after step) advances across ticks like real wall time so the interval
+    # gate has something to compare against.
+    clock = ScriptedClock(
+        [
+            0.000,
+            0.060,  # tick 1: 60 ms, first warning ever -> logged
+            1.000,
+            1.070,  # tick 2: 70 ms, 1.01 s since the last warning -> rate limited
+            6.500,
+            6.580,  # tick 3: 80 ms, 6.52 s since the last warning -> logged
+            7.000,
+            7.150,  # tick 4: 150 ms, past the alarm budget -> logged as an error
+        ]
+    )
+    loop, *_ = make_loop(cfg, good_source(cfg), clock=clock)
+    with caplog.at_level(logging.WARNING, logger="aqua_bridge.loop"):
+        for _ in range(4):
+            loop.tick()
+    assert loop.budget_warn_count == 4  # every tick exceeded budget_ms, alarm tick included
+    assert loop.budget_alarm_count == 1
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(warnings) == 2, [r.getMessage() for r in warnings]
+    assert len(errors) == 1, [r.getMessage() for r in errors]
+    assert "1 exceedance" in warnings[0].getMessage()
+    assert "2 exceedance" in warnings[1].getMessage()
+    assert "1 exceedance" in errors[0].getMessage()
+
+
+def test_step_budget_counters_and_last_reach_the_mqtt_state_blob(fast_cfg):
+    """``ControlSnapshot.to_dict()`` (the MQTT state blob) carries ``health``."""
+    cfg = dataclasses.replace(fast_cfg, budget_ms=10.0, budget_alarm_ms=20.0)
+    clock = ScriptedClock([0.0, 0.015])  # one tick, 15 ms: past budget_ms, not the alarm
+    loop, *_ = make_loop(cfg, good_source(cfg), clock=clock)
+    loop.tick()
+    sup = loop.supervisor
+    blob = sup.snapshot().to_dict()
+    assert blob["health"]["step_ms_last"] == pytest.approx(15.0)
+    assert blob["health"]["budget_warn_count"] == 1
+    assert blob["health"]["budget_alarm_count"] == 0

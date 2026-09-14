@@ -1432,6 +1432,13 @@ class MpcConfig:
       controlled temperature drops when one of its channels goes +1.0 PWM,
       and the per-tick gain of the offset-free disturbance estimator. Ignored
       by the ``pi`` solver.
+    * ``budget_ms`` / ``budget_alarm_ms`` / ``budget_log_interval_s`` -- the
+      per-tick ``step()`` wall-time gate (measured outside ``step`` --
+      ``control/loop.py``, ``tools/bench_step.py``, ``tests/test_bench_budget.py``):
+      logged as a warning past ``budget_ms`` and an error past ``budget_alarm_ms``,
+      each rate limited to at most one line per ``budget_log_interval_s`` carrying
+      the count of exceedances since the last line. Both modes; both apply
+      regardless of ``dt``.
     * ``model_shadow`` / ``model_window_s`` / ``model_lambda`` / ``model_p_trace_max`` /
       ``model_converged_rel_se`` / ``model_max_pred_err_c`` / ``model_use_rpm`` -- the
       zoned thermal model's online identification (``control/thermal.py``): shadow
@@ -1497,6 +1504,9 @@ class MpcConfig:
     mpc_tau_s: float = 120.0
     mpc_gain_c_per_pwm: float = 8.0
     mpc_estimator_gain: float = 0.1
+    budget_ms: float = 600.0
+    budget_alarm_ms: float = 750.0
+    budget_log_interval_s: float = 60.0
     topology: Topology | None = None
     sensors: dict[str, SensorSpec] = field(default_factory=dict)
     drive_classes: dict[str, DriveClass] = field(default_factory=dict)
@@ -1590,6 +1600,13 @@ class MpcConfig:
         s(self, "mpc_tau_s", _cfg_num("mpc_tau_s", self.mpc_tau_s))
         s(self, "mpc_gain_c_per_pwm", _cfg_num("mpc_gain_c_per_pwm", self.mpc_gain_c_per_pwm))
         s(self, "mpc_estimator_gain", _cfg_num("mpc_estimator_gain", self.mpc_estimator_gain))
+        s(self, "budget_ms", _cfg_num("budget_ms", self.budget_ms))
+        s(self, "budget_alarm_ms", _cfg_num("budget_alarm_ms", self.budget_alarm_ms))
+        s(
+            self,
+            "budget_log_interval_s",
+            _cfg_num("budget_log_interval_s", self.budget_log_interval_s),
+        )
         for name in ("model_shadow", "model_use_rpm", "model_accept_prior"):
             _cfg_bool(name, getattr(self, name))
         for name in (
@@ -1804,6 +1821,19 @@ class MpcConfig:
         if not 0.0 < self.mpc_estimator_gain <= 1.0:
             raise ConfigError(
                 f"mpc.mpc_estimator_gain must be in (0, 1], got {self.mpc_estimator_gain}"
+            )
+        if self.budget_ms <= 0:
+            raise ConfigError(f"mpc.budget_ms must be > 0, got {self.budget_ms}")
+        if self.budget_alarm_ms <= 0:
+            raise ConfigError(f"mpc.budget_alarm_ms must be > 0, got {self.budget_alarm_ms}")
+        if self.budget_ms >= self.budget_alarm_ms:
+            raise ConfigError(
+                f"mpc.budget_ms ({self.budget_ms}) must be < mpc.budget_alarm_ms "
+                f"({self.budget_alarm_ms})"
+            )
+        if self.budget_log_interval_s <= 0:
+            raise ConfigError(
+                f"mpc.budget_log_interval_s must be > 0, got {self.budget_log_interval_s}"
             )
         if self.solver is SolverKind.MPC and self.regulates_drive_limits:
             # The DAS MPC (control/solver_das.py) tracks no setpoint: its QP is strictly
