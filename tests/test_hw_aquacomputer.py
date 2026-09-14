@@ -31,6 +31,7 @@ from aqua_bridge.hw.aquacomputer import (
     finalize_control_report,
     is_status_report,
     kind_by_name,
+    output_mode,
     patch_duties,
     restore_channel,
 )
@@ -193,6 +194,27 @@ def test_aquaero_channel_state_before_and_after_the_write() -> None:
     assert not channel_holds(AQUAERO, after, 1, 1413)
     # Firmware controllers on every other channel.
     assert {channel_state(AQUAERO, after, k).source for k in (0, 2, 3)} <= {0x58, 0x59}
+
+
+def test_aquaero_output_mode_word() -> None:
+    """The firmware fixture: outputs 1-2 in PWM mode (0x0502), 3-4 in DC mode (0x0501);
+    a duty write does not touch the mode."""
+    for name in ("aquaero-ctrl-firmware.bin", "aquaero-ctrl-after-writes.bin"):
+        data = _bin(name)
+        modes = [output_mode(AQUAERO, data, k) for k in range(4)]
+        assert [m.raw for m in modes] == [0x0502, 0x0502, 0x0501, 0x0501]
+        assert [m.name for m in modes] == ["pwm", "pwm", "dc", "dc"]
+        assert [channel_state(AQUAERO, data, k).mode for k in range(4)] == modes
+    patched = bytearray(_bin("aquaero-ctrl-firmware.bin"))
+    patched[0x248 + 0x0E : 0x248 + 0x10] = (0x0503).to_bytes(2, "big")
+    odd = output_mode(AQUAERO, patched, 3)
+    assert odd is not None and odd.name == "unknown" and not odd.is_pwm
+
+
+def test_quadro_has_no_known_output_mode() -> None:
+    data = _bin("quadro-ctrl-firmware.bin")
+    assert output_mode(QUADRO, data, 0) is None
+    assert channel_state(QUADRO, data, 0).mode is None
 
 
 def test_quadro_channel_state_has_no_aquaero_fields() -> None:
