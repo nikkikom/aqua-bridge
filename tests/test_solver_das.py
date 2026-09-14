@@ -456,6 +456,22 @@ def test_das_mpc_config_rules():
         dataclasses.replace(cfg, solver_outer_max=0)
     with pytest.raises(ConfigError, match="model_max_drift"):
         dataclasses.replace(cfg, model_max_drift_c_per_min=0.0)
+    assert (cfg.model_return_factor, cfg.model_return_dwell_s) == (0.5, 300.0)
+    assert cfg.model_drift_rate_tau_s == 120.0
+    for bad in (0.0, -0.5, 1.01):
+        with pytest.raises(ConfigError, match="model_return_factor"):
+            dataclasses.replace(cfg, model_return_factor=bad)
+    assert dataclasses.replace(cfg, model_return_factor=1.0).model_return_factor == 1.0
+    with pytest.raises(ConfigError, match="model_return_dwell_s"):
+        dataclasses.replace(cfg, model_return_dwell_s=-1.0)
+    assert dataclasses.replace(cfg, model_return_dwell_s=0.0).model_return_dwell_s == 0.0
+    for bad in (0.0, -1.0):
+        with pytest.raises(ConfigError, match="model_drift_rate_tau_s"):
+            dataclasses.replace(cfg, model_drift_rate_tau_s=bad)
+    for key in ("model_return_factor", "model_return_dwell_s", "model_drift_rate_tau_s"):
+        for bad in (float("nan"), float("inf"), "0.5", True):
+            with pytest.raises(ConfigError, match=key):
+                MpcConfig.from_mapping({**cfg.to_dict(), key: bad})
     with pytest.raises(ConfigError, match="weight_noise"):
         dataclasses.replace(
             cfg, weight_dpwm=0.0, noise=dataclasses.replace(cfg.noise, weight_noise=0.0)
@@ -905,7 +921,7 @@ def test_fallback_is_bumpless_and_returns_after_the_dwell_with_hysteresis():
             break
     assert back is not None
     elapsed = (back - 2) * cfg.dt
-    assert solver_das.MODEL_DWELL_S <= elapsed <= solver_das.MODEL_DWELL_S + cfg.dt
+    assert cfg.model_return_dwell_s <= elapsed <= cfg.model_return_dwell_s + cfg.dt
     assert c.diagnostics["target_pwm"] == pytest.approx(prev, abs=1e-12)  # bumpless back
 
 
@@ -938,7 +954,7 @@ def test_a_clock_stepped_back_keeps_the_prediction_error_guard_and_the_dwell():
     # in fallback, the clock steps back again: the dwell counts from the new clock
     later = back + 40 * cfg.dt
     memory = {**memory, "err2": 0.0, "pred": None}
-    res, memory = ticks(memory, later - 86_400.0, int(2 * solver_das.MODEL_DWELL_S / cfg.dt))
+    res, memory = ticks(memory, later - 86_400.0, int(2 * cfg.model_return_dwell_s / cfg.dt))
     assert res.diagnostics["model"]["active"] == "mpc"
 
 

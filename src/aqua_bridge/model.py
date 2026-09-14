@@ -82,6 +82,7 @@ choice for cooling:
   a long ``dt``.
 * The DAS MPC keys (``mpc_pred_dt_s``, ``mpc_blocks``, ``mpc_every_ticks``,
   ``rho_soft``, ``rho_hard``, ``solver_outer_max``, ``model_max_drift_c_per_min``,
+  ``model_return_factor``, ``model_return_dwell_s``, ``model_drift_rate_tau_s``,
   ``model_accept_prior``; ``aqua_bridge.control.solver_das``) are flat keys too,
   validated always and inert in legacy mode. ``mpc_pred_dt_s >= dt`` is checked
   only with ``topology``; ``mpc_blocks`` empty (the default) means the plan's
@@ -1467,13 +1468,17 @@ class MpcConfig:
       bound, relative standard error and prediction error for ``converged``, and fan
       airflow from the tachometer instead of the PWM curve.
     * ``mpc_pred_dt_s`` / ``mpc_blocks`` / ``mpc_every_ticks`` / ``rho_soft`` / ``rho_hard``
-      / ``solver_outer_max`` / ``model_max_drift_c_per_min`` / ``model_accept_prior`` --
+      / ``solver_outer_max`` / ``model_max_drift_c_per_min`` / ``model_return_factor`` /
+      ``model_return_dwell_s`` / ``model_drift_rate_tau_s`` / ``model_accept_prior`` --
       the DAS MPC (``control/solver_das.py``, ``solver: mpc`` with ``topology`` and no
       ``setpoints``): prediction step (``horizon`` counts these steps), move blocks
       (:meth:`blocks`), solve every n-th tick, soft / hard penalty weights, cap on the
-      active-piece iterations, the validity gate's equilibrium drift limit and whether
-      a thermal model that has not converged (its prior or what it learnt so far) may
-      drive the fans. Inert in legacy mode.
+      active-piece iterations, the validity gate's equilibrium drift limit, the factor
+      on the gate's numeric limits and the time they must hold for the MPC to return
+      from the model fallback, the low-pass time constant of the drives' observed rate
+      that the return's relative drift check subtracts, and whether a thermal model
+      that has not converged (its prior or what it learnt so far) may drive the fans.
+      Inert in legacy mode.
     * ``model_store_interval_s`` / ``model_store_max_age_days`` / ``model_reconfirm_s`` --
       the model store (``modelstore.py``, ``control/persist.py``): the shortest interval
       between two writes of ``model.json``, the age above which a stored model loads
@@ -1552,6 +1557,9 @@ class MpcConfig:
     rho_hard: float = 4000.0
     solver_outer_max: int = 4
     model_max_drift_c_per_min: float = 0.5
+    model_return_factor: float = 0.5
+    model_return_dwell_s: float = 300.0
+    model_drift_rate_tau_s: float = 120.0
     model_accept_prior: bool = False
     model_store_interval_s: float = 600.0
     model_store_max_age_days: float = 30.0
@@ -1644,6 +1652,9 @@ class MpcConfig:
             "rho_soft",
             "rho_hard",
             "model_max_drift_c_per_min",
+            "model_return_factor",
+            "model_return_dwell_s",
+            "model_drift_rate_tau_s",
             "model_store_interval_s",
             "model_store_max_age_days",
             "model_reconfirm_s",
@@ -2017,6 +2028,18 @@ class MpcConfig:
         if self.model_max_drift_c_per_min <= 0:
             raise ConfigError(
                 f"mpc.model_max_drift_c_per_min must be > 0, got {self.model_max_drift_c_per_min}"
+            )
+        if not 0.0 < self.model_return_factor <= 1.0:
+            raise ConfigError(
+                f"mpc.model_return_factor must be in (0, 1], got {self.model_return_factor}"
+            )
+        if self.model_return_dwell_s < 0:
+            raise ConfigError(
+                f"mpc.model_return_dwell_s must be >= 0, got {self.model_return_dwell_s}"
+            )
+        if self.model_drift_rate_tau_s <= 0:
+            raise ConfigError(
+                f"mpc.model_drift_rate_tau_s must be > 0, got {self.model_drift_rate_tau_s}"
             )
 
     def _validate_das(self) -> None:

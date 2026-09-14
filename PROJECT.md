@@ -403,6 +403,9 @@ long `dt`):
 | `rho_soft` / `rho_hard` | 40 / 4000 | > 0, `rho_hard ≥ rho_soft` |
 | `solver_outer_max` | 4 | int ≥ 1 |
 | `model_max_drift_c_per_min` | 0.5 | > 0 |
+| `model_return_factor` | 0.5 | `(0, 1]`: the validity gate's numeric limits are scaled by this for the MPC to return from the model fallback |
+| `model_return_dwell_s` | 300 | ≥ 0, s: how long the scaled checks must pass continuously (and since the fallback began) |
+| `model_drift_rate_tau_s` | 120 | > 0, s: low-pass time constant of the drives' observed rate that the return's drift check subtracts |
 | `model_accept_prior` | `false` | the DAS MPC may act on a model that has not converged (needs `topology`) |
 | `model_store_interval_s` | 600 | > 0 |
 | `model_store_max_age_days` | 30 | > 0 |
@@ -1233,7 +1236,23 @@ change, a fast-swap jump or a calibration change are left out of the last
 two checks. A failure switches to the **PI-like DAS form on the same
 estimates**: `mode` stays `auto`, `diagnostics.solver_diag.model` says
 `active: pi_das` and why. The MPC returns only after the checks pass at
-0.5× their numeric limits for 300 s. Every switch is bumpless. The
+`model_return_factor` (0.5) times their numeric limits for
+`model_return_dwell_s` (300 s). On the return the drift check is
+relative: `max_j |dT_d,j/dt − r_j|`, with `r_j` the observed rate of the
+estimator's drive `j` (tick-to-tick difference low-passed with
+`model_drift_rate_tau_s`, 120 s; 0 for a fresh track). A load step warms
+the drives at 0.26–0.36 °C/min, which a sound model predicts; the plain
+drift had to fall below 0.25 °C/min before the dwell started and held the
+fallback for up to 29 minutes on the truth simulator, the relative check
+returns after the dwell (`tests/test_model_fallback_sim.py`: within
+`model_return_dwell_s + 2 · mpc_every_ticks · dt`, 320 s). A model whose
+equilibrium is wrong keeps its drift while the drives settle and stays in
+the fallback (bay gains 0.3×, 2× or 3×: caught within 150 s of a load
+step; 0.5×: 830–860 s, when the warming drives push the plain drift over
+the limit). The entry keeps the plain drift: the relative one follows the
+MPC's own command moves at once while the observed rate lags, and added
+fallbacks on the `rich` simulator. `checks` reports both
+(`drift_abs_c_per_min`, `drift_rel_c_per_min`). Every switch is bumpless. The
 fallback regulates every drive at its soft target with the same margins,
 so a model fallback changes loudness, not safety. Without
 `model_accept_prior` nothing can act before a model has converged, which
@@ -2218,6 +2237,7 @@ tests carry the `nightly` marker.
 | `tests/test_thermal_model.py` | structure, fan groups, parameter table, Jacobians vs finite differences, `eig` vs matrix exponential and the Euler fallback, windows, lag correction, RLS safeguards, status machine, never raising in `step`, shadow never changes the command | PR |
 | `tests/test_thermal_ident.py` | identifiability with group experiments on the truth sim: in-zone `E` within 15 % (PR seed), per-bay `k` within 25 %, `leak` / `κ` at prior, convergence; regulation only never converges; the seed sweep (bound 25 %), sensor offsets, the rich preset | PR: 4 cases; nightly: sweeps |
 | `tests/test_solver_das.py` | active-piece SQP vs a projected-gradient reference, monotone objective, iteration cap, forbidden-band snap and hysteresis, zero-order hold, prediction vs thermal Jacobians, noise index and surrogate, bumpless offset, fixed channels, validity gate and model fallback with dwell, a clock stepped back, horizon and block extremes | PR |
+| `tests/test_model_fallback_sim.py` | return from the model fallback after a load step (§8 item 10): the observed drive rate (ramp, restarts, memory), a sound model returns within `model_return_dwell_s + 2 · mpc_every_ticks · dt`, a model with wrong bay gains is caught and held, every drive within its limit and bumpless switches; the plain drift holds the same step | PR: 1 return, 1 broken model; nightly: zones × seeds on `basic` and `rich`, more broken gains |
 | `tests/test_noise_regression.py` | calibrated DAS MPC noise ≤ 0.8× the quietest uniform curve at equal or better worst true margin (measured 0.31–0.48×); uncalibrated bound 2.0 (0.30–0.69×); rich preset bound 1.3 (up to 1.21×); MPC vs PI-DAS reported, not asserted (PI-DAS has not settled within the window on several seeds) | PR: 2 seeds; nightly: 8-seed sweeps |
 | `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× (named constant) the legacy MPC p99, the 75th percentile of several interleaved, warm-up-discarded repeats (§8 item 6); `bench_step.py` runs both DAS solvers; absolute p99 ≤ `mpc.budget_ms` only on `armv6l` | PR / Pi |
 | `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise | PR |
@@ -2727,7 +2747,7 @@ them as "§8 item N".
    estimator until then, while its group stays trusted through the others.
    A Jump on a redundant group member was accepted after one tick without
    `confirm_ticks`.
-10. The drift check's hysteresis can hold the PI-DAS model fallback for
+10. **Done:** the return from the model fallback checks the drift relative to the drives' observed rate, with `model_return_factor`, `model_return_dwell_s` and `model_drift_rate_tau_s` as config keys, so a sound model returns about 5 minutes after a load step (§3, validity gate and model fallback). The drift check's hysteresis can hold the PI-DAS model fallback for
     tens of minutes after a load step (return threshold 0.25 °C/min against
     0.26–0.29 °C/min physical transients); tune it.
 11. The prediction-error guard also scores drives in faulted zones (extra,

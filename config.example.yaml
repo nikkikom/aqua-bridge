@@ -94,6 +94,9 @@ mpc:
   rho_hard: 4000.0       # penalty per degC^2 above its hard target (>= rho_soft)
   solver_outer_max: 4    # active-piece iterations per solve (>= 1)
   model_max_drift_c_per_min: 0.5  # validity gate: model drift at the estimate, degC/min (> 0)
+  model_return_factor: 0.5  # back from the model fallback: gate limits scaled by this (0, 1]
+  model_return_dwell_s: 300.0  # ... held continuously this long, seconds (>= 0)
+  model_drift_rate_tau_s: 120.0  # low-pass of the drives' observed rate the return subtracts, s (> 0)
   model_accept_prior: false  # true (needs topology): the MPC may act on a model that has not converged
   # DAS model store ($STATE_DIRECTORY/model.json or --model-store PATH); inert in legacy mode.
   model_store_interval_s: 600.0   # at most one write of model.json per interval, seconds (> 0)
