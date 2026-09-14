@@ -2807,9 +2807,10 @@ Owner decisions (2026-09-14, later the same day):
 24. HTML page: drive estimates, bays, zone and model status (the JSON views
     exist).
 25. HTML Host section shows dashes: `/api/state` carries no host metrics.
-26. CI time: `test (latest)` reaches 10–11 min on slow runners against
-    the 11-minute guideline; move heavy PR tests to `nightly` or split the
-    job.
+26. **Done:** `test (latest)` reached 10–11 min on slow runners against the
+    11-minute guideline; `tools/ci_pytest_shards.py` now runs several
+    pytest processes concurrently, each on a disjoint deterministic slice
+    of `tests/test_*.py`, inside both `test` matrix jobs (§12).
 27. Test gap: the DS18B20 plateau test uses an 1800 s sine, so no plateau
     is longer than `stuck_s`; add one.
 28. `tools/bench_step.py` reports `plant.preset: basic` for
@@ -3638,9 +3639,35 @@ are.
 | Job | When | What | Timeout |
 |-----|------|------|---------|
 | `lint` | push, PR, dispatch | Python 3.13, `ruff==0.16.7`: `ruff check .`, `ruff format --check .` | 5 min |
-| `test (latest)` | push, PR, dispatch | Python 3.14, `pip install -e ".[dev,http,mqtt]"`, `HYPOTHESIS_PROFILE=ci`, `pytest -m "not hardware and not nightly" --durations=15` | 15 min |
-| `test (pi-parity)` | push, PR, dispatch | Python 3.13 with the Pi’s apt versions pinned (numpy 2.2.4, pyyaml 6.0.2, pytest 8.3.5, hypothesis 6.130.5, aiohttp 3.11.16, paho-mqtt 2.1.0), `pip install -e . --no-deps`, same pytest | 15 min |
-| `nightly-fuzz (latest, pi-parity)` | schedule, dispatch | same installs, `HYPOTHESIS_PROFILE=nightly` (randomized, 1000 examples), `pytest -m "not hardware"`: everything the PR jobs run plus the `nightly` sweeps | 60 min |
+| `test (latest)` | push, PR, dispatch | Python 3.14, `pip install -e ".[dev,http,mqtt]"`, `HYPOTHESIS_PROFILE=ci`, `tools/ci_pytest_shards.py -- -m "not hardware and not nightly" --durations=15` | 15 min |
+| `test (pi-parity)` | push, PR, dispatch | Python 3.13 with the Pi’s apt versions pinned (numpy 2.2.4, pyyaml 6.0.2, pytest 8.3.5, hypothesis 6.130.5, aiohttp 3.11.16, paho-mqtt 2.1.0), `pip install -e . --no-deps`, same sharded pytest | 15 min |
+| `nightly-fuzz (latest, pi-parity)` | schedule, dispatch | same installs, `HYPOTHESIS_PROFILE=nightly` (randomized, 1000 examples), plain `pytest -m "not hardware"` (unsharded, 60-minute budget): everything the PR jobs run plus the `nightly` sweeps | 60 min |
+
+**Sharded PR test job (§8 item 26).** `tools/ci_pytest_shards.py` replaces
+the single `pytest` invocation in `test (latest)` and `test (pi-parity)`:
+it lists `tests/test_*.py`, bin-packs them onto `os.cpu_count()` shards
+(greedy longest-processing-time-first, weighted by each file's line count
+plus a flat bonus per `@given` — a property test runs many examples
+through a closed-loop sim, so line count alone badly under-weighted
+`test_mpc_fuzzy.py`; both are cheap stand-ins, no timing history is kept
+or needed), and runs one plain `pytest <forwarded args> <shard's files>`
+subprocess per shard concurrently, no plugin (`pytest-xdist` included).
+It waits for every shard, prints each shard's file list up front and its
+wall time at the end, and exits non-zero if any shard failed — the job
+stays red exactly when an unsharded run would have. The assignment is
+deterministic (same files, same weights, same buckets every run), so a
+shard's failure reproduces locally with `pytest` on the same file list.
+The suites needed no isolation changes: every shared fixture already
+hands out a private `tempfile.mkdtemp()` directory or an OS-assigned port
+(`aiohttp` `TestServer`, `AF_UNIX` sockets in short per-test temp dirs),
+golden regeneration is opt-in only via `AQUA_BRIDGE_REGEN_GOLDEN=1` (never
+set in CI), the `ci` Hypothesis profile runs `derandomize=True`, under
+which Hypothesis does not use its on-disk example database, and
+`tests/test_bench_budget.py`'s relative step-time gate was already
+written to tolerate a slow shared runner (§12 budget gate paragraph
+below) — so concurrent shards never touch the same file or destabilise
+each other's timing. `nightly-fuzz` keeps the plain unsharded `pytest`
+call: its 60-minute budget has headroom the 15-minute PR jobs do not.
 
 **Selectors.** PR and `main` runs exclude `hardware` (no device on a
 runner) and `nightly` (seed × placement sweeps of the identification,
