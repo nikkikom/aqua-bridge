@@ -2817,7 +2817,10 @@ Owner decisions (2026-09-14, later the same day):
 29. Stale docstrings: `thermal.py` and `noise.py` still call experiments
     and `fit_fans` a later milestone; `FanSpec` says `forbidden_pwm` is not
     honoured.
-30. README: bring-up on a fresh Pi (checklist §10).
+30. **Done:** README carries a condensed, numbered bring-up checklist
+    matching §10, with every command and flag checked against
+    `deploy/install-pi.sh`, `deploy/host-usb.sh` and the `tools/*.py`
+    `--help` output (README.md).
 53. Experiments count `k·σ` twice: `control/ident.py` checks `T̂ + k·σ`
     against `soft` and `hard`, which already subtract `k·σ`. Now that
     PI-like DAS settles at `soft`, a settled enclosure is refused by the
