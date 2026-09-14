@@ -28,7 +28,7 @@ import aiohttp
 import pytest
 import yaml
 from aiohttp.test_utils import TestClient, TestServer
-from hypothesis import given, settings
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from aqua_bridge.config import AppConfig, load_config
@@ -1045,3 +1045,84 @@ def test_refusals_are_logged_at_most_once_per_window(
     lines = [r.getMessage() for r in caplog.records if "refused with 429" in r.getMessage()]
     assert len(lines) == 2
     assert lines[0].startswith("http: 1 request(s)") and "(1 per 60 s, 2 at once)" in lines[0]
+
+
+def test_failure_bookkeeping_stays_cheap_under_a_many_address_flood(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Malformed headers need no PBKDF2 and take no global slot, but each one records a
+    failure for its address on the event loop. A flood from many addresses must not
+    make each record scan every stored address (quadratic work that would starve the
+    event loop and the control loop's thread): the work per request stays bounded, and
+    the observable backoff and forgetting stay as before."""
+    clock = FakeClock()
+    s = auth_settings(auth_fail_limit=2, auth_backoff_s=1.0, auth_backoff_max_s=8.0)
+    auth = BasicAuthenticator(s, clock=clock)
+    looked_at = 0
+    real_wait = BasicAuthenticator._wait_s
+
+    def counting_wait(self: BasicAuthenticator, count: int) -> float:
+        nonlocal looked_at
+        looked_at += 1
+        return real_wait(self, count)
+
+    monkeypatch.setattr(BasicAuthenticator, "_wait_s", counting_wait)
+    n = 3000
+    for i in range(n):
+        assert auth.fast("Basic !!!", f"2001:db8::{i:x}") == httpauth.AuthDecision(False)
+        clock.t += 0.001
+    assert looked_at < 10 * n
+    # Semantics unchanged: a client at its limit backs off, and is forgotten once the
+    # longest wait has passed after its backoff ended; its next failure starts afresh.
+    for _ in range(s.auth_fail_limit):
+        auth.fast("Basic !!!", "repeat")
+    assert auth.fast(basic_header(), "repeat").retry_after_s == pytest.approx(s.auth_backoff_s)
+    clock.t += s.auth_backoff_s + s.auth_backoff_max_s + 0.01
+    auth.fast("Basic !!!", "someone-else")  # prunes
+    assert "repeat" not in auth._failures
+    assert all(not key.startswith("2001:db8::") for key in auth._failures)
+    auth.fast("Basic !!!", "repeat")
+    assert auth._failures["repeat"][0] == 1  # one failure: below the limit
+    assert auth.fast(basic_header(), "repeat") is None  # no backoff, needs a check
+
+
+@given(
+    events=st.lists(
+        st.tuples(
+            st.sampled_from(["a", "b", "c", "d"]),
+            st.sampled_from([0.0, 0.3, 1.0, 2.5, 7.9, 8.0, 8.1, 17.0]),
+            st.booleans(),
+        ),
+        max_size=60,
+    )
+)
+# A long backoff at the front keeps a stale entry behind it, whose client fails again.
+@example(events=[("a", 0.0, True)] * 5 + [("b", 0.0, True), ("b", 8.1, True)])
+def test_failure_pruning_matches_a_full_scan(events: list[tuple[str, float, bool]]) -> None:
+    """The amortised pruning backs off exactly like pruning every expired address on
+    each failure (the reference below)."""
+    clock = FakeClock()
+    s = auth_settings(auth_fail_limit=2, auth_backoff_s=1.0, auth_backoff_max_s=8.0)
+    auth = BasicAuthenticator(s, clock=clock)
+    ref: dict[str, tuple[int, float]] = {}
+    for client, dt, fail in events:
+        clock.t += dt
+        now = clock.t
+        with auth._lock:
+            if fail:
+                auth._record_failure_locked(client, now)
+                for key, entry in list(ref.items()):
+                    if auth._failure_expired(entry, now):
+                        del ref[key]
+                count = ref.get(client, (0, now))[0]
+                ref[client] = (count + 1, now)
+            else:
+                auth._failures.pop(client, None)
+                ref.pop(client, None)
+            for key in "abcd":
+                expected = None
+                if key in ref:
+                    count, last = ref[key]
+                    remaining = last + auth._wait_s(count) - now
+                    expected = remaining if auth._wait_s(count) > 0 and remaining > 0 else None
+                assert auth._backoff_locked(key, now) == expected
