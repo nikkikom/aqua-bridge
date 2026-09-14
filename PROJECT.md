@@ -2603,7 +2603,8 @@ them as "§8 item N".
    controller compensates (about one in three 75-minute `sim/das.py`
    runs). Fix the evidence rule; regression: long DAS sim runs with zero
    false zone faults.
-4. HTTPS with basic auth for the API and the page: certificate and key
+4. **Done (PR #24):** the API and page are served only over HTTPS with basic auth (§6), with `tools/http_user.py` for users and a self-signed certificate from `install-pi.sh`.
+   HTTPS with basic auth for the API and the page: certificate and key
    paths in `http:`, hashed credentials in a root-owned 0640 file under
    `/etc/aqua-bridge`, every route authenticated, plain HTTP refused.
    Document that the MQTT counterparts (`cmd/bay`, `cmd/limit`,
