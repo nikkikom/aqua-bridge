@@ -861,7 +861,8 @@ def floor_case(
 #: floor 0.06, in the first minutes after the loss).
 UNCOVERED_LOSS_C = 0.05
 #: ...and within this much altogether over 65 minutes of loss, degC (measured up to 1.03
-#: on basic seeds 1-5; 2.39 without a floor).
+#: on basic seeds 1-5; 2.39 without a floor). Not a bound for a longer loss: once the floor
+#: has released, the loss converges to that of the run without a floor.
 SOFT_FLOOR_LOSS_C = 1.25
 #: ...and the mean modelled noise until the zone's first fault within this much of the run
 #: without a floor, dB (the hard floor: 32.5 against 27.1 dB).
@@ -953,6 +954,38 @@ def test_the_soft_sigma_floor_sweep(preset, seed, solver, sensor):
     assert case.mean_noise_db(case.soft) <= case.mean_noise_db(case.bare) + SOFT_FLOOR_NOISE_DB
     if solver == "mpc" and preset == "basic" and sensor == "prox_b02":
         assert max(case.margin_loss(case.bare)) > 2.0
+
+
+@pytest.mark.nightly
+@pytest.mark.parametrize(
+    ("preset", "seed", "sensor"),
+    [("basic", 1, "prox_b02"), ("basic", 4, "prox_b13"), ("rich", 0, "prox_b02")],
+)
+def test_the_soft_sigma_floor_until_it_has_released(preset, seed, sensor):
+    """The DAS MPC with the sensor lost for good, run until the documented end of the
+    floor (``sigma_floor_hold_s + 60 * (pwm_max - pwm_min) / sigma_floor_release_per_min``
+    after the loss). The floor is released by then; every drive stays within its limit;
+    the true margin lost against the run with the sensor stays within ``k_sigma`` times the
+    sigma growth plus ``UNCOVERED_LOSS_C`` on every tick. ``SOFT_FLOOR_LOSS_C`` bounds the
+    total loss only over the sweep's 65 minutes: once the floor has released, the loss
+    converges to that of the run without a floor (2.4 degC on b02, measured 2.42 against
+    2.40), so in total it stays within the larger of the two plus ``UNCOVERED_LOSS_C``."""
+    cfg = example_cfg("sigma", "mpc")
+    policy = cfg.zones
+    end_s = policy.sigma_floor_hold_s + 60.0 * (cfg.pwm_max - cfg.pwm_min) / (
+        policy.sigma_floor_release_per_min
+    )
+    ticks = int((LOSS_S + end_s) / cfg.dt) + 2
+    case = floor_case("mpc", ticks, sensor, preset, seed)
+    phases = [
+        rec.cmd.diagnostics["sigma_floor"].get(case.zone, {}).get("phase")
+        for rec in case.soft.records[case.start :]
+    ]
+    assert zones.FLOOR_RELEASED in phases
+    assert case.soft.violations() == 0
+    assert case.uncovered_loss(case.soft) <= UNCOVERED_LOSS_C
+    bare = max(case.margin_loss(case.bare))
+    assert max(case.margin_loss(case.soft)) <= max(bare, SOFT_FLOOR_LOSS_C) + UNCOVERED_LOSS_C
 
 
 def test_a_lost_redundant_proximal_sensor_changes_nothing(healthy_sigma_run):
