@@ -18,25 +18,80 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  lint:
+  # Decides whether anything besides Markdown changed. lint and test always run
+  # so the required checks report, but on a documentation-only change their
+  # steps are skipped and the jobs finish in seconds. (A job-level `if` would
+  # skip the matrix job under its unexpanded name, and the required checks
+  # "test (latest)" / "test (pi-parity)" would never report.)
+  changes:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Detect changes outside documentation
+        id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          code=true
+          range=""
+          case "$EVENT" in
+            pull_request) range="$BASE_SHA...$GITHUB_SHA" ;;
+            push)
+              if [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
+                && git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+                range="$BEFORE_SHA..$GITHUB_SHA"
+              fi
+              ;;
+          esac
+          if [ -n "$range" ]; then
+            files=$(git diff --name-only "$range")
+            echo "Changed files:"
+            echo "$files"
+            # Documentation-only means: at least one file, and every file is Markdown.
+            if [ -n "$files" ] && ! printf '%s\n' "$files" | grep -qvE '\.md$'; then
+              code=false
+            fi
+          fi
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
+  lint:
+    if: github.event_name != 'schedule'
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Documentation-only change, lint skipped
+        if: needs.changes.outputs.code != 'true'
+        run: echo "Only Markdown files changed; nothing to lint."
+      - uses: actions/checkout@v7
+        if: needs.changes.outputs.code == 'true'
       - uses: actions/setup-python@v7
+        if: needs.changes.outputs.code == 'true'
         with:
           python-version: "3.13"
       # Keep in sync with the ruff pin in pyproject.toml [dev].
       - name: Install ruff
+        if: needs.changes.outputs.code == 'true'
         run: pip install "ruff==0.16.7"
       - name: ruff check
+        if: needs.changes.outputs.code == 'true'
         run: ruff check .
       - name: ruff format --check
+        if: needs.changes.outputs.code == 'true'
         run: ruff format --check .
 
   test:
     if: github.event_name != 'schedule'
+    needs: changes
     name: test (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -53,8 +108,13 @@ jobs:
             python-version: "3.13"
             pi-parity: true
     steps:
+      - name: Documentation-only change, tests skipped
+        if: needs.changes.outputs.code != 'true'
+        run: echo "Only Markdown files changed; build and tests skipped."
       - uses: actions/checkout@v7
+        if: needs.changes.outputs.code == 'true'
       - uses: actions/setup-python@v7
+        if: needs.changes.outputs.code == 'true'
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -64,7 +124,7 @@ jobs:
       # (Raspberry Pi OS Trixie), installed before the project so the run
       # matches what the daemon uses there. --no-deps keeps the pins.
       - name: Install pinned pi-parity dependencies
-        if: matrix.pi-parity
+        if: needs.changes.outputs.code == 'true' && matrix.pi-parity
         run: |
           pip install \
             numpy==2.2.4 \
@@ -76,14 +136,16 @@ jobs:
           pip install -e . --no-deps
 
       - name: Install latest dependencies
-        if: ${{ !matrix.pi-parity }}
+        if: needs.changes.outputs.code == 'true' && !matrix.pi-parity
         run: pip install -e ".[dev,http,mqtt]"
 
       - name: shellcheck version
+        if: needs.changes.outputs.code == 'true'
         run: shellcheck --version | head -2
 
       # "nightly" tests (heavy sweeps, long simulations) run only in nightly-fuzz.
       - name: pytest
+        if: needs.changes.outputs.code == 'true'
         run: pytest -m "not hardware and not nightly" --durations=15
 
   nightly-fuzz:
