@@ -4,16 +4,25 @@ Every reader takes an injectable path/root so tests can point at a fake
 sysfs/procfs tree instead of the real one; a missing or malformed file
 yields ``None`` for that one metric, never an exception. Callers combine
 the metrics into a single JSON-serialisable dict with :func:`collect_hostinfo`.
+
+:class:`CachedHostInfo` wraps a reader (:func:`collect_hostinfo` by default)
+with a refresh interval, so a caller polled more often than ``host.interval_s``
+(the HTTP ``/api/state`` route, the MQTT per-tick publisher) does not re-read
+``/proc`` and ``/sys`` on every call.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "CachedHostInfo",
     "collect_hostinfo",
     "read_cpu_temp_c",
     "read_disk",
@@ -22,6 +31,8 @@ __all__ = [
     "read_uptime_s",
     "read_wifi_rssi",
 ]
+
+_LOG = logging.getLogger(__name__)
 
 
 def _read_text(path: Path) -> str | None:
@@ -186,3 +197,39 @@ def collect_hostinfo(
         "wifi_rssi_dbm": read_wifi_rssi(wireless_path, wifi_iface),
         "uptime_s": read_uptime_s(uptime_path),
     }
+
+
+class CachedHostInfo:
+    """``reader()`` (:func:`collect_hostinfo` by default), refreshed at most every
+    ``interval_s`` seconds.
+
+    ``get()`` never raises: a reader exception is logged and yields ``{}`` for
+    that refresh, leaving the previous cached value in place from the next
+    call on (so one failed refresh does not blank an otherwise working page).
+    Not thread-safe by itself; each caller (the HTTP app, the MQTT service)
+    owns one instance.
+    """
+
+    def __init__(
+        self,
+        *,
+        interval_s: float = 5.0,
+        reader: Callable[[], Mapping[str, Any]] = collect_hostinfo,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._interval_s = max(0.0, float(interval_s))
+        self._reader = reader
+        self._clock = clock
+        self._cached: dict[str, Any] = {}
+        self._at = float("-inf")
+
+    def get(self) -> dict[str, Any]:
+        now = self._clock()
+        if now - self._at >= self._interval_s:
+            self._at = now
+            try:
+                self._cached = dict(self._reader())
+            except Exception:  # readers promise not to raise; belt and braces
+                _LOG.exception("hostinfo reader failed")
+                self._cached = {}
+        return self._cached

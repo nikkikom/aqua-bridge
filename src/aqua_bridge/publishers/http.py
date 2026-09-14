@@ -1,9 +1,18 @@
 """HTTP view and control (PROJECT.md section 6).
 
 ``create_app`` wires GET ``/api/state``, GET ``/api/health``, GET ``/`` (the
-static single-page UI), the DAS views GET ``/api/estimate``, GET ``/api/bays`` and
-GET ``/api/model``, and the eight ``POST /api/{mode,setpoint,pwm,preset,auto,limit,
-bay,ident}`` intents against a :class:`aqua_bridge.control.intents.ControlSurface`.
+static single-page UI), the DAS views GET ``/api/estimate``, GET ``/api/bays``,
+GET ``/api/model`` and GET ``/api/zones``, and the eight ``POST /api/{mode,setpoint,
+pwm,preset,auto,limit,bay,ident}`` intents against a
+:class:`aqua_bridge.control.intents.ControlSurface`.
+
+``GET /api/state`` also carries a top-level ``host`` key (host machine metrics,
+:mod:`aqua_bridge.hostinfo`): the same numbers as the MQTT state blob's ``host``
+key, refreshed at most every ``host.interval_s`` seconds (default 5.0) through a
+:class:`~aqua_bridge.hostinfo.CachedHostInfo` owned by this app -- polled every 2 s
+by the page, so an uncached read on every request would mean unnecessary
+``/proc``/``/sys`` I/O per poll for no fresher data than the refresh interval already
+gives.
 
 HTTP never computes PWM itself: every POST body becomes an
 :class:`~aqua_bridge.control.intents.Intent` via
@@ -41,6 +50,12 @@ DAS views (plan sections 1 and 7), read from the snapshot, never computed here:
   candidates, ...} | null}}}``: the declarations in force and what the estimator
   made of them, including the serial candidates of the association by
   correlation with their scores (confirm one with ``POST /api/bay {bay, serial}``).
+* ``GET /api/zones`` -- ``{"zones": {zone: {...}}, "zones_in_fault": [...],
+  "degraded": bool}``: per-zone trust, fault state and reason, and which of the
+  zone's channels are currently under fallback policy (``diagnostics["zones"]``,
+  intersected per zone with ``diagnostics["fallback_channels"]``, see
+  :mod:`aqua_bridge.control.mpc`); ``degraded`` mirrors ``/api/health``'s
+  ``solver == "degraded"``. Both empty/false before the first tick.
 * ``GET /api/model`` -- ``{"thermal": {...}, "parameters": {kind: {unit, lo, hi, prior,
   identified_from}}, "calibration": {bay: {serial, calibrated, sigma_cal_c,
   calibration}}, "store": {...}}``: the zoned thermal model's identification summary of the last
@@ -79,6 +94,7 @@ import asyncio
 import json
 import logging
 import math
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -90,9 +106,11 @@ from aqua_bridge.control.intents import (
     IntentConflict,
     IntentError,
     IntentInvalid,
+    SolverStatus,
     parse_intent,
 )
 from aqua_bridge.control.thermal import PARAMETERS
+from aqua_bridge.hostinfo import CachedHostInfo, collect_hostinfo
 from aqua_bridge.publishers.httpauth import (
     BasicAuthenticator,
     HttpSettings,
@@ -110,6 +128,7 @@ _SURFACE_KEY = web.AppKey("surface", ControlSurface)
 _CFG_KEY: web.AppKey[Any] = web.AppKey("cfg")
 _SMART_KEY: web.AppKey[Any] = web.AppKey("smart_inbox")
 _AUTH_KEY = web.AppKey("auth", BasicAuthenticator)
+_HOST_KEY = web.AppKey("host_cache", CachedHostInfo)
 
 # URL tail -> intent kind (identical today, kept separate so the route table
 # and aqua_bridge.control.intents.INTENT_KINDS can diverge later).
@@ -182,7 +201,9 @@ def _make_intent_handler(kind: str):
 async def _get_state(request: web.Request) -> web.Response:
     surface: ControlSurface = request.app[_SURFACE_KEY]
     snapshot = surface.snapshot()
-    return web.json_response(snapshot.state_payload())
+    payload = snapshot.state_payload()
+    payload["host"] = request.app[_HOST_KEY].get()
+    return web.json_response(payload)
 
 
 async def _get_health(request: web.Request) -> web.Response:
@@ -191,7 +212,7 @@ async def _get_health(request: web.Request) -> web.Response:
     return web.json_response(snapshot.health_payload())
 
 
-_NOT_DAS = "estimates, bays and the thermal model need a DAS config (mpc.topology)"
+_NOT_DAS = "estimates, bays, zones and the thermal model need a DAS config (mpc.topology)"
 
 
 def _diagnostics(snapshot: Any) -> dict[str, Any]:
@@ -222,6 +243,30 @@ async def _get_bays(request: web.Request) -> web.Response:
                 bay: {"declared": dict(declared), "estimator": seen.get(bay)}
                 for bay, declared in snapshot.bays.items()
             }
+        }
+    )
+
+
+async def _get_zones(request: web.Request) -> web.Response:
+    surface: ControlSurface = request.app[_SURFACE_KEY]
+    snapshot = surface.snapshot()
+    if not snapshot.bays:
+        return _error(404, _NOT_DAS)
+    diag = _diagnostics(snapshot)
+    zones_diag = diag.get("zones") or {}
+    fallback_channels = set(diag.get("fallback_channels") or [])
+    zones_out: dict[str, Any] = {}
+    for zone, info in zones_diag.items():
+        info = dict(info)
+        channels = list(info.get("channels") or ())
+        info["channels"] = channels
+        info["channels_under_fallback"] = [ch for ch in channels if ch in fallback_channels]
+        zones_out[zone] = info
+    return web.json_response(
+        {
+            "zones": zones_out,
+            "zones_in_fault": list(diag.get("zones_in_fault") or []),
+            "degraded": snapshot.solver_status is SolverStatus.DEGRADED,
         }
     )
 
@@ -285,14 +330,20 @@ def create_app(
     *,
     auth: BasicAuthenticator,
     smart_inbox: Any = None,
+    hostinfo: Callable[[], Mapping[str, Any]] = collect_hostinfo,
 ) -> web.Application:
     """Build the aiohttp application. ``cfg`` is accepted for parity with
-    :func:`run_http` and future per-instance config; today the app needs
-    nothing from it beyond what ``surface`` already carries. ``auth`` is
-    required: there is no unauthenticated app. ``smart_inbox``
-    (a :class:`~aqua_bridge.publishers.inputs.SmartInbox`, duck-typed --
-    only ``.record(dict) -> bool`` is used) wires ``POST /api/in/smart``;
-    left ``None`` that route answers 404, never a 5xx.
+    :func:`run_http` and future per-instance config; today the app reads only
+    ``cfg.host["interval_s"]`` (the ``host.interval_s`` key documented in section
+    7) from it, for the ``/api/state`` host-metrics cache below -- ``cfg=None``
+    (most tests) uses that key's default, 5.0 s. ``auth`` is required: there is
+    no unauthenticated app. ``smart_inbox`` (a
+    :class:`~aqua_bridge.publishers.inputs.SmartInbox`, duck-typed -- only
+    ``.record(dict) -> bool`` is used) wires ``POST /api/in/smart``; left
+    ``None`` that route answers 404, never a 5xx. ``hostinfo`` is the reader
+    :class:`~aqua_bridge.hostinfo.CachedHostInfo` wraps for ``GET /api/state``'s
+    ``host`` key (default :func:`aqua_bridge.hostinfo.collect_hostinfo`; tests
+    inject a fixed dict).
     """
     if not isinstance(auth, BasicAuthenticator):
         raise TypeError("create_app needs a BasicAuthenticator")
@@ -301,10 +352,13 @@ def create_app(
     app[_SURFACE_KEY] = surface
     app[_CFG_KEY] = cfg
     app[_SMART_KEY] = smart_inbox
+    host_interval_s = 5.0 if cfg is None else float(cfg.section("host").get("interval_s", 5.0))
+    app[_HOST_KEY] = CachedHostInfo(interval_s=host_interval_s, reader=hostinfo)
     app.router.add_get("/api/state", _get_state)
     app.router.add_get("/api/health", _get_health)
     app.router.add_get("/api/estimate", _get_estimate)
     app.router.add_get("/api/bays", _get_bays)
+    app.router.add_get("/api/zones", _get_zones)
     app.router.add_get("/api/model", _get_model)
     app.router.add_get("/", _get_index)
     for kind in _POST_KINDS:

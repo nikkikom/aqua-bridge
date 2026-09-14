@@ -19,7 +19,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from hypothesis import given
 from hypothesis import strategies as st
 
-from aqua_bridge.config import load_config
+from aqua_bridge.config import AppConfig, load_config
 from aqua_bridge.control.intents import (
     ClearOverride,
     ControlMode,
@@ -141,8 +141,13 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+# A fixed reader, not the real aqua_bridge.hostinfo.collect_hostinfo: the HTTP
+# suites must stay deterministic and independent of the sandbox's /proc, /sys.
+_HOST_STUB = {"cpu_temp_c": 42.0, "load1": 0.5, "uptime_s": 100.0}
+
+
 async def _client(surface: StubSurface) -> TestClient:
-    app = create_app(surface, cfg=None, auth=make_authenticator())
+    app = create_app(surface, cfg=None, auth=make_authenticator(), hostinfo=lambda: _HOST_STUB)
     server = TestServer(app)
     client = TestClient(server, **client_auth())
     await client.start_server()
@@ -176,9 +181,11 @@ def test_get_state_shape_matches_model(surface: StubSurface, cfg: MpcConfig) -> 
         finally:
             await client.close()
         expected = surface.snapshot().state_payload()
+        expected["host"] = _HOST_STUB
         assert body == expected
         assert body["obs"] == surface.obs.to_dict()
         assert body["cmd"] == surface.last_cmd.to_dict()
+        assert body["host"] == _HOST_STUB
         assert set(body) == {
             "obs",
             "cmd",
@@ -190,9 +197,60 @@ def test_get_state_shape_matches_model(surface: StubSurface, cfg: MpcConfig) -> 
             "temps",
             "pwm_min",
             "pwm_max",
+            "host",
         }
 
     _run(scenario())
+
+
+def test_get_state_host_reader_error_is_swallowed(surface: StubSurface) -> None:
+    def broken() -> dict:
+        raise RuntimeError("no /proc here")
+
+    async def scenario() -> None:
+        app = create_app(surface, cfg=None, auth=make_authenticator(), hostinfo=broken)
+        server = TestServer(app)
+        client = TestClient(server, **client_auth())
+        await client.start_server()
+        try:
+            resp = await client.get("/api/state")
+            assert resp.status == 200
+            body = await resp.json()
+        finally:
+            await client.close()
+        assert body["host"] == {}
+
+    _run(scenario())
+
+
+def test_get_state_host_cache_reads_interval_from_cfg(surface: StubSurface, cfg: MpcConfig) -> None:
+    """``host.interval_s`` (section 7) gates the cache in ``create_app`` too, not
+    only the MQTT publisher: ``0`` refreshes on every request, the section's
+    default (5.0) does not move within one fast test."""
+    calls = {"n": 0}
+
+    def counting() -> dict:
+        calls["n"] += 1
+        return {"cpu_temp_c": float(calls["n"])}
+
+    async def scenario(host_section: dict, expected_calls: int) -> None:
+        app_cfg = AppConfig(mpc=cfg, host=host_section)
+        app = create_app(surface, app_cfg, auth=make_authenticator(), hostinfo=counting)
+        server = TestServer(app)
+        client = TestClient(server, **client_auth())
+        await client.start_server()
+        try:
+            for _ in range(3):
+                resp = await client.get("/api/state")
+                assert resp.status == 200
+        finally:
+            await client.close()
+        assert calls["n"] == expected_calls
+
+    calls["n"] = 0
+    _run(scenario({"interval_s": 0}, 3))
+    calls["n"] = 0
+    _run(scenario({}, 1))  # default 5.0 s: cached across three requests in one test
 
 
 def test_get_health_shape(surface: StubSurface) -> None:

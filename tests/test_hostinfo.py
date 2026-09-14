@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from aqua_bridge.hostinfo import (
+    CachedHostInfo,
     collect_hostinfo,
     read_cpu_temp_c,
     read_disk,
@@ -212,3 +213,79 @@ def test_collect_hostinfo_all_present(tmp_path: Path) -> None:
     assert info["uptime_s"] == pytest.approx(100.0)
     assert info["wifi_rssi_dbm"] == pytest.approx(-60.0)
     assert info["disk_used_pct"] is not None
+
+
+# --- CachedHostInfo ----------------------------------------------------------
+
+
+def test_cached_host_info_refreshes_at_the_configured_interval() -> None:
+    now = [0.0]
+    calls = {"n": 0}
+
+    def reader() -> dict:
+        calls["n"] += 1
+        return {"cpu_temp_c": float(calls["n"])}
+
+    cache = CachedHostInfo(interval_s=5.0, reader=reader, clock=lambda: now[0])
+    assert cache.get() == {"cpu_temp_c": 1.0}
+    assert calls["n"] == 1
+    now[0] = 4.9
+    assert cache.get() == {"cpu_temp_c": 1.0}  # still cached
+    assert calls["n"] == 1
+    now[0] = 5.0
+    assert cache.get() == {"cpu_temp_c": 2.0}  # interval elapsed exactly: refreshes
+    assert calls["n"] == 2
+
+
+def test_cached_host_info_zero_interval_refreshes_every_call() -> None:
+    calls = {"n": 0}
+
+    def reader() -> dict:
+        calls["n"] += 1
+        return {}
+
+    cache = CachedHostInfo(interval_s=0.0, reader=reader, clock=lambda: 0.0)
+    cache.get()
+    cache.get()
+    cache.get()
+    assert calls["n"] == 3
+
+
+def test_cached_host_info_reader_error_yields_empty_dict_never_raises() -> None:
+    def broken() -> dict:
+        raise RuntimeError("no /proc here")
+
+    cache = CachedHostInfo(reader=broken, clock=lambda: 0.0)
+    assert cache.get() == {}
+
+
+def test_cached_host_info_a_failed_refresh_keeps_the_previous_value_until_next_try() -> None:
+    now = [0.0]
+    state = {"ok": True}
+
+    def flaky() -> dict:
+        if state["ok"]:
+            return {"cpu_temp_c": 30.0}
+        raise RuntimeError("gone")
+
+    cache = CachedHostInfo(interval_s=1.0, reader=flaky, clock=lambda: now[0])
+    assert cache.get() == {"cpu_temp_c": 30.0}
+    state["ok"] = False
+    now[0] = 1.0
+    assert cache.get() == {}  # the failed refresh, not the stale good value
+    state["ok"] = True
+    now[0] = 2.0
+    assert cache.get() == {"cpu_temp_c": 30.0}
+
+
+def test_cached_host_info_negative_interval_is_clamped_to_zero() -> None:
+    calls = {"n": 0}
+
+    def reader() -> dict:
+        calls["n"] += 1
+        return {}
+
+    cache = CachedHostInfo(interval_s=-3.0, reader=reader, clock=lambda: 0.0)
+    cache.get()
+    cache.get()
+    assert calls["n"] == 2

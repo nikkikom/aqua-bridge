@@ -1,8 +1,9 @@
 """DAS-mode intents and views: ``SetLimit`` (``POST /api/limit``, MQTT ``cmd/limit``),
 ``SetBay`` (``POST /api/bay``, MQTT ``cmd/bay``), ``GET /api/estimate``, ``GET /api/bays``,
-``GET /api/model`` and the HA ``model_status`` / ``model_pred_err_c`` sensors,
-the Home Assistant drive entities and the DAS preset semantics (plan sections 4 and 7).
-Legacy configs keep ``/api/setpoint`` and the legacy presets unchanged.
+``GET /api/zones``, ``GET /api/model`` and the HA ``model_status`` / ``model_pred_err_c`` /
+``zone_status_<zone>`` sensors, the Home Assistant drive entities and the DAS preset
+semantics (plan sections 4, 7 and 8, items 22 and 24). Legacy configs keep
+``/api/setpoint`` and the legacy presets unchanged.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ from aqua_bridge.control.supervisor import (
     Supervisor,
     apply_preset,
 )
-from aqua_bridge.model import ConfigError, MpcConfig, MpcState
+from aqua_bridge.model import ConfigError, Mode, MpcConfig, MpcState
 from aqua_bridge.publishers.mqtt_ha import build_discovery_entities, command_topics, parse_command
 from das_fixtures import das_obs
 
@@ -614,6 +615,75 @@ def test_http_bay_estimate_and_bays_on_a_das_config(dcfg):
     assert "candidates" in bays["b01"]["estimator"]
 
 
+@needs_socket
+def test_http_zones_view_on_a_das_config(dcfg):
+    """§8 item 22: GET /api/zones -- per-zone trust, fault state and reasons, and
+    which of a zone's channels are currently under fallback policy."""
+    sup = Supervisor(dcfg)
+    state = MpcState.cold()
+    obs = das_obs(dcfg, 0.0, pwm=0.5)
+    cmd, state = step(obs, sup.effective_config(), state)
+    sup.record_tick(obs=obs, mpc_cmd=cmd, cmd=cmd, state=state, applied=True, usb_present=True)
+
+    ((status, body),) = asyncio.run(_post_all(sup, [("GET /api/zones", None)]))
+    assert status == 200
+    assert set(body) == {"zones", "zones_in_fault", "degraded"}
+    assert set(body["zones"]) == set(dcfg.topology.zones)
+    assert body["zones_in_fault"] == [] and body["degraded"] is False
+    for zone, info in body["zones"].items():
+        assert info["fault"] is False and info["policy"] == "solver"
+        assert info["channels_under_fallback"] == []
+        assert info["channels"] == list(dcfg.topology.zones[zone].channels)
+
+    # z3's only zone-air sensor drops: z3 faults; z2 (coupled_to z3) is not itself
+    # faulted but shares fallback-held channels, so it shows "coupled".
+    obs2 = das_obs(dcfg, dcfg.dt, pwm=cmd.pwm, drop=("air_z3",))
+    cmd2, state2 = step(obs2, sup.effective_config(), state)
+    sup.record_tick(obs=obs2, mpc_cmd=cmd2, cmd=cmd2, state=state2, applied=True, usb_present=True)
+    assert cmd2.mode is Mode.DEGRADED
+
+    ((status2, body2),) = asyncio.run(_post_all(sup, [("GET /api/zones", None)]))
+    assert status2 == 200
+    assert body2["zones_in_fault"] == ["z3"]
+    assert body2["degraded"] is True
+    diag = cmd2.diagnostics
+    fallback = set(diag["fallback_channels"])
+    for zone, info in body2["zones"].items():
+        zone_diag = diag["zones"][zone]
+        assert info["trusted"] == zone_diag["trusted"]
+        assert info["fault"] == zone_diag["fault"]
+        assert info["fault_reason"] == zone_diag["fault_reason"]
+        assert info["policy"] == zone_diag["policy"]
+        assert info["channels"] == zone_diag["channels"]
+        expected_fallback = [ch for ch in zone_diag["channels"] if ch in fallback]
+        assert info["channels_under_fallback"] == expected_fallback
+    assert body2["zones"]["z3"]["fault"] is True
+    assert body2["zones"]["z3"]["fault_reason"] == "sensor_gate"
+    assert body2["zones"]["z3"]["policy"] in ("hold", "ramp_high")
+    assert body2["zones"]["z3"]["channels_under_fallback"] == body2["zones"]["z3"]["channels"]
+    assert body2["zones"]["z2"]["fault"] is False and body2["zones"]["z2"]["in_closure"] is True
+    assert body2["zones"]["z2"]["policy"] == "coupled"
+    assert body2["zones"]["z0"]["fault"] is False and body2["zones"]["z0"]["policy"] == "solver"
+
+
+def test_mqtt_zone_status_entities_in_das_mode_only(dcfg, cfg):
+    entities = build_discovery_entities(
+        dcfg, node_id=NODE, discovery_prefix="homeassistant", control_mode=ControlMode.AUTO
+    )
+    by_id = {e.object_id: e for e in entities}
+    for zone in dcfg.topology.zones:
+        status = by_id[f"zone_status_{zone}"]
+        assert status.component == "sensor"
+        assert status.config_topic == f"homeassistant/sensor/{NODE}/zone_status_{zone}/config"
+        assert f"diagnostics.zones.{zone}.policy" in status.payload["value_template"]
+        assert "default('off')" in status.payload["value_template"]
+        assert "unit_of_measurement" not in status.payload and "state_class" not in status.payload
+    legacy = build_discovery_entities(
+        cfg, node_id=NODE, discovery_prefix="homeassistant", control_mode=ControlMode.AUTO
+    )
+    assert not any(e.object_id.startswith("zone_status_") for e in legacy)
+
+
 def test_mqtt_thermal_model_entities_in_das_mode_only(dcfg, cfg):
     entities = build_discovery_entities(
         dcfg, node_id=NODE, discovery_prefix="homeassistant", control_mode=ControlMode.AUTO
@@ -664,14 +734,16 @@ def test_http_estimate_and_bays_on_a_legacy_config_are_404(cfg):
             [
                 ("GET /api/estimate", None),
                 ("GET /api/bays", None),
+                ("GET /api/zones", None),
                 ("/api/bay", {"bay": "b01", "occupied": True}),
                 ("GET /api/model", None),
             ],
         )
     )
-    assert [s for s, _ in results] == [404, 404, 400, 404]
+    assert [s for s, _ in results] == [404, 404, 404, 400, 404]
     assert "DAS config" in results[0][1]["error"]
-    assert "DAS config" in results[3][1]["error"]
+    assert "DAS config" in results[2][1]["error"]
+    assert "DAS config" in results[4][1]["error"]
 
 
 @needs_socket
