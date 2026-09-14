@@ -2760,46 +2760,6 @@ them as "§8 item N".
 
 ### 8.2 Open — no DAS hardware needed (dev machine, CI, the Pi, the PC)
 
-1. **Done:** the PI-like DAS error is now `max(t̂ − soft)`, counting `k·σ` once inside `soft`. PI-like DAS: count `k·σ` once. The per-channel error becomes
-   `max(t̂ − soft)` with `soft = limit − comfort − k·σ` (today `k·σ` is also
-   added to `t̂`). Regenerate only the DAS goldens `das_*.pi_das.json`; keep
-   every per-zone invariant.
-2. **Done:** `tests/test_hw_xt6.py::test_live_read_and_writeback` no
-   longer writes `0.0` to a channel whose PWM read returns `None`; such
-   channels are excluded from the write-back and reported, and the test
-   skips with a clear reason if none is readable. **Must land before item 36.**
-3. **Done:** a zoned sensor's Stuck evidence is now its zone's relative airflow (`stuck_airflow_net`, void for a proximal sensor when the zone air moved against it by more than `stuck_air_oppose_c`) and a proximal sensor's siblings are on its own bay (§3). False zone fault on a healthy enclosure: the Stuck rule's sibling
-   evidence faults a zone when an idle bay's DS18B20 stays inside its
-   1.5-LSB band for `stuck_s` while a sibling's activity changes and the
-   controller compensates (about one in three 75-minute `sim/das.py`
-   runs). Fix the evidence rule; regression: long DAS sim runs with zero
-   false zone faults.
-4. **Done:** the API and page are served only over HTTPS with basic auth (§6), with `tools/http_user.py` for users and a self-signed certificate from `install-pi.sh`.
-   HTTPS with basic auth for the API and the page: certificate and key
-   paths in `http:`, hashed credentials in a root-owned 0640 file under
-   `/etc/aqua-bridge`, every route authenticated, plain HTTP refused.
-   Document that the MQTT counterparts (`cmd/bay`, `cmd/limit`,
-   `cmd/ident`) rely on broker authentication.
-5. **Done:** Runtime budget alarm: `control/loop.py` logs a
-   rate-limited warning past `mpc.budget_ms` and error past
-   `mpc.budget_alarm_ms`, both now config keys, with `step_ms_last` /
-   `step_ms_max` / exceedance counters in `/api/health` and the MQTT state
-   blob.
-6. **Done:** The relative budget gate in CI is thin (DAS MPC p99
-   9–11× the legacy MPC against 12×); `tests/test_bench_budget.py` now
-   interleaves, discards a warm-up repeat and gates on the 75th percentile
-   of several per-repeat ratios instead of one min/min pair.
-7. **Done:** `install-pi.sh --das` installs `config.example-das.yaml` and the `deploy/aqua-bridge-das.conf` systemd drop-in (`ExecStart=` with `--source hwmon`); without `--das` the legacy path is unchanged.
-8. **Done:** `zones.trust_rule: sigma` now trusts a zone on this tick's estimator σ (`sigma_fault_c`, `sigma_air_fault_c`) instead of its drive and air sensor groups, so a lost sensor widens the margin and only a σ past its threshold faults the zone (§3 per-zone trust). `zones.trust_rule: sigma` (zone trust from the estimator's σ); the
-   config accepts it, `strict` applies today.
-9. **Done:** a sensor whose value the gate rejects now confirms over
-   `confirm_ticks` on its own (§3 Sensor confirmation) and stays out of the
-   estimator until then, while its group stays trusted through the others.
-   A Jump on a redundant group member was accepted after one tick without
-   `confirm_ticks`.
-10. **Done:** the return from the model fallback checks the drift relative to the drives' observed rate, with `model_return_factor`, `model_return_dwell_s` and `model_drift_rate_tau_s` as config keys, so a sound model returns about 5 minutes after a load step (§3, validity gate and model fallback). The drift check's hysteresis can hold the PI-DAS model fallback for
-    tens of minutes after a load step (return threshold 0.25 °C/min against
-    0.26–0.29 °C/min physical transients); tune it.
 11. The prediction-error guard also scores drives in faulted zones (extra,
     louder fallbacks only); restrict it to eligible zones.
 12. Reset a bay's thermal coefficients on a hot swap to a different drive
@@ -2814,7 +2774,7 @@ them as "§8 item N".
 16. A switch that freezes online adaptation of a converged model (today
     only a fresh store file loads zones `frozen`).
 17. Estimator accuracy on the `rich` sim preset: calibrated estimates up to
-    2 °C off make the MPC up to 1.21× the uniform-curve noise.
+    2 °C off make the MPC up to 1.30× the uniform-curve noise.
 18. Serial → bay association: a wrong correlation pair can still feed
     another drive's SMART into a bay's calibration (bounded by
     `smart_reject_c`); tighten acceptance.
@@ -2836,7 +2796,7 @@ them as "§8 item N".
 24. HTML page: drive estimates, bays, zone and model status (the JSON views
     exist).
 25. HTML Host section shows dashes: `/api/state` carries no host metrics.
-26. CI time: `test (latest)` reaches 10–10.5 min on slow runners against
+26. CI time: `test (latest)` reaches 10–11 min on slow runners against
     the 11-minute guideline; move heavy PR tests to `nightly` or split the
     job.
 27. Test gap: the DS18B20 plateau test uses an 1800 s sine, so no plateau
@@ -2847,6 +2807,85 @@ them as "§8 item N".
     and `fit_fans` a later milestone; `FanSpec` says `forbidden_pwm` is not
     honoured.
 30. README: bring-up on a fresh Pi (checklist §10).
+53. Experiments count `k·σ` twice: `control/ident.py` checks `T̂ + k·σ`
+    against `soft` and `hard`, which already subtract `k·σ`. Now that
+    PI-like DAS settles at `soft`, a settled enclosure is refused by the
+    start band (`ident_start_band_c`) and sits on the `ident_max_over_c`
+    abort edge; the module docstring is also stale.
+54. `control/ident.py` hardcodes `ABORT_BELOW_LIMIT_C = 1.0` (the
+    absolute abort margin below the limit); make it a config key.
+55. The nightly noise sweep runs calibrated PI-like DAS but never
+    asserts zero true limit violations; PI-like DAS now runs closer to
+    the limit.
+56. HTTPS auth cost on the Zero W: one PBKDF2 check at
+    `http.hash_iterations: 100000` takes 1.15–1.4 s on the single core.
+    Clients on many source addresses (easy with IPv6) can each force an
+    uncached check; bound the global rate of uncached checks and choose
+    a Zero W default for the iteration count.
+57. `http.enabled: "true"` as a string silently leaves the API off with
+    no log line; validate booleans in the `http:` section (and other
+    sections read with `is True`).
+58. Stuck detection gap after item 3: a proximal reading frozen while
+    its zone's airflow stays within `stuck_airflow_net` (fans pinned at
+    `pwm_max`, slow trims) is no longer flagged; on the `rich` sim 21 of
+    48 frozen readings are flagged against 48 before. Add evidence such
+    as a zone-air move at constant airflow or SMART diverging from the
+    proximal reading.
+59. `mpc.stuck_air_oppose_c` has no upper bound on how far the zone air
+    may move while a plateau still counts as plausible.
+60. The Stuck rule's quarter-window lag is hardcoded as `stuck_ticks //
+    4` in `control/gate.py` (legacy too); make it a config key (for
+    example a lag fraction, default 0.25, legacy bit for bit).
+61. A redundant sensor missing since boot has no reference value, so its
+    first reading passes the slew check and is fused at once without
+    confirmation.
+62. `src/aqua_bridge/recorder.py` still records a sensor while it is
+    confirming; skip the names in `diagnostics["sensor_confirm"]`.
+63. `diagnostics["gate"]["per_temp"]` shows a confirming sensor as
+    trusted, so HTTP and MQTT show it trusted while the estimator
+    ignores it.
+64. Model-fallback flapping: after a return, the DAS MPC lowers the
+    fans, drives warm faster than the plain-drift entry threshold, and
+    the gate re-enters the fallback, often within 40 s. The entry check
+    should not treat the MPC's own quieter move as a model fault.
+65. On the `rich` sim the drift entry check trips on the drives'
+    physical warm-up right after `bay_settle_s` on about half the seeds.
+66. The drift check cannot see errors in the fan gains `E` (they only
+    change air-node dynamics): a fouling jump to 0.3–0.5× airflow causes
+    no model fallback.
+67. Sigma trust with two proximal sensors on one bay at different
+    placements: the estimator fuses both into one sensor node, their
+    disagreement trips the fast-swap rule every tick and the bay's σ
+    stays at 4–7 °C, which faults healthy zones on the `rich` sim.
+    `trust_rule: sigma` is not usable with the example's redundant pairs
+    until this is fixed.
+68. Owner decision: the sigma floor (a zone with a lost sensor group
+    keeps its fans at or above `prev`) ratchets the DAS MPC's fans up
+    until the zone faults when a bay's only sensor is lost for good
+    (32.5 dB against 27.1 dB without the floor). A softer floor, for
+    example one that ends after σ has grown by a set amount, is
+    possible.
+69. Under `sigma` a hot swap faults its zone for 1 tick plus
+    `confirm_ticks` (the estimator's deliberate variance inflation), and
+    a sensor missing on the estimator's first tick trips the fast-swap
+    rule when it returns.
+70. `estimator.sigma_air_fault_c` almost never decides: with every
+    sensor of a zone lost the air σ stays below 0.35 °C, and only drive
+    σ faults a blind zone (after about 17 min, or 44 min for a bay's
+    only sensor).
+71. Hardcoded estimator tunables: `RESET_DRIVE_VAR`, `JUMP_MIN_C`,
+    `JUMP_SIGMAS`, the `P0_*` values and `SIGMA_UNCALIBRATED_C`; make
+    them config keys.
+72. Under `sigma`, an identification experiment can start in a zone that
+    has a lost sensor, because the zone is still trusted
+    (`control/ident.py` precondition).
+73. DAS step budget on the Zero W after items 3, 8, 9 and 10: DAS MPC
+    p99 609–615 ms (solve ticks 643 ms) against `mpc.budget_ms` 600, so
+    `pytest -m pi` fails again (it was 507–552 ms). PI-like DAS p99 322
+    ms. Decide between optimising (the estimator now runs before zone
+    trust every tick), `mpc_every_ticks: 3`, or a higher budget. The
+    20-minute daemon run used the example's PI-like DAS, so the runtime
+    alarm has not run against the DAS MPC on the Pi.
 
 ### 8.3 Open — needs the DAS hardware
 
@@ -2905,6 +2944,49 @@ them as "§8 item N".
     demand, which the Zero 2 W's compute allows every tick.
 
 ### 8.5 Done
+
+#### Finished from §8.2 (2026-09-14)
+
+1. **Done:** the PI-like DAS error is now `max(t̂ − soft)`, counting `k·σ` once inside `soft`. PI-like DAS: count `k·σ` once. The per-channel error becomes
+   `max(t̂ − soft)` with `soft = limit − comfort − k·σ` (today `k·σ` is also
+   added to `t̂`). Regenerate only the DAS goldens `das_*.pi_das.json`; keep
+   every per-zone invariant.
+2. **Done:** `tests/test_hw_xt6.py::test_live_read_and_writeback` no
+   longer writes `0.0` to a channel whose PWM read returns `None`; such
+   channels are excluded from the write-back and reported, and the test
+   skips with a clear reason if none is readable. **Must land before item 36.**
+3. **Done:** a zoned sensor's Stuck evidence is now its zone's relative airflow (`stuck_airflow_net`, void for a proximal sensor when the zone air moved against it by more than `stuck_air_oppose_c`) and a proximal sensor's siblings are on its own bay (§3). False zone fault on a healthy enclosure: the Stuck rule's sibling
+   evidence faults a zone when an idle bay's DS18B20 stays inside its
+   1.5-LSB band for `stuck_s` while a sibling's activity changes and the
+   controller compensates (about one in three 75-minute `sim/das.py`
+   runs). Fix the evidence rule; regression: long DAS sim runs with zero
+   false zone faults.
+4. **Done:** the API and page are served only over HTTPS with basic auth (§6), with `tools/http_user.py` for users and a self-signed certificate from `install-pi.sh`.
+   HTTPS with basic auth for the API and the page: certificate and key
+   paths in `http:`, hashed credentials in a root-owned 0640 file under
+   `/etc/aqua-bridge`, every route authenticated, plain HTTP refused.
+   Document that the MQTT counterparts (`cmd/bay`, `cmd/limit`,
+   `cmd/ident`) rely on broker authentication.
+5. **Done:** Runtime budget alarm: `control/loop.py` logs a
+   rate-limited warning past `mpc.budget_ms` and error past
+   `mpc.budget_alarm_ms`, both now config keys, with `step_ms_last` /
+   `step_ms_max` / exceedance counters in `/api/health` and the MQTT state
+   blob.
+6. **Done:** The relative budget gate in CI is thin (DAS MPC p99
+   9–11× the legacy MPC against 12×); `tests/test_bench_budget.py` now
+   interleaves, discards a warm-up repeat and gates on the 75th percentile
+   of several per-repeat ratios instead of one min/min pair.
+7. **Done:** `install-pi.sh --das` installs `config.example-das.yaml` and the `deploy/aqua-bridge-das.conf` systemd drop-in (`ExecStart=` with `--source hwmon`); without `--das` the legacy path is unchanged.
+8. **Done:** `zones.trust_rule: sigma` now trusts a zone on this tick's estimator σ (`sigma_fault_c`, `sigma_air_fault_c`) instead of its drive and air sensor groups, so a lost sensor widens the margin and only a σ past its threshold faults the zone (§3 per-zone trust). `zones.trust_rule: sigma` (zone trust from the estimator's σ); the
+   config accepts it, `strict` applies today.
+9. **Done:** a sensor whose value the gate rejects now confirms over
+   `confirm_ticks` on its own (§3 Sensor confirmation) and stays out of the
+   estimator until then, while its group stays trusted through the others.
+   A Jump on a redundant group member was accepted after one tick without
+   `confirm_ticks`.
+10. **Done:** the return from the model fallback checks the drift relative to the drives' observed rate, with `model_return_factor`, `model_return_dwell_s` and `model_drift_rate_tau_s` as config keys, so a sound model returns about 5 minutes after a load step (§3, validity gate and model fallback). The drift check's hysteresis can hold the PI-DAS model fallback for
+    tens of minutes after a load step (return threshold 0.25 °C/min against
+    0.26–0.29 °C/min physical transients); tune it.
 
 #### Docs / repo
 
