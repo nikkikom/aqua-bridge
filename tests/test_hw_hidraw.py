@@ -48,9 +48,9 @@ def _hidraw(root: Path, name: str, product: int | None, interface: int, serial: 
 @pytest.fixture
 def sysfs(tmp_path: Path) -> Path:
     root = tmp_path / "sys" / "class" / "hidraw"
-    _hidraw(root, "hidraw0", 0xF001, 0, "12345-67890")  # aquaero keyboard interface
-    _hidraw(root, "hidraw1", 0xF001, 1, "12345-67890")  # aquaero mouse interface
-    _hidraw(root, "hidraw10", 0xF001, 2, "12345-67890")  # aquaero status/control
+    _hidraw(root, "hidraw0", 0xF001, 0, "12345-54321")  # aquaero keyboard interface
+    _hidraw(root, "hidraw1", 0xF001, 1, "12345-54321")  # aquaero mouse interface
+    _hidraw(root, "hidraw10", 0xF001, 2, "12345-54321")  # aquaero status/control
     _hidraw(root, "hidraw2", 0xF00D, 1, "00000-11111")  # Quadro
     _hidraw(root, "hidraw3", None, 0)  # some other HID device
     (root / "hidraw4").mkdir()  # no uevent: skipped
@@ -68,7 +68,7 @@ def test_list_hidraw_devices_in_number_order(sysfs: Path, tmp_path: Path) -> Non
     aquaero = devices[-1]
     assert aquaero.node == tmp_path / "dev" / "hidraw10"
     assert (aquaero.vendor_id, aquaero.product_id, aquaero.interface) == (0x0C70, 0xF001, 2)
-    assert aquaero.serial == "12345-67890"
+    assert aquaero.serial == "12345-54321"
     assert devices[3].vendor_id is None and devices[3].serial == ""
 
 
@@ -85,12 +85,12 @@ def test_find_device_picks_the_status_interface(sysfs: Path, tmp_path: Path) -> 
 
 def test_find_device_by_serial(sysfs: Path) -> None:
     _hidraw(sysfs, "hidraw11", 0xF001, 2, "99999-00001")
-    with pytest.raises(AmbiguousDevice, match=r"\['12345-67890', '99999-00001'\]") as info:
+    with pytest.raises(AmbiguousDevice, match=r"\['12345-54321', '99999-00001'\]") as info:
         find_device(AQUAERO, sysfs_root=sysfs)
     assert "serial:" in str(info.value)
     assert isinstance(info.value, DeviceUnavailable)
     assert find_device(AQUAERO, "99999-00001", sysfs_root=sysfs).name == "hidraw11"
-    assert find_device(AQUAERO, "12345-67890", sysfs_root=sysfs).name == "hidraw10"
+    assert find_device(AQUAERO, "12345-54321", sysfs_root=sysfs).name == "hidraw10"
 
 
 def test_find_device_not_found(sysfs: Path, tmp_path: Path) -> None:

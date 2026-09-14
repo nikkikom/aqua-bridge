@@ -67,7 +67,7 @@ class FakeController:
     kind: DeviceKind
     clock: FakeClock
     node: str = "/dev/hidraw3"
-    serial: str = "12345-67890"
+    serial: str = "12345-54321"
     ctrl: bytearray = field(default_factory=bytearray)
     status_template: bytes = b""
     #: Output duty reported instead of what the control report says, per channel index.
@@ -81,6 +81,12 @@ class FakeController:
     closed: bool = False
     #: wait_readable() makes a report arrive after this many seconds (None: never).
     report_delay_s: float | None = None
+    #: Seconds each feature report operation takes (advances the clock).
+    op_delay_s: float = 0.0
+    #: Serial written into status reports (None: the HID serial above).
+    status_serial: str | None = None
+    #: The Quadro/aquaero ignores writes to these channels and keeps this duty (start boost).
+    ignores: dict[int, int] = field(default_factory=dict)
     open_count: int = 0
 
     def __post_init__(self) -> None:
@@ -108,6 +114,8 @@ class FakeController:
     def output_duty(self, k: int) -> int:
         if k in self.duty_override:
             return self.duty_override[k]
+        if k in self.ignores:
+            return self.ignores[k]
         state = channel_state(self.kind, self.ctrl, k)
         if state.on_duty:
             return state.duty
@@ -119,6 +127,10 @@ class FakeController:
         layout = self.kind.fan_layout
         for k, base in enumerate(self.kind.fan_blocks):
             _put_u16(buf, base + layout.duty, self.output_duty(k))
+        serial = self.status_serial if self.status_serial is not None else self.serial
+        first, second = (int(part) for part in serial.split("-"))
+        _put_u16(buf, self.kind.serial_offset, first)
+        _put_u16(buf, self.kind.serial_offset + 2, second)
         if self.kind.power_cycles_offset is not None and self.power_cycles is not None:
             offset = self.kind.power_cycles_offset
             buf[offset : offset + 4] = self.power_cycles.to_bytes(4, "big")
@@ -130,6 +142,11 @@ class FakeController:
 
     def sets(self) -> list[Op]:
         return [op for op in self.ops if op.what == "set"]
+
+    def last_set_duties(self) -> list[int]:
+        from aqua_bridge.hw.aquacomputer import control_duty
+
+        return [control_duty(self.kind, self.sets()[-1].data, k) for k in range(4)]
 
     def gets(self) -> list[Op]:
         return [op for op in self.ops if op.what == "get"]
@@ -163,6 +180,7 @@ class FakeController:
     def get_feature(self, report_id: int, size: int) -> bytes:
         self._check_usable()
         assert (report_id, size) == (self.kind.ctrl_report_id, self.kind.ctrl_size)
+        self.clock.advance(self.op_delay_s)
         self.ops.append(Op("get", self.clock(), b""))
         if self.failures:
             raise self.failures.pop(0)
@@ -171,6 +189,7 @@ class FakeController:
     def set_feature(self, data: bytes) -> None:
         self._check_usable()
         what = "set" if data[0] == self.kind.ctrl_report_id else "secondary"
+        self.clock.advance(self.op_delay_s)
         self.ops.append(Op(what, self.clock(), bytes(data)))
         if self.failures:
             raise self.failures.pop(0)

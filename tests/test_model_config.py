@@ -247,14 +247,17 @@ def test_example_configs_show_every_timing_key_at_its_default(
     example_config_path, example_das_config_path
 ):
     """The example files document each controller timing key with the one default
-    the config model holds (AquacomputerTiming)."""
+    the config model holds for that device kind (AquacomputerTiming.for_kind)."""
     from aqua_bridge.hw.aquacomputer_adapter import TIMING_KEYS, AquacomputerTiming
 
-    defaults = dataclasses.asdict(AquacomputerTiming())
     legacy = load_config(example_config_path).xt6
-    das = load_config(example_das_config_path).aquacomputer[0]
-    for entry in (legacy, das):
-        assert {key: entry[key] for key in TIMING_KEYS} == defaults
+    aquaero, quadro = load_config(example_das_config_path).aquacomputer
+    for entry in (legacy, aquaero, quadro):
+        defaults = dataclasses.asdict(AquacomputerTiming.for_kind(entry["device"]))
+        shown = {key: entry[key] for key in TIMING_KEYS if key in entry}
+        assert shown == {key: defaults[key] for key in shown}
+    assert set(TIMING_KEYS) <= set(legacy) and set(TIMING_KEYS) <= set(aquaero)
+    assert "ctrl_gap_ms" in quadro  # the kind-dependent default is shown for both kinds
 
 
 def test_digole_enabled_bad_type_logs_a_warning_and_does_not_raise(cfg, caplog):

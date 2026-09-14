@@ -5,44 +5,60 @@
 :class:`~aqua_bridge.hw.sources.CompositeSource` use. The Linux hwmon driver
 is not involved: through hwmon every ``pwmN`` read cost 210 ms and every write
 420 ms, about 5 s per tick with 8 outputs (PROJECT.md section 2). Here a read
-drains the unsolicited status report (about 1 ms) and a changed command is one
-control report SET per controller.
+drains the unsolicited status report (2 ms on the Pi) and a changed command is
+one control report SET per controller (9-13 ms).
 
 Reading
     Every ``read()`` drains the input reports and uses the newest status
     report: temperatures in degC (``None`` where nothing is connected), rpm,
     and ``obs.pwm`` from the status report's *output duty* -- what the device
-    actually drives, not the cached command. No status report for longer than
-    ``status_max_age_s`` raises :class:`~aqua_bridge.hw.hidraw.DeviceUnavailable`
-    (the loop's blank-observation fallback ramps the fans up). A vanished node
-    closes the device; the next call finds it again, possibly as a new
-    ``hidrawN``, and waits up to ``status_max_age_s`` for its first report.
+    actually drives, not the cached command. A report's age is known to one
+    read: it counts as received when the queue is drained. The kernel queue
+    holds 63 reports and drops new ones while full, so a drain that returns a
+    full queue proves nothing about the present: those reports are discarded
+    (no status time, no duty evidence) and the queue is read once more. No
+    status report for longer than ``status_max_age_s`` raises
+    :class:`~aqua_bridge.hw.hidraw.DeviceUnavailable` (the loop's
+    blank-observation fallback ramps the fans up). After an open, the first
+    ``read()`` waits up to ``status_max_age_s`` for a report; later reads never
+    block. A vanished node closes the device; the next call finds it again,
+    possibly as a new ``hidrawN``. With ``serial:`` configured, a first status
+    report carrying another serial closes the device and raises.
 
 Writing
-    The control report is read (GET) once after opening and kept as a cache;
-    a normal tick does no control read. ``apply()`` writes nothing when every
-    configured channel already holds its duty (and, on the aquaero, follows
-    its preset with limits 0 / 100 %); otherwise it patches every changed
-    channel into the cached report and sends one SET plus the secondary
-    report. Before any control operation it waits until ``ctrl_gap_ms`` has
-    passed since the previous SET. A failed operation invalidates the cache
-    and is retried from a fresh GET up to ``ctrl_retries`` times, then raises
-    ``DeviceUnavailable``.
+    ``apply()`` opens the node without waiting for a status report, so the
+    fallback ramp and the stop write reach a device whose status reports have
+    stopped. The control report is read (GET) once after opening and kept as a
+    cache; a normal tick does no control read. A channel is written when its
+    duty rises (cooling never waits) or when it does not follow its duty at
+    all; a fall is written only when it is at least ``write_deadband`` below
+    the written duty and ``write_min_interval_s`` has passed since this
+    device's last write (flash wear, PROJECT.md section 8 item 77). Any write
+    carries every channel with a pending change, as one SET plus the secondary
+    report. Before every GET or SET the adapter waits ``ctrl_gap_ms`` after the
+    previous control operation, failed ones included (the secondary report
+    follows its SET at once). A failed operation invalidates the cache and is
+    retried from a fresh GET up to ``ctrl_retries`` times; no control operation
+    starts once ``ctrl_budget_s`` of this call is spent. Either way
+    ``DeviceUnavailable`` is raised.
 
 Keeping the cache honest
-    The status report shows speed, duty, voltage, current and power every
-    second, so drift of the fans themselves is visible without a control read.
-    What a one-time read misses is a configuration changed behind the daemon's
-    back (front panel, aquasuite, liquidctl, a controller reset):
+    Speed, duty, voltage, current and power arrive in every status report, so
+    drift of the fans themselves is visible without a control read. What a
+    one-time read misses is a configuration changed behind the daemon's back
+    (front panel, aquasuite, liquidctl, a controller reset):
 
-    a) for every channel this adapter commands, a status duty further than
-       ``duty_mismatch_tolerance`` from the command for longer than
-       ``duty_mismatch_s`` (counted from the later of the mismatch start and
-       the last SET, on reports received after that SET) invalidates the
-       cache and makes the next ``apply()`` GET and rewrite every channel;
-    b) a change of the Quadro's power-cycle count does the same;
-    c) every ``ctrl_refresh_s`` (0 disables) ``apply()`` GETs the report
-       again and rewrites any commanded channel that no longer holds its duty.
+    a) per channel, a status duty further than ``duty_mismatch_tolerance``
+       from the duty written to the device, on reports received after that
+       channel's last change, for longer than ``duty_mismatch_s`` invalidates
+       the cache and makes the next ``apply()`` GET and rewrite every channel.
+       A channel that mismatches again after that rewrite is logged once as an
+       error and listed in ``stuck_channels``; it is not rewritten for the
+       mismatch again until the device reports its duty (its normal writes on
+       a changed command continue);
+    b) a change of the Quadro's power-cycle count invalidates the same way;
+    c) every ``ctrl_refresh_s`` (0 disables) ``apply()`` GETs the report again
+       and rewrites any channel that no longer holds its duty.
 
 Releasing
     ``release()`` restores, for every channel this adapter has written, the
@@ -62,6 +78,7 @@ import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, TypeVar
 
 from aqua_bridge.hw.aquacomputer import (
@@ -73,6 +90,7 @@ from aqua_bridge.hw.aquacomputer import (
     StatusReport,
     capture_channel,
     channel_holds,
+    channel_state,
     check_control_report,
     decode_status,
     finalize_control_report,
@@ -81,6 +99,8 @@ from aqua_bridge.hw.aquacomputer import (
     restore_channel,
 )
 from aqua_bridge.hw.hidraw import (
+    HIDRAW_QUEUE_FULL,
+    USB_CTRL_TIMEOUT_S,
     DeviceUnavailable,
     FeatureReportError,
     HidTransport,
@@ -89,7 +109,9 @@ from aqua_bridge.hw.hidraw import (
 from aqua_bridge.model import ConfigError, MpcCommand, PlantObservation
 
 __all__ = [
+    "CTRL_RETRIES_MAX",
     "ENTRY_KEYS",
+    "KIND_TIMING_DEFAULTS",
     "TIMING_KEYS",
     "AquacomputerAdapter",
     "AquacomputerTiming",
@@ -97,6 +119,7 @@ __all__ = [
     "DeviceUnavailable",
     "Opener",
     "build_adapter_from_config",
+    "check_watchdog",
     "parse_device_section",
 ]
 
@@ -112,40 +135,86 @@ _T = TypeVar("_T")
 # Configuration model
 # ---------------------------------------------------------------------------
 
+#: Validation bound of ``ctrl_retries``: with ``ctrl_budget_s`` limiting the
+#: time, more retries only add log lines.
+CTRL_RETRIES_MAX = 5
 
-@dataclass(frozen=True)
+#: The timing defaults that depend on the device kind (owner decision
+#: 2026-09-15, measured on the Pi: aquaero writes back to back fail with EPIPE
+#: at 0 and 25 ms, none at 50-150 ms; the Quadro needs no gap).
+KIND_TIMING_DEFAULTS: Mapping[str, Mapping[str, Any]] = MappingProxyType(
+    {
+        "aquaero": MappingProxyType({"ctrl_gap_ms": 100.0}),
+        "quadro": MappingProxyType({"ctrl_gap_ms": 0.0}),
+    }
+)
+
+
+@dataclass(frozen=True, kw_only=True)
 class AquacomputerTiming:
-    """Operator-tunable timing of one device; each default is the documented one
-    (config.example.yaml, config.example-das.yaml, PROJECT.md section 3)."""
+    """Operator-tunable timing of one device. Every default is declared here once,
+    ``ctrl_gap_ms`` per kind in :data:`KIND_TIMING_DEFAULTS`; build one with
+    :meth:`for_kind` (documented in both example configs and PROJECT.md section 3)."""
 
+    #: Wait after a control operation before the next GET or SET, ms (>= 0); per kind.
+    ctrl_gap_ms: float
     #: A status report older than this is no observation, seconds (> 0).
     status_max_age_s: float = 3.0
-    #: Wait after a control report SET before the next control operation, ms (>= 0).
-    ctrl_gap_ms: float = 200.0
-    #: Retries of a failed control operation, each from a fresh GET (int >= 0).
+    #: Retries of a failed control operation, each from a fresh GET (int 0..5).
     ctrl_retries: int = 1
+    #: No control operation starts once this much of one apply() is spent, seconds (> 0).
+    ctrl_budget_s: float = 5.0
     #: Read the control report again this often, seconds (>= 0; 0 disables).
     ctrl_refresh_s: float = 60.0
-    #: Status duty further than this from the command is a mismatch, centi-percent.
+    #: Status duty further than this from the written duty is a mismatch, centi-percent.
     duty_mismatch_tolerance: int = 100
     #: A mismatch lasting longer than this rewrites the channels, seconds (> 0).
     duty_mismatch_s: float = 5.0
+    #: A falling duty is written at most this often per device, seconds (>= 0).
+    write_min_interval_s: float = 30.0
+    #: A falling duty is written only this far below the written one, centi-percent.
+    write_deadband: int = 50
 
     def __post_init__(self) -> None:
-        _number("status_max_age_s", self.status_max_age_s, positive=True)
         _number("ctrl_gap_ms", self.ctrl_gap_ms, positive=False)
-        _integer("ctrl_retries", self.ctrl_retries, 0, None)
+        _number("status_max_age_s", self.status_max_age_s, positive=True)
+        _integer("ctrl_retries", self.ctrl_retries, 0, CTRL_RETRIES_MAX)
+        _number("ctrl_budget_s", self.ctrl_budget_s, positive=True)
         _number("ctrl_refresh_s", self.ctrl_refresh_s, positive=False)
         _integer("duty_mismatch_tolerance", self.duty_mismatch_tolerance, 0, DUTY_MAX)
         _number("duty_mismatch_s", self.duty_mismatch_s, positive=True)
+        _number("write_min_interval_s", self.write_min_interval_s, positive=False)
+        _integer("write_deadband", self.write_deadband, 0, DUTY_MAX)
 
     @classmethod
-    def from_section(cls, section: Mapping[str, Any], label: str) -> AquacomputerTiming:
+    def for_kind(cls, kind: DeviceKind | str, **overrides: Any) -> AquacomputerTiming:
+        """The defaults for ``kind`` with ``overrides`` applied."""
+        name = kind if isinstance(kind, str) else kind.name
+        return cls(**{**KIND_TIMING_DEFAULTS[name], **overrides})
+
+    @classmethod
+    def from_section(
+        cls, section: Mapping[str, Any], label: str, kind: DeviceKind
+    ) -> AquacomputerTiming:
         values = {f.name: section[f.name] for f in dataclasses.fields(cls) if f.name in section}
         try:
-            return cls(**values)
+            return cls.for_kind(kind, **values)
         except ConfigError as exc:
             raise ConfigError(f"{label}.{exc}") from exc
+
+    def worst_case_tick_s(self) -> float:
+        """The longest one ``read()`` plus one ``apply()`` of this device can block.
+
+        ``read()`` waits up to ``status_max_age_s`` for the first report after an
+        open; ``apply()`` starts no control operation after ``ctrl_budget_s``,
+        but one started just before can still block for a usbhid control
+        transfer timeout (or a gap wait, whichever is longer).
+        """
+        return (
+            self.status_max_age_s
+            + self.ctrl_budget_s
+            + max(USB_CTRL_TIMEOUT_S, self.ctrl_gap_ms / 1000.0)
+        )
 
 
 TIMING_KEYS: tuple[str, ...] = tuple(f.name for f in dataclasses.fields(AquacomputerTiming))
@@ -167,13 +236,34 @@ def _integer(name: str, value: Any, minimum: int, maximum: int | None) -> None:
     raise ConfigError(f"{name} must be an integer {bound}, got {value!r}")
 
 
+def check_watchdog(
+    timings: Sequence[tuple[str, AquacomputerTiming]], watchdog_s: float | None
+) -> None:
+    """Raises :class:`ConfigError` when the devices' worst-case blocking per tick
+    (:meth:`AquacomputerTiming.worst_case_tick_s`, summed) is not below the
+    systemd watchdog: a tick that long would get the daemon killed without its
+    ``fallback_pwm`` stop write. ``watchdog_s`` ``None`` (no watchdog) skips it."""
+    if watchdog_s is None:
+        return
+    parts = [(label, timing.worst_case_tick_s()) for label, timing in timings]
+    total = sum(worst for _, worst in parts)
+    if total >= watchdog_s:
+        detail = ", ".join(f"{label} {worst:g} s" for label, worst in parts)
+        raise ConfigError(
+            f"the controllers can block one tick for {total:g} s ({detail}: status_max_age_s "
+            f"+ ctrl_budget_s + one {USB_CTRL_TIMEOUT_S:g} s control transfer each), not below "
+            f"the systemd watchdog of {watchdog_s:g} s; lower those keys or raise WatchdogSec"
+        )
+
+
 @dataclass(frozen=True)
 class DeviceBinding:
     """Which device, and where the logical names live on it.
 
     ``pwm_map`` is channel -> output number (``pwmN``), ``fan_map`` channel ->
     ``fanN`` (keys must be ``pwm_map`` channels), ``temp_map`` logical
-    temperature -> ``tempN``. Numbers are 1-based as in the config.
+    temperature -> ``tempN``. Numbers are 1-based as in the config. ``timing``
+    defaults to :meth:`AquacomputerTiming.for_kind`.
     """
 
     kind: DeviceKind
@@ -181,9 +271,11 @@ class DeviceBinding:
     fan_map: Mapping[str, int] = field(default_factory=dict)
     temp_map: Mapping[str, int] = field(default_factory=dict)
     serial: str | None = None
-    timing: AquacomputerTiming = field(default_factory=AquacomputerTiming)
+    timing: AquacomputerTiming = None  # type: ignore[assignment]  # set in __post_init__
 
     def __post_init__(self) -> None:
+        if self.timing is None:
+            object.__setattr__(self, "timing", AquacomputerTiming.for_kind(self.kind))
         kind = self.kind
         for what, mapping, count in (
             ("pwm", self.pwm_map, kind.pwm_count),
@@ -211,6 +303,14 @@ class DeviceBinding:
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
+
+
+class _BudgetSpent(Exception):
+    """``ctrl_budget_s`` ran out before ``operation`` could start."""
+
+    def __init__(self, operation: str) -> None:
+        super().__init__(operation)
+        self.operation = operation
 
 
 def _default_opener(kind: DeviceKind, serial: str | None) -> HidTransport:
@@ -243,7 +343,9 @@ class AquacomputerAdapter:
         self._names = {k: ch for ch, k in self._index.items()}
 
         self._transport: HidTransport | None = None
+        self._opened_t: float | None = None
         self._status: StatusReport | None = None
+        #: When the newest status report was drained; ``None`` until one arrives after an open.
         self._status_t: float | None = None
         self._power_cycles: int | None = None
 
@@ -252,13 +354,22 @@ class AquacomputerAdapter:
         self._ctrl_t: float | None = None
         #: The next write sends every configured channel, held or not.
         self._rewrite = False
-        self._last_set_t: float | None = None
-        #: Channel index -> duty this adapter commands (verified against status).
-        self._commanded: dict[int, int] = {}
+        #: End of the last control operation, failed ones included (ctrl_gap_ms).
+        self._last_op_t: float | None = None
+        #: End of the last complete write, SET and secondary report (write_min_interval_s).
+        self._last_write_t: float | None = None
+        #: Channel index -> the duty the device holds for it, as written or read back.
+        self._written: dict[int, int] = {}
+        #: Channel index -> when that duty was last written or changed.
+        self._changed_t: dict[int, float] = {}
         self._mismatch_since: dict[int, float] = {}
+        #: Rewritten after a mismatch; the device has not reported the duty since.
+        self._rewritten: set[int] = set()
+        #: Mismatching again after that rewrite: logged once, not rewritten again.
+        self._stuck: set[int] = set()
         #: Fields captured by the first GET, restored by release().
         self._originals: dict[int, ChannelSnapshot] | None = None
-        self._written: set[int] = set()
+        self._ever_written: set[int] = set()
 
     # -- diagnostics -------------------------------------------------------
 
@@ -276,15 +387,44 @@ class AquacomputerAdapter:
     def is_open(self) -> bool:
         return self._transport is not None
 
+    @property
+    def stuck_channels(self) -> tuple[str, ...]:
+        """Channels whose output kept disagreeing with the written duty after a
+        rewrite (module docstring, rule a); empty once the device follows."""
+        return tuple(sorted(self._names[k] for k in self._stuck))
+
     def close(self) -> None:
         """Closes the device node (the next call opens it again)."""
         if self._transport is not None:
             transport, self._transport = self._transport, None
             transport.close()
+        self._opened_t = None
         self._status_t = None
         self._ctrl = None
 
     # -- open / status -----------------------------------------------------
+
+    def _io(self, call: Callable[[], _T]) -> _T:
+        """A transport call; a vanished node closes the device."""
+        try:
+            return call()
+        except DeviceUnavailable:
+            self.close()
+            raise
+
+    def _open(self) -> HidTransport:
+        """Opens the node if needed, without waiting for a status report."""
+        if self._transport is not None:
+            return self._transport
+        transport = self._opener(self.kind, self.binding.serial)
+        self._transport = transport
+        self._opened_t = self._clock()
+        self._status_t = None
+        self._power_cycles = None
+        self._ctrl = None
+        self._mismatch_since.clear()
+        _LOG.info("%s: opened %s", self.binding.label, transport.info.node)
+        return transport
 
     def _newest_status(self, reports: Sequence[bytes]) -> StatusReport | None:
         newest = None
@@ -293,72 +433,83 @@ class AquacomputerAdapter:
                 newest = report
         return None if newest is None else decode_status(self.kind, newest)
 
-    def _ensure_open(self) -> HidTransport:
-        if self._transport is not None:
-            return self._transport
-        label = self.binding.label
-        max_age = self.timing.status_max_age_s
-        transport = self._opener(self.kind, self.binding.serial)
-        try:
-            deadline = self._clock() + max_age
-            while True:
-                status = self._newest_status(transport.read_reports())
-                if status is not None:
-                    break
-                remaining = deadline - self._clock()
-                if remaining <= 0:
-                    raise DeviceUnavailable(
-                        f"{label}: {transport.info.node} sent no status report within "
-                        f"status_max_age_s = {max_age:g} s of opening"
-                    )
-                transport.wait_readable(remaining)
-        except BaseException:
-            transport.close()
-            raise
-        self._transport = transport
-        self._status, self._status_t = status, self._clock()
-        self._power_cycles = status.power_cycles
-        self._ctrl = None
-        self._mismatch_since.clear()
-        _LOG.info(
-            "%s: opened %s (serial %s, firmware %d)",
-            label,
-            transport.info.node,
-            status.serial,
-            status.firmware,
-        )
-        return transport
-
     def _drain(self, transport: HidTransport) -> bool:
-        """Takes queued reports; True when a new status report arrived."""
-        try:
-            status = self._newest_status(transport.read_reports())
-        except DeviceUnavailable:
-            self.close()
-            raise
+        """Takes queued reports; True when a status report known to be recent arrived."""
+        reports = self._io(transport.read_reports)
+        if len(reports) >= HIDRAW_QUEUE_FULL:
+            _LOG.warning(
+                "%s: %d input reports were queued: the kernel queue was full and dropped newer "
+                "reports, so these are discarded as stale",
+                self.binding.label,
+                len(reports),
+            )
+            reports = self._io(transport.read_reports)
+            if len(reports) >= HIDRAW_QUEUE_FULL:
+                return False
+        status = self._newest_status(reports)
         if status is None:
             return False
+        first = self._status_t is None
+        if first:
+            self._check_serial(transport, status)
+        self._check_power_cycles(status, first=first)
         self._status, self._status_t = status, self._clock()
         return True
+
+    def _check_serial(self, transport: HidTransport, status: StatusReport) -> None:
+        configured = self.binding.serial
+        if configured is None or status.serial == configured:
+            return
+        self.close()
+        raise DeviceUnavailable(
+            f"{self.binding.label}: {transport.info.node} reports serial {status.serial} in "
+            f"its status report, not the configured serial {configured}"
+        )
+
+    def _check_power_cycles(self, status: StatusReport, *, first: bool) -> None:
+        count = status.power_cycles
+        if count is None:
+            return
+        if not first and self._power_cycles is not None and count != self._power_cycles:
+            _LOG.warning(
+                "%s: power-cycle count changed from %d to %d; reading the control report "
+                "again and rewriting every channel",
+                self.binding.label,
+                self._power_cycles,
+                count,
+            )
+            self._invalidate(rewrite=True)
+        self._power_cycles = count
 
     # -- read --------------------------------------------------------------
 
     def read(self) -> PlantObservation:
         """One observation from the newest status report (module docstring)."""
-        transport = self._ensure_open()
+        transport = self._open()
+        max_age = self.timing.status_max_age_s
         fresh = self._drain(transport)
+        if self._status_t is None:
+            assert self._opened_t is not None
+            deadline = self._opened_t + max_age
+            while not fresh:
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise DeviceUnavailable(
+                        f"{self.binding.label}: {transport.info.node} sent no status report "
+                        f"within status_max_age_s = {max_age:g} s of opening"
+                    )
+                self._io(lambda wait=remaining: transport.wait_readable(wait))
+                fresh = self._drain(transport)
+        status, received = self._status, self._status_t
+        assert status is not None and received is not None
         now = self._clock()
-        status = self._status
-        assert status is not None and self._status_t is not None
-        age = now - self._status_t
-        if age > self.timing.status_max_age_s:
+        if now - received > max_age:
             raise DeviceUnavailable(
                 f"{self.binding.label}: no status report from {transport.info.node} for "
-                f"{age:.1f} s (status_max_age_s = {self.timing.status_max_age_s:g})"
+                f"{now - received:.1f} s (status_max_age_s = {max_age:g})"
             )
         if fresh:
-            self._check_power_cycles(status)
-        self._verify_duties(status, now)
+            self._verify_duties(status, received)
         b = self.binding
         return PlantObservation(
             temps={name: status.temp(n) for name, n in b.temp_map.items()},
@@ -372,86 +523,146 @@ class AquacomputerAdapter:
         if rewrite:
             self._rewrite = True
 
-    def _check_power_cycles(self, status: StatusReport) -> None:
-        count = status.power_cycles
-        if count is None:
+    def _verify_duties(self, status: StatusReport, received: float) -> None:
+        """Rule a of the module docstring, per channel, on one newly received report."""
+        if self._ctrl is None:
             return
-        if self._power_cycles is not None and count != self._power_cycles:
-            _LOG.warning(
-                "%s: power-cycle count changed from %d to %d; reading the control report "
-                "again and rewriting every channel",
-                self.binding.label,
-                self._power_cycles,
-                count,
-            )
-            self._invalidate(rewrite=True)
-        self._power_cycles = count
-
-    def _verify_duties(self, status: StatusReport, now: float) -> None:
-        if self._ctrl is None or not self._commanded:
-            return
-        last_set = self._last_set_t
-        assert self._status_t is not None
-        if last_set is not None and self._status_t <= last_set:
-            return  # no report since the last SET: no evidence either way
         tolerance = self.timing.duty_mismatch_tolerance
-        for k, duty in sorted(self._commanded.items()):
+        label = self.binding.label
+        for k, duty in sorted(self._written.items()):
             reported = status.fans[k].duty
+            name = self._names.get(k, "?")
             if abs(reported - duty) <= tolerance:
                 self._mismatch_since.pop(k, None)
+                self._rewritten.discard(k)
+                if k in self._stuck:
+                    self._stuck.discard(k)
+                    _LOG.info("%s: pwm%d (%s) follows its duty again", label, k + 1, name)
                 continue
-            start = self._mismatch_since.setdefault(k, now)
-            since = start if last_set is None else max(start, last_set)
-            if now - since > self.timing.duty_mismatch_s:
-                _LOG.warning(
-                    "%s: pwm%d (%s) is commanded to %.2f %% but the device has reported "
-                    "%.2f %% for %.1f s; reading the control report again and rewriting "
-                    "every channel",
-                    self.binding.label,
+            if k in self._stuck or received <= self._changed_t.get(k, -math.inf):
+                continue
+            start = self._mismatch_since.setdefault(k, received)
+            if received - start <= self.timing.duty_mismatch_s:
+                continue
+            del self._mismatch_since[k]
+            if k in self._rewritten:
+                self._stuck.add(k)
+                _LOG.error(
+                    "%s: pwm%d (%s) still reports %.2f %% after it was rewritten to %.2f %%; "
+                    "not rewriting it again until the device follows (PROJECT.md section 8 "
+                    "item 81)",
+                    label,
                     k + 1,
-                    self._names.get(k, "?"),
-                    duty / 100.0,
+                    name,
                     reported / 100.0,
-                    now - since,
+                    duty / 100.0,
                 )
-                self._mismatch_since.clear()
-                self._invalidate(rewrite=True)
-                return
+                continue
+            self._rewritten.add(k)
+            _LOG.warning(
+                "%s: pwm%d (%s) holds %.2f %% but the device has reported %.2f %% for %.1f s; "
+                "reading the control report again and rewriting every channel",
+                label,
+                k + 1,
+                name,
+                duty / 100.0,
+                reported / 100.0,
+                received - start,
+            )
+            self._invalidate(rewrite=True)
 
     # -- control report ----------------------------------------------------
 
     def _wait_gap(self) -> None:
-        if self._last_set_t is None:
+        if self._last_op_t is None:
             return
-        remaining = self.timing.ctrl_gap_ms / 1000.0 - (self._clock() - self._last_set_t)
+        remaining = self.timing.ctrl_gap_ms / 1000.0 - (self._clock() - self._last_op_t)
         if remaining > 0:
             self._sleep(remaining)
 
-    def _get(self, transport: HidTransport) -> bytes:
+    def _control(
+        self, deadline: float, operation: str, call: Callable[[], _T], *, gap: bool = True
+    ) -> _T:
+        """One control operation: gap, budget, and its end time recorded even on failure."""
+        if gap:
+            self._wait_gap()
+        if self._clock() >= deadline:
+            raise _BudgetSpent(operation)
+        try:
+            return call()
+        finally:
+            self._last_op_t = self._clock()
+
+    def _fetch(self, transport: HidTransport, deadline: float) -> bytes:
         self._ctrl = None
-        self._wait_gap()
-        data = transport.get_feature(self.kind.ctrl_report_id, self.kind.ctrl_size)
+        data = self._control(
+            deadline,
+            "control report GET",
+            lambda: transport.get_feature(self.kind.ctrl_report_id, self.kind.ctrl_size),
+        )
         check_control_report(self.kind, data)
-        self._ctrl, self._ctrl_t = bytes(data), self._clock()
+        data = bytes(data)
         if self._originals is None:
             self._originals = {k: capture_channel(self.kind, data, k) for k in self._names}
-        return self._ctrl
+        return data
 
-    def _set(self, transport: HidTransport, report: bytes) -> None:
-        self._wait_gap()
-        try:
-            transport.set_feature(report)
-            transport.set_feature(self.kind.secondary_report)
-        finally:
-            self._last_set_t = self._clock()
+    def _adopt(self, data: bytes) -> list[int]:
+        """Takes a fresh control report as the cache. Returns the channels whose held
+        duty is no longer the one this adapter knew (external changes)."""
+        now = self._clock()
+        drifted: list[int] = []
+        for k in sorted(self._names):
+            state = channel_state(self.kind, data, k)
+            known = self._written.get(k)
+            held = state.duty if state.on_duty else None
+            if held == known:
+                continue
+            if known is not None:
+                drifted.append(k)
+            self._mismatch_since.pop(k, None)
+            self._rewritten.discard(k)
+            self._stuck.discard(k)
+            if held is None:
+                self._written.pop(k, None)
+            else:
+                self._written[k] = held
+                self._changed_t[k] = now
+        self._ctrl, self._ctrl_t = data, now
+        return drifted
 
-    def _with_retries(self, what: str, operation: Callable[[HidTransport], _T]) -> _T:
-        transport = self._ensure_open()
+    def _write(self, transport: HidTransport, report: bytes, deadline: float) -> float:
+        """SET plus the secondary report; returns when the write ended."""
+        self._rewrite = True  # until both went out, the next write sends every channel
+        self._control(deadline, "control report SET", lambda: transport.set_feature(report))
+        self._control(
+            deadline,
+            "secondary report",
+            lambda: transport.set_feature(self.kind.secondary_report),
+            gap=False,
+        )
+        assert self._last_op_t is not None
+        self._last_write_t = self._last_op_t
+        self._ctrl = report
+        self._rewrite = False
+        return self._last_write_t
+
+    def _with_retries(self, what: str, operation: Callable[[HidTransport, float], _T]) -> _T:
+        transport = self._open()
+        budget = self.timing.ctrl_budget_s
+        deadline = self._clock() + budget
         attempts = self.timing.ctrl_retries + 1
+        failure: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
-                return operation(transport)
+                return operation(transport, deadline)
+            except _BudgetSpent as spent:
+                after = f"; last failure: {failure}" if failure is not None else ""
+                raise DeviceUnavailable(
+                    f"{self.binding.label}: {what}: ctrl_budget_s = {budget:g} s spent before "
+                    f"the {spent.operation}{after}"
+                ) from failure
             except (FeatureReportError, ReportError) as exc:
+                failure = exc
                 self._invalidate(rewrite=False)
                 _LOG.warning(
                     "%s: %s failed (attempt %d of %d): %s",
@@ -501,71 +712,96 @@ class AquacomputerAdapter:
 
         Every configured channel needs a finite value in ``[0, 1]`` or
         :class:`ValueError` is raised before anything is sent (no silent
-        clamping). Channels of other devices in ``cmd.pwm`` are ignored.
+        clamping). Channels of other devices in ``cmd.pwm`` are ignored. A
+        deferred fall (write limiting) is not an error: ``obs.pwm`` keeps
+        reporting what the output actually drives.
         """
         duties = self._duties(cmd)
-        self._with_retries("control report write", lambda t: self._apply_once(t, duties))
+        self._with_retries(
+            "control report write",
+            lambda transport, deadline: self._apply_once(transport, duties, deadline),
+        )
 
-    def _apply_once(self, transport: HidTransport, duties: dict[int, int]) -> None:
-        if self._refresh_due():
-            self._refresh(transport)
-        ctrl = self._ctrl if self._ctrl is not None else self._get(transport)
+    def _falls_may_be_written(self) -> bool:
+        last = self._last_write_t
+        return last is None or self._clock() - last >= self.timing.write_min_interval_s
+
+    def _plan(self, ctrl: bytes, duties: Mapping[int, int]) -> dict[int, int]:
+        """The channels one write sends now (empty: no write). Module docstring, Writing."""
         if self._rewrite:
-            changed = sorted(duties)
-        else:
-            changed = [
-                k for k in sorted(duties) if not channel_holds(self.kind, ctrl, k, duties[k])
-            ]
-        if changed:
-            buf = bytearray(ctrl)
-            patch_duties(self.kind, buf, {k: duties[k] for k in changed})
-            finalize_control_report(self.kind, buf)
-            # Until SET and secondary report both succeed, a retry rewrites everything.
-            self._rewrite = True
-            self._set(transport, bytes(buf))
-            self._ctrl = bytes(buf)
-            self._rewrite = False
-            self._written.update(changed)
-            for k in changed:
-                self._mismatch_since.pop(k, None)
-        self._commanded = dict(duties)
+            return dict(duties)
+        pending = {
+            k: duty for k, duty in duties.items() if not channel_holds(self.kind, ctrl, k, duty)
+        }
+        for k, duty in pending.items():
+            state = channel_state(self.kind, ctrl, k)
+            if not state.on_duty or duty > state.duty:
+                return pending  # a rise, or a channel not following: never waits
+            if state.duty - duty >= self.timing.write_deadband and self._falls_may_be_written():
+                return pending
+        return {}
 
-    def _refresh(self, transport: HidTransport) -> None:
-        self._get(transport)
-        assert self._ctrl is not None
-        drifted = [
-            k
-            for k, duty in sorted(self._commanded.items())
-            if not channel_holds(self.kind, self._ctrl, k, duty)
-        ]
-        if drifted:
-            _LOG.warning(
-                "%s: periodic control report read: %s no longer hold the commanded duty; rewriting",
-                self.binding.label,
-                ", ".join(f"pwm{k + 1} ({self._names.get(k, '?')})" for k in drifted),
-            )
+    def _apply_once(
+        self, transport: HidTransport, duties: Mapping[int, int], deadline: float
+    ) -> None:
+        if self._refresh_due():
+            drifted = self._adopt(self._fetch(transport, deadline))
+            if drifted:
+                _LOG.warning(
+                    "%s: periodic control report read: %s changed outside the daemon; "
+                    "writing the commanded duty again",
+                    self.binding.label,
+                    ", ".join(f"pwm{k + 1} ({self._names.get(k, '?')})" for k in drifted),
+                )
+        if self._ctrl is None:
+            self._adopt(self._fetch(transport, deadline))
+        ctrl = self._ctrl
+        assert ctrl is not None
+        send = self._plan(ctrl, duties)
+        if not send:
+            return
+        forced = self._rewrite
+        buf = bytearray(ctrl)
+        patch_duties(self.kind, buf, send)
+        finalize_control_report(self.kind, buf)
+        written_at = self._write(transport, bytes(buf), deadline)
+        for k, duty in send.items():
+            if forced or self._written.get(k) != duty:
+                self._changed_t[k] = written_at
+                self._mismatch_since.pop(k, None)
+            self._written[k] = duty
+        self._ever_written.update(send)
 
     # -- release -----------------------------------------------------------
 
     def release(self) -> None:
         """Restores the captured control fields of every channel this adapter
         wrote, with one SET (module docstring). No-op when nothing was written."""
-        if not self._written or not self._originals:
+        if not self._ever_written or not self._originals:
             return
-        restore = {k: self._originals[k] for k in sorted(self._written) if k in self._originals}
-        self._with_retries("control report restore", lambda t: self._release_once(t, restore))
+        restore = {
+            k: self._originals[k] for k in sorted(self._ever_written) if k in self._originals
+        }
+        self._with_retries(
+            "control report restore",
+            lambda transport, deadline: self._release_once(transport, restore, deadline),
+        )
 
-    def _release_once(self, transport: HidTransport, restore: dict[int, ChannelSnapshot]) -> None:
-        buf = bytearray(self._get(transport))
+    def _release_once(
+        self, transport: HidTransport, restore: dict[int, ChannelSnapshot], deadline: float
+    ) -> None:
+        buf = bytearray(self._fetch(transport, deadline))
         for snapshot in restore.values():
             restore_channel(buf, snapshot)
         finalize_control_report(self.kind, buf)
-        self._set(transport, bytes(buf))
-        self._ctrl = bytes(buf)
+        self._write(transport, bytes(buf), deadline)
+        self._ever_written.clear()
         self._written.clear()
-        self._commanded.clear()
+        self._changed_t.clear()
         self._mismatch_since.clear()
-        self._rewrite = False
+        self._rewritten.clear()
+        self._stuck.clear()
+        self._adopt(bytes(buf))
         _LOG.info(
             "%s: restored the captured control settings of %s",
             self.binding.label,
@@ -676,12 +912,12 @@ def parse_device_section(
     Entry shape (``xt6:`` or one ``aquacomputer:`` list entry)::
 
         device: aquaero               # required: aquaero | quadro
-        serial: "12345-67890"         # optional; required when several of one kind are attached
+        serial: "12345-54321"         # optional; required when several of one kind are attached
         fans:                         # one entry per fan channel
           radiator: {pwm: pwm1, rpm: fan1}
           intake:   {pwm: pwm2}       # rpm optional
         temp_map: {coolant: temp1}    # logical temperature -> tempN
-        ctrl_gap_ms: 200              # optional timing keys, see AquacomputerTiming
+        ctrl_gap_ms: 100              # optional timing keys, see AquacomputerTiming
 
     Channel numbers are checked against the device kind. ``hwmon_name``,
     ``root`` and ``name`` (the hwmon era) and ``map`` / ``fan_map`` are
@@ -718,7 +954,7 @@ def parse_device_section(
     serial = section.get("serial")
     if serial is not None and (not isinstance(serial, str) or not serial.strip()):
         raise ConfigError(
-            f'{label}.serial must be a non-empty string such as "12345-67890", got {serial!r}'
+            f'{label}.serial must be a non-empty string such as "12345-54321", got {serial!r}'
         )
     pwm_map, fan_map = _parse_fans(section, label, kind)
     temp_section = section.get("temp_map")
@@ -733,7 +969,7 @@ def parse_device_section(
         _check_keys(f"{label}.fans", pwm_map, channels, "mpc.channels")
     if temps is not None:
         _check_keys(f"{label}.temp_map", temp_map, temps, "mpc.temps")
-    timing = AquacomputerTiming.from_section(section, label)
+    timing = AquacomputerTiming.from_section(section, label, kind)
     return DeviceBinding(
         kind=kind,
         pwm_map=pwm_map,
@@ -753,10 +989,13 @@ def build_adapter_from_config(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     opener: Opener | None = None,
+    watchdog_s: float | None = None,
 ) -> AquacomputerAdapter:
     """``--source xt6``: the single-device ``xt6:`` section (``prefer`` ignored).
-    Opens nothing; the first ``read()`` / ``apply()`` does."""
+    Opens nothing; the first ``read()`` / ``apply()`` does. ``watchdog_s`` (the
+    systemd watchdog, ``None`` without one) is checked by :func:`check_watchdog`."""
     binding = parse_device_section(
         section, label=label, channels=channels, temps=temps, ignored_keys=("prefer",)
     )
+    check_watchdog([(label, binding.timing)], watchdog_s)
     return AquacomputerAdapter(binding, clock=clock, sleep=sleep, opener=opener)
