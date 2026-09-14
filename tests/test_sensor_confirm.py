@@ -19,11 +19,15 @@ import dataclasses
 import json
 from collections.abc import Callable, Mapping
 from typing import Any
+from unittest import mock
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
-from aqua_bridge.control import zones
+from aqua_bridge.control import estimator, zones
 from aqua_bridge.control.gate import evaluate_gate
+from aqua_bridge.control.mpc import solver_for
 from aqua_bridge.model import Mode, MpcConfig, MpcState, PlantObservation
 from das_fixtures import PROX_C, das_cfg, das_obs, default_temps
 from invariants import checked_step
@@ -345,3 +349,104 @@ def _legacy_gate(cfg: MpcConfig):
     )
     good = dataclasses.replace(obs, temps=dict.fromkeys(cfg.temps, 40.0), ts=0.0)
     return evaluate_gate(obs, cfg, last_good_obs=good, last_raw_temps=good.temps, window=())
+
+
+# ---------------------------------------------------------------------------
+# property: nothing unconfirmed reaches the estimator, the solver or last_good_obs
+# ---------------------------------------------------------------------------
+
+#: Per-tick events on a sensor: its nominal value, the offset level, a dropout.
+_EVENTS = st.sampled_from(["nominal", "nominal", "nominal", "level", "drop"])
+_WATCHED = ("inlet", "air_a2", "prox_a1b", "prox_a1", "prox_a2")
+PROPERTY_TICKS = 16
+
+
+class _RecordingSolver:
+    """Delegates to the configured solver and records every request's temperatures."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.name = inner.name
+        self.temps: list[set[str]] = []
+
+    def initialise(self, cfg: MpcConfig, req: Any) -> Any:
+        return self._inner.initialise(cfg, req)
+
+    def solve(self, cfg: MpcConfig, req: Any) -> Any:
+        self.temps.append(set(req.temps))
+        return self._inner.solve(cfg, req)
+
+
+@settings(max_examples=40)
+@given(
+    events=st.lists(
+        st.fixed_dictionaries({name: _EVENTS for name in _WATCHED}),
+        min_size=PROPERTY_TICKS,
+        max_size=PROPERTY_TICKS,
+    ),
+    offset=st.sampled_from([JUMP_C, -JUMP_C, 3.0]),
+    median3=st.booleans(),
+    repeated_ts=st.sets(st.integers(1, PROPERTY_TICKS - 1), max_size=3),
+)
+def test_no_unconfirmed_value_is_ever_used(events, offset, median3, repeated_ts):
+    cfg = das_cfg(confirm_s=CONFIRM_S, median3=median3)
+    state = settled(cfg)
+    nominal = default_temps(cfg)
+    solver = _RecordingSolver(solver_for(cfg))
+    seen: list[set[str]] = []
+    real_update = estimator.update
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(set(kwargs["temps"]))
+        return real_update(*args, **kwargs)
+
+    expected: dict[str, int] = {}
+    with mock.patch.object(estimator, "update", spy):
+        for k, tick in enumerate(events):
+            temps: dict[str, float | None] = dict(nominal)
+            for name, event in tick.items():
+                if event == "level":
+                    temps[name] = nominal[name] + offset  # type: ignore[operator]
+                elif event == "drop":
+                    temps[name] = None
+            pwm = dict(state.last_cmd.pwm)  # type: ignore[union-attr]
+            ts = float(SETTLE_TICKS + k - (1 if k in repeated_ts else 0)) * cfg.dt  # a time fault
+            obs = das_obs(cfg, ts, temps=temps, pwm=pwm)
+            before = state.last_good_obs
+            n_solves = len(solver.temps)
+            cmd, state = checked_step(obs, cfg, state, solver=solver)
+            gate = cmd.diagnostics["gate"]
+
+            # the reference counter, from the gate's verdict and the time status alone
+            time_ok = cmd.diagnostics["time"]["status"] in ("ok", "first")
+            for name in cfg.temps:
+                if set(gate["reasons"].get(name, ())) & {"range", "slew", "stuck"}:
+                    expected[name] = 0
+                elif name in expected:
+                    if gate["per_temp"][name] and time_ok:
+                        expected[name] += 1
+                        if expected[name] >= cfg.confirm_ticks:
+                            del expected[name]
+                    else:
+                        expected[name] = 0
+            confirming = cmd.diagnostics["sensor_confirm"]
+            assert confirming == expected, k
+
+            assert len(seen) == k + 1 and not seen[-1] & set(confirming), k
+            if len(solver.temps) > n_solves:
+                assert not solver.temps[-1] & set(confirming), k
+            for name in confirming:
+                old = None if before is None else before.temps.get(name)
+                new = None if state.last_good_obs is None else state.last_good_obs.temps.get(name)
+                assert new == old, (k, name)
+            # with every sole member trusted and a confirmed trusted member on bay a1, za is
+            # trusted: a redundant member, confirming or not, never faults the zone by itself
+            groups_ok = (
+                gate["per_temp"]["air_a"]
+                and gate["per_temp"]["prox_a2"]
+                and any(
+                    gate["per_temp"][m] and m not in confirming for m in ("prox_a1", "prox_a1b")
+                )
+            )
+            if groups_ok and time_ok:
+                assert cmd.diagnostics["zones"]["za"]["trusted"] is True, k

@@ -2208,7 +2208,7 @@ tests carry the `nightly` marker.
 |------|--------|-------|
 | `tests/test_zones.py` | DAS config parsing, defaults and rejections; `strict` trust per group; closure `F*` with `declared` / `none`; per-zone timers and confirmation; `degraded` vs `fallback`; legacy = one implicit zone; per-channel `compose`; per-role Stuck sizing; the DEGRADED banner and health field | PR |
 | `tests/test_mpc_zone_fallback.py` | a fault in zone A never lowers any channel of its reach below `prev` (hold, then `max(prev, fallback_pwm)`); channels outside keep regulating; the solver request never carries faulted-zone sensors and healthy commands do not depend on their values; per-zone recovery is bumpless; Flicker in one zone never resets another; a dropout in a redundant group is no fault; solver faults; legacy `mpc` turns a zone fault into whole fallback | PR (one sweep nightly) |
-| `tests/test_sensor_confirm.py` | sensor confirmation (§3): a jumping redundant member (proximal, zone air, inlet) is not fused until it confirms and the zone does not fault, the estimates of the DAS example config match a run without the member until then; a real level change is fused after `confirm_ticks`; restart on a new jump or a dropout; a sole member costs `confirm_ticks` once; a zone in fault waits for a confirmed member in every group; malformed memory; JSON and determinism; legacy keeps no state | PR |
+| `tests/test_sensor_confirm.py` | sensor confirmation (§3): a jumping redundant member (proximal, zone air, inlet) is not fused until it confirms and the zone does not fault, the estimates of the DAS example config match a run without the member until then; a real level change is fused after `confirm_ticks`; restart on a new jump or a dropout; a sole member costs `confirm_ticks` once; a zone in fault waits for a confirmed member in every group; a property over random jumps, dropouts and time faults (median3 on and off) that the counts follow the gate alone and no confirming sensor reaches the estimator, the solver or `last_good_obs`; malformed memory; JSON and determinism; legacy keeps no state | PR |
 | `tests/test_das_core.py` | the core invariants, closed loops and DAS goldens for `pi_das` and `mpc_das` (§4.2) | PR |
 | `tests/test_pi_das.py`, `tests/test_estimates.py`, `tests/test_das_config.py` | the margin-deficit PI (served zones, unconstrained channels, fixed channels, occupancy), the estimates block and prior map, `noise` / `limit_c` / served-zone config | PR |
 | `tests/test_estimator.py` | exact discretisation and Joseph form (random sequences keep P symmetric PSD); first tick and constant readings; σ grows while a bay is unobserved and shrinks back; redundant members; the occupancy machine incl. "never empty while zone air is unobserved"; SMART calibration acceptance, rejection, serial change and expiry after `calibration_max_age_days`; a guessed serial never relaxes a class; determinism, JSON round trip, malformed memory | PR |
@@ -2722,10 +2722,11 @@ them as "§8 item N".
 7. **Done:** `install-pi.sh --das` installs `config.example-das.yaml` and the `deploy/aqua-bridge-das.conf` systemd drop-in (`ExecStart=` with `--source hwmon`); without `--das` the legacy path is unchanged.
 8. `zones.trust_rule: sigma` (zone trust from the estimator's σ); the
    config accepts it, `strict` applies today.
-9. **Done:** A Jump on a redundant group member is accepted after one tick without
-   `confirm_ticks`; a sensor whose value the gate rejects now confirms over
+9. **Done:** a sensor whose value the gate rejects now confirms over
    `confirm_ticks` on its own (§3 Sensor confirmation) and stays out of the
    estimator until then, while its group stays trusted through the others.
+   A Jump on a redundant group member was accepted after one tick without
+   `confirm_ticks`.
 10. The drift check's hysteresis can hold the PI-DAS model fallback for
     tens of minutes after a load step (return threshold 0.25 °C/min against
     0.26–0.29 °C/min physical transients); tune it.
