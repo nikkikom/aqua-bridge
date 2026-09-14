@@ -2484,10 +2484,15 @@ them as "§8 item N".
    `/etc/aqua-bridge`, every route authenticated, plain HTTP refused.
    Document that the MQTT counterparts (`cmd/bay`, `cmd/limit`,
    `cmd/ident`) rely on broker authentication.
-5. Runtime budget alarm: log when a tick's `step` exceeds 600 ms and
-   750 ms (today only the benchmark and the `pi` test check it).
-6. The relative budget gate in CI is thin (DAS MPC p99 9–11× the legacy
-   MPC against 12×); make it robust on slow runners.
+5. **Done (PR #23):** Runtime budget alarm: `control/loop.py` logs a
+   rate-limited warning past `mpc.budget_ms` and error past
+   `mpc.budget_alarm_ms`, both now config keys, with `step_ms_last` /
+   `step_ms_max` / exceedance counters in `/api/health` and the MQTT state
+   blob.
+6. **Done (PR #23):** The relative budget gate in CI is thin (DAS MPC p99
+   9–11× the legacy MPC against 12×); `tests/test_bench_budget.py` now
+   interleaves, discards a warm-up repeat and gates on the 75th percentile
+   of several per-repeat ratios instead of one min/min pair.
 7. DAS install path: `ExecStart=` with `--source hwmon` for DAS configs
    (a drop-in today, §10) and an `install-pi.sh` option that installs
    `config.example-das.yaml`.
