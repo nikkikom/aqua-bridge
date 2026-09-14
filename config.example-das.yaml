@@ -110,8 +110,15 @@ mpc:
   median3: false
   stuck_s: 600           # legacy global Stuck window; DAS sensors use the per-role values
   stuck_eps_c: 0.1
-  stuck_pwm_net: 0.15
-  stuck_sibling_dT_c: 1.0
+  stuck_pwm_net: 0.15    # legacy per-channel PWM evidence; DAS sensors use stuck_airflow_net
+  stuck_sibling_dT_c: 1.0  # a sibling's plausible net move (same zone and role; proximal: same bay)
+  # DAS Stuck evidence (PROJECT.md section 3, "Stuck sizing"): a sensor frozen in its band
+  # is flagged when its zone's relative airflow (sum of count-weighted fan curves, block
+  # means over the window) moved by more than stuck_airflow_net, (0, 1]; for a proximal
+  # sensor not when every zone-air sensor moved against that move (warmer after more
+  # airflow, cooler after less) by more than stuck_air_oppose_c, degC (> 0).
+  stuck_airflow_net: 0.15
+  stuck_air_oppose_c: 0.3
   solver_max_iter: 50
   channels: [xt1, xt2, xt3, xt4, qd1, qd2, qd3, qd4]
 

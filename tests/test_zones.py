@@ -176,15 +176,24 @@ def test_stuck_params_per_role_with_automatic_decimation():
     assert (prox.ticks, prox.decimate, prox.samples) == (360, 6, 60)
     assert prox.eps_c == pytest.approx(0.09375)
     assert prox.channels == ("fa1", "fa2")
-    assert prox.siblings == ("prox_a1", "prox_a1b")  # same zone and role only
+    assert prox.siblings == ()  # no other proximal sensor on bay a2 (prox_a1 is bay a1's)
+    assert cfg.stuck_params("prox_a1").siblings == ("prox_a1b",)  # same zone, role and bay
+    assert prox.air == ("air_a", "air_a2")  # the zone air can cancel an airflow move
+    # za's airflow: fa1 carries 2 fans, fa2 one, both only in za; p12 curve (0.1, 1.0)
+    assert prox.airflow == (
+        ("fa1", pytest.approx(2 / 3), 0.1, 1.0),
+        ("fa2", pytest.approx(1 / 3), 0.1, 1.0),
+    )
     air = cfg.stuck_params("air_b")
     assert (air.ticks, air.decimate, air.samples) == (36, 1, 36)
-    assert air.channels == ("fb1",) and air.siblings == ()
+    assert air.channels == ("fb1",) and air.siblings == () and air.air == ()
+    assert air.airflow == (("fb1", 1.0, 0.2, 1.1),)
     inlet = cfg.stuck_params("inlet")
     assert (inlet.ticks, inlet.decimate, inlet.samples) == (120, 2, 60)
     assert inlet.channels == ()  # no zone: fans are not evidence for an inlet sensor
+    assert inlet.airflow == () and inlet.air == ()
     exhaust = cfg.stuck_params("exhaust")
-    assert exhaust.channels == ("fb1",) and exhaust.siblings == ()
+    assert exhaust.channels == ("fb1",) and exhaust.siblings == () and exhaust.air == ()
     # Dense window: the longest non-decimated sensor window (the zone-air sensors).
     assert cfg.window_ticks == 36
     assert cfg.slow_window_samples == {2: 60, 6: 60}
@@ -217,6 +226,7 @@ def test_legacy_config_is_one_implicit_zone(cfg):
         )
         assert p.channels == cfg.channels
         assert p.siblings == tuple(t for t in cfg.temps if t != name)
+        assert p.airflow == () and p.air == ()  # each channel's own PWM move, no air rule
     assert cfg.window_ticks == cfg.stuck_ticks and cfg.slow_window_samples == {}
     for section in DAS_SECTIONS:
         assert getattr(cfg, section) in (None, {})

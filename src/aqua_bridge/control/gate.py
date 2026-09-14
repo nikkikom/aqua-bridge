@@ -76,11 +76,27 @@ every number of rule 3 comes from :meth:`MpcConfig.stuck_params`:
 * the window (``sensors.<name>.stuck_s``, per role 1800 s proximal, 180 s
   zone air, 600 s inlet / exhaust) and the band (``stuck_eps_c``, default
   ``1.5 * quant_c``) are the sensor's own;
-* the PWM evidence counts only the channels of the sensor's zone (a sensor
-  without a zone, such as an inlet in front of the intake, has none: fans
-  do not move the inlet temperature);
+* the PWM evidence is the net move of the **zone's relative airflow**
+  ``sum w * phi(u)`` over the channels of the sensor's zone (``phi`` the
+  estimator's fan curve, ``w`` the fan count split evenly over the zones
+  listing the channel, normalised) above ``stuck_airflow_net``, not one
+  channel's PWM on its own: the solver moves a zone's channels apart (one up,
+  a shared one down), and a shared single-fan output moves little of one
+  zone's air. The move compares block means (:func:`_airflow_move`), so a fan
+  dip of a tick or two at the window's start is not a move of the window. A
+  sensor without a zone, such as an inlet in front of the intake, has none:
+  fans do not move the inlet temperature;
+* for a ``drive_proximal`` sensor that evidence does not count when every
+  zone-air sensor of the zone with a plausible path over the window moved
+  *against* it by more than ``stuck_air_oppose_c`` (warmer air after more
+  airflow, cooler after less): the proximal reading mixes the zone air with
+  the drive-to-air difference, which airflow moves the other way, and the
+  two cancel on a healthy sensor;
 * the sibling evidence counts only the other sensors of the same zone and
-  the same role.
+  the same role, and for a ``drive_proximal`` sensor only those of its own
+  bay: another bay's reading follows that bay's drive heat, which does not
+  reach this sensor (an idle drive's reading sits on one code for half an hour
+  while a neighbour's activity burst moves that neighbour's reading by degrees).
 
 Long windows are **decimated**: a sensor whose ``StuckParams.decimate`` is
 ``k > 1`` is checked on a window that keeps one sample every ``k`` ticks
@@ -89,11 +105,11 @@ windows from the newest sample of ``MpcState.window`` -- the previous tick,
 whose command the loop has already replaced by what was applied -- storing
 the value the checks ran on (median3 when enabled) and the command. The
 decimated check interpolates nothing: it compares the stored samples and
-the current value against the band, measures the net PWM move from the
-oldest stored sample to the one ``stuck_pwm_lag(samples)`` samples before
-the newest, and bounds a sibling's single step by ``k * dT_max_tick``. An
-excursion shorter than ``k`` ticks can therefore go unseen, which can only
-flag Stuck *more* readily (its zone faults, cooling rises), never less.
+the current value against the band, measures the airflow move on the stored
+commands (:func:`_airflow_move`), and bounds a sibling's or zone-air sensor's
+single step by ``k * dT_max_tick``. A reading's excursion shorter than ``k``
+ticks can therefore go unseen by the band check, which can only flag Stuck
+*more* readily (its zone faults, cooling rises), never less.
 The decimated windows live in ``solver_memory["stuck_slow"]`` (factor as a
 string -> list of ``{"t": temps, "p": pwm}``) with the dense sample counter
 ``solver_memory["stuck_seq"]``; legacy mode has neither key.
@@ -333,9 +349,7 @@ def _stuck(
         def series_of(other: str) -> list[float | None]:
             return _filtered_series(_window_series(recent, other), cfg.median3)
 
-        oldest_pwm: Mapping[str, Any] = recent[0].cmd_pwm
-        # the PWM move must be old enough for the plant to have answered it
-        newest_pwm: Mapping[str, Any] = recent[-1 - stuck_pwm_lag(n)].cmd_pwm
+        commands: list[Mapping[str, Any]] = [w.cmd_pwm for w in recent]
         step_limit = cfg.dT_max_tick
     else:
         stored = None if slow_windows is None else slow_windows.get(str(params.decimate))
@@ -350,8 +364,7 @@ def _stuck(
         def series_of(other: str) -> list[float | None]:
             return [_finite_or_none(sample["t"].get(other)) for sample in slow]
 
-        oldest_pwm = slow[0]["p"]
-        newest_pwm = slow[-1 - stuck_pwm_lag(m)]["p"]
+        commands = [sample["p"] for sample in slow]
         step_limit = cfg.dT_max_tick * params.decimate
 
     series = series_of(name)
@@ -363,15 +376,132 @@ def _stuck(
             return None
 
     # Frozen. Did anything that should have moved it actually move?
-    for ch in params.channels:
-        a = _finite_or_none(oldest_pwm.get(ch))
-        b = _finite_or_none(newest_pwm.get(ch))
-        if a is not None and b is not None and abs(b - a) > cfg.stuck_pwm_net:
+    pwm_moves: list[tuple[float | None, float]]
+    if params.airflow:  # zoned: the net move of the zone's relative airflow
+        pwm_moves = [(_airflow_move(params.airflow, commands), cfg.stuck_airflow_net)]
+    else:  # legacy / no zone: the net PWM move of each channel on its own
+        # the PWM move must be old enough for the plant to have answered it
+        oldest_pwm = commands[0]
+        newest_pwm = commands[-1 - stuck_pwm_lag(len(commands))]
+        pwm_moves = [
+            (_pwm_move(oldest_pwm.get(ch), newest_pwm.get(ch)), cfg.stuck_pwm_net)
+            for ch in params.channels
+        ]
+    air_moves: list[float] | None = None
+    for move, threshold in pwm_moves:
+        if move is None or abs(move) <= threshold:
+            continue
+        if params.air and air_moves is None:
+            air_moves = []
+            for air in params.air:
+                air_move = _plausible_move(
+                    cfg, [*series_of(air), filtered_now.get(air)], step_limit
+                )
+                if air_move is not None:
+                    air_moves.append(air_move)
+        if not _air_opposes(cfg, air_moves, move):
             return first
     for other in params.siblings:
         if _plausible_net_move(cfg, [*series_of(other), filtered_now.get(other)], step_limit):
             return first
     return None
+
+
+def _pwm_move(old: object, new: object) -> float | None:
+    """Net PWM move of one channel between two commands; ``None`` when either is unusable."""
+    a = _finite_or_none(old)
+    b = _finite_or_none(new)
+    return None if a is None or b is None else b - a
+
+
+def _airflow_move(
+    airflow: Sequence[tuple[str, float, float, float]],
+    commands: Sequence[Mapping[str, Any]],
+) -> float | None:
+    """Net move of a zone's relative airflow over a Stuck window (``StuckParams.airflow``).
+
+    ``commands`` are the window's commands, oldest first (``m`` of them). With
+    ``L = stuck_pwm_lag(m)`` and ``B = max(1, L)`` the move is the mean airflow
+    of the ``B`` commands that end at the lagged one (``L`` before the newest)
+    minus the mean of the first ``B``: a move must be ``L`` samples old to count,
+    as in the legacy rule, and a short excursion of the command at either end
+    (the DAS MPC dips a fan for a tick or two) counts only by the share of the
+    block it fills. A drive with a time constant of minutes does not answer such
+    a dip, so a single oldest sample caught in it read as a move of the whole
+    window. The airflow of one command is ``sum w * phi(u)`` over the zone's
+    channels with ``phi(u) = clip((u - deadband) / (1 - deadband), 0, 1) **
+    exponent``, the estimator's fan curve; a channel without a usable command
+    adds nothing, and a block without any usable command gives ``None``.
+    """
+    m = len(commands)
+    lag = stuck_pwm_lag(m)
+    block = max(1, lag)
+    first = _mean_airflow(airflow, commands[:block])
+    last = _mean_airflow(airflow, commands[m - lag - block : m - lag])
+    return None if first is None or last is None else last - first
+
+
+def _mean_airflow(
+    airflow: Sequence[tuple[str, float, float, float]], commands: Sequence[Mapping[str, Any]]
+) -> float | None:
+    """Mean relative airflow of ``commands`` (see :func:`_airflow_move`)."""
+    values: list[float] = []
+    for command in commands:
+        total = 0.0
+        seen = False
+        for ch, weight, deadband, exponent in airflow:
+            u = _finite_or_none(command.get(ch))
+            if u is not None:
+                seen = True
+                total += weight * _phi(u, deadband, exponent)
+        if seen:
+            values.append(total)
+    return sum(values) / len(values) if values else None
+
+
+def _phi(u: float, deadband: float, exponent: float) -> float:
+    """Relative airflow of a fan at PWM ``u`` (``aqua_bridge.control.thermal.phi``)."""
+    frac = min(1.0, max(0.0, (u - deadband) / (1.0 - deadband)))
+    return frac**exponent if frac > 0 else 0.0
+
+
+def _air_opposes(cfg: MpcConfig, air_moves: Sequence[float] | None, pwm_move: float) -> bool:
+    """Whether the zone air moved against an airflow move (``StuckParams.air``, proximal only).
+
+    More airflow cools the zone air and shrinks the drive-to-air difference,
+    so a proximal reading falls; warmer air (a rising inlet) raises it by as
+    much. When every zone-air sensor with a plausible path over the window
+    (``air_moves``) moved against the airflow move -- warmer after more
+    airflow, cooler after less -- by more than ``stuck_air_oppose_c``, the two
+    effects can cancel on a healthy reading and the airflow move is no evidence
+    that it should have moved. No plausible zone-air path (a dropout, a Spike)
+    keeps the evidence, and so does a zone-air sensor that did not move (a
+    frozen one included): flagging more readily only raises cooling.
+    """
+    if not air_moves:
+        return False
+    sign = 1.0 if pwm_move > 0 else -1.0
+    return all(sign * move > cfg.stuck_air_oppose_c for move in air_moves)
+
+
+def _plausible_move(
+    cfg: MpcConfig, series: Sequence[float | None], step_limit: float | None = None
+) -> float | None:
+    """Net displacement of ``series`` when its trajectory could be the plant's, else ``None``.
+
+    Every sample finite and inside the valid range, no single step larger
+    than ``dT_max_tick`` (a plant cannot do that; a sensor Spike or Jump
+    can).
+    """
+    if len(series) < 2 or any(v is None for v in series):
+        return None
+    vals = [float(v) for v in series]  # type: ignore[arg-type]
+    if any(not cfg.temp_min_c <= v <= cfg.temp_max_c for v in vals):
+        return None
+    limit = cfg.dT_max_tick if step_limit is None else step_limit
+    if any(abs(b - a) > limit for a, b in zip(vals, vals[1:], strict=False)):
+        return None
+    return vals[-1] - vals[0]
 
 
 def _plausible_net_move(
@@ -385,15 +515,8 @@ def _plausible_net_move(
     a Spike or Jump on one sensor would brand a calm sibling as Stuck for a
     whole window and trap the Jump in fallback.
     """
-    if len(series) < 2 or any(v is None for v in series):
-        return False
-    vals = [float(v) for v in series]  # type: ignore[arg-type]
-    if any(not cfg.temp_min_c <= v <= cfg.temp_max_c for v in vals):
-        return False
-    limit = cfg.dT_max_tick if step_limit is None else step_limit
-    if any(abs(b - a) > limit for a, b in zip(vals, vals[1:], strict=False)):
-        return False
-    return abs(vals[-1] - vals[0]) > cfg.stuck_sibling_dT_c
+    move = _plausible_move(cfg, series, step_limit)
+    return move is not None and abs(move) > cfg.stuck_sibling_dT_c
 
 
 def evaluate_gate(

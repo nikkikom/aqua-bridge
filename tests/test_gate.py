@@ -604,11 +604,11 @@ def _base_temps() -> dict[str, float | None]:
 def test_ds18b20_plateaus_next_to_a_drive_never_flag_stuck():
     """A proximal DS18B20 (1/16 degC) follows a slow drive: minutes on one code at every
     turning point while its zone's fans move hardest. The per-role window (1800 s) and
-    band (1.5 LSB) never call that Stuck; a 180 s window would."""
+    band (1.5 LSB) never call that Stuck; a 300 s window would."""
     m = das_mapping()
     m.update(dt=5.0, confirm_s=10.0, fallback_hold_s=20.0, stuck_s=10.0)
     cfg = MpcConfig.from_mapping(m)
-    m["sensors"]["prox_a2"]["stuck_s"] = 180.0
+    m["sensors"]["prox_a2"]["stuck_s"] = 300.0
     short = MpcConfig.from_mapping(m)
     assert cfg.stuck_params("prox_a2").decimate == 6
     period = 1800.0
@@ -646,7 +646,7 @@ def test_ds18b20_plateaus_next_to_a_drive_never_flag_stuck():
         last = temps["prox_a2"]
         longest_plateau = max(longest_plateau, run)
     assert longest_plateau * cfg.dt >= 150.0  # the scenario really has multi-minute plateaus
-    assert short_flags > 0  # and a 180 s window would have branded the sensor Stuck
+    assert short_flags > 0  # and a 300 s window would have branded the sensor Stuck
     # Decimated storage stays bounded: 60 samples per factor, dense window 36 ticks.
     assert {k: len(v) for k, v in replay.slow.items()} == {"2": 60, "6": 60}
     assert len(replay.window) == cfg.window_ticks == 36
@@ -696,17 +696,20 @@ def test_pwm_evidence_counts_only_the_sensors_zone_channels():
     assert not r.stuck["prox_a2"]  # za's fans did not move
 
 
-def test_sibling_evidence_counts_only_same_zone_and_role():
-    cfg = _dense_das()
+def test_sibling_evidence_counts_only_same_zone_role_and_bay():
+    """A proximal reading answers its own drive: another bay's reading moves with that bay's
+    drive heat, which never reaches this sensor, so only a sensor on the same bay counts."""
+    cfg = _dense_das(prox_a1b={"stuck_s": 8.0, "stuck_decimate": 1})
     n = cfg.stuck_params("prox_a2").ticks + 1
 
     def still(i: int) -> dict[str, float]:
         return dict.fromkeys(cfg.channels, 0.5)
 
-    def moving(name: str) -> Callable[[int], dict[str, float | None]]:
+    def moving(*names: str) -> Callable[[int], dict[str, float | None]]:
         def temps(i: int) -> dict[str, float | None]:
             t = _base_temps()
-            t[name] = float(t[name]) + 0.2 * i  # net 1.6 degC > stuck_sibling_dT_c, no jump
+            for name in names:
+                t[name] = float(t[name]) + 0.2 * i  # net 1.6 degC > stuck_sibling_dT_c, no jump
             return t
 
         return temps
@@ -714,9 +717,165 @@ def test_sibling_evidence_counts_only_same_zone_and_role():
     for other in ("air_a", "prox_b1"):  # other role / other zone: no evidence
         _, r = _history(cfg, n, moving(other), still)
         assert not r.stuck["prox_a2"], other
-    _, r = _history(cfg, n, moving("prox_a1"), still)  # same zone and role
-    assert r.stuck["prox_a2"]
-    assert not r.stuck["prox_a1"]
+    # same zone and role, other bay: a neighbour's activity burst is no evidence
+    _, r = _history(cfg, n, moving("prox_a1", "prox_a1b"), still)
+    assert not r.stuck["prox_a2"]
+    # same bay: the other sensor on the same drive moved, this one did not
+    _, r = _history(cfg, n, moving("prox_a1b"), still)
+    assert r.stuck["prox_a1"] and r.reasons["prox_a1"] == (REASON_STUCK,)
+    assert not r.stuck["prox_a1b"] and not r.stuck["prox_a2"]
+
+
+def test_zone_airflow_evidence_weighs_channels_and_ignores_moves_that_cancel():
+    """The PWM evidence of a zoned sensor is its zone's relative airflow: fa1 (two fans) up
+    while fa2 (one fan) goes down twice as far leaves za's airflow where it was, although
+    each channel moved by more than stuck_pwm_net; fa2 alone moves a third of za's air."""
+    cfg = _dense_das()
+    assert cfg.stuck_pwm_net == cfg.stuck_airflow_net == 0.15
+    n = cfg.stuck_params("prox_a2").ticks + 1
+
+    def fans(
+        fa1: Callable[[int], float], fa2: Callable[[int], float]
+    ) -> Callable[[int], dict[str, float]]:
+        return lambda i: {"fa1": fa1(i), "fa2": fa2(i), "fb1": 0.5, "fc1": 0.5}
+
+    apart = fans(lambda i: 0.3 + 0.04 * i, lambda i: 0.9 - 0.08 * i)
+    _, r = _history(cfg, n, lambda i: _base_temps(), apart)
+    assert not r.stuck["prox_a2"] and not r.stuck["air_c"]
+    shared = fans(lambda i: 0.5, lambda i: 0.3 + 0.05 * i)  # +0.2 PWM net, a third of the air
+    _, r = _history(cfg, n, lambda i: _base_temps(), shared)
+    assert not r.stuck["prox_a2"]
+    together = fans(lambda i: 0.3 + 0.04 * i, lambda i: 0.3 + 0.04 * i)
+    _, r = _history(cfg, n, lambda i: _base_temps(), together)
+    assert r.stuck["prox_a2"] and r.reasons["prox_a2"] == (REASON_STUCK,)
+
+
+def test_a_short_fan_dip_at_the_window_start_is_no_airflow_evidence():
+    """Block means, not single samples: a drive with a time constant of minutes does not
+    answer a fan dip of one tick, so the dip must not read as a move of the whole window
+    (the DAS MPC dips a fan for a tick or two). A sustained step still counts."""
+    cfg = _das(prox_a2={"stuck_s": 40.0, "stuck_decimate": 1})
+    n = cfg.stuck_params("prox_a2").ticks
+
+    def stuck_at_the_end(pwm_at: Callable[[int], float]) -> bool:
+        replay = DasReplay(cfg)
+        r = None
+        for i in range(2 * n):
+            u = pwm_at(i)
+            r = replay.tick(_base_temps(), {"fa1": u, "fa2": u, "fb1": 0.5, "fc1": 0.5})
+        assert r is not None
+        return r.stuck["prox_a2"]
+
+    # the check on the last tick (2n - 1) sees ticks n - 1 .. 2n - 2: the dip is its oldest
+    assert not stuck_at_the_end(lambda i: 0.4 if i == n - 1 else 0.9)
+    assert stuck_at_the_end(lambda i: 0.4 if i < n + 5 else 0.9)
+
+
+def _zone_air_drift(air_a: float, air_a2: float | None) -> Callable[[int], dict[str, float | None]]:
+    """Default (frozen) readings; the zone-air sensors of za drift by ``air_*`` over 8 ticks
+    (``None``: a dropout on ``air_a2`` at every tick)."""
+
+    def temps(i: int) -> dict[str, float | None]:
+        t = _base_temps()
+        t["air_a"] = SP + air_a * i / 8
+        t["air_a2"] = None if air_a2 is None else SP + air_a2 * i / 8
+        return t
+
+    return temps
+
+
+def test_zone_air_against_the_airflow_voids_it_for_a_proximal_reading():
+    """More airflow lowers a proximal reading, a warmer zone air raises it: when every
+    zone-air sensor with a plausible path moved against the airflow by more than
+    stuck_air_oppose_c, a still reading is plausible and the move is no evidence."""
+    cfg = _dense_das(air_a={"stuck_s": 8.0}, air_a2={"stuck_s": 8.0})
+    tol = cfg.stuck_air_oppose_c
+    n = cfg.stuck_params("prox_a2").ticks + 1
+
+    def up(i: int) -> dict[str, float]:
+        return {"fa1": 0.3 + 0.04 * i, "fa2": 0.3 + 0.04 * i, "fb1": 0.5, "fc1": 0.5}
+
+    def down(i: int) -> dict[str, float]:
+        return {"fa1": 0.7 - 0.04 * i, "fa2": 0.7 - 0.04 * i, "fb1": 0.5, "fc1": 0.5}
+
+    def stuck(temps: Callable[[int], dict[str, float | None]], pwm) -> bool:
+        return _history(cfg, n, temps, pwm)[1].stuck["prox_a2"]
+
+    assert not stuck(_zone_air_drift(2 * tol, 2 * tol), up)  # warmer air after more airflow
+    assert not stuck(_zone_air_drift(-2 * tol, -2 * tol), down)  # cooler air after less
+    assert stuck(_zone_air_drift(tol / 2, tol / 2), up)  # too little to cancel
+    assert stuck(_zone_air_drift(-2 * tol, -2 * tol), up)  # cooler air adds to more airflow
+    assert stuck(_zone_air_drift(2 * tol, 0.0), up)  # every zone-air sensor must agree
+    assert not stuck(_zone_air_drift(2 * tol, None), up)  # a dropout has no plausible path
+
+    def spiked(i: int) -> dict[str, float | None]:
+        t = _zone_air_drift(2 * tol, None)(i)
+        if i == 4:
+            t["air_a"] = 90.0  # a Spike: no plausible path either, so the evidence stays
+        return t
+
+    assert stuck(spiked, up)
+    # a frozen zone-air reading is flagged by the airflow and does not void it either
+    _, r = _history(cfg, n, _zone_air_drift(0.0, 2 * tol), up)
+    assert r.stuck["air_a"] and r.stuck["prox_a2"]  # air_a did not oppose: evidence stays
+
+
+def test_frozen_readings_are_flagged_within_the_documented_time():
+    """Section 3: a reading frozen from t0 is flagged at the latest at
+    max(t0 + stuck_s, t1 + stuck_s / 2) plus two decimation intervals once its zone's
+    relative airflow has stepped by more than stuck_airflow_net at t1 >= t0 + stuck_s / 4,
+    and not before the step is a quarter window old. A DS18B20 and a thermistor alike."""
+    m = das_mapping()
+    m.update(dt=5.0, confirm_s=10.0, fallback_hold_s=20.0, stuck_s=10.0)
+    m["sensors"]["prox_a1b"]["quant_c"] = 0.01  # a thermistor on bay a1
+    cfg = MpcConfig.from_mapping(m)
+    names = ("prox_a2", "prox_a1b")
+    assert cfg.stuck_params("prox_a1b").eps_c == pytest.approx(0.015)
+    for t1 in (600.0, 2400.0):
+        replay = DasReplay(cfg)
+        first: dict[str, float] = {}
+        for i in range(int((t1 + 1800.0) / cfg.dt)):
+            ts = i * cfg.dt
+            u = 0.3 if ts < t1 else 0.6  # za's relative airflow +0.33
+            r = replay.tick(_base_temps(), {"fa1": u, "fa2": u, "fb1": 0.5, "fc1": 0.5})
+            for name in names:
+                if r.stuck[name]:
+                    first.setdefault(name, ts)
+        for name in names:
+            p = cfg.stuck_params(name)
+            window_s, slack_s = p.ticks * cfg.dt, 2 * p.decimate * cfg.dt
+            assert name in first, (name, t1)
+            assert t1 + window_s / 4 <= first[name], (name, t1, first[name])
+            assert first[name] <= max(window_s, t1 + window_s / 2) + slack_s, (name, t1, first)
+
+
+def test_idle_bay_plateau_longer_than_its_window_next_to_a_busy_bay_stays_trusted():
+    """The report's case: an idle bay's DS18B20 sits on one code for twice stuck_s while the
+    neighbouring bay's drive heats up by 3 degC and the fans answer it a little (less than
+    stuck_airflow_net). Never Stuck."""
+    m = das_mapping()
+    m.update(dt=5.0, confirm_s=10.0, fallback_hold_s=20.0, stuck_s=10.0)
+    cfg = MpcConfig.from_mapping(m)
+    window_s = cfg.stuck_params("prox_a2").ticks * cfg.dt
+    replay = DasReplay(cfg)
+    ticks = int(2 * window_s / cfg.dt)
+    for i in range(ticks):
+        heat = min(1.0, i / (ticks / 2))  # the neighbour's burst ramps up over a window
+        dither = 0.02 * (-1) ** i  # thermistor noise on the zone-air sensors
+        temps = _base_temps()
+        temps.update(
+            air_a=_q(SP + 0.05 * heat + dither, 0.01),
+            air_a2=_q(SP + 0.1 + 0.05 * heat + dither, 0.01),
+            prox_a1=_q(41.0 + 3.0 * heat + 0.03 * (-1) ** i, 0.0625),
+            prox_a1b=_q(41.2 + 3.0 * heat + 0.03 * (-1) ** i, 0.0625),
+            prox_a2=40.0,
+            prox_b1=_q(40.0 + 0.1 * (-1) ** i, 0.0625),
+            prox_c1=_q(30.0 + 0.1 * (-1) ** i, 0.0625),
+        )
+        fan = 0.4 + 0.1 * heat  # the solver answers the burst: +0.11 relative airflow
+        r = replay.tick(temps, {"fa1": fan, "fa2": fan, "fb1": 0.5, "fc1": 0.5})
+        assert not r.stuck["prox_a2"], f"tick {i}: stuck {r.stuck}"
+        assert r.per_temp["prox_a2"], f"tick {i}: {r.reasons}"
 
 
 def test_inlet_without_zone_gets_no_pwm_evidence_but_other_inlets_count():

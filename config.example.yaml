@@ -58,6 +58,8 @@ mpc:
   stuck_eps_c: 0.02      # "unchanged" band; aquaero reports 0.01 °C
   stuck_pwm_net: 0.15    # net PWM move over the window that must show up in T
   stuck_sibling_dT_c: 1.0
+  stuck_airflow_net: 0.15  # DAS only (inert here): zone relative-airflow move that is Stuck evidence, (0, 1]
+  stuck_air_oppose_c: 0.3  # DAS only (inert here): zone-air move against it that voids it for a proximal sensor, degC
   solver_max_iter: 50    # MPC iteration cap; hitting it is a solver fault (fallback)
   channels:
     - radiator
