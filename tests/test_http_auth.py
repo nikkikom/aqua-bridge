@@ -737,3 +737,76 @@ def test_http_user_tool_refusals(tmp_path: Path, monkeypatch, capsys) -> None:
     answers = iter(["same", "same"])
     assert tool.main(["--config", str(conf), "--file", str(tmp_path / "f"), "alice"]) == 0
     assert verify_password("same", load_credentials(tmp_path / "f")["alice"])
+
+
+# ---------------------------------------------------------------------------
+# Review findings (PR #24)
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_user_costs_one_derivation_at_the_stored_iteration_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A probe for an unknown name must cost what a known name costs: one PBKDF2
+    at the iteration count of the stored hashes, not at ``http.hash_iterations``
+    (which only governs newly written hashes and may differ)."""
+    stored = TEST_ITERATIONS * 3
+    creds = tmp_path / "users"
+    creds.write_text(f"{TEST_USER}:{hash_password(TEST_PASSWORD, stored)}\n")
+    os.chmod(creds, 0o640)
+    auth = BasicAuthenticator(
+        auth_settings(credentials_file=str(creds), auth_fail_limit=0), clock=FakeClock()
+    )
+    counts: list[int] = []
+    real = httpauth._derive
+    monkeypatch.setattr(
+        httpauth, "_derive", lambda pw, salt, it: counts.append(it) or real(pw, salt, it)
+    )
+    assert not auth.verify(basic_header(TEST_USER, "wrong"), "c").ok
+    known = list(counts)
+    counts.clear()
+    assert not auth.verify(basic_header("nobody", "wrong"), "c").ok
+    assert counts == known == [stored]
+    counts.clear()
+    assert not auth.verify(basic_header("nobody2", "wrong"), "c").ok
+    assert counts == [stored]
+
+
+def test_private_file_owned_by_another_unprivileged_user_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 0640 file owned by some other non-root account is readable and writable by
+    that account: only root or the service user itself may own the key and the
+    credentials file."""
+    if os.getuid() == 0:
+        pytest.skip("running as root: every file owner looks privileged")
+    path = write_credentials(tmp_path / "users")
+    assert set(load_credentials(path)) == {TEST_USER}  # owned by us: accepted
+    monkeypatch.setattr(httpauth.os, "getuid", lambda: os.stat(path).st_uid + 1)
+    with pytest.raises(HttpSetupError, match="owner"):
+        load_credentials(path)
+
+
+def test_backoff_does_not_reset_when_the_longest_wait_ends() -> None:
+    """A client at the longest backoff that tries again as soon as the wait ends
+    stays at the longest backoff; it must not get a fresh ``auth_fail_limit``."""
+    clock = FakeClock()
+    s = auth_settings(auth_backoff_s=1.0, auth_backoff_max_s=8.0, auth_fail_limit=3)
+    auth = BasicAuthenticator(s, clock=clock)
+    wrong = basic_header(TEST_USER, "wrong")
+    for _ in range(30):
+        decision = auth.verify(wrong, "attacker")
+        if decision.retry_after_s is not None:
+            clock.t += decision.retry_after_s + 0.5
+    # At the longest wait now: wait it out and fail once more.
+    decision = auth.verify(wrong, "attacker")
+    if decision.retry_after_s is None:  # that was an attempt; the next call is refused
+        decision = auth.verify(wrong, "attacker")
+    assert decision.retry_after_s == pytest.approx(s.auth_backoff_max_s)
+    clock.t += s.auth_backoff_max_s + 0.5
+    assert not auth.verify(wrong, "attacker").ok
+    again = auth.verify(wrong, "attacker").retry_after_s
+    assert again is not None and again == pytest.approx(s.auth_backoff_max_s)
+    # A client that stays away for the longest wait after its backoff ended is forgiven.
+    clock.t += 2 * s.auth_backoff_max_s + 1.0
+    assert auth.verify(wrong, "attacker").retry_after_s is None

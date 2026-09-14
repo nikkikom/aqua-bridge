@@ -114,7 +114,8 @@ class HttpSettings:
     auth_fail_limit: int = 5
     #: First backoff after the limit, doubled with every further failure.
     auth_backoff_s: float = 1.0
-    #: Longest backoff; a client's failure count is forgotten after this long without failures.
+    #: Longest backoff; a client's failure count is forgotten once this long has passed
+    #: without a failure after its backoff ended.
     auth_backoff_max_s: float = 300.0
 
     @classmethod
@@ -293,13 +294,19 @@ def update_credentials_text(text: str, user: str, encoded: str) -> str:
 
 
 def check_private_file(path: str | os.PathLike[str], what: str) -> os.stat_result:
-    """A regular file, not readable by others and not writable by the group or others."""
+    """A regular file owned by root or this process's user, not readable by others and
+    not writable by the group or others."""
     try:
         st = os.stat(path)
     except OSError as exc:
         raise HttpSetupError(f"{what} {path}: {exc.strerror or exc}") from exc
     if not stat.S_ISREG(st.st_mode):
         raise HttpSetupError(f"{what} {path} is not a regular file")
+    if st.st_uid not in (0, os.getuid()):
+        raise HttpSetupError(
+            f"{what} {path} belongs to uid {st.st_uid}; its owner must be root or the "
+            "service user (chown root:<service user>)"
+        )
     mode = stat.S_IMODE(st.st_mode)
     if mode & 0o027:
         raise HttpSetupError(
@@ -408,18 +415,37 @@ class BasicAuthenticator:
         self._cache_key = secrets.token_bytes(32)
         self._cache: dict[bytes, tuple[str, float]] = {}
         self._failures: dict[str, tuple[int, float]] = {}
-        self._dummy_hash: str | None = None
+        self._dummy_hash = ""
         self._signature: tuple[int, int, int, int] | None = None
         self._users: dict[str, str] = {}
         self._reload_error: str | None = None
         # Refuse to start without a valid file: raises HttpSetupError.
-        self._users = load_credentials(settings.credentials_file)
+        self._set_users_locked(load_credentials(settings.credentials_file))
         self._signature = self._stat_signature()
 
     @property
     def users(self) -> tuple[str, ...]:
         with self._lock:
             return tuple(sorted(self._users))
+
+    def _set_users_locked(self, users: dict[str, str]) -> None:
+        """Install ``users`` and the stand-in hash an unknown name is checked against.
+
+        The stand-in has a random salt and key and the highest iteration count of
+        the stored hashes, so an unknown name costs one derivation, like a known
+        one (``http.hash_iterations`` only governs hashes written later and may
+        differ from what the file holds).
+        """
+        self._users = users
+        iterations = max(
+            (parse_hash(encoded)[0] for encoded in users.values()),
+            default=self.settings.hash_iterations,
+        )
+        self._dummy_hash = (
+            f"{HASH_SCHEME}${iterations}$"
+            f"{_b64encode(secrets.token_bytes(_SALT_BYTES))}$"
+            f"{_b64encode(secrets.token_bytes(_KEY_BYTES))}"
+        )
 
     def _stat_signature(self) -> tuple[int, int, int, int] | None:
         try:
@@ -435,14 +461,15 @@ class BasicAuthenticator:
         self._signature = signature
         self._cache.clear()
         try:
-            self._users = load_credentials(self.settings.credentials_file)
+            users = load_credentials(self.settings.credentials_file)
         except HttpSetupError as exc:
-            self._users = {}
+            self._set_users_locked({})
             message = str(exc)
             if message != self._reload_error:
                 _LOG.error("http: credentials unusable, denying every request: %s", message)
             self._reload_error = message
             return
+        self._set_users_locked(users)
         if self._reload_error is not None:
             _LOG.info("http: credentials file readable again (%d users)", len(self._users))
         self._reload_error = None
@@ -452,26 +479,34 @@ class BasicAuthenticator:
         msg = user.encode("utf-8") + b"\0" + password.encode("utf-8", "surrogatepass")
         return hmac.new(self._cache_key, msg, hashlib.sha256).digest()
 
-    def _backoff_locked(self, client: str, now: float) -> float | None:
-        """Seconds the client still has to wait, or ``None``."""
+    def _wait_s(self, count: int) -> float:
+        """The backoff after ``count`` consecutive failures (0 below the limit)."""
         limit = self.settings.auth_fail_limit
-        entry = self._failures.get(client)
-        if limit <= 0 or entry is None:
-            return None
-        count, last = entry
-        if count < limit:
-            return None
-        wait = min(
+        if limit <= 0 or count < limit:
+            return 0.0
+        return min(
             self.settings.auth_backoff_s * 2.0 ** min(count - limit, 64),
             self.settings.auth_backoff_max_s,
         )
+
+    def _backoff_locked(self, client: str, now: float) -> float | None:
+        """Seconds the client still has to wait, or ``None``."""
+        entry = self._failures.get(client)
+        if entry is None:
+            return None
+        count, last = entry
+        wait = self._wait_s(count)
+        if wait <= 0.0:
+            return None
         remaining = last + wait - now
         return remaining if remaining > 0.0 else None
 
     def _record_failure_locked(self, client: str, now: float) -> None:
+        # A count is forgotten auth_backoff_max_s after its backoff ended, so a
+        # client retrying right when the longest wait ends stays at that wait.
         horizon = self.settings.auth_backoff_max_s
-        for key, (_count, last) in list(self._failures.items()):
-            if now - last > horizon:
+        for key, (count, last) in list(self._failures.items()):
+            if now - last > self._wait_s(count) + horizon:
                 del self._failures[key]
         count, _last = self._failures.get(client, (0, now))
         self._failures[client] = (count + 1, now)
@@ -511,12 +546,11 @@ class BasicAuthenticator:
                 if wait is not None:
                     return AuthDecision(False, retry_after_s=wait)
                 encoded = self._users.get(user)
+                dummy = self._dummy_hash
                 signature = self._signature
             if encoded is None:
-                # Same cost as a real user, so a probe cannot tell names apart.
-                if self._dummy_hash is None:
-                    self._dummy_hash = hash_password("", self.settings.hash_iterations)
-                verify_password(password, self._dummy_hash)
+                # One derivation at the stored cost, so a probe cannot tell names apart.
+                verify_password(password, dummy)
                 ok = False
             else:
                 ok = verify_password(password, encoded)

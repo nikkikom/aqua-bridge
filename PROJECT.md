@@ -2207,14 +2207,14 @@ Config `http:` (parsed and validated by `HttpSettings` in
 | `bind` | `0.0.0.0` | listen address |
 | `port` | `8443` | TLS port (`0` picks a free port; tests) |
 | `tls_cert` | `/etc/aqua-bridge/tls/cert.pem` | PEM certificate (chain) |
-| `tls_key` | `/etc/aqua-bridge/tls/key.pem` | PEM key; must not be readable by others nor group-writable (`0640 root:<service user>`) |
-| `credentials_file` | `/etc/aqua-bridge/http-users` | `user:hash` lines, same mode rule |
+| `tls_key` | `/etc/aqua-bridge/tls/key.pem` | PEM key; owned by root or the service user, not readable by others nor group-writable (`0640 root:<service user>`) |
+| `credentials_file` | `/etc/aqua-bridge/http-users` | `user:hash` lines, same owner and mode rule |
 | `realm` | `aqua-bridge` | basic-auth realm (1–64 printable ASCII, no `"` or `\`) |
 | `hash_iterations` | `100000` | PBKDF2 iterations for hashes written by `tools/http_user.py` (≥ 1000) |
 | `auth_cache_s` | `300` | seconds a verified user:password stays cached in memory; `0` verifies every request |
 | `auth_fail_limit` | `5` | consecutive failed logins from one client address before the backoff; `0` disables it |
 | `auth_backoff_s` | `1` | first backoff, doubled with every further failure |
-| `auth_backoff_max_s` | `300` | longest backoff (≥ `auth_backoff_s`); a client's count is forgotten after this long without a failure |
+| `auth_backoff_max_s` | `300` | longest backoff (≥ `auth_backoff_s`); a client's count is forgotten once this long has passed without a failure after its backoff ended |
 
 - **TLS:** TLS 1.2 or newer, the certificate and key from `tls_cert` /
   `tls_key`. `deploy/install-pi.sh` creates a self-signed ECDSA P-256
@@ -2228,8 +2228,9 @@ Config `http:` (parsed and validated by `HttpSettings` in
   stdlib `hashlib`; a 16-byte random salt per user and the 32-byte key in
   unpadded URL-safe base64). The iteration count travels with each hash,
   so changing `hash_iterations` affects only users written afterwards.
-  Verification uses `hmac.compare_digest`; an unknown user costs the same
-  derivation as a known one. The file is reread whenever it changes on
+  Verification uses `hmac.compare_digest`; an unknown user costs one
+  derivation at the highest iteration count stored in the file, like a
+  known one. The file is reread whenever it changes on
   disk (no restart); if it becomes missing, unreadable, too permissive or
   invalid, every request is denied (logged) until it is fixed.
 - **`tools/http_user.py`** creates or updates one user: `sudo
@@ -2258,7 +2259,8 @@ Config `http:` (parsed and validated by `HttpSettings` in
   `http:`, loads the certificate and key and the credentials file (at
   least one user) **before** opening a socket. Any problem — an unknown
   key or invalid value, a missing or unreadable certificate or key, a key
-  or credentials file readable by others, an empty credentials file —
+  or credentials file readable by others or owned by another non-root
+  account, an empty credentials file —
   leaves the API off with one error in the journal (`http: HTTPS API not
   started (fan control continues without it): ...`), as does a bind
   failure; the daemon keeps controlling the fans (publishers never touch
@@ -2910,7 +2912,8 @@ without a controller exception (read and apply failures included);
 | `/etc/aqua-bridge/http-users` | `0640 root:<service user>` | `tools/http_user.py --group <service user>` |
 
 The daemon refuses a key or credentials file that others can read or the
-group can write (§6); ownership is not checked. The paths are the `http:`
+group can write, or that belongs to an account other than root or the
+service user (§6). The paths are the `http:`
 defaults (`tests/test_deploy.py` checks the script against them).
 
 ### Overlays and modules
