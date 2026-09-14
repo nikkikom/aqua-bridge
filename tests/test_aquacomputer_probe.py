@@ -38,8 +38,8 @@ def _hidraw(root: Path, name: str, product: int, interface: int, serial: str) ->
 def rig(tmp_path: Path):
     sysfs = tmp_path / "hidraw"
     dev = tmp_path / "dev"
-    _hidraw(sysfs, "hidraw0", 0xF001, 0, "12345-67890")  # keyboard interface: not listed
-    _hidraw(sysfs, "hidraw2", 0xF001, 2, "12345-67890")
+    _hidraw(sysfs, "hidraw0", 0xF001, 0, "12345-54321")  # keyboard interface: not listed
+    _hidraw(sysfs, "hidraw2", 0xF001, 2, "12345-54321")
     _hidraw(sysfs, "hidraw5", 0xF00D, 1, "00000-11111")
     clock = FakeClock()
     controllers = {
@@ -68,7 +68,7 @@ def _run(rig, **kwargs) -> tuple[int, str]:
 def test_lists_and_decodes_both_devices_without_writing(rig) -> None:
     code, text = _run(rig)
     assert code == 0
-    assert "aquaero  serial 12345-67890    interface 2" in text
+    assert "aquaero  serial 12345-54321    interface 2" in text
     assert "quadro   serial 00000-11111    interface 1" in text
     assert "hidraw0" not in text
     # aquaero status: a connected input, a virtual sensor, the commanded output, flow
@@ -87,7 +87,7 @@ def test_lists_and_decodes_both_devices_without_writing(rig) -> None:
 def test_filters_by_kind_and_serial(rig) -> None:
     code, text = _run(rig, kinds=(QUADRO,))
     assert code == 0 and "aquaero" not in text
-    code, text = _run(rig, serial="12345-67890")
+    code, text = _run(rig, serial="12345-54321")
     assert code == 0 and "quadro" not in text
     code, text = _run(rig, serial="99999-99999")
     assert code == 1 and "with serial '99999-99999'" in text

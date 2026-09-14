@@ -4,7 +4,7 @@
 Run on the Pi (the service user, or any user in ``plugdev``)::
 
     tools/aquacomputer_probe.py
-    tools/aquacomputer_probe.py --device quadro --serial 12345-67890
+    tools/aquacomputer_probe.py --device quadro --serial 12345-54321
 
 Lists every discovered status/control hidraw node (kind, serial, USB
 interface, device node), then for each device prints its newest status
@@ -166,7 +166,12 @@ def probe(
     """Lists and reads every matching device. Exit code: 0 all probed, 1 none
     found, 3 at least one could not be read."""
     out = sys.stdout if out is None else out
-    wait = AquacomputerTiming().status_max_age_s if timeout_s is None else timeout_s
+
+    def wait(kind: DeviceKind) -> float:
+        if timeout_s is not None:
+            return timeout_s
+        return AquacomputerTiming.for_kind(kind).status_max_age_s
+
     open_node: Opener = opener if opener is not None else HidrawTransport.open
     devices = list_hidraw_devices(sysfs_root, dev_dir)
     found = [
@@ -191,7 +196,8 @@ def probe(
     for kind, info in found:
         print(file=out)
         ok = (
-            _probe_device(kind, info, opener=open_node, timeout_s=wait, clock=clock, out=out) and ok
+            _probe_device(kind, info, opener=open_node, timeout_s=wait(kind), clock=clock, out=out)
+            and ok
         )
     return 0 if ok else 3
 
@@ -207,7 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="S",
         help=(
             "seconds to wait for a status report (default: the status_max_age_s default, "
-            f"{AquacomputerTiming().status_max_age_s:g})"
+            f"{AquacomputerTiming.for_kind('aquaero').status_max_age_s:g})"
         ),
     )
     p.add_argument(

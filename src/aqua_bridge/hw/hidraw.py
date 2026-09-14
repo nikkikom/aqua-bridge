@@ -7,7 +7,7 @@ injectable so tests use a fake tree)::
     HID_ID=0003:00000C70:0000F001
     HID_NAME=Aqua Computer GmbH & Co. KG aquaero
     HID_PHYS=usb-20980000.usb-1.1/input2
-    HID_UNIQ=12345-67890
+    HID_UNIQ=12345-54321
 
 ``HID_ID`` is bus:vendor:product, the trailing ``inputN`` of ``HID_PHYS`` the
 USB interface number and ``HID_UNIQ`` the serial. A device matches a
@@ -49,6 +49,9 @@ except ImportError:  # pragma: no cover - Windows
 __all__ = [
     "DEFAULT_DEV_DIR",
     "DEFAULT_SYSFS_ROOT",
+    "HIDRAW_BUFFER_SIZE",
+    "HIDRAW_QUEUE_FULL",
+    "USB_CTRL_TIMEOUT_S",
     "AmbiguousDevice",
     "DeviceUnavailable",
     "FeatureReportError",
@@ -70,6 +73,17 @@ DEFAULT_DEV_DIR = Path("/dev")
 #: Larger than any input report of the supported devices (a shorter buffer
 #: would silently truncate a report).
 _READ_SIZE = 4096
+#: The kernel's per-open-file hidraw report queue (``HIDRAW_BUFFER_SIZE`` in
+#: drivers/hid/hidraw.c). It is a ring buffer that holds one report less than
+#: its size and drops new reports while it is full.
+HIDRAW_BUFFER_SIZE = 64
+#: A drain returning this many reports found the queue full: newer reports were
+#: dropped, so what it returned may be arbitrarily old.
+HIDRAW_QUEUE_FULL = HIDRAW_BUFFER_SIZE - 1
+#: usbhid control transfer timeout (``USB_CTRL_GET_TIMEOUT`` /
+#: ``USB_CTRL_SET_TIMEOUT``, 5000 ms): the longest one feature report GET or SET
+#: can block.
+USB_CTRL_TIMEOUT_S = 5.0
 #: errno values meaning the device node is gone (unplugged, hub dropout).
 _GONE_ERRNOS = frozenset({errno.ENODEV, errno.ENXIO, errno.ENOENT, errno.ESHUTDOWN})
 

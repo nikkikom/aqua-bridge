@@ -7,18 +7,25 @@ PROJECT.md section 3 (Track B).
 
 from __future__ import annotations
 
+import dataclasses
+import re
+from pathlib import Path
+
 import pytest
 import yaml
 
-from aqua_bridge.hw.aquacomputer import AQUAERO, QUADRO
+from aqua_bridge.hw.aquacomputer import AQUAERO, KINDS, QUADRO
 from aqua_bridge.hw.aquacomputer_adapter import (
     ENTRY_KEYS,
+    KIND_TIMING_DEFAULTS,
     TIMING_KEYS,
     AquacomputerAdapter,
     AquacomputerTiming,
     build_adapter_from_config,
+    check_watchdog,
     parse_device_section,
 )
+from aqua_bridge.hw.hidraw import USB_CTRL_TIMEOUT_S
 from aqua_bridge.model import ConfigError, Mode, MpcCommand
 from aquacomputer_fakes import FakeBus, FakeClock, FakeController
 
@@ -44,7 +51,7 @@ def test_matching_mpc_section_is_accepted() -> None:
     assert binding.pwm_map == {"radiator": 1, "intake": 2}
     assert binding.fan_map == {"radiator": 1}  # rpm is optional per fan
     assert binding.temp_map == {"coolant": 1, "air": 2}
-    assert binding.timing == AquacomputerTiming()
+    assert binding.timing == AquacomputerTiming.for_kind(AQUAERO)
     # without the mpc tuples the check is skipped (mapping-only callers)
     assert _parse(_SECTION).pwm_map == binding.pwm_map
 
@@ -53,7 +60,7 @@ def test_one_line_yaml_flow_mappings_and_every_optional_key() -> None:
     section = yaml.safe_load(
         """
 device: quadro
-serial: 12345-67890
+serial: 12345-54321
 prefer: hid
 fans:
   radiator: {pwm: pwm4, rpm: fan5}
@@ -62,13 +69,16 @@ temp_map: {coolant: temp20, air: temp5}
 status_max_age_s: 2.5
 ctrl_gap_ms: 150
 ctrl_retries: 3
+ctrl_budget_s: 4
 ctrl_refresh_s: 0
 duty_mismatch_tolerance: 250
 duty_mismatch_s: 12
+write_min_interval_s: 0
+write_deadband: 0
 """
     )
     binding = _parse(section, channels=_CHANNELS, temps=_TEMPS)
-    assert binding.kind is QUADRO and binding.serial == "12345-67890"
+    assert binding.kind is QUADRO and binding.serial == "12345-54321"
     assert binding.pwm_map == {"radiator": 4, "intake": 2}
     assert binding.fan_map == {"radiator": 5, "intake": 2}
     assert binding.temp_map == {"coolant": 20, "air": 5}
@@ -76,9 +86,12 @@ duty_mismatch_s: 12
         status_max_age_s=2.5,
         ctrl_gap_ms=150,
         ctrl_retries=3,
+        ctrl_budget_s=4,
         ctrl_refresh_s=0,
         duty_mismatch_tolerance=250,
         duty_mismatch_s=12,
+        write_min_interval_s=0,
+        write_deadband=0,
     )
     assert set(TIMING_KEYS) <= set(ENTRY_KEYS)
 
@@ -274,8 +287,16 @@ def test_temp_map_not_equal_to_mpc_temps_is_a_startup_error(temp_map) -> None:
         ("status_max_age_s", "3", "status_max_age_s must be a finite number > 0"),
         ("ctrl_gap_ms", -1, "ctrl_gap_ms must be a finite number >= 0"),
         ("ctrl_gap_ms", True, "ctrl_gap_ms must be a finite number >= 0"),
-        ("ctrl_retries", -1, "ctrl_retries must be an integer >= 0"),
-        ("ctrl_retries", 1.0, "ctrl_retries must be an integer >= 0"),
+        ("ctrl_retries", -1, "ctrl_retries must be an integer in 0..5"),
+        ("ctrl_retries", 1.0, "ctrl_retries must be an integer in 0..5"),
+        ("ctrl_retries", 6, "ctrl_retries must be an integer in 0..5"),
+        ("ctrl_budget_s", 0, "ctrl_budget_s must be a finite number > 0"),
+        ("ctrl_budget_s", float("inf"), "ctrl_budget_s must be a finite number > 0"),
+        ("write_min_interval_s", -0.5, "write_min_interval_s must be a finite number >= 0"),
+        ("write_min_interval_s", "30", "write_min_interval_s must be a finite number >= 0"),
+        ("write_deadband", -1, "write_deadband must be an integer in 0..10000"),
+        ("write_deadband", 10001, "write_deadband must be an integer in 0..10000"),
+        ("write_deadband", 0.5, "write_deadband must be an integer in 0..10000"),
         ("ctrl_refresh_s", float("nan"), "ctrl_refresh_s must be a finite number >= 0"),
         (
             "duty_mismatch_tolerance",
@@ -296,3 +317,51 @@ def test_zero_is_allowed_where_documented() -> None:
     timing = _parse(dict(_SECTION, ctrl_gap_ms=0, ctrl_retries=0, ctrl_refresh_s=0.0)).timing
     assert (timing.ctrl_gap_ms, timing.ctrl_retries, timing.ctrl_refresh_s) == (0, 0, 0.0)
     assert _parse(dict(_SECTION, duty_mismatch_tolerance=0)).timing.duty_mismatch_tolerance == 0
+    writes = _parse(dict(_SECTION, write_min_interval_s=0, write_deadband=0)).timing
+    assert (writes.write_min_interval_s, writes.write_deadband) == (0, 0)
+
+
+def test_ctrl_gap_default_depends_on_the_device_kind() -> None:
+    """Owner decision 2026-09-15: 100 ms for the aquaero (EPIPE at 0 and 25 ms on the
+    Pi), no gap for the Quadro; declared once, in KIND_TIMING_DEFAULTS."""
+    assert set(KIND_TIMING_DEFAULTS) == set(KINDS)
+    assert _parse(_SECTION).timing.ctrl_gap_ms == KIND_TIMING_DEFAULTS["aquaero"]["ctrl_gap_ms"]
+    quadro = _parse(dict(_SECTION, device="quadro")).timing
+    assert quadro.ctrl_gap_ms == KIND_TIMING_DEFAULTS["quadro"]["ctrl_gap_ms"]
+    assert (AquacomputerTiming.for_kind(AQUAERO).ctrl_gap_ms, quadro.ctrl_gap_ms) == (100, 0)
+    assert _parse(dict(_SECTION, device="quadro", ctrl_gap_ms=40)).timing.ctrl_gap_ms == 40
+    # Everything else is the same for both kinds.
+    aquaero = AquacomputerTiming.for_kind(AQUAERO)
+    assert dataclasses.replace(aquaero, ctrl_gap_ms=0) == AquacomputerTiming.for_kind(QUADRO)
+    with pytest.raises(TypeError):
+        AquacomputerTiming()  # type: ignore[call-arg]  # no kind-independent gap default
+
+
+def test_worst_case_tick_and_the_watchdog_check() -> None:
+    aquaero = AquacomputerTiming.for_kind(AQUAERO)
+    quadro = AquacomputerTiming.for_kind(QUADRO)
+    worst = aquaero.status_max_age_s + aquaero.ctrl_budget_s + USB_CTRL_TIMEOUT_S
+    assert aquaero.worst_case_tick_s() == pytest.approx(worst)
+    slow_gap = AquacomputerTiming.for_kind(AQUAERO, ctrl_gap_ms=8000)
+    assert slow_gap.worst_case_tick_s() == pytest.approx(worst - USB_CTRL_TIMEOUT_S + 8.0)
+    pair = [("aquacomputer[0]", aquaero), ("aquacomputer[1]", quadro)]
+    total = aquaero.worst_case_tick_s() + quadro.worst_case_tick_s()
+    check_watchdog(pair, None)
+    check_watchdog(pair, total + 0.001)
+    with pytest.raises(ConfigError, match=r"aquacomputer\[0\] .*not below the systemd watchdog"):
+        check_watchdog(pair, total)
+    with pytest.raises(ConfigError, match="WatchdogSec"):
+        build_adapter_from_config(_SECTION, watchdog_s=aquaero.worst_case_tick_s())
+    build_adapter_from_config(_SECTION, watchdog_s=aquaero.worst_case_tick_s() + 1)
+
+
+def test_the_unit_watchdog_fits_two_controllers_at_their_defaults() -> None:
+    """deploy/aqua-bridge.service's WatchdogSec against the DAS pair at defaults."""
+    unit = (Path(__file__).resolve().parent.parent / "deploy" / "aqua-bridge.service").read_text()
+    match = re.search(r"^WatchdogSec=(\d+)$", unit, re.MULTILINE)
+    assert match is not None
+    pair = [
+        ("aquaero", AquacomputerTiming.for_kind(AQUAERO)),
+        ("quadro", AquacomputerTiming.for_kind(QUADRO)),
+    ]
+    check_watchdog(pair, float(match.group(1)))

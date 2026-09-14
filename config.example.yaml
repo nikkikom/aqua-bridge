@@ -117,7 +117,7 @@ mpc:
 # /sys/class/hidraw by USB id (tools/aquacomputer_probe.py lists what is attached).
 xt6:
   device: aquaero        # aquaero | quadro
-  # serial: "12345-67890"  # only needed when several of one kind are attached
+  # serial: "12345-54321"  # only needed when several of one kind are attached
   fans:                  # one entry per mpc.channels name: output pwm1..pwm4 and optional tachometer fanN
     radiator: {pwm: pwm1, rpm: fan1}
     intake:   {pwm: pwm2, rpm: fan2}
@@ -126,11 +126,14 @@ xt6:
     air: temp2
   # Timing, defaults shown (PROJECT.md section 3, Track B):
   status_max_age_s: 3.0         # an older status report is no observation: fallback (> 0)
-  ctrl_gap_ms: 200              # wait after a control report write before the next control operation (>= 0)
-  ctrl_retries: 1               # retries of a failed control operation, each from a fresh read (int >= 0)
+  ctrl_gap_ms: 100              # wait after a control operation before the next read or write, ms (>= 0; default aquaero 100, quadro 0)
+  ctrl_retries: 1               # retries of a failed control operation, each from a fresh read (int 0..5)
+  ctrl_budget_s: 5.0            # no control operation starts after this much of one write (> 0)
   ctrl_refresh_s: 60.0          # read the control report again this often (>= 0, 0 disables)
-  duty_mismatch_tolerance: 100  # output duty this far from the command is a mismatch, 1/100 % (0..10000)
+  duty_mismatch_tolerance: 100  # output duty this far from the written duty is a mismatch, 1/100 % (0..10000)
   duty_mismatch_s: 5.0          # a mismatch lasting longer re-reads and rewrites every channel (> 0)
+  write_min_interval_s: 30.0    # a falling duty is written at most this often (>= 0; rises go out at once)
+  write_deadband: 50            # a falling duty is written only this far below the written one, 1/100 % (0..10000)
 
 http:
   # HTTPS with basic auth only; there is no plain-HTTP listener (PROJECT.md section 6).
