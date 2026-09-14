@@ -26,6 +26,11 @@
 # the code already present at /opt/aqua-bridge, or run it once to create
 # /opt/aqua-bridge and rsync/clone the code into it afterwards, then
 # re-run to install the venv, config, udev rule and unit.
+#
+# The aquacomputer_d5next hwmon driver is built and installed with DKMS by
+# deploy/install-aquacomputer-dkms.sh (downloads the driver source from
+# kernel.org for the running kernel); a module that is already installed is
+# left as is.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -97,6 +102,11 @@ else
   echo "error: $PACKAGES_FILE not found" >&2
   exit 1
 fi
+
+echo "== aquacomputer_d5next driver =="
+# The Raspberry Pi OS kernel ships without this hwmon driver; build it with
+# DKMS from the matching kernel.org source plus deploy/dkms patches (PROJECT.md §9).
+"$SCRIPT_DIR/install-aquacomputer-dkms.sh"
 
 echo "== install directory =="
 sudo install -d -o "$USER_ACCOUNT" -g "$USER_ACCOUNT" "$INSTALL_DIR"

@@ -208,7 +208,7 @@ def test_install_script_das_flag_installs_das_config_and_dropin_never_enabling()
     assert "systemctl start" not in before_summary
 
 
-@pytest.mark.parametrize("script", ["install-pi.sh", "host-usb.sh"])
+@pytest.mark.parametrize("script", ["install-pi.sh", "host-usb.sh", "install-aquacomputer-dkms.sh"])
 def test_shell_scripts_parse(script):
     bash = shutil.which("bash")
     if bash is None:
@@ -218,3 +218,97 @@ def test_shell_scripts_parse(script):
     if shellcheck is None:
         pytest.skip("shellcheck not installed (bash -n passed)")
     subprocess.run([shellcheck, str(DEPLOY / script)], check=True)
+
+
+# --- aquacomputer_d5next DKMS package (section 9) --------------------------------------
+
+DKMS_PKG = DEPLOY / "dkms" / "aquacomputer_d5next"
+DKMS_SCRIPT = DEPLOY / "install-aquacomputer-dkms.sh"
+
+
+def _packages() -> list[str]:
+    return [
+        line.strip()
+        for line in (DEPLOY / "packages-rpi.txt").read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def test_packages_include_what_the_driver_build_needs():
+    packages = _packages()
+    for name in ("dkms", "curl", "patch", "linux-headers-rpi-v6", "make", "gcc"):
+        assert name in packages, name
+
+
+def test_install_script_builds_the_driver_after_apt_and_before_udev():
+    text = (DEPLOY / "install-pi.sh").read_text()
+    apt_pos = text.index("apt-get install -y")
+    driver_pos = text.index('"$SCRIPT_DIR/install-aquacomputer-dkms.sh"')
+    udev_pos = text.index('echo "== udev rule =="')
+    assert apt_pos < driver_pos < udev_pos
+
+
+def test_dkms_conf_is_a_template_the_script_fills_in():
+    conf = _unit_values((DKMS_PKG / "dkms.conf").read_text())
+    assert conf["PACKAGE_NAME"] == ['"aquacomputer_d5next"']
+    assert conf["PACKAGE_VERSION"] == ['"@PKGVER@"']
+    assert conf["BUILT_MODULE_NAME[0]"] == ['"aquacomputer_d5next"']
+    assert conf["AUTOINSTALL"] == ['"yes"']
+    makefile = (DKMS_PKG / "Makefile").read_text()
+    assert re.search(r"^obj-m\s*:=\s*aquacomputer_d5next\.o$", makefile, re.MULTILINE)
+    script = DKMS_SCRIPT.read_text()
+    assert "s/@PKGVER@/$PKG_VER/" in script
+    assert '"$PKG_DIR"/*.patch' in script
+
+
+def test_dkms_script_never_unloads_a_loaded_module():
+    # The daemon may be using the hwmon device; a reload is left to a reboot.
+    for line in DKMS_SCRIPT.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("#", "echo", '"')):
+            continue
+        assert "rmmod" not in stripped and "modprobe -r" not in stripped, line
+
+
+def _hunk_sides(patch_text: str) -> tuple[list[str], list[str]]:
+    """Old and new side of every hunk, in order (context lines on both)."""
+    old: list[str] = []
+    new: list[str] = []
+    in_hunk = False
+    for line in patch_text.splitlines():
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if not in_hunk or line.startswith(("--- ", "+++ ")):
+            continue
+        tag, body = line[:1], line[1:]
+        if tag == " ":
+            old.append(body)
+            new.append(body)
+        elif tag == "-":
+            old.append(body)
+        elif tag == "+":
+            new.append(body)
+        elif line == "":
+            old.append("")
+            new.append("")
+    return old, new
+
+
+@pytest.mark.parametrize("patch_file", sorted(DKMS_PKG.glob("*.patch")), ids=lambda p: p.name)
+def test_driver_patch_is_well_formed_and_applies_to_its_own_context(patch_file, tmp_path):
+    text = patch_file.read_text()
+    assert text.startswith("SPDX-License-Identifier: GPL-2.0")
+    assert "\n--- a/aquacomputer_d5next.c\n+++ b/aquacomputer_d5next.c\n@@ " in text
+    patch = shutil.which("patch")
+    if patch is None:
+        pytest.skip("patch not installed")
+    old, new = _hunk_sides(text)
+    target = tmp_path / "aquacomputer_d5next.c"
+    target.write_text("\n".join(old) + "\n")
+    subprocess.run([patch, "-s", "-p1", "-d", str(tmp_path)], input=text.encode(), check=True)
+    assert target.read_text() == "\n".join(new) + "\n"
+
+
+def test_at_least_one_driver_patch_exists():
+    assert sorted(DKMS_PKG.glob("*.patch"))

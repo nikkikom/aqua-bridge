@@ -2,8 +2,10 @@
 
 PROJECT.md section 3 (Track B) / section 4.7 / section 2 (Risk, USB spike).
 
-Assumed ABI (``aquacomputer_d5next`` driver, already in 6.18; to be
-confirmed by the USB spike -- see :mod:`aqua_bridge.hw.map` docstring):
+ABI of the ``aquacomputer_d5next`` driver (not built into Raspberry Pi OS
+kernels; ``deploy/install-aquacomputer-dkms.sh`` installs it). Names and
+units are confirmed on USB-attached devices, which have no ``pwmK_enable``
+(PROJECT.md section 2, "USB spike results"):
 
 * ``tempK_input``  -- millidegrees Celsius, read-only
 * ``fanK_input``   -- RPM, read-only

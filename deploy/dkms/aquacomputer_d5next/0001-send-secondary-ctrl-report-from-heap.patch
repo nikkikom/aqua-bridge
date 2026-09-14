@@ -1,0 +1,47 @@
+SPDX-License-Identifier: GPL-2.0-or-later
+(a change to the Linux kernel driver drivers/hwmon/aquacomputer_d5next.c)
+
+hwmon: (aquacomputer_d5next) send the secondary control report from heap memory
+
+aqc_send_ctrl_data() passes priv->secondary_ctrl_report, which points at the
+static secondary_ctrl_report[] / aquaero_secondary_ctrl_report[] arrays, to
+hid_hw_raw_request(). usbhid hands that buffer to usb_control_msg(), and USB
+transfer buffers must be DMA-mappable. Module data is not on every platform:
+on a Raspberry Pi Zero W (ARMv6, dwc_otg) every write to pwmN fails with
+-EAGAIN and a warning
+
+  WARNING: ... at kernel/dma/direct.h:117 dma_map_phys+0x43c/0x464
+  dwc_otg 20980000.usb: DMA addr 0xffffffff+7 overflow (mask ffffffff, bus limit 9fffffff).
+
+after the control report itself has already been sent, so the device gets
+the change without the follow-up report the official software always sends.
+
+Keep a devm_kmemdup() copy of the template per device and send that.
+
+Seen on 6.18.39+rpt-rpi-v6 with an aquaero 6 XT and a Quadro. Unchanged in
+mainline as of 2026-09-14.
+--- a/aquacomputer_d5next.c
++++ b/aquacomputer_d5next.c
+@@ -1864,6 +1864,22 @@ static int aqc_probe(struct hid_device *hdev, const struct hid_device_id *id)
+ 
+ 	priv->name = aqc_device_names[priv->kind];
+ 
++	/*
++	 * The secondary report templates are static driver data. USB transfer
++	 * buffers must be DMA-mappable, which module data is not on every
++	 * platform (ARMv6 BCM2835: "DMA addr 0xffffffff+7 overflow" and -EAGAIN
++	 * from every control write), so send a per-device heap copy instead.
++	 */
++	if (priv->secondary_ctrl_report) {
++		priv->secondary_ctrl_report = devm_kmemdup(&hdev->dev, priv->secondary_ctrl_report,
++							   priv->secondary_ctrl_report_size,
++							   GFP_KERNEL);
++		if (!priv->secondary_ctrl_report) {
++			ret = -ENOMEM;
++			goto fail_and_close;
++		}
++	}
++
+ 	priv->buffer = devm_kzalloc(&hdev->dev, priv->buffer_size, GFP_KERNEL);
+ 	if (!priv->buffer) {
+ 		ret = -ENOMEM;

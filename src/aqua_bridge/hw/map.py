@@ -1,8 +1,9 @@
 """Logical name -> hwmon sysfs file resolution (PROJECT.md section 3, Track B).
 
 The aquaero (and Quadro, over aquabus) show up under Linux as one hwmon
-device (assumed driver: ``aquacomputer_d5next``; to be confirmed by the
-USB spike in section 2 -- keep everything here name-based and configurable
+device (driver ``aquacomputer_d5next``, installed with DKMS, PROJECT.md
+section 9; the aquabus layout is still open in section 2 -- keep everything
+here name-based and configurable
 so a different driver name or file layout is a config change, not a code
 change).
 
