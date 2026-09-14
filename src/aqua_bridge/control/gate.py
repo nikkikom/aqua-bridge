@@ -197,7 +197,7 @@ def _finite_or_none(value: object) -> float | None:
         return None
     try:
         f = float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: an int no float holds
         return None
     return f if math.isfinite(f) else None
 

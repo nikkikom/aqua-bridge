@@ -1093,3 +1093,20 @@ def test_step_tolerates_malformed_decimated_windows_in_memory(garbage):
         for sample in samples:
             assert isinstance(sample["t"], Mapping) and isinstance(sample["p"], Mapping)
     json.dumps(nxt.to_dict(), allow_nan=False)
+
+
+def test_step_tolerates_integers_too_large_for_a_float_in_memory():
+    """A JSON state can carry an integer no float holds (``10**400``). Behind a frozen reading
+    the Stuck evidence reads the stored commands: such a value is unusable like a string,
+    never an ``OverflowError`` out of ``step``."""
+    cfg = das_cfg()
+    state = MpcState.cold()
+    for i in range(5):
+        _, state = step(das_obs(cfg, float(i)), cfg, state)
+    mem = dict(state.solver_memory)
+    huge = {"t": default_temps(cfg), "p": dict.fromkeys(cfg.channels, 10**400)}
+    mem["stuck_slow"] = {k: [dict(huge) for _ in range(70)] for k in mem["stuck_slow"]}
+    bad = dataclasses.replace(state, solver_memory=mem)
+    cmd, nxt = step(das_obs(cfg, 5.0, pwm=state.last_cmd.pwm), cfg, bad)
+    assert not any(cmd.diagnostics["gate"]["stuck"].values())
+    json.dumps(nxt.to_dict(), allow_nan=False)
