@@ -67,6 +67,15 @@ Order inside :func:`step`
    fault-free or on its ``confirm_ticks``-th consecutive trusted tick with a
    confirmed trusted member in every required group its trust rule checks
    (``sigma``: the setpoint groups only).
+4b. Sigma floor (``zones.trust_rule: sigma`` only): an eligible zone whose
+   required sensor groups (the ``strict`` groups) are not all held by a
+   gate-trusted, confirmed member runs on the estimator's growing sigma; while
+   it does, the solver's demand on every channel of its reach is raised to at
+   least ``prev`` (``diagnostics["sigma_floor_channels"]``). The estimator
+   cannot see the heat a lost sensor would have shown, and ``k * sigma`` grows
+   slowly, so without the floor a solver that had followed the measured warming
+   (the DAS MPC) lowers the fans the moment the sensor goes (PROJECT.md
+   section 3 per-zone trust). The floor is released with the sensor.
 5. Solver -- only when some zone is eligible. The channels of the zones
    that stay in fault (and, with ``fault_coupling: declared``, of the zones
    coupled to them) are under fallback policy: they reach the solver as
@@ -594,6 +603,15 @@ def step(
             )
         )
     ]
+    # 4b. sigma floor (``trust_rule: sigma``; module docstring): an eligible zone with a
+    # required sensor group that has no confirmed trusted member keeps the channels of its
+    # reach at or above ``prev`` while the solver drives them
+    sigma_floor: set[str] = set()
+    if das and trust_rule == "sigma":
+        degraded = [
+            z for z in eligible if not zones.groups_confirmed(z, gate, confirming, cfg, "strict")
+        ]
+        sigma_floor = set(zones.fallback_channels(degraded, cfg))
     # Zones that stay in fault whatever the solver does, and their channels.
     remaining = [z for z in zone_names if z not in eligible]
     fixed_pre = set(zones.fallback_channels(remaining, cfg))
@@ -727,7 +745,10 @@ def step(
                 prev[ch], cfg.fallback_pwm[ch], ch_elapsed[ch], cfg
             )
         elif result_pwm is not None:
-            target[ch], policy_by_channel[ch] = result_pwm[ch], "solver"
+            want = result_pwm[ch]
+            if ch in sigma_floor:  # never below what is already on the fans (step 4b)
+                want = max(want, prev[ch])
+            target[ch], policy_by_channel[ch] = want, "solver"
         else:  # unreachable: a channel outside fallback policy had a solver result; hold
             target[ch], policy_by_channel[ch] = prev[ch], "hold"
     policy = _overall_policy(policy_by_channel)
@@ -851,6 +872,9 @@ def step(
         diagnostics["zones_in_fault"] = list(faulted)
         diagnostics["fallback_channels"] = [ch for ch in cfg.channels if ch in ch_elapsed]
         diagnostics["policy_by_channel"] = policy_by_channel
+        diagnostics["sigma_floor_channels"] = [
+            ch for ch in cfg.channels if ch in sigma_floor and policy_by_channel[ch] == "solver"
+        ]
         diagnostics["trust_rule"] = trust_rule
         diagnostics["sensor_confirm"] = dict(confirming)
         diagnostics["estimates"] = _estimate_diagnostics(est_block, verdicts, faulted)
