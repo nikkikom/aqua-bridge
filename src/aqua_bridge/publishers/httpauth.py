@@ -19,8 +19,13 @@ it without the HTTP stack:
   verified credentials (``http.auth_cache_s``, so the page's 2 s poll does not
   run PBKDF2 each time), a per-client backoff after ``http.auth_fail_limit``
   consecutive failures (``http.auth_backoff_s`` doubling up to
-  ``http.auth_backoff_max_s``), and a reload of the credentials file whenever
-  it changes on disk (a missing or invalid file then denies everyone).
+  ``http.auth_backoff_max_s``), a global limit on uncached password checks
+  (``http.auth_verify_max`` per ``http.auth_verify_window_s`` and at most
+  ``http.auth_verify_pending_max`` admitted at once, across every client, so
+  requests from many source addresses cannot keep the single core busy), one
+  worker thread at a lowered priority (``http.auth_verify_nice``) for the
+  checks, and a reload of the credentials file whenever it changes on disk (a
+  missing or invalid file then denies everyone).
 
 The private files (key, credentials) must not be readable by others nor
 writable by the group: ``0640 root:<service user>`` is the intended mode.
@@ -39,17 +44,22 @@ import re
 import secrets
 import ssl
 import stat
+import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, fields
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 __all__ = [
     "HASH_SCHEME",
     "MIN_HASH_ITERATIONS",
+    "MAX_NICE",
     "AuthDecision",
+    "AuthTicket",
     "BasicAuthenticator",
     "HttpSettings",
     "HttpSetupError",
@@ -57,6 +67,7 @@ __all__ = [
     "check_private_file",
     "hash_password",
     "load_credentials",
+    "lower_thread_priority",
     "parse_authorization",
     "parse_credentials",
     "parse_hash",
@@ -73,6 +84,8 @@ _SALT_BYTES = 16
 _KEY_BYTES = 32
 # Validation floor for http.hash_iterations (a smaller count is a mistake).
 MIN_HASH_ITERATIONS = 1000
+# The largest nice value Linux accepts (validation bound of http.auth_verify_nice).
+MAX_NICE = 19
 
 _USERNAME = re.compile(r"^[A-Za-z0-9._@+-]{1,64}$")
 # A realm is quoted into WWW-Authenticate: printable ASCII without quote or backslash.
@@ -117,6 +130,16 @@ class HttpSettings:
     #: Longest backoff; a client's failure count is forgotten once this long has passed
     #: without a failure after its backoff ended.
     auth_backoff_max_s: float = 300.0
+    #: Uncached password checks (PBKDF2) admitted per ``auth_verify_window_s`` across
+    #: every client; beyond it a request that needs one gets 429 (0 = no window limit).
+    auth_verify_max: int = 6
+    #: The sliding window of ``auth_verify_max``, seconds (> 0).
+    auth_verify_window_s: float = 60.0
+    #: Uncached checks admitted and unfinished at once (one runs, the rest wait); beyond
+    #: it 429 (>= 1).
+    auth_verify_pending_max: int = 2
+    #: Added to the nice value of the thread that runs the checks (Linux; 0 = unchanged).
+    auth_verify_nice: int = 10
 
     @classmethod
     def from_section(cls, section: Mapping[str, Any] | None) -> HttpSettings:
@@ -165,6 +188,30 @@ class HttpSettings:
         if isinstance(fail_limit, bool) or not isinstance(fail_limit, int) or fail_limit < 0:
             raise HttpSetupError("http.auth_fail_limit must be an integer >= 0")
         values["auth_fail_limit"] = fail_limit
+        for name, low, high in (
+            ("auth_verify_max", 0, None),
+            ("auth_verify_pending_max", 1, None),
+            ("auth_verify_nice", 0, MAX_NICE),
+        ):
+            value = get(name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < low
+                or (high is not None and value > high)
+            ):
+                bound = f">= {low}" if high is None else f"in [{low}, {high}]"
+                raise HttpSetupError(f"http.{name} must be an integer {bound}")
+            values[name] = value
+        window = get("auth_verify_window_s")
+        if (
+            isinstance(window, bool)
+            or not isinstance(window, int | float)
+            or not math.isfinite(float(window))
+            or float(window) <= 0.0
+        ):
+            raise HttpSetupError("http.auth_verify_window_s must be a finite number > 0")
+        values["auth_verify_window_s"] = float(window)
         for name in ("auth_cache_s", "auth_backoff_s", "auth_backoff_max_s"):
             value = get(name)
             if isinstance(value, bool) or not isinstance(value, int | float):
@@ -387,19 +434,53 @@ def parse_authorization(header: str | None) -> tuple[str, str] | None:
 
 @dataclass(frozen=True)
 class AuthDecision:
-    """``ok`` with ``user``; otherwise ``retry_after_s`` is set while the client backs off."""
+    """``ok`` with ``user``; otherwise ``retry_after_s`` is set while the client backs
+    off or the global limit on uncached checks refuses (both answer 429)."""
 
     ok: bool
     user: str | None = None
     retry_after_s: float | None = None
 
 
+@dataclass(frozen=True, eq=False)
+class AuthTicket:
+    """An admitted uncached check: pass it to :meth:`BasicAuthenticator.check` once."""
+
+    user: str
+    password: str = field(repr=False)
+    client: str = ""
+
+
+def lower_thread_priority(increment: int) -> None:
+    """Add ``increment`` to the calling thread's nice value (capped at :data:`MAX_NICE`).
+
+    Linux only: there ``setpriority(PRIO_PROCESS, <thread id>)`` applies to that one
+    thread. Elsewhere, and on an error (logged), the priority is left as it is.
+    """
+    if increment <= 0 or not sys.platform.startswith("linux"):
+        return
+    try:
+        tid = threading.get_native_id()
+        current = os.getpriority(os.PRIO_PROCESS, tid)
+        os.setpriority(os.PRIO_PROCESS, tid, min(MAX_NICE, current + increment))
+    except OSError as exc:
+        _LOG.warning("http: cannot lower the password-check thread's priority: %s", exc)
+
+
 class BasicAuthenticator:
-    """Basic-auth checks with a cache, per-client backoff and credentials reload.
+    """Basic-auth checks with a cache, per-client backoff, a global limit on
+    uncached checks and credentials reload.
 
     Thread-safe. :meth:`fast` answers without PBKDF2 (a cache hit, a missing or
-    malformed header, a client backing off) or returns ``None``; :meth:`verify`
-    then does the full check and may run PBKDF2 (serialised, one at a time).
+    malformed header, a client backing off) or returns ``None``. :meth:`begin`
+    adds the global admission of uncached checks: a decision (the ``fast``
+    answers, or 429 when ``http.auth_verify_max`` checks already started within
+    ``http.auth_verify_window_s`` or ``http.auth_verify_pending_max`` are admitted
+    and unfinished) or an :class:`AuthTicket`. :meth:`check` runs a ticket's
+    PBKDF2 (serialised, one at a time) and releases its slot; call it exactly
+    once per ticket. The server runs it on :attr:`executor`, one worker thread
+    whose nice value is raised by ``http.auth_verify_nice``. :meth:`verify` is
+    :meth:`begin` plus :meth:`check` in the calling thread.
     """
 
     def __init__(
@@ -415,6 +496,14 @@ class BasicAuthenticator:
         self._cache_key = secrets.token_bytes(32)
         self._cache: dict[bytes, tuple[str, float]] = {}
         self._failures: dict[str, tuple[int, float]] = {}
+        # Start times of the uncached checks admitted within the window, oldest first.
+        self._admitted: deque[float] = deque()
+        self._pending = 0
+        self._last_check_s = 0.0
+        # Refusals by the global limit not logged yet, and when the last line was logged.
+        self._refused = 0
+        self._refused_logged_at: float | None = None
+        self._executor: ThreadPoolExecutor | None = None
         self._dummy_hash = ""
         self._signature: tuple[int, int, int, int] | None = None
         self._users: dict[str, str] = {}
@@ -422,6 +511,26 @@ class BasicAuthenticator:
         # Refuse to start without a valid file: raises HttpSetupError.
         self._set_users_locked(load_credentials(settings.credentials_file))
         self._signature = self._stat_signature()
+
+    @property
+    def executor(self) -> ThreadPoolExecutor:
+        """The one worker thread for :meth:`check` (started on first use)."""
+        with self._lock:
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="aqua-bridge-auth",
+                    initializer=lower_thread_priority,
+                    initargs=(self.settings.auth_verify_nice,),
+                )
+            return self._executor
+
+    def close(self) -> None:
+        """Let the worker thread exit once its queue is done (a later use starts a new one)."""
+        with self._lock:
+            executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.shutdown(wait=False)
 
     @property
     def users(self) -> tuple[str, ...]:
@@ -531,29 +640,100 @@ class BasicAuthenticator:
                     return AuthDecision(True, user=creds[0])
         return None
 
-    def verify(self, header: str | None, client: str) -> AuthDecision:
-        """The full check (may run PBKDF2). Never raises."""
+    def _admit_locked(self, now: float) -> float | None:
+        """Reserve a slot for one uncached check: ``None``, or the seconds to wait."""
+        s = self.settings
+        horizon = now - s.auth_verify_window_s
+        while self._admitted and self._admitted[0] <= horizon:
+            self._admitted.popleft()
+        wait: float | None = None
+        if s.auth_verify_max > 0 and len(self._admitted) >= s.auth_verify_max:
+            wait = self._admitted[0] + s.auth_verify_window_s - now
+        if self._pending >= s.auth_verify_pending_max:
+            # The queue drains one check at a time; the last check's duration is the estimate.
+            wait = max(wait or 0.0, self._pending * self._last_check_s)
+        if wait is not None:
+            self._refused += 1
+            # At most one line per window, however long a flood lasts.
+            if self._refused_logged_at is None or now - self._refused_logged_at >= (
+                s.auth_verify_window_s
+            ):
+                _LOG.warning(
+                    "http: %d request(s) refused with 429: uncached password checks over the "
+                    "limit (%d per %g s, %d at once)",
+                    self._refused,
+                    s.auth_verify_max,
+                    s.auth_verify_window_s,
+                    s.auth_verify_pending_max,
+                )
+                self._refused_logged_at = now
+                self._refused = 0
+            return max(wait, 0.0)
+        self._admitted.append(now)
+        self._pending += 1
+        return None
+
+    def begin(self, header: str | None, client: str) -> AuthDecision | AuthTicket:
+        """:meth:`fast`, then the global admission of an uncached check. Never raises."""
         decision = self.fast(header, client)
         if decision is not None:
             return decision
         creds = parse_authorization(header)
         if creds is None:  # pragma: no cover - fast() answered already
             return AuthDecision(False)
-        user, password = creds
-        with self._verify_lock:
+        with self._lock:
+            wait = self._admit_locked(self._clock())
+        if wait is not None:
+            # Nothing was checked, so this is not a failure of the client.
+            return AuthDecision(False, retry_after_s=wait)
+        return AuthTicket(user=creds[0], password=creds[1], client=client)
+
+    def verify(self, header: str | None, client: str) -> AuthDecision:
+        """:meth:`begin` and :meth:`check` in the calling thread (may run PBKDF2). Never
+        raises."""
+        outcome = self.begin(header, client)
+        if isinstance(outcome, AuthDecision):
+            return outcome
+        return self.check(outcome)
+
+    def check(self, ticket: AuthTicket) -> AuthDecision:
+        """Run an admitted check (may run PBKDF2) and release its slot. Never raises."""
+        try:
+            with self._verify_lock:
+                started = self._clock()
+                try:
+                    return self._check_serialised(ticket)
+                finally:
+                    elapsed = self._clock() - started
+                    with self._lock:
+                        self._last_check_s = max(0.0, elapsed)
+        finally:
             with self._lock:
-                wait = self._backoff_locked(client, self._clock())
-                if wait is not None:
-                    return AuthDecision(False, retry_after_s=wait)
-                encoded = self._users.get(user)
-                dummy = self._dummy_hash
-                signature = self._signature
-            if encoded is None:
-                # One derivation at the stored cost, so a probe cannot tell names apart.
-                verify_password(password, dummy)
-                ok = False
-            else:
-                ok = verify_password(password, encoded)
+                self._pending -= 1
+
+    def _check_serialised(self, ticket: AuthTicket) -> AuthDecision:
+        """The body of :meth:`check`, under the verify lock."""
+        user, password, client = ticket.user, ticket.password, ticket.client
+        with self._lock:
+            now = self._clock()
+            wait = self._backoff_locked(client, now)
+            if wait is not None:
+                return AuthDecision(False, retry_after_s=wait)
+            if self.settings.auth_cache_s > 0.0:
+                # A check queued behind one for the same credentials needs no derivation.
+                hit = self._cache.get(self._cache_digest(user, password))
+                if hit is not None and hit[1] > now and hit[0] in self._users:
+                    self._failures.pop(client, None)
+                    return AuthDecision(True, user=user)
+            encoded = self._users.get(user)
+            dummy = self._dummy_hash
+            signature = self._signature
+        if encoded is None:
+            # One derivation at the stored cost, so a probe cannot tell names apart.
+            verify_password(password, dummy)
+            ok = False
+        else:
+            ok = verify_password(password, encoded)
         now = self._clock()
         with self._lock:
             if ok and self._signature == signature and user in self._users:

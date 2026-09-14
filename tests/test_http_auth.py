@@ -17,6 +17,8 @@ import logging
 import os
 import socket
 import ssl
+import sys
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -225,6 +227,16 @@ def test_settings_defaults_when_section_is_empty() -> None:
         ({"auth_fail_limit": -1}, "http.auth_fail_limit"),
         ({"auth_fail_limit": 2.5}, "http.auth_fail_limit"),
         ({"auth_backoff_s": 10, "auth_backoff_max_s": 5}, "auth_backoff_max_s must be >="),
+        ({"auth_verify_max": -1}, "http.auth_verify_max"),
+        ({"auth_verify_max": 1.5}, "http.auth_verify_max"),
+        ({"auth_verify_max": True}, "http.auth_verify_max"),
+        ({"auth_verify_window_s": 0}, "http.auth_verify_window_s"),
+        ({"auth_verify_window_s": float("inf")}, "http.auth_verify_window_s"),
+        ({"auth_verify_window_s": "60"}, "http.auth_verify_window_s"),
+        ({"auth_verify_pending_max": 0}, "http.auth_verify_pending_max"),
+        ({"auth_verify_nice": -1}, "http.auth_verify_nice"),
+        ({"auth_verify_nice": 20}, "http.auth_verify_nice"),
+        ({"auth_verify_nice": False}, "http.auth_verify_nice"),
     ],
 )
 def test_settings_reject_invalid_values(section: dict[str, Any], message: str) -> None:
@@ -296,7 +308,7 @@ def test_authenticator_caches_verified_credentials(monkeypatch: pytest.MonkeyPat
 
 def test_authenticator_backoff_per_client_doubles_and_resets() -> None:
     clock = FakeClock()
-    s = auth_settings()
+    s = auth_settings(auth_verify_max=0)  # the global limit has its own tests
     auth = BasicAuthenticator(s, clock=clock)
     wrong = basic_header(TEST_USER, "wrong")
     for _ in range(s.auth_fail_limit):
@@ -453,7 +465,9 @@ _POST_ROUTES = (
 @needs_bind
 def test_every_route_needs_auth_over_tls(cfg: MpcConfig, tls_files: tuple[Path, Path]) -> None:
     cert, _key = tls_files
-    app_cfg = AppConfig(mpc=cfg, http=_http_section(tls_files, auth_fail_limit=0))
+    app_cfg = AppConfig(
+        mpc=cfg, http=_http_section(tls_files, auth_fail_limit=0, auth_verify_max=0)
+    )
     settings_ = HttpSettings.from_section(app_cfg.http)
     wrong = (
         {},
@@ -792,7 +806,9 @@ def test_backoff_does_not_reset_when_the_longest_wait_ends() -> None:
     """A client at the longest backoff that tries again as soon as the wait ends
     stays at the longest backoff; it must not get a fresh ``auth_fail_limit``."""
     clock = FakeClock()
-    s = auth_settings(auth_backoff_s=1.0, auth_backoff_max_s=8.0, auth_fail_limit=3)
+    s = auth_settings(
+        auth_backoff_s=1.0, auth_backoff_max_s=8.0, auth_fail_limit=3, auth_verify_max=0
+    )
     auth = BasicAuthenticator(s, clock=clock)
     wrong = basic_header(TEST_USER, "wrong")
     for _ in range(30):
@@ -811,3 +827,221 @@ def test_backoff_does_not_reset_when_the_longest_wait_ends() -> None:
     # A client that stays away for the longest wait after its backoff ended is forgiven.
     clock.t += 2 * s.auth_backoff_max_s + 1.0
     assert auth.verify(wrong, "attacker").retry_after_s is None
+
+
+# ---------------------------------------------------------------------------
+# Global limit on uncached password checks (section 8 item 56)
+# ---------------------------------------------------------------------------
+
+
+def _count_derivations(monkeypatch: pytest.MonkeyPatch, clock: FakeClock | None = None) -> list:
+    """Record every PBKDF2 (the thread's name); advance ``clock`` 1.2 s per call."""
+    calls: list[str] = []
+    real = httpauth._derive
+
+    def derive(*args: Any) -> bytes:
+        calls.append(threading.current_thread().name)
+        if clock is not None:
+            clock.t += 1.2
+        return real(*args)
+
+    monkeypatch.setattr(httpauth, "_derive", derive)
+    return calls
+
+
+def test_flood_from_many_addresses_is_bounded_per_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every uncached check counts against one global window, whatever the source
+    address: beyond ``auth_verify_max`` a request needing PBKDF2 gets 429 without a
+    derivation and without a failure charged to its address, while a cached login
+    is still answered at once."""
+    clock = FakeClock()
+    s = auth_settings(auth_verify_max=3, auth_verify_window_s=60.0, auth_fail_limit=2)
+    auth = BasicAuthenticator(s, clock=clock)
+    calls = _count_derivations(monkeypatch, clock)
+    started = clock.t
+    assert auth.verify(basic_header(), "owner").ok  # verified and cached: slot 1
+    wrong = basic_header(TEST_USER, "wrong")
+    assert not auth.verify(wrong, "2001:db8::1").ok  # slot 2
+    assert not auth.verify(basic_header("nobody", "x"), "2001:db8::2").ok  # slot 3
+    assert len(calls) == 3
+    for n in range(50):
+        decision = auth.verify(wrong, f"2001:db8::{n + 16:x}")
+        assert not decision.ok
+        assert decision.retry_after_s == pytest.approx(started + s.auth_verify_window_s - clock.t)
+        cached = auth.begin(basic_header(), "owner")
+        assert isinstance(cached, httpauth.AuthDecision) and cached.ok
+        clock.t += 0.5
+    assert len(calls) == 3  # no derivation for any refused request
+    # A refusal is not a failure of that address: its own backoff never starts.
+    for _ in range(s.auth_fail_limit + 2):
+        assert auth.verify(wrong, "2001:db8::10").retry_after_s is not None
+    assert "2001:db8::10" not in auth._failures
+    # The window slides: once the first check is older than the window, one more starts.
+    clock.t = started + s.auth_verify_window_s + 0.01
+    assert not auth.verify(wrong, "2001:db8::10").ok
+    assert len(calls) == 4
+    clock.t = started + s.auth_verify_window_s + 0.01  # the other two slots are still in
+    assert auth.verify(wrong, "2001:db8::11").retry_after_s is not None
+
+
+def test_zero_disables_the_window_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    auth = BasicAuthenticator(
+        auth_settings(auth_verify_max=0, auth_fail_limit=0), clock=FakeClock()
+    )
+    calls = _count_derivations(monkeypatch)
+    for n in range(20):
+        decision = auth.verify(basic_header(TEST_USER, "wrong"), f"c{n}")
+        assert not decision.ok and decision.retry_after_s is None
+    assert len(calls) == 20
+
+
+def test_pending_limit_refuses_while_checks_are_queued(monkeypatch: pytest.MonkeyPatch) -> None:
+    """At most ``auth_verify_pending_max`` checks are admitted and unfinished; the
+    Retry-After estimate is the queue times the last check's duration, and a slot is
+    released even when the check raises."""
+    clock = FakeClock()
+    s = auth_settings(auth_verify_max=0, auth_verify_pending_max=2, auth_fail_limit=0)
+    auth = BasicAuthenticator(s, clock=clock)
+    _count_derivations(monkeypatch, clock)
+    assert not auth.verify(basic_header(TEST_USER, "wrong"), "a").ok  # last check: 1.2 s
+    first = auth.begin(basic_header(TEST_USER, "w1"), "b")
+    second = auth.begin(basic_header(TEST_USER, "w2"), "c")
+    assert isinstance(first, httpauth.AuthTicket) and isinstance(second, httpauth.AuthTicket)
+    refused = auth.begin(basic_header(TEST_USER, "w3"), "d")
+    assert isinstance(refused, httpauth.AuthDecision) and not refused.ok
+    assert refused.retry_after_s == pytest.approx(2 * 1.2)
+    # A cached login is never behind the queue.
+    auth._cache[auth._cache_digest(TEST_USER, TEST_PASSWORD)] = (TEST_USER, clock.t + 60.0)
+    cached = auth.begin(basic_header(), "owner")
+    assert isinstance(cached, httpauth.AuthDecision) and cached.ok
+    assert not auth.check(first).ok
+    assert isinstance(auth.begin(basic_header(TEST_USER, "w4"), "e"), httpauth.AuthTicket)
+
+    def boom(*_args: Any) -> bytes:
+        raise RuntimeError("derivation failed")
+
+    monkeypatch.setattr(httpauth, "_derive", boom)
+    with pytest.raises(RuntimeError):
+        auth.check(second)
+    assert auth._pending == 1  # the "w4" ticket only
+
+
+def test_backing_off_client_takes_no_slot(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = FakeClock()
+    s = auth_settings(auth_verify_max=3, auth_fail_limit=1, auth_backoff_s=30.0)
+    auth = BasicAuthenticator(s, clock=clock)
+    calls = _count_derivations(monkeypatch)
+    assert not auth.verify(basic_header(TEST_USER, "wrong"), "x").ok
+    for _ in range(10):
+        decision = auth.verify(basic_header(TEST_USER, "wrong"), "x")
+        assert decision.retry_after_s == pytest.approx(s.auth_backoff_s)
+    assert len(calls) == 1 and len(auth._admitted) == 1
+
+
+def test_queued_check_for_cached_credentials_skips_the_derivation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parallel first requests with the same credentials queue two checks; the second
+    finds the first one's cache entry and runs no PBKDF2."""
+    auth = BasicAuthenticator(auth_settings(), clock=FakeClock())
+    calls = _count_derivations(monkeypatch)
+    first = auth.begin(basic_header(), "tab1")
+    second = auth.begin(basic_header(), "tab2")
+    assert isinstance(first, httpauth.AuthTicket) and isinstance(second, httpauth.AuthTicket)
+    assert auth.check(first).ok and auth.check(second).ok
+    assert len(calls) == 1 and auth._pending == 0
+
+
+def test_lower_thread_priority_is_a_no_op_off_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[tuple] = []
+    monkeypatch.setattr(httpauth.sys, "platform", "darwin")
+    monkeypatch.setattr(httpauth.os, "setpriority", lambda *a: seen.append(a), raising=False)
+    httpauth.lower_thread_priority(10)
+    assert seen == []
+
+
+def test_lower_thread_priority_caps_and_logs_errors(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    seen: list[tuple] = []
+    monkeypatch.setattr(httpauth.sys, "platform", "linux")
+    monkeypatch.setattr(httpauth.os, "PRIO_PROCESS", 0, raising=False)
+    monkeypatch.setattr(httpauth.os, "getpriority", lambda *_a: 15, raising=False)
+    monkeypatch.setattr(httpauth.os, "setpriority", lambda *a: seen.append(a), raising=False)
+    httpauth.lower_thread_priority(10)
+    assert seen == [(0, threading.get_native_id(), httpauth.MAX_NICE)]
+    httpauth.lower_thread_priority(0)
+    assert len(seen) == 1
+
+    def denied(*_a: Any) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(httpauth.os, "setpriority", denied, raising=False)
+    with caplog.at_level(logging.WARNING, logger="aqua_bridge.publishers.httpauth"):
+        httpauth.lower_thread_priority(5)  # never raises
+    assert "priority" in caplog.text
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="per-thread nice is Linux only")
+def test_worker_thread_runs_at_a_raised_nice_value() -> None:
+    auth = make_authenticator(auth_verify_nice=5)
+    try:
+        own = os.getpriority(os.PRIO_PROCESS, threading.get_native_id())
+        worker = auth.executor.submit(
+            lambda: os.getpriority(os.PRIO_PROCESS, threading.get_native_id())
+        ).result(timeout=10)
+        assert worker == min(httpauth.MAX_NICE, own + 5)
+        # The calling thread keeps its priority.
+        assert os.getpriority(os.PRIO_PROCESS, threading.get_native_id()) == own
+    finally:
+        auth.close()
+
+
+def test_http_answers_429_beyond_the_limit_and_serves_cached_logins(
+    cfg: MpcConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Over HTTP: the checks run on the authenticator's worker thread, a flood beyond
+    ``auth_verify_max`` gets 429 with Retry-After, and a cached login gets 200."""
+    auth = make_authenticator(auth_verify_max=3, auth_verify_window_s=600, auth_fail_limit=0)
+    calls = _count_derivations(monkeypatch)
+    good = {"Authorization": basic_header()}
+    wrong = {"Authorization": basic_header(TEST_USER, "wrong")}
+
+    async def scenario() -> None:
+        client = TestClient(TestServer(create_app(Supervisor(cfg), auth=auth)))
+        await client.start_server()
+        try:
+            resp = await client.get("/api/health", headers=good)
+            assert resp.status == 200
+            for _ in range(2):
+                resp = await client.get("/api/health", headers=wrong)
+                assert resp.status == 401
+            for _ in range(5):
+                resp = await client.get("/api/health", headers=wrong)
+                assert resp.status == 429
+                assert 1 <= int(resp.headers["Retry-After"]) <= 600
+                resp = await client.get("/api/health", headers=good)
+                assert resp.status == 200
+        finally:
+            await client.close()
+
+    asyncio.run(scenario())
+    assert calls == ["aqua-bridge-auth_0"] * 3
+    assert auth._executor is None  # closed with the app
+
+
+def test_refusals_are_logged_at_most_once_per_window(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    clock = FakeClock()
+    s = auth_settings(auth_verify_max=1, auth_verify_window_s=60.0, auth_fail_limit=0)
+    auth = BasicAuthenticator(s, clock=clock)
+    _count_derivations(monkeypatch)
+    wrong = basic_header(TEST_USER, "wrong")
+    with caplog.at_level(logging.WARNING, logger="aqua_bridge.publishers.httpauth"):
+        for n in range(200):  # 100 s of refusals every 0.5 s, one admitted per window
+            auth.verify(wrong, f"c{n}")
+            clock.t += 0.5
+    lines = [r.getMessage() for r in caplog.records if "refused with 429" in r.getMessage()]
+    assert len(lines) == 2
+    assert lines[0].startswith("http: 1 request(s)") and "(1 per 60 s, 2 at once)" in lines[0]
