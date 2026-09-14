@@ -24,8 +24,9 @@ PR runs two seeds of the calibrated case. The nightly sweep adds seeds, the unca
 case (ratio reported and bounded below 2.0), the ``rich`` preset (unknown physical
 parameters drawn from the seed: no limit violation after the first 10 minutes, and a
 ratio below :data:`RICH_BOUND` where a uniform curve below full speed exists; a
-deviation from the plan's 0.8, see the constant) and reports the PI-like DAS form on the
-same scenario. It does not assert that the
+deviation from the plan's 0.8, see the constant) and runs the PI-like DAS form on the
+same scenario, asserting zero true limit violations over the whole run for every
+solver (calibrated and uncalibrated MPC, PI-like DAS). It does not assert that the
 MPC is quieter than PI-DAS: the PI's slow integral has not settled by the end of the
 window on several seeds (its drives are still warming, so it can read quieter at a
 smaller margin), and at an equal margin the two are not comparable within one run.
@@ -213,8 +214,9 @@ def test_noise_sweep_basic_preset(seed):
     print(f"seed {seed} calibrated PI-DAS: {describe(pi)}")
     assert_healthy(cal)
     assert cal.ratio <= CALIBRATED_BOUND, describe(cal)
-    assert uncal.run.violations() == 0
+    assert uncal.run.violations() == 0, describe(uncal)
     assert uncal.ratio < UNCALIBRATED_BOUND, describe(uncal)
+    assert pi.run.violations() == 0, describe(pi)
 
 
 @pytest.mark.nightly

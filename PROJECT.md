@@ -2946,9 +2946,9 @@ Owner decisions (2026-09-14, later the same day):
     abort edge; the module docstring is also stale.
 54. `control/ident.py` hardcodes `ABORT_BELOW_LIMIT_C = 1.0` (the
     absolute abort margin below the limit); make it a config key.
-55. The nightly noise sweep runs calibrated PI-like DAS but never
-    asserts zero true limit violations; PI-like DAS now runs closer to
-    the limit.
+55. **Done:** `test_noise_sweep_basic_preset` now asserts zero true
+    limit violations over the whole run for the calibrated PI-like DAS
+    result too (MPC calibrated/uncalibrated already had the check).
 56. **Done:** a global limit on uncached password checks (`http.auth_verify_max` per `http.auth_verify_window_s`, `http.auth_verify_pending_max`) answers 429 beyond it, the checks run on one worker thread at a raised nice value (`http.auth_verify_nice`), and one check measured 1.23 s on the Zero W, where 100000 iterations stays the recommended count (§6). HTTPS auth cost on the Zero W: one PBKDF2 check at
     `http.hash_iterations: 100000` takes 1.15–1.4 s on the single core.
     Legitimate use pays it once per `http.auth_cache_s` per credential
