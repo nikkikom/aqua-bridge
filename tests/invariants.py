@@ -13,7 +13,14 @@ import numbers
 from collections.abc import Mapping
 from typing import Any
 
-from aqua_bridge.model import Mode, MpcCommand, MpcConfig, MpcState, PlantObservation
+from aqua_bridge.model import (
+    SETPOINT_GROUP_PREFIX,
+    Mode,
+    MpcCommand,
+    MpcConfig,
+    MpcState,
+    PlantObservation,
+)
 
 __all__ = [
     "TOL",
@@ -161,15 +168,21 @@ def structurally_faulted_zones(obs: PlantObservation, cfg: MpcConfig) -> set[str
 
     An unknown key faults every zone; otherwise a zone faults when some
     required group (``cfg.zone_layout.required_groups``) has every member
-    structurally bad. Legacy mode: the implicit zone iff
+    structurally bad. With ``zones.trust_rule: sigma`` only the setpoint groups
+    count: a lost drive or air sensor is the estimator's sigma, which needs
+    history (on a tick with an estimator fault ``sigma`` applies ``strict``, which
+    faults at least these zones). Legacy mode: the implicit zone iff
     :func:`obs_structurally_untrusted`.
     """
     layout = cfg.zone_layout
     if set(obs.temps) - set(cfg.temps):
         return set(layout.zones)
+    sigma = cfg.zones is not None and cfg.zones.trust_rule == "sigma" and not layout.implicit
     out: set[str] = set()
     for zone in layout.zones:
-        for _label, members in layout.required_groups[zone]:
+        for label, members in layout.required_groups[zone]:
+            if sigma and not label.startswith(SETPOINT_GROUP_PREFIX):
+                continue
             if all(_structurally_bad(obs, cfg, name) for name in members):
                 out.add(zone)
                 break

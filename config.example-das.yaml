@@ -207,14 +207,17 @@ mpc:
     qd4: {model: case120, count: 1}
   fan_models:            # PWM -> RPM curve and noise at full speed; tools/fit_fans.py fits the curve
     case120: {rpm_max: 1500, deadband: 0.1, exponent: 1.0, noise_db_at_max: 30.0}
-  # zones: trust_rule strict (sigma is accepted but applies strict for now);
-  # fault_coupling declared (a zone fault also reaches the outputs of the zones
-  # in its coupled_to) or none (strictly per zone).
+  # zones: trust_rule strict (a zone faults when a required sensor group has no
+  # trusted member) or sigma (a zone faults when a bay's drive sigma or its air
+  # sigma passes estimator.sigma_fault_c / sigma_air_fault_c: a lost sensor widens
+  # the margin first; not with two proximal sensors on a bay at different
+  # placements); fault_coupling declared (a zone fault also reaches the outputs of
+  # the zones in its coupled_to) or none (strictly per zone).
   zones: {trust_rule: strict, fault_coupling: declared}
   noise: {exponent: 5.0, weight_noise: 1.0, band_hysteresis: 0.02}
   estimator:             # drive temperature estimator (per-zone Kalman filter), defaults shown
     k_sigma: 2.0         # margin = k_sigma * sigma; sigma >= 1.5 degC until SMART calibrates a bay
-    sigma_fault_c: 4.0   # reserved for zones.trust_rule: sigma (not evaluated yet)
+    sigma_fault_c: 4.0   # zones.trust_rule: sigma faults a zone past these (degC; > 1.5 with sigma)
     sigma_air_fault_c: 2.0
     q_t_air: 1.0e-4      # process noise per tick: air, air disturbance, drive, sensor node, heat
     q_d_air: 4.0e-7

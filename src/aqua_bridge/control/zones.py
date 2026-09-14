@@ -45,11 +45,26 @@ status is ``first`` / ``ok``, ``obs.temps`` has no key outside
   through the other members, and the zone does not fault. The counts live in
   ``solver_memory["sensor_confirm"]`` (sensor -> consecutive trusted ticks,
   confirming sensors only); legacy mode has no such key.
-* ``sigma`` -- the estimator's per-drive and zone-air uncertainty below
-  thresholds. The rule is a later milestone: ``step`` does not pass
-  ``estimates`` yet, so the ``strict`` rule applies (more faults, never
-  fewer), and :func:`effective_trust_rule` reports ``strict`` in the
-  diagnostics.
+* ``sigma`` -- the estimator's uncertainty instead of the drive and air
+  groups (:func:`sigma_reasons`): for every bay of the zone declared
+  ``occupied: true`` / ``auto`` that the estimator does not report
+  ``empty`` this tick, the bay has an estimate whose ``sigma`` is at most
+  ``estimator.sigma_fault_c``, and the zone's air estimate is initialised
+  with ``sigma_air_c`` at most ``estimator.sigma_air_fault_c``. A lost
+  sensor is then not a fault by itself: the estimator predicts the
+  unobserved node, its variance grows every tick, the margin ``k * sigma``
+  widens and the solver raises the fans; the zone faults only once the
+  estimator can no longer bound a drive or the air (observability loss). The
+  setpoint groups stay required with the confirmation rule above (a zoned
+  setpoint config regulates on those sensors directly, and nothing stands in
+  for them). The zone-air and bay groups, and their confirmation
+  (:func:`groups_confirmed`), are not checked: a confirming sensor is not
+  fused, so the sigma of its bay or zone already carries its absence.
+  *Tick ordering*: ``step`` runs the estimator before zone trust, on this
+  tick's gate-trusted, confirmed temperatures, which depend on no zone
+  verdict, so the rule reads this tick's posterior sigma. Without an
+  estimator update (an estimator fault) :func:`effective_trust_rule` is
+  ``strict`` for that tick, and the diagnostics say so.
 
 Fault closure (:func:`closure`, :func:`fallback_channels`)
 ----------------------------------------------------------
@@ -78,10 +93,13 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aqua_bridge.control.gate import REASON_RANGE, REASON_SLEW, REASON_STUCK, GateResult
-from aqua_bridge.model import MpcConfig
+from aqua_bridge.model import SETPOINT_GROUP_PREFIX, MpcConfig
+
+if TYPE_CHECKING:
+    from aqua_bridge.control.estimator import EstimatorUpdate
 
 __all__ = [
     "CONFIRM_REASONS",
@@ -94,6 +112,7 @@ __all__ = [
     "fallback_channels",
     "fallback_target",
     "groups_confirmed",
+    "sigma_reasons",
 ]
 
 #: Time statuses of ``mpc.step`` under which a sample may be trusted.
@@ -114,12 +133,68 @@ class ZoneTrust:
         return {"trusted": self.trusted, "reasons": list(self.reasons)}
 
 
-def effective_trust_rule(cfg: MpcConfig, estimates: Mapping[str, Any] | None = None) -> str:
-    """The trust rule that actually runs: ``sigma`` falls back to ``strict`` without estimates."""
+def effective_trust_rule(cfg: MpcConfig, estimator: EstimatorUpdate | None = None) -> str:
+    """The trust rule that actually runs: ``sigma`` falls back to ``strict`` without an
+    estimator update of this tick (an estimator fault) and in legacy mode."""
     rule = "strict" if cfg.zones is None else cfg.zones.trust_rule
-    if rule == "sigma" and estimates is None:
+    if rule == "sigma" and (estimator is None or cfg.zone_layout.implicit):
         return "strict"
     return rule
+
+
+def _rule_groups(zone: str, cfg: MpcConfig, rule: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """The required groups ``rule`` checks: every group (``strict``) or only the setpoint
+    groups (``sigma``, whose drive and air checks come from the estimator)."""
+    groups = cfg.zone_layout.required_groups[zone]
+    if rule == "sigma":
+        return tuple(g for g in groups if g[0].startswith(SETPOINT_GROUP_PREFIX))
+    return groups
+
+
+def _sigma_ok(value: object, threshold: float) -> bool:
+    """``value`` is a number at most ``threshold`` (NaN, None and non-numbers are not)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    return value <= threshold
+
+
+def _sigma_text(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return "none"
+    return f"{float(value):.3f}"
+
+
+def sigma_reasons(zone: str, cfg: MpcConfig, estimator: EstimatorUpdate) -> list[str]:
+    """Why the ``sigma`` rule does not trust ``zone`` this tick (empty: it does).
+
+    Reads this tick's estimator update: ``zones[zone]["sigma_air_c"]`` of an initialised
+    zone, and ``estimates[bay]["sigma"]`` for every bay of the zone declared ``occupied:
+    true`` / ``auto`` that ``bays[bay]["occupancy"]`` does not report ``empty``. A zone
+    that is not initialised, a missing estimate or a sigma that is not a number at most
+    its threshold is a reason (module docstring).
+    """
+    topo = cfg.topology
+    spec = cfg.estimator
+    if topo is None or spec is None:
+        return ["sigma:no_estimator"]
+    reasons: list[str] = []
+    air = estimator.zones.get(zone)
+    sigma_air = (
+        air.get("sigma_air_c") if isinstance(air, Mapping) and air.get("initialised") else None
+    )
+    if not _sigma_ok(sigma_air, spec.sigma_air_fault_c):
+        reasons.append(f"sigma:zone_air={_sigma_text(sigma_air)}>{spec.sigma_air_fault_c:g}")
+    for bay, bay_spec in topo.bays.items():
+        if bay_spec.zone != zone or not bay_spec.constrained:
+            continue
+        info = estimator.bays.get(bay)
+        if isinstance(info, Mapping) and info.get("occupancy") == "empty":
+            continue
+        est = estimator.estimates.get(bay)
+        sigma = est.get("sigma") if isinstance(est, Mapping) else None
+        if not _sigma_ok(sigma, spec.sigma_fault_c):
+            reasons.append(f"sigma:bay:{bay}={_sigma_text(sigma)}>{spec.sigma_fault_c:g}")
+    return reasons
 
 
 def advance_confirmation(
@@ -169,12 +244,18 @@ def _member_trusted(
 
 
 def groups_confirmed(
-    zone: str, gate: GateResult, confirming: Mapping[str, int], cfg: MpcConfig
+    zone: str,
+    gate: GateResult,
+    confirming: Mapping[str, int],
+    cfg: MpcConfig,
+    rule: str = "strict",
 ) -> bool:
-    """Whether every required group of ``zone`` has a gate-trusted member that is not confirming."""
+    """Whether every required group of ``zone`` that ``rule`` checks (every group with
+    ``strict``, the setpoint groups with ``sigma``) has a gate-trusted member that is not
+    confirming."""
     return all(
         any(_member_trusted(name, gate, confirming, False) for name in members)
-        for _label, members in cfg.zone_layout.required_groups[zone]
+        for _label, members in _rule_groups(zone, cfg, rule)
     )
 
 
@@ -182,21 +263,22 @@ def evaluate(
     gate: GateResult,
     time_status: str,
     cfg: MpcConfig,
-    estimates: Mapping[str, Any] | None = None,
+    estimator: EstimatorUpdate | None = None,
     *,
     confirming: Mapping[str, int] | None = None,
     in_fault: Iterable[str] = (),
 ) -> dict[str, ZoneTrust]:
     """Per-zone trust for this tick, keyed and ordered like ``cfg.zone_layout.zones``.
 
-    ``estimates`` is the estimator's block; it is accepted so the ``sigma``
-    rule has its interface, and ignored until that rule exists (module
-    docstring). ``confirming`` is :func:`advance_confirmation` for this tick and
-    ``in_fault`` the zones in fault before it: a confirming member counts only for
-    a zone in fault. Legacy mode: the implicit zone is trusted iff the gate's
-    whole-tick verdict is and the time status is ``first`` / ``ok``.
+    ``estimator`` is this tick's estimator update, which the ``sigma`` rule reads;
+    without it ``sigma`` applies ``strict`` (:func:`effective_trust_rule`).
+    ``confirming`` is :func:`advance_confirmation` for this tick and ``in_fault`` the
+    zones in fault before it: a confirming member counts only for a zone in fault.
+    Legacy mode: the implicit zone is trusted iff the gate's whole-tick verdict is and
+    the time status is ``first`` / ``ok``.
     """
     layout = cfg.zone_layout
+    rule = effective_trust_rule(cfg, estimator)
     pending: Mapping[str, int] = {} if confirming is None else confirming
     faulted = set(in_fault)
     common: list[str] = []
@@ -208,11 +290,13 @@ def evaluate(
     for zone in layout.zones:
         reasons = list(common)
         counts_confirming = zone in faulted
-        for label, members in layout.required_groups[zone]:
+        for label, members in _rule_groups(zone, cfg, rule):
             if any(_member_trusted(name, gate, pending, counts_confirming) for name in members):
                 continue
             detail = ",".join(f"{name}={_member_detail(name, gate, pending)}" for name in members)
             reasons.append(f"{label}:{detail}")
+        if rule == "sigma" and estimator is not None:
+            reasons.extend(sigma_reasons(zone, cfg, estimator))
         out[zone] = ZoneTrust(trusted=not reasons, reasons=tuple(reasons))
     return out
 

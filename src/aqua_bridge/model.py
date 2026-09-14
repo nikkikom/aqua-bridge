@@ -687,6 +687,12 @@ STUCK_WINDOW_SAMPLES = 60
 #: ``zones.trust_rule`` and ``zones.fault_coupling`` values.
 TRUST_RULES: tuple[str, ...] = ("strict", "sigma")
 FAULT_COUPLINGS: tuple[str, ...] = ("declared", "none")
+#: Label prefix of a setpoint sensor's own required group (``ZoneLayout.required_groups``).
+SETPOINT_GROUP_PREFIX = "setpoint:"
+#: Calibration floor of an uncalibrated bay, degC (plan section 2): no drive estimate of
+#: an uncalibrated bay has a smaller sigma, so ``zones.trust_rule: sigma`` needs
+#: ``estimator.sigma_fault_c`` above it (``aqua_bridge.control.estimates`` re-exports it).
+SIGMA_UNCALIBRATED_C = 1.5
 
 #: ``ident_levels`` values: ``above`` (base and base + amplitude, never less cooling
 #: than the solver's level at start) or ``symmetric`` (base +- amplitude, owner opt-in).
@@ -1113,8 +1119,8 @@ class ZonePolicy:
     """``zones``: how a zone's trust is decided and how far a zone fault reaches.
 
     * ``trust_rule``     -- ``strict`` (every required sensor group has a trusted
-      member) or ``sigma`` (estimator uncertainty; the rule itself is a later
-      milestone and until then ``strict`` applies, see ``aqua_bridge.control.zones``)
+      member) or ``sigma`` (the estimator's drive and zone-air sigma within
+      ``estimator.sigma_fault_c`` / ``sigma_air_fault_c``, see ``aqua_bridge.control.zones``)
     * ``fault_coupling`` -- ``declared`` (a zone fault also puts the channels of
       the zones in its ``coupled_to`` under fallback policy) or ``none``
       (strictly per zone)
@@ -1214,7 +1220,9 @@ class EstimatorSpec:
 
     * ``k_sigma``                  -- ``k`` in ``margin = k * sigma``, in ``[0, 4]``
     * ``sigma_fault_c`` / ``sigma_air_fault_c`` -- thresholds of the ``sigma`` zone trust
-      rule (parsed; the rule itself is a later milestone)
+      rule, degC (> 0): a zone is untrusted while a constrained bay's drive sigma or its
+      air sigma is above them; with ``zones.trust_rule: sigma``, ``sigma_fault_c`` must
+      exceed :data:`SIGMA_UNCALIBRATED_C`
     * ``q_t_air`` / ``q_d_air`` / ``q_t_drive`` / ``q_t_sensor`` / ``q_heat`` -- process
       noise per tick of the filter states ``T_a``, ``d_a``, ``T_d``, ``T_s``, ``q`` (> 0)
     * ``sensor_noise_c``           -- white noise of a temperature sensor, degC (>= 0);
@@ -2241,6 +2249,16 @@ class MpcConfig:
             raise ConfigError(f"mpc.zones.trust_rule must be one of {list(TRUST_RULES)}")
         if policy.fault_coupling not in FAULT_COUPLINGS:
             raise ConfigError(f"mpc.zones.fault_coupling must be one of {list(FAULT_COUPLINGS)}")
+        if (
+            policy.trust_rule == "sigma"
+            and isinstance(self.estimator, EstimatorSpec)
+            and not self.estimator.sigma_fault_c > SIGMA_UNCALIBRATED_C
+        ):
+            raise ConfigError(
+                "mpc.estimator.sigma_fault_c must be > the uncalibrated sigma floor "
+                f"{SIGMA_UNCALIBRATED_C} degC with zones.trust_rule: sigma (every zone with an "
+                f"uncalibrated bay would stay in fault), got {self.estimator.sigma_fault_c}"
+            )
 
         noise = self.noise
         if not isinstance(noise, NoiseSpec):
@@ -2317,7 +2335,7 @@ class MpcConfig:
                 zone_groups.append((f"bay:{b}", members))
             for t in self.temps:
                 if t in self.setpoints and sensors[t].zone == z:
-                    zone_groups.append((f"setpoint:{t}", (t,)))
+                    zone_groups.append((f"{SETPOINT_GROUP_PREFIX}{t}", (t,)))
             groups[z] = tuple(zone_groups)
 
         channel_zones = {ch: tuple(z for z in zones if ch in zone_channels[z]) for ch in channels}

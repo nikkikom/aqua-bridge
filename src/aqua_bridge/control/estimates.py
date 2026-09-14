@@ -60,7 +60,7 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping
 from typing import Any
 
-from aqua_bridge.model import MpcConfig
+from aqua_bridge.model import SIGMA_UNCALIBRATED_C, MpcConfig
 
 __all__ = [
     "K_SIGMA",
@@ -80,8 +80,6 @@ __all__ = [
 PRIOR_BETA = 0.3
 #: Prior offset ``b`` of the proximal sensor model, degC: ``-(1 - beta) * 3``.
 PRIOR_OFFSET_C = -(1.0 - PRIOR_BETA) * 3.0
-#: Calibration floor of an uncalibrated bay, degC (plan section 2).
-SIGMA_UNCALIBRATED_C = 1.5
 #: ``k`` in ``margin = k * sigma`` (plan section 2, ``estimator.k_sigma`` default).
 K_SIGMA = 2.0
 #: ``source`` of an entry built by :func:`prior_estimates`.
