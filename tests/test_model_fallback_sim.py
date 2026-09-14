@@ -1,0 +1,294 @@
+"""Return from the DAS MPC's model fallback after a load step (PROJECT.md section 8 item 10).
+
+The validity gate's drift check used to hold the PI-like DAS fallback for tens of minutes
+after a load step: the drives warm at 0.26-0.36 degC/min, which the model predicts, and
+the plain drift had to fall below ``model_return_factor * model_max_drift_c_per_min``
+(0.25 degC/min) before the dwell even started. The return now checks the drift relative
+to the drives' observed rate (``control/solver_das.py``, validity gate), so a sound model
+returns after ``model_return_dwell_s``, and a model whose equilibrium is wrong still
+enters the fallback and stays there.
+
+Scenario: the example DAS config with the DAS MPC acting on the prior thermal model
+(``model_accept_prior``; on the ``basic`` simulator the prior matches the truth), every
+bay idle, then at :data:`T_STEP` every bay of one zone at full load. A sound model is
+pushed into the fallback at the step by a thermal status the gate rejects for two ticks
+(the check under test is the return, not the cause); a broken model has its bay gains
+``g0`` and ``k`` scaled from the step on and reports ``converged``. The runs call
+``mpc.step`` directly, as ``tests/test_stuck_sim.py`` does. ``nightly`` sweeps zones and
+seeds, the ``rich`` simulator (drawn physics the prior does not match) and more broken
+models.
+"""
+
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from aqua_bridge.config import load_config
+from aqua_bridge.control import thermal
+from aqua_bridge.control.mpc import step
+from aqua_bridge.control.solver_das import DasMpcSolver, _fresh_memory, _parse_memory
+from aqua_bridge.model import MpcConfig, SolverKind
+from aqua_bridge.sim.das import (
+    SENSOR_TYPES,
+    DasRun,
+    build_das_plant,
+    run_das_closed_loop,
+    topology_from_config,
+)
+from conftest import EXAMPLE_DAS_CONFIG
+
+#: Bay settling (``estimator.bay_settle_s``, 600 s) and a steady idle enclosure first.
+T_STEP = 1800.0
+T_END = 3600.0
+#: Ticks the thermal status is rejected at the step (a sound model's fallback).
+KICK_TICKS = 2
+#: A broken model is detected within this long after it breaks (bay gains 0.3x, 2x and
+#: 3x: measured 0-150 s after the load step).
+DETECT_BOUND_S = 300.0
+#: Bay gains at half their value are detected only when the warming drives push the plain
+#: drift over ``model_max_drift_c_per_min`` (measured 830-860 s after the step on the
+#: basic simulator; the entry is unchanged by this item).
+SLOW_GAINS = (0.5,)
+DETECT_SLOW_BOUND_S = 1200.0
+
+
+def scenario_cfg(**changes: Any) -> MpcConfig:
+    data = load_config(EXAMPLE_DAS_CONFIG).mpc.to_dict()
+    data.update(solver=SolverKind.MPC.value, model_accept_prior=True, **changes)
+    return MpcConfig.from_mapping(data)
+
+
+def return_bound_s(cfg: MpcConfig) -> float:
+    """The documented bound: the dwell plus two solve periods (the first passing check
+    after the kick and the solve tick at which the dwell has run out)."""
+    return cfg.model_return_dwell_s + 2 * cfg.mpc_every_ticks * cfg.dt
+
+
+def load_step_run(
+    cfg: MpcConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    zone: str = "z0",
+    seed: int = 1,
+    preset: str = "basic",
+    gain: float | None = None,
+) -> DasRun:
+    """The scenario of the module docstring; ``gain`` scales the model's bay gains from
+    :data:`T_STEP` on (a broken model), ``None`` kicks a sound model into the fallback."""
+    topology = topology_from_config(cfg)
+    for entry in topology["sensors"].values():
+        entry["noise_sigma_c"] = SENSOR_TYPES[entry["type"]].noise_sigma_c
+    topology["inlet"] = {"base_c": 25.0}
+    schedule = {
+        bay: [(0.0, 0.0), (T_STEP, 1.0 if entry["zone"] == zone else 0.0)]
+        for bay, entry in topology["bays"].items()
+    }
+    plant = build_das_plant(
+        topology, preset=preset, dt=cfg.dt, initial_pwm=0.5, seed=seed, heat_schedule=schedule
+    )
+    clock = {"ts": 0.0}
+    current_model = thermal.current_model
+
+    def model_at_ts(memory: object, c: MpcConfig) -> tuple[str, dict[str, float]]:
+        status, theta = current_model(memory, c)
+        if clock["ts"] < T_STEP:
+            return status, theta
+        if gain is None:
+            return ("error", theta) if clock["ts"] < T_STEP + KICK_TICKS * c.dt else (status, theta)
+        scaled = {k: v * gain if k.split(".")[0] in ("g0", "k") else v for k, v in theta.items()}
+        return "converged", scaled
+
+    monkeypatch.setattr(thermal, "current_model", model_at_ts)
+
+    def controller(obs, c, state):
+        clock["ts"] = float(obs.ts)
+        return step(obs, c, state)
+
+    return run_das_closed_loop(plant, cfg, controller, int(T_END / cfg.dt))
+
+
+def model_view(run: DasRun) -> list[tuple[float, dict[str, Any]]]:
+    return [
+        (ts, rec.cmd.diagnostics["solver_diag"]["model"])
+        for ts, rec in zip(run.series["ts"], run.records, strict=True)
+    ]
+
+
+def switches(run: DasRun) -> list[tuple[float, str]]:
+    view = model_view(run)
+    return [
+        (ts, m["active"])
+        for (_, before), (ts, m) in zip(view, view[1:], strict=False)
+        if m["active"] != before["active"]
+    ]
+
+
+def assert_safe_and_bumpless(run: DasRun) -> None:
+    """Every drive within its limit; on a switch the output is the previous command."""
+    assert run.violations() == 0, run.worst_margin_c()
+    for before, rec in zip(run.records, run.records[1:], strict=False):
+        m0 = before.cmd.diagnostics["solver_diag"]["model"]["active"]
+        m1 = rec.cmd.diagnostics["solver_diag"]["model"]["active"]
+        if m0 != m1:
+            target = rec.cmd.diagnostics["target_pwm"]
+            for ch, value in before.cmd.pwm.items():
+                assert target[ch] == pytest.approx(value, abs=1e-9), (ch, m0, m1)
+
+
+def first_return_after_step(run: DasRun) -> float | None:
+    back = [ts for ts, active in switches(run) if active == "mpc" and ts >= T_STEP]
+    return back[0] - T_STEP if back else None
+
+
+def assert_returns_in_bound(run: DasRun, cfg: MpcConfig) -> None:
+    sw = switches(run)
+    assert sw and sw[0] == (T_STEP, "pi_das"), sw
+    elapsed = first_return_after_step(run)
+    assert elapsed is not None, sw
+    assert cfg.model_return_dwell_s <= elapsed <= return_bound_s(cfg), sw
+
+
+def assert_caught_and_held(run: DasRun, bound_s: float = DETECT_BOUND_S) -> None:
+    sw = [(ts, a) for ts, a in switches(run) if ts >= T_STEP]
+    assert sw and sw[0][1] == "pi_das", sw
+    assert sw[0][0] - T_STEP <= bound_s, sw
+    assert len(sw) == 1, f"a broken model came back: {sw}"
+    reason = model_view(run)[-1][1]["reason"]
+    assert reason.startswith(("drift:", "pred_err:")), reason
+
+
+# ---------------------------------------------------------------------------
+# observed rate of the drive estimates
+# ---------------------------------------------------------------------------
+
+
+def _rate_request(bays: dict[str, dict[str, Any]]) -> Any:
+    return SimpleNamespace(plant={"bays": bays})
+
+
+def _track(cfg: MpcConfig, mem: dict[str, Any], ts: float, bays: dict[str, dict[str, Any]]):
+    DasMpcSolver._track_rates(cfg, _rate_request(bays), mem, ts)
+    return mem["rate"]["r"]
+
+
+def test_observed_rate_follows_a_ramp_and_restarts_at_zero():
+    cfg = scenario_cfg()
+    mem = _fresh_memory()
+    slope = 0.3  # degC/min
+    r = _track(cfg, mem, 0.0, {"b01": {"t": 40.0, "since_ts": 0.0}})
+    assert r == {"b01": 0.0}  # a fresh track checks the plain drift
+    ts = 0.0
+    for _ in range(int(10 * cfg.model_drift_rate_tau_s / cfg.dt)):
+        ts += cfg.dt
+        r = _track(cfg, mem, ts, {"b01": {"t": 40.0 + slope * ts / 60.0, "since_ts": 0.0}})
+    assert r["b01"] == pytest.approx(slope, abs=1e-3)
+    t_now = 40.0 + slope * ts / 60.0
+    # one tau after the ramp stops, the rate has decayed by about 1/e
+    for _ in range(int(cfg.model_drift_rate_tau_s / cfg.dt)):
+        ts += cfg.dt
+        r = _track(cfg, mem, ts, {"b01": {"t": t_now, "since_ts": 0.0}})
+    assert r["b01"] == pytest.approx(slope * 2.718281828**-1, rel=0.05)
+    json.loads(json.dumps(mem))  # plain JSON
+    restored = _parse_memory(json.loads(json.dumps(mem)), cfg)
+    assert restored["rate"] == mem["rate"]
+
+    def restarted(ts_next: float, since: float) -> float:
+        probe = json.loads(json.dumps(mem))
+        return _track(cfg, probe, ts_next, {"b01": {"t": t_now + 1.0, "since_ts": since}})["b01"]
+
+    assert restarted(ts + cfg.dt, 0.0) != 0.0
+    assert restarted(ts + cfg.dt, ts) == 0.0  # occupancy changed
+    assert restarted(ts + 3601.0, 0.0) == 0.0  # a gap over an hour
+    assert restarted(ts - cfg.dt, 0.0) == 0.0  # a clock stepped back
+    assert restarted(ts, 0.0) == 0.0  # a clock that did not advance
+    probe = json.loads(json.dumps(mem))
+    assert _track(cfg, probe, ts + cfg.dt, {"b01": {"t": None}, "b02": {"t": 30.0}}) == {"b02": 0.0}
+
+
+@pytest.mark.parametrize(
+    "rate",
+    [
+        {"t": {}, "r": {}, "since": []},
+        {"t": {}, "since": {}},
+        {"t": {"b01": "x"}, "r": {}, "since": {}},
+    ],
+)
+def test_a_malformed_rate_memory_starts_over(rate):
+    cfg = scenario_cfg()
+    mem = {**_fresh_memory(), "active": "mpc", "rate": rate}
+    assert _parse_memory(mem, cfg) == _fresh_memory()
+
+
+# ---------------------------------------------------------------------------
+# closed loop on the truth simulator
+# ---------------------------------------------------------------------------
+
+
+def test_a_sound_model_returns_after_a_load_step_within_the_bound(monkeypatch):
+    cfg = scenario_cfg()
+    run = load_step_run(cfg, monkeypatch)
+    assert_safe_and_bumpless(run)
+    assert_returns_in_bound(run, cfg)
+    # the load step is the case of the item: the plain drift stayed above the return
+    # limit during the dwell, the relative one below it
+    limit = cfg.model_return_factor * cfg.model_max_drift_c_per_min
+    dwell = [
+        m["checks"]
+        for ts, m in model_view(run)
+        if T_STEP < ts < T_STEP + cfg.model_return_dwell_s and m["active"] == "pi_das"
+    ]
+    assert max(c["drift_abs_c_per_min"] or 0.0 for c in dwell) > limit
+    assert all((c["drift_rel_c_per_min"] or 0.0) <= limit for c in dwell[KICK_TICKS:])
+
+
+@pytest.mark.nightly
+def test_the_plain_drift_would_hold_the_fallback_after_the_same_step(monkeypatch):
+    """The same run with a rate filter too slow to follow the drives checks the plain
+    drift on the return, which is what held the fallback before."""
+    cfg = scenario_cfg(model_drift_rate_tau_s=1e9)
+    run = load_step_run(cfg, monkeypatch)
+    assert_safe_and_bumpless(run)
+    elapsed = first_return_after_step(run)
+    assert elapsed is None or elapsed > 2 * return_bound_s(cfg), switches(run)
+
+
+def test_a_broken_model_is_caught_and_held_in_the_fallback(monkeypatch):
+    cfg = scenario_cfg()
+    run = load_step_run(cfg, monkeypatch, gain=2.0)
+    assert_safe_and_bumpless(run)
+    assert_caught_and_held(run)
+
+
+# ---------------------------------------------------------------------------
+# nightly sweep
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.nightly
+@pytest.mark.parametrize("zone", ["z0", "z1", "z2", "z3"])
+@pytest.mark.parametrize(
+    ("preset", "seed"),
+    [("basic", 2), ("basic", 3), ("rich", 1), ("rich", 2), ("rich", 3), ("rich", 4)],
+)
+def test_return_sweep(monkeypatch, preset, seed, zone):
+    cfg = scenario_cfg()
+    run = load_step_run(cfg, monkeypatch, zone=zone, seed=seed, preset=preset)
+    assert_safe_and_bumpless(run)
+    assert_returns_in_bound(run, cfg)
+
+
+@pytest.mark.nightly
+@pytest.mark.parametrize("zone", ["z0", "z2"])
+@pytest.mark.parametrize(
+    ("preset", "gain"),
+    [("basic", 0.3), ("basic", 0.5), ("basic", 2.0), ("basic", 3.0), ("rich", 0.3), ("rich", 2.0)],
+)
+def test_broken_model_sweep(monkeypatch, preset, gain, zone):
+    cfg = scenario_cfg()
+    run = load_step_run(cfg, monkeypatch, zone=zone, seed=2, preset=preset, gain=gain)
+    assert_safe_and_bumpless(run)
+    assert_caught_and_held(run, DETECT_SLOW_BOUND_S if gain in SLOW_GAINS else DETECT_BOUND_S)

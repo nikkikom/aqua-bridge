@@ -134,7 +134,8 @@ On every solve tick the model must pass (:func:`check_model`):
   first tick at or after that time compares it with the estimator's drives
   (worst bay), as an exponentially weighted RMS (:data:`PRED_ERR_ALPHA`);
 * the equilibrium drift ``max_j |dT_d,j/dt|`` of the model at ``(x_hat, prev)`` over the
-  constrained bays is at most ``model_max_drift_c_per_min``.
+  constrained bays is at most ``model_max_drift_c_per_min``. While the fallback is active
+  the drift checked is the part the drives' own movement does not explain (below).
 
 Bays within ``estimator.bay_settle_s`` of an occupancy change are left out of the last
 two checks (a hot swap's transient is real, not a model error), and so are bays within
@@ -148,8 +149,21 @@ fallback for 20 minutes). A failure switches to
 the **PI-like DAS solver on the same estimates** (``solver_pi``, margin-deficit form):
 ``mode`` stays ``auto``, ``diagnostics["solver_diag"]["model"]`` says ``active: pi_das``
 and why. The MPC comes back only after the checks have passed with the numeric limits
-scaled by :data:`MODEL_HYSTERESIS` continuously for :data:`MODEL_DWELL_S` (so at least
+scaled by ``model_return_factor`` continuously for ``model_return_dwell_s`` (so at least
 that long after the fallback began). A cold solver starts on whichever model passes.
+
+The return's drift check is **relative**: ``max_j |dT_d,j/dt - r_j|``, where ``r_j`` is
+the observed rate of the estimator's drive ``j`` (its tick-to-tick difference, low-passed
+with ``model_drift_rate_tau_s``; it starts at 0 when a bay first reports, after an
+occupancy change, a gap over an hour or a clock that did not advance, so a fresh track
+checks the plain drift). A load step warms the drives at a rate the model predicts
+(0.26-0.36 degC/min on the truth simulator, above the plain return limit 0.25): the plain
+drift held the fallback for up to 29 minutes, the relative one returns after the dwell.
+A model whose equilibrium is wrong (bay gains off by 2x) keeps its drift while the drives
+settle, so it fails the relative check as well and stays in the fallback. The entry keeps
+the plain drift: the relative one reacts to the MPC's own moves (the model's rate follows
+a new command at once, the observed rate lags by the filter) and added fallbacks on the
+truth simulator.
 The PI-like DAS fallback regulates every drive at its soft target with the same margins,
 so a model fallback changes loudness, not safety. A clock stepped back (``step``
 re-confirms the zones and then calls the solver with the earlier ``ts``) drops a pending
@@ -187,7 +201,9 @@ Memory (``solver_memory["mpc"]``, plain JSON)::
      "ok_since": ts | None, "reason": str | None, "tick": calls since the last solve,
      "key": structure key, "plan": [U] | None, "plan_ts": ts, "core": {ch: demand},
      "bias": {ch: offset}, "band": {ch: band index}, "pred": {"ts", "t": {bay: degC}},
-     "err2": mean-square prediction error | None, "checks": {...}, "status": str,
+     "err2": mean-square prediction error | None,
+     "rate": {"ts", "t": {bay: degC}, "r": {bay: degC/min}, "since": {bay: since_ts}},
+     "checks": {...}, "status": str,
      "fresh": {"pwm", "integrator", "iterations", "diagnostics"} | None}
 
 A malformed memory starts over (cold: the next output is bumpless from ``prev``).
@@ -217,8 +233,6 @@ __all__ = [
     "DIST_TAU_S",
     "EIG_IMAG_REL",
     "GAIN_MIN",
-    "MODEL_DWELL_S",
-    "MODEL_HYSTERESIS",
     "PRED_ERR_ALPHA",
     "PN_ITER",
     "QP_FAST_ITER",
@@ -250,11 +264,10 @@ VERSION = 1
 #: Thermal statuses the validity gate accepts; with ``model_accept_prior`` also these.
 ACCEPTED_STATUSES: tuple[str, ...] = ("converged", "frozen")
 PRIOR_STATUSES: tuple[str, ...] = ("prior", "learning", "off")
-#: Model fallback: numeric limits scaled by this to come back, for this long.
-MODEL_HYSTERESIS = 0.5
-MODEL_DWELL_S = 300.0
 #: EW factor of the prediction error's mean square.
 PRED_ERR_ALPHA = 0.2
+#: A gap between two ticks longer than this restarts a drive's observed rate.
+_RATE_GAP_S = 3600.0
 #: Quantisation of the command at which ``A`` is linearised (PWM).
 QUANT_U = 1.0 / 64.0
 #: Steady-state gain below this (degC per unit PWM) is no gain.
@@ -860,8 +873,8 @@ def check_model(
     error: str | None = None,
 ) -> ModelCheck:
     """The validity gate (module docstring). ``relax`` scales the numeric limits
-    (:data:`MODEL_HYSTERESIS` while the fallback is active); ``error`` is a failure to
-    build the model at all."""
+    (``model_return_factor`` while the fallback is active, when the caller passes the
+    relative drift); ``error`` is a failure to build the model at all."""
     accepted = ACCEPTED_STATUSES + (PRIOR_STATUSES if cfg.model_accept_prior else ())
     checks: dict[str, Any] = {"status": status}
     reasons: list[str] = []
@@ -928,6 +941,7 @@ def _fresh_memory() -> dict[str, Any]:
         "band": {},
         "pred": None,
         "err2": None,
+        "rate": _fresh_rate(),
         "checks": {},
         "status": None,
         "fresh": None,
@@ -956,6 +970,10 @@ def _num_map(value: object, names: Sequence[str] | None = None) -> dict[str, flo
         if names is None or k in names:
             out[k] = float(v)
     return out
+
+
+def _fresh_rate() -> dict[str, Any]:
+    return {"ts": None, "t": {}, "r": {}, "since": {}}
 
 
 def _parse_memory(raw: object, cfg: MpcConfig) -> dict[str, Any]:
@@ -1026,6 +1044,17 @@ def _parse(raw: object, cfg: MpcConfig) -> dict[str, Any]:
             "d": _num_map(dist["d"]),
             "since": {k: _opt_num(v) for k, v in since.items() if isinstance(k, str)},
         }
+    rate = raw.get("rate")
+    if rate is not None:
+        since = rate["since"]
+        if not isinstance(since, Mapping):
+            raise TypeError("rate.since")
+        mem["rate"] = {
+            "ts": _opt_num(rate.get("ts")),
+            "t": _num_map(rate["t"]),
+            "r": _num_map(rate["r"]),
+            "since": {k: _opt_num(v) for k, v in since.items() if isinstance(k, str)},
+        }
     fresh = raw.get("fresh")
     if fresh is not None:
         pwm = _num_map(fresh["pwm"])
@@ -1067,6 +1096,7 @@ class _Model:
     c: np.ndarray | None = None
     x0: np.ndarray | None = None
     drift: float | None = None
+    drift_rel: float | None = None
     error: str | None = None
 
 
@@ -1129,6 +1159,7 @@ class DasMpcSolver:
         settling = self._settling_bays(cfg, req, mem, ts)
         self._score_prediction(cfg, req, mem, ts, settling)
         self._filter_disturbances(req, mem, ts)
+        self._track_rates(cfg, req, mem, ts)
 
         rows = self._rows(cfg, req)
         key = json.dumps(
@@ -1145,7 +1176,9 @@ class DasMpcSolver:
         switched = False
         model: _Model | None = None
         if solve_now:
-            model = self._model(cfg, req, rows, mem["dist"], settling, mem["lin_u"])
+            model = self._model(
+                cfg, req, rows, mem["dist"], settling, mem["lin_u"], mem["rate"]["r"]
+            )
             if model.pred is not None:
                 mem["lin_u"] = dict(zip(model.pred.channels, model.pred.u_lin, strict=True))
             self._store_prediction(mem, model, prev, ts)
@@ -1327,6 +1360,36 @@ class DasMpcSolver:
         mem["dist"] = new
 
     @staticmethod
+    def _track_rates(cfg: MpcConfig, req: SolverRequest, mem: dict[str, Any], ts: float) -> None:
+        """The observed rate of every drive estimate (degC/min) for the relative drift check
+        (module docstring, validity gate): the tick-to-tick difference low-passed with
+        ``model_drift_rate_tau_s``, starting at 0 for a bay without a usable previous
+        estimate (first report, occupancy changed, a gap over :data:`_RATE_GAP_S`, a clock
+        that did not advance)."""
+        plant = req.plant if isinstance(req.plant, Mapping) else {}
+        old = mem["rate"]
+        last = old["ts"]
+        elapsed = 0.0 if last is None else ts - last
+        usable = last is not None and 0.0 < elapsed <= _RATE_GAP_S
+        w = 1.0 - math.exp(-elapsed / cfg.model_drift_rate_tau_s) if usable else 0.0
+        new = _fresh_rate()
+        new["ts"] = ts
+        for bay, info in (plant.get("bays") or {}).items():
+            if not isinstance(info, Mapping) or not _finite(info.get("t")):
+                continue
+            since = float(info["since_ts"]) if _finite(info.get("since_ts")) else None
+            t = float(info["t"])
+            new["t"][bay] = t
+            new["since"][bay] = since
+            prev_t, prev_r = old["t"].get(bay), old["r"].get(bay)
+            if not usable or prev_t is None or prev_r is None or old["since"].get(bay) != since:
+                new["r"][bay] = 0.0
+                continue
+            raw = (t - prev_t) / elapsed * 60.0
+            new["r"][bay] = prev_r + (raw - prev_r) * w
+        mem["rate"] = new
+
+    @staticmethod
     def _store_prediction(
         mem: dict[str, Any], model: _Model, prev: Mapping[str, float], ts: float
     ) -> None:
@@ -1388,6 +1451,7 @@ class DasMpcSolver:
         dist: Mapping[str, Any],
         settling: set[str],
         lin_u: Mapping[str, float] | None = None,
+        rates: Mapping[str, float] | None = None,
     ) -> _Model:
         """Model inputs from the request and, when possible, the prediction."""
         st = thermal.cached_structure(cfg)
@@ -1399,7 +1463,7 @@ class DasMpcSolver:
             return model
         model = _Model(st, status, theta, rows, {}, {})
         try:
-            self._build(cfg, req, model, dist, settling, lin_u)
+            self._build(cfg, req, model, dist, settling, lin_u, rates)
         except Exception as exc:  # numerical failure of the model: a model fallback
             model.pred = None
             model.error = f"{type(exc).__name__}: {exc}"[:120]
@@ -1413,6 +1477,7 @@ class DasMpcSolver:
         dist: Mapping[str, Any],
         settling: set[str],
         lin_u: Mapping[str, float] | None = None,
+        rates: Mapping[str, float] | None = None,
     ) -> None:
         st = model.st
         plant = req.plant if isinstance(req.plant, Mapping) else {}
@@ -1475,8 +1540,13 @@ class DasMpcSolver:
             raise FloatingPointError("non-finite operating point")
         model.pred, model.hit, model.c, model.x0 = pred, hit, c, x0
         model.x_air, model.x_drive = x_air, x_drive
-        drifts = [abs(float(f[st.i_drive(b)])) * 60.0 for b in model.rows if b not in settling]
-        model.drift = max(drifts) if drifts else None
+        checked = [b for b in model.rows if b not in settling]
+        rates = {} if rates is None else rates
+        model.drift = max((abs(float(f[st.i_drive(b)])) * 60.0 for b in checked), default=None)
+        model.drift_rel = max(
+            (abs(float(f[st.i_drive(b)]) * 60.0 - rates.get(b, 0.0)) for b in checked),
+            default=None,
+        )
 
     def _decide(self, cfg: MpcConfig, mem: dict[str, Any], model: _Model, ts: float) -> bool:
         """Run the validity gate and switch the active model; ``True`` on a switch."""
@@ -1494,12 +1564,14 @@ class DasMpcSolver:
             pred=model.pred,
             rows=model.rows,
             pred_err_c=err,
-            drift_c_per_min=model.drift,
-            relax=MODEL_HYSTERESIS if in_fallback else 1.0,
+            drift_c_per_min=model.drift_rel if in_fallback else model.drift,
+            relax=cfg.model_return_factor if in_fallback else 1.0,
             error=model.error,
         )
         checks = dict(verdict.checks)
         checks["cache_hit"] = model.hit
+        checks["drift_abs_c_per_min"] = model.drift
+        checks["drift_rel_c_per_min"] = model.drift_rel
         mem["checks"] = checks
         mem["status"] = model.status
         before = mem["active"]
@@ -1515,7 +1587,8 @@ class DasMpcSolver:
                 return False
             mem.update(active=PI_DAS, since=ts, ok_since=None, reason=verdict.reason)
             return True
-        # fallback active: come back after passing the relaxed checks for the dwell
+        # fallback active: come back after passing the relaxed checks (the drift relative
+        # to the drives' observed rate) for the dwell
         if not verdict.ok:
             mem["ok_since"] = None
             mem["reason"] = verdict.reason
@@ -1523,7 +1596,8 @@ class DasMpcSolver:
         if mem["ok_since"] is None:
             mem["ok_since"] = ts
         since = mem["since"] if mem["since"] is not None else ts
-        if ts - mem["ok_since"] >= MODEL_DWELL_S and ts - since >= MODEL_DWELL_S:
+        dwell = cfg.model_return_dwell_s
+        if ts - mem["ok_since"] >= dwell and ts - since >= dwell:
             mem.update(active=MPC, since=ts, reason=None)
             return True
         mem["reason"] = "dwell"
