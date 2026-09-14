@@ -144,9 +144,13 @@ jobs:
         run: shellcheck --version | head -2
 
       # "nightly" tests (heavy sweeps, long simulations) run only in nightly-fuzz.
-      - name: pytest
+      # Sharded across the runner's cores (tools/ci_pytest_shards.py): several plain
+      # pytest processes on disjoint, deterministic subsets of tests/test_*.py, run
+      # concurrently; fails if any shard fails, prints each shard's file list and
+      # wall time. No pytest-xdist or other plugin.
+      - name: pytest (sharded)
         if: needs.changes.outputs.code == 'true'
-        run: pytest -m "not hardware and not nightly" --durations=15
+        run: python tools/ci_pytest_shards.py -- -m "not hardware and not nightly" --durations=15
 
   nightly-fuzz:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
