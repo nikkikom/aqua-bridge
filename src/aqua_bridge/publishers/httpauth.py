@@ -610,15 +610,28 @@ class BasicAuthenticator:
         remaining = last + wait - now
         return remaining if remaining > 0.0 else None
 
+    def _failure_expired(self, entry: tuple[int, float], now: float) -> bool:
+        count, last = entry
+        return now - last > self._wait_s(count) + self.settings.auth_backoff_max_s
+
     def _record_failure_locked(self, client: str, now: float) -> None:
         # A count is forgotten auth_backoff_max_s after its backoff ended, so a
         # client retrying right when the longest wait ends stays at that wait.
-        horizon = self.settings.auth_backoff_max_s
-        for key, (count, last) in list(self._failures.items()):
-            if now - last > self._wait_s(count) + horizon:
-                del self._failures[key]
-        count, _last = self._failures.get(client, (0, now))
-        self._failures[client] = (count + 1, now)
+        # The dict is kept in order of the last failure (a record moves its client to
+        # the end), so pruning pops expired entries from the front and stops at the
+        # first live one: amortised O(1) per failure, however many addresses a flood
+        # uses. An expired entry left behind a live one is at most
+        # 2 * auth_backoff_max_s old and is never read as live (checked below, and a
+        # stale backoff has no time remaining).
+        failures = self._failures
+        while failures:
+            key = next(iter(failures))
+            if not self._failure_expired(failures[key], now):
+                break
+            del failures[key]
+        entry = failures.pop(client, None)
+        count = 0 if entry is None or self._failure_expired(entry, now) else entry[0]
+        failures[client] = (count + 1, now)
 
     def fast(self, header: str | None, client: str) -> AuthDecision | None:
         """A decision that needs no key derivation, or ``None`` (call :meth:`verify`)."""
