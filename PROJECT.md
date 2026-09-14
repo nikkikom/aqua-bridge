@@ -137,9 +137,12 @@ measure it.
   it is connected; `config.example-das.yaml` binds none of them.
 - The daemon reads and writes through **hwmon sysfs**
   (`aquacomputer_d5next`, `/sys/class/hwmon/hwmonN/{tempK_input,fanK_input,pwmK}`),
-  not raw HID. The HID udev rules stay for liquidctl and the spike. The
-  hwmon ABI the adapter assumes (§3 Track B) is unconfirmed until the
-  spike.
+  not raw HID. Raspberry Pi OS kernels are built without that driver;
+  `deploy/install-aquacomputer-dkms.sh` builds it with DKMS and a local
+  fix (§9). The HID udev rules stay for liquidctl and the spike. The
+  first spike results (§2 "USB spike results") confirm the attribute
+  names and units, and show there is no `pwmK_enable` and that the `pwmK`
+  attributes are slow.
 - **Sensors per role** (recommended plan for 15 bays / 4 zones; the config
   binding is the only thing that changes):
 
@@ -184,12 +187,14 @@ trees.
 
 ### Risk (first-evening USB spike)
 
-The `aquacomputer_d5next` driver (already in 6.18) exposes aquaero’s
+The `aquacomputer_d5next` driver (mainline, but not built into Raspberry
+Pi OS kernels; installed with DKMS, §9) exposes aquaero’s
 **own 4 fans**. Quadro channels over aquabus may be sensors only, with
 no PWM write. Until verified:
 
 1. `sensors` and `/sys/class/hwmon/` — which `temp*`, `fan*`, `pwm*`
-   exist, their units, and whether `pwmK_enable` exists.
+   exist, their units, and whether `pwmK_enable` exists. Answered for
+   USB-attached devices (results below).
 2. Whether Quadro PWM is writable through XT6 (hwmon or HID).
 3. **Does XT6 revert on its own after the Pi stops writing?** Write a PWM
    via hwmon/HID, then stop. If the fan stays pinned, firmware curves are
@@ -233,6 +238,87 @@ At exit the adapter leaves `pwmK_enable` in manual mode with
 **not** called, because it would undo the `fallback_pwm` write. If spike
 (3) shows the firmware curve is the better state after exit, calling it
 is a one-line change in `__main__.py`.
+
+### USB spike results (2026-09-14)
+
+Temporary setup: the aquaero 6 XT and the Quadro each on its own USB port
+behind a powered hub, one fan and one thermistor on each, nothing on
+aquabus; kernel `6.18.39+rpt-rpi-v6`, driver from
+`deploy/install-aquacomputer-dkms.sh` (§9). Questions (2)–(4) above stay
+open: they need the Quadro on aquabus.
+
+- **Driver.** Not in the Raspberry Pi OS kernel
+  (`CONFIG_SENSORS_AQUACOMPUTER_D5NEXT` is not set): both controllers bind
+  to `hid-generic` and no hwmon device appears. Built with DKMS the driver
+  binds both. Unpatched, every `pwmK` write failed with `EAGAIN` and a
+  `dma_map_phys` kernel warning, after the control report itself had been
+  sent: the driver sends its follow-up report from static module data,
+  which is not DMA-mappable on the Zero W. The DKMS package carries a fix
+  (§9).
+- **Attributes.** hwmon names `aquaero` and `quadro`. aquaero:
+  `temp1..8` sensors, `temp9..16` virtual sensors, `temp17..20` calculated
+  virtual sensors, `fan1..4` plus flow `fan5..6`, `pwm1..4`, per fan
+  `inN` / `currN` / `powerN`, and `tempK_offset` for the 8 sensors. Quadro:
+  `temp1..4` sensors, `temp5..20` virtual sensors, `fan1..4` plus flow
+  `fan5`, `pwm1..4`. Units as §3 Track B assumes (millidegrees, rpm,
+  0..255). An input with nothing connected fails its read with `ENODATA`,
+  which the adapter already turns into `None`.
+- **No `pwmK_enable`** on either device: `apply()` has nothing to switch
+  and `release()` nothing to restore.
+- **A `pwmK` write reconfigures the aquaero channel.** The driver points
+  the channel's control source at its manual preset and sets its minimum
+  power to 0 % and maximum to 100 %. The firmware controller that drove
+  the channel before is no longer assigned, nothing in hwmon assigns it
+  again, and after the daemon exits the channel holds its last preset.
+  Reading `pwmK` on the aquaero returns that preset, not the effective
+  output: it read 0 while the fan ran at 1082 rpm from its firmware
+  controller. On the Quadro a write only sets the channel's manual value.
+  Save both control reports before the first write (HID feature reports
+  `0x0b`, 2707 bytes, and `0x03`, 961 bytes): written back followed by the
+  follow-up report, they restored the configuration byte for byte.
+- **Cost.** `tempK_input` and `fanK_input` come from the cached status
+  report. Every `pwmK` read fetches the whole control report, and every
+  write fetches, patches and sends it, with the driver's 200 ms spacing
+  between control operations (both devices):
+
+  | Operation | Median time |
+  |---|---|
+  | `fanK_input` or `tempK_input` read | 1 ms |
+  | `pwmK` read | 210 ms |
+  | `pwmK` write | 420 ms |
+
+  `Xt6Adapter.read()` reads every `pwmK` and `apply()` writes every channel
+  on every tick: with 8 outputs that is about 5 s per tick, the whole `dt`
+  of the DAS example (§8 item 74).
+- **The outputs run in PWM mode.** The output voltage stays at 12.1 V from
+  5 % to 100 %; 0 % switches the output off. The aquaero reports 0 mA and
+  0 W in this mode; the Quadro reports current and power.
+- **PWM to rpm**, one test fan per controller, 10 s settle per step, up
+  from 0 % and back down:
+
+  | PWM | aquaero up | aquaero down | Quadro up | Quadro down |
+  |---|---|---|---|---|
+  | 0 % | 0 | 0 | 0 | 0 |
+  | 5 % | 0 | 0 | 694, unstable | 569, unstable |
+  | 10 % | 0 | 0 | 167 | 136 |
+  | 15 % | 0 | 125 | 165 | 251 |
+  | 20 % | 0 | 185 | 186 | 271 |
+  | 25 % | 250 | 256 | 302 | 391 |
+  | 30 % | 304 | 316 | 322 | 424 |
+  | 40 % | 410 | 423 | 452 | 550 |
+  | 50 % | 502 | 513 | 565 | 581 |
+  | 60 % | 605 | 623 | 675 | 693 |
+  | 70 % | 709 | 727 | 704 | 806 |
+  | 80 % | 820 | 828 | 840 | 931 |
+  | 90 % | 926 | 939 | 968 | 1066 |
+  | 100 % | 1078 | 1078 | 1087 | 1087 |
+
+  The aquaero fan starts only at 25 %, keeps turning down to 14 %
+  (120 rpm) and stops at 13 %. The Quadro fan keeps turning at 9 %
+  (about 123 rpm after a minute); at 5–8 % its speed jumps between 0 and
+  860 rpm, faster than at 10 %. Up and down differ by up to 100 rpm on the
+  Quadro: 10 s may be too short, or the firmware ramps; not checked
+  (§8 item 75).
 
 ---
 
@@ -1518,9 +1604,10 @@ converges only with them.
 - `hw/xt6.py`: `Xt6Adapter(hwmon_map, clock)` with
   `read() -> PlantObservation` and `apply(MpcCommand)`. `ts` comes from
   the injected monotonic clock.
-  - Assumed ABI (to be confirmed by the spike): `tempK_input`
-    millidegrees °C, `fanK_input` RPM, `pwmK` 0..255 read/write,
-    optional `pwmK_enable` where `1` is manual.
+  - ABI: `tempK_input` millidegrees °C, `fanK_input` RPM, `pwmK`
+    0..255 read/write, optional `pwmK_enable` where `1` is manual. Names
+    and units are confirmed on USB-attached devices, where neither has
+    `pwmK_enable` (§2 "USB spike results").
   - `read`: a single missing, unreadable or garbage file becomes `None`
     for that value; a vanished device directory raises
     `DeviceUnavailable`.
@@ -1738,6 +1825,8 @@ aqua-bridge/
     99-aquacomputer.rules    # udev: usb, hidraw, hwmon pwm group write (§9)
     host-usb.sh              # dwc2 host overlay, idempotent (§10)
     install-pi.sh            # provisioning, self-signed HTTPS certificate, --das (§10)
+    install-aquacomputer-dkms.sh  # aquacomputer_d5next hwmon driver via DKMS (§9)
+    dkms/aquacomputer_d5next/     # dkms.conf template, Makefile, driver patches (§9)
   src/aqua_bridge/
     __main__.py              # python -m aqua_bridge: wiring, signals, exit codes
     model.py                 # the contract, incl. the DAS config sections
@@ -3049,7 +3138,9 @@ Owner decisions (2026-09-14, later the same day):
     its `temp_map`.
 35. Confirm the hwmon ABI on the real device (`tempK_input` millidegrees,
     `pwmK` 0..255, `pwmK_enable` semantics) and that the udev rule makes
-    `pwmK` / `pwmK_enable` group-writable for the service user.
+    `pwmK` / `pwmK_enable` group-writable for the service user. Partly
+    answered (§2 "USB spike results"): names and units match and there is
+    no `pwmK_enable`; the udev group write is still unchecked.
 36. `pytest -m hardware` on the Pi with the aquaero attached (after
     item 2).
 37. Verify every `temp_map` entry against its physical sensor (warm one,
@@ -3081,6 +3172,31 @@ Owner decisions (2026-09-14, later the same day):
 48. Time `model.json` writes on the Pi's SD card.
 49. Digole: protocol, pages (Overview, Drives, Zones/Fans, Model, Host),
     touch, hit-test.
+74. hwmon PWM cost (§2 "USB spike results"): a `pwmK` read takes 210 ms
+    and a write 420 ms, and `Xt6Adapter` reads every `pwmK` and writes every
+    channel on every tick, about 5 s per tick with 8 outputs. Report the
+    last commanded value instead of reading `pwmK` back, write only
+    channels whose raw value changed (and all of them again after a
+    re-plug), and time a full tick on the Pi.
+75. Fan stall and restart: a fan below its stall duty stops and starts
+    again only at a higher duty (aquaero test fan: stops at 13 %, starts
+    at 25 %), and a fan can speed up in a low-duty band (Quadro test fan:
+    up to 860 rpm at 5–8 %). `mpc.pwm_min` is one global value. Per-output
+    stall and start duties in the config, a start kick when a channel
+    reads 0 rpm under a command above its stall duty, and
+    `tools/fit_fans.py` finding both duties and the unstable band.
+76. What the aquaero channels hold after exit: without `pwmK_enable`,
+    `release()` does nothing and each channel keeps its manual preset. Decide
+    together with item 33 whether that stays (the stop write leaves
+    `fallback_pwm`) or the adapter restores the saved firmware controller
+    assignment through HID.
+77. Find out whether a control-report write is stored in the aquaero's or
+    the Quadro's non-volatile memory. If it is, a write every tick wears
+    it; item 74 cuts the rate, but the answer decides how far. Before
+    item 42.
+78. Send the driver fix in `deploy/dkms/aquacomputer_d5next/` upstream
+    (linux-hwmon), then drop the patch once a Raspberry Pi OS kernel
+    carries it.
 
 ### 8.4 Open — Zero 2 W upgrade
 
@@ -3353,6 +3469,47 @@ resolution that is a few percent of the CPU; measure with
 
 I2C userspace module: `/etc/modules-load.d/i2c-dev.conf` → `i2c-dev`.
 
+### Kernel module `aquacomputer_d5next` (DKMS)
+
+Raspberry Pi OS kernels are built without
+`CONFIG_SENSORS_AQUACOMPUTER_D5NEXT`, so the aquaero and the Quadro bind
+to `hid-generic` and have no hwmon device. `install-pi.sh` runs
+`deploy/install-aquacomputer-dkms.sh` right after the apt packages
+(`dkms`, `curl`, `patch`, `linux-headers-rpi-v6`). The script:
+
+1. derives the stable tag from the kernel release
+   (`6.18.39+rpt-rpi-v6` → `v6.18.39`; `--tag` overrides it) and
+   downloads `drivers/hwmon/aquacomputer_d5next.c` from the kernel.org
+   stable tree (`--source FILE` uses a local copy);
+2. applies `deploy/dkms/aquacomputer_d5next/*.patch` in name order; a
+   patch already contained in the source is skipped, one that does not
+   apply stops the script;
+3. removes other versions of the module from DKMS, installs the source
+   with `Makefile` and `dkms.conf` as
+   `/usr/src/aquacomputer_d5next-<upstream>-aqb<PATCH_LEVEL>` and runs
+   `dkms install`; the module goes to `updates/dkms` and loads by its
+   HID alias at boot;
+4. loads the module when none is loaded. It never unloads a loaded one
+   (the daemon may be using it) and says when a reboot is needed.
+
+It is idempotent, and a kernel with the driver built in (`=y`) is left
+alone with a warning. Bump `PATCH_LEVEL` in the script when a patch is
+added or changed. After a kernel upgrade DKMS rebuilds the old source for
+the new kernel; run the script with `--kernel <new release>` before
+rebooting so the source matches the kernel.
+
+The patch (`0001-send-secondary-ctrl-report-from-heap.patch`): after
+every control write the driver sends a short follow-up report from static
+module data. USB transfer buffers must be DMA-mappable and module data is
+not on the Zero W, so every `pwmK` write failed with `EAGAIN` and a
+`dma_map_phys` warning (§2 "USB spike results"). The patch sends a heap
+copy made once per device. Mainline still has the bug (2026-09-14; §8
+item 78).
+
+Check: `sudo dkms status` lists the module as installed, and
+`cat /sys/class/hwmon/hwmon*/name` shows `aquaero` (and `quadro` on its
+own USB port).
+
 UART: `cmdline.txt` has no `console=serial0,115200` — the line is free for
 Digole.
 
@@ -3511,7 +3668,8 @@ on a Zero W; the hardware steps are waiting for the aquaero.
    Then, from `/opt/aqua-bridge`: `deploy/install-pi.sh --user USER`
    (`USER` is the service account and its group; add `--das` for a DAS
    enclosure, see below). Idempotent. It
-   installs the apt packages, creates the install dir and the
+   installs the apt packages, builds the `aquacomputer_d5next` driver
+   with DKMS (§9; downloads the driver source from kernel.org), creates the install dir and the
    `--system-site-packages` venv, runs `pip install -e . --no-deps` as
    the service user (aborting if pip tries to fetch numpy), installs
    `config.example.yaml` (`config.example-das.yaml` with `--das`) as
