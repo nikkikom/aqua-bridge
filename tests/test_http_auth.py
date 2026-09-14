@@ -740,7 +740,7 @@ def test_http_user_tool_refusals(tmp_path: Path, monkeypatch, capsys) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Review findings (PR #24)
+# Review findings
 # ---------------------------------------------------------------------------
 
 

@@ -2592,11 +2592,11 @@ them as "§8 item N".
 
 ### 8.2 Open — no DAS hardware needed (dev machine, CI, the Pi, the PC)
 
-1. **Done (PR #22):** the PI-like DAS error is now `max(t̂ − soft)`, counting `k·σ` once inside `soft`. PI-like DAS: count `k·σ` once. The per-channel error becomes
+1. **Done:** the PI-like DAS error is now `max(t̂ − soft)`, counting `k·σ` once inside `soft`. PI-like DAS: count `k·σ` once. The per-channel error becomes
    `max(t̂ − soft)` with `soft = limit − comfort − k·σ` (today `k·σ` is also
    added to `t̂`). Regenerate only the DAS goldens `das_*.pi_das.json`; keep
    every per-zone invariant.
-2. **Done (PR #21):** `tests/test_hw_xt6.py::test_live_read_and_writeback` no
+2. **Done:** `tests/test_hw_xt6.py::test_live_read_and_writeback` no
    longer writes `0.0` to a channel whose PWM read returns `None`; such
    channels are excluded from the write-back and reported, and the test
    skips with a clear reason if none is readable. **Must land before item 36.**
@@ -2606,22 +2606,22 @@ them as "§8 item N".
    controller compensates (about one in three 75-minute `sim/das.py`
    runs). Fix the evidence rule; regression: long DAS sim runs with zero
    false zone faults.
-4. **Done (PR #24):** the API and page are served only over HTTPS with basic auth (§6), with `tools/http_user.py` for users and a self-signed certificate from `install-pi.sh`.
+4. **Done:** the API and page are served only over HTTPS with basic auth (§6), with `tools/http_user.py` for users and a self-signed certificate from `install-pi.sh`.
    HTTPS with basic auth for the API and the page: certificate and key
    paths in `http:`, hashed credentials in a root-owned 0640 file under
    `/etc/aqua-bridge`, every route authenticated, plain HTTP refused.
    Document that the MQTT counterparts (`cmd/bay`, `cmd/limit`,
    `cmd/ident`) rely on broker authentication.
-5. **Done (PR #23):** Runtime budget alarm: `control/loop.py` logs a
+5. **Done:** Runtime budget alarm: `control/loop.py` logs a
    rate-limited warning past `mpc.budget_ms` and error past
    `mpc.budget_alarm_ms`, both now config keys, with `step_ms_last` /
    `step_ms_max` / exceedance counters in `/api/health` and the MQTT state
    blob.
-6. **Done (PR #23):** The relative budget gate in CI is thin (DAS MPC p99
+6. **Done:** The relative budget gate in CI is thin (DAS MPC p99
    9–11× the legacy MPC against 12×); `tests/test_bench_budget.py` now
    interleaves, discards a warm-up repeat and gates on the 75th percentile
    of several per-repeat ratios instead of one min/min pair.
-7. **Done (PR #25):** `install-pi.sh --das` installs `config.example-das.yaml` and the `deploy/aqua-bridge-das.conf` systemd drop-in (`ExecStart=` with `--source hwmon`); without `--das` the legacy path is unchanged.
+7. **Done:** `install-pi.sh --das` installs `config.example-das.yaml` and the `deploy/aqua-bridge-das.conf` systemd drop-in (`ExecStart=` with `--source hwmon`); without `--das` the legacy path is unchanged.
 8. `zones.trust_rule: sigma` (zone trust from the estimator's σ); the
    config accepts it, `strict` applies today.
 9. A Jump on a redundant group member is accepted after one tick without
