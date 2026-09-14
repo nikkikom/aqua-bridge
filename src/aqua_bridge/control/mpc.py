@@ -20,16 +20,14 @@ Order inside :func:`step`
    A "gap" tick drops the window but keeps the latch: only a value that
    leaves the ``stuck_eps_c`` band proves the sensor alive. (With zones the
    decimated Stuck windows are advanced first and dropped on a gap, too.)
-3b. Zone trust (:func:`aqua_bridge.control.zones.evaluate`). Legacy mode is
-   one implicit zone whose verdict is exactly the whole-tick gate verdict.
-   With zones, a sensor whose value the gate rejected (``range``, ``slew``,
-   ``stuck``) first confirms over ``confirm_ticks`` consecutive trusted ticks
-   (:func:`aqua_bridge.control.zones.advance_confirmation`, counts in
-   ``solver_memory["sensor_confirm"]``, ``diagnostics["sensor_confirm"]``): a
-   confirming sensor is not fused by the estimator, not in the solver's
-   ``temps``, not a last good value, and counts toward its group's trust only
-   while its zone is already in fault, so a redundant member that jumps stays
-   out while its group stays trusted through the others.
+3b. Sensor confirmation (zones only): a sensor whose value the gate rejected
+   (``range``, ``slew``, ``stuck``) first confirms over ``confirm_ticks``
+   consecutive trusted ticks (:func:`aqua_bridge.control.zones.advance_confirmation`,
+   counts in ``solver_memory["sensor_confirm"]``, ``diagnostics["sensor_confirm"]``):
+   a confirming sensor is not fused by the estimator, not in the solver's
+   ``temps``, not a last good value, and counts toward its group's trust (step
+   3d) only while its zone is already in fault, so a redundant member that jumps
+   stays out while its group stays trusted through the others.
 3b'. With zones, a model loaded from the store (``solver_memory["store_seed"]``, put
    into the initial state by :mod:`aqua_bridge.modelstore`) is applied once, on the
    first zoned tick, by :func:`aqua_bridge.control.persist.apply_seed` with this tick's
@@ -43,9 +41,8 @@ Order inside :func:`step`
    gate-trusted, confirmed temperatures of this tick (none on a tick whose time
    status is not ``first`` / ``ok``), the command ``prev`` and
    ``obs.inputs["smart"]``; its memory is ``solver_memory["estimator"]`` and
-   its estimates block feeds the solver and the diagnostics. It is not an
-   input of zone trust (``zones.evaluate`` gets ``estimates=None``, so the
-   ``sigma`` trust rule still applies ``strict``). Any exception from it is an
+   its estimates block feeds the solver and the diagnostics. Its inputs depend
+   on no zone verdict, so it runs before zone trust. Any exception from it is an
    *estimator fault*: its memory is dropped (the next tick starts over), the
    diagnostics fall back to the prior map
    (:func:`aqua_bridge.control.estimates.prior_estimates`) and, when the
@@ -55,13 +52,21 @@ Order inside :func:`step`
    estimates nothing in it can be constrained). A zoned config that still
    regulates on setpoints does not read the estimates, so there the fault is
    only reported.
+3d. Zone trust (:func:`aqua_bridge.control.zones.evaluate`). Legacy mode is
+   one implicit zone whose verdict is exactly the whole-tick gate verdict.
+   ``zones.trust_rule: strict`` checks the required sensor groups;
+   ``sigma`` reads this tick's estimator update (step 3c), so the verdict uses
+   the posterior sigma of the same tick the solver acts on. On a tick with an
+   estimator fault ``sigma`` applies ``strict``; ``diagnostics["trust_rule"]`` is
+   the rule that ran.
 4. Fault bookkeeping, per zone: an untrusted tick resets the zone's streak
    and opens its fault timer (``since`` is kept, never restarted, while
    the zone's fault is active -- Flicker must not reset the hold). A
    trusted tick while in fault only counts toward ``confirm_ticks``. A
    zone is *eligible* for the solver when it is trusted and either
    fault-free or on its ``confirm_ticks``-th consecutive trusted tick with a
-   confirmed trusted member in every required group.
+   confirmed trusted member in every required group its trust rule checks
+   (``sigma``: the setpoint groups only).
 5. Solver -- only when some zone is eligible. The channels of the zones
    that stay in fault (and, with ``fault_coupling: declared``, of the zones
    coupled to them) are under fallback policy: they reach the solver as
@@ -509,17 +514,9 @@ def step(
     )
     trusted = gate.trusted and time_status in ("ok", "first")
 
-    # 3b. zone trust (legacy: the implicit zone's verdict is exactly ``trusted``); with
-    # zones a sensor whose value the gate rejected confirms first (module docstring)
+    # 3b. with zones a sensor whose value the gate rejected confirms first (module docstring)
     books = _read_books(state, mem, cfg)
     confirming = zones.advance_confirmation(mem.get("sensor_confirm"), gate, time_status, cfg)
-    verdicts = zones.evaluate(
-        gate,
-        time_status,
-        cfg,
-        confirming=confirming,
-        in_fault=[z for z in zone_names if books[z].since is not None],
-    )
     trusted_temps: dict[str, float] = {}
     if das:
         trusted_temps = {
@@ -554,6 +551,19 @@ def step(
             if cfg.regulates_drive_limits and cfg.topology is not None:
                 constrained = {b.zone for b in cfg.topology.bays.values() if b.constrained}
                 estimator_faulted = {z for z in zone_names if z in constrained}
+
+    # 3d. zone trust (legacy: the implicit zone's verdict is exactly ``trusted``), after the
+    # estimator: the sigma rule reads this tick's posterior sigma (module docstring)
+    trust_rule = zones.effective_trust_rule(cfg, est_update)
+    verdicts = zones.evaluate(
+        gate,
+        time_status,
+        cfg,
+        est_update,
+        confirming=confirming,
+        in_fault=[z for z in zone_names if books[z].since is not None],
+    )
+    if das:
         for zone in estimator_faulted:
             verdicts[zone] = zones.ZoneTrust(
                 trusted=False,
@@ -580,7 +590,7 @@ def step(
             books[z].since is None
             or (
                 books[z].streak >= cfg.confirm_ticks
-                and zones.groups_confirmed(z, gate, confirming, cfg)
+                and zones.groups_confirmed(z, gate, confirming, cfg, trust_rule)
             )
         )
     ]
@@ -841,7 +851,7 @@ def step(
         diagnostics["zones_in_fault"] = list(faulted)
         diagnostics["fallback_channels"] = [ch for ch in cfg.channels if ch in ch_elapsed]
         diagnostics["policy_by_channel"] = policy_by_channel
-        diagnostics["trust_rule"] = zones.effective_trust_rule(cfg)
+        diagnostics["trust_rule"] = trust_rule
         diagnostics["sensor_confirm"] = dict(confirming)
         diagnostics["estimates"] = _estimate_diagnostics(est_block, verdicts, faulted)
         diagnostics["bays"] = {} if est_update is None else est_update.bays

@@ -498,14 +498,15 @@ def test_unknown_key_faults_every_zone(dcfg):
     assert v["zc"].reasons == ("unknown_keys:gpu",)
 
 
-def test_sigma_rule_uses_strict_until_estimates_exist():
+def test_sigma_rule_applies_strict_only_without_an_estimator_update():
+    """``tests/test_sigma_trust.py`` covers the rule itself."""
     cfg = das_cfg(zones={"trust_rule": "sigma"})
     assert zones.effective_trust_rule(cfg) == "strict"
-    assert zones.effective_trust_rule(cfg, estimates={}) == "sigma"
     obs = das_obs(cfg, 0.0, prox_a2=None)
     assert trusted_zones(verdicts_for(cfg, obs)) == {"zb", "zc"}
     cmd, _ = step(obs, cfg, MpcState.cold())
-    assert cmd.diagnostics["trust_rule"] == "strict"
+    assert cmd.diagnostics["trust_rule"] == "sigma"
+    assert cmd.diagnostics["zones_in_fault"] == []  # a2's sigma is the estimator's prior
 
 
 @pytest.mark.parametrize(
