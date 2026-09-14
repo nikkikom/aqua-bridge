@@ -317,8 +317,8 @@ Lists become tuples; ints are accepted for floats.
 | `dT_max_c_per_s` | required | gate slew limit, °C/s; > 0 |
 | `stuck_s` | required | Stuck window, seconds; ≥ `2 * dt` (useful range: minutes). DAS: validated, but each sensor uses `sensors.<name>.stuck_s` |
 | `stuck_eps_c` | required | “unchanged” band, °C; > 0 (≥ sensor resolution, aquaero 0.01 °C). DAS: per sensor, `sensors.<name>.stuck_eps_c` |
-| `stuck_pwm_net` | required | net PWM move that must show up in T; in `(0, 1]` |
-| `stuck_sibling_dT_c` | required | net move of another temperature, °C; > 0 |
+| `stuck_pwm_net` | required | net PWM move that must show up in T; in `(0, 1]`. DAS: a zoned sensor's evidence is its zone's relative airflow instead, `stuck_airflow_net` |
+| `stuck_sibling_dT_c` | required | net move of another temperature, °C; > 0. DAS: only the siblings of `stuck_params` (same zone and role; a proximal sensor's own bay) |
 | `median3` | `false` | pre-filter; must be a YAML bool (`"false"` is rejected) |
 | `temp_min_c`, `temp_max_c` | `-20.0`, `120.0` | gate absolute valid range, °C; min < max |
 | `solver` | `pi` | `pi` or `mpc`. Legacy: PI / small linear MPC. DAS without setpoints: PI-like DAS form / DAS MPC |
@@ -415,6 +415,8 @@ long `dt`):
 | `ident_settle_s` | 600 | ≥ 0; ≥ `confirm_s` when enabled |
 | `ident_start_band_c` / `ident_max_over_c` | 1.0 / 3.0 | > 0 |
 | `ident_seed` | 1 | int ≥ 0 |
+| `stuck_airflow_net` | 0.15 | `(0, 1]`: net move of a zone's relative airflow (block means over the Stuck window, below) that is Stuck evidence for the zone's sensors |
+| `stuck_air_oppose_c` | 0.3 | > 0, °C: a zone-air move against that airflow move by more than this voids it for the zone's `drive_proximal` sensors |
 
 `budget_ms` / `budget_alarm_ms` (600 ms / 750 ms default, at `dt = 5 s` in the
 DAS example) gate both the benchmark (`tools/bench_step.py`,
@@ -435,7 +437,8 @@ Derived tick quantities are properties, never YAML keys:
   required sensor groups per zone, `reach` = channels a zone fault puts
   under fallback policy, `served` = zones a channel works for: the zones
   listing it plus their `coupled_to`); `stuck_params(name)` (window
-  ticks, band, decimation, evidence channels and siblings of one sensor);
+  ticks, band, decimation, evidence channels with their airflow weights,
+  siblings and zone-air witnesses of one sensor);
   `window_ticks` (length of `MpcState.window`: `stuck_ticks` in legacy
   mode, the longest undecimated sensor window, ≥ 3, in DAS mode);
   `bay_class(bay)`, `bay_limit(bay)`, `bay_comfort(bay)`; `blocks()`
@@ -752,19 +755,81 @@ number of rule 3 comes from `MpcConfig.stuck_params(name)`:
   (defaults per role: `drive_proximal` 1800 s, `zone_air` 180 s, `inlet`
   and `exhaust` 600 s) and `stuck_eps_c` (default `1.5 × quant_c`, never
   below `quant_c`);
-- the PWM evidence counts only the channels of the sensor's zone (an
-  inlet without a zone has none: the fans do not move the inlet);
+- the PWM evidence is the zone's **relative airflow**, not one channel:
+  `Qn = Σ w · φ(u)` over the channels of the sensor's zone, with
+  `φ(u) = clip((u − deadband) / (1 − deadband), 0, 1) ^ exponent` from
+  `fan_models` (the estimator's fan curve) and `w` the channel's
+  `fans.<ch>.count` split evenly over the zones that list it, normalised
+  to a sum of 1. It counts when the mean `Qn` of the `L` samples that end
+  at the lagged sample (`L = stuck_pwm_lag`, a quarter window before the
+  newest) differs from the mean of the first `L` samples by more than
+  `stuck_airflow_net` (`stuck_pwm_net` stays the legacy per-channel rule).
+  Block means, not the oldest sample: a drive does not answer a fan dip
+  of a tick or two. An inlet without a zone has none: the fans do not move
+  the inlet;
+- for a `drive_proximal` sensor that airflow move is **no evidence** when
+  every zone-air sensor of its zone with a plausible path over the window
+  moved against it by more than `stuck_air_oppose_c` (warmer air after
+  more airflow, cooler after less): a proximal reading mixes the zone air
+  with the drive-to-air difference, which airflow moves the other way. A
+  zone-air sensor without a plausible path (dropout, Spike) does not vote;
+  one that did not move (a frozen one included) keeps the evidence;
 - the sibling evidence counts only other sensors of the same zone **and**
-  role.
+  role, and for a `drive_proximal` sensor only those of its own **bay**:
+  another bay's reading follows that bay's drive heat, which does not
+  reach this sensor.
+
+Why (§8 item 3). With every zone channel's own net PWM move and every
+proximal sensor of the zone as evidence, the `rich` simulator with the
+PI-like DAS solver flagged a healthy sensor in 37 and faulted a healthy
+zone in 34 of 260 75-minute runs (seeds 0–259). An idle bay's DS18B20
+sat inside its band for half an hour while a neighbouring bay's activity
+burst moved that bay's reading by 1–2 °C (31 of the 37), or while the
+zone's fans moved and the reading had a physical reason to stay: a warming
+inlet against more airflow, the solver moving a zone's channels apart (one
+up, a shared one down), a shared single-fan output carrying a small share
+of the zone's air, or, with the DAS MPC, a short fan dip caught as the
+oldest sample. With the rules above no healthy sensor was flagged in 1,040
+PI-like DAS runs (seeds 0–1039) and 320 DAS MPC runs (seeds 0–319) of
+2.5 hours each; the smallest zone-air opposition that voided a move there
+was 0.61 °C, and an airflow threshold of 0.1 brought three false flags
+back where 0.125 did not. Rejected: the estimator's predicted change for
+the bay (its proximal channel is closed on the very sensor under test, an
+open-loop prediction over the window integrates the zone model every tick
+on the Zero W, and the prior sensor map, `β = 0.3` against 0.15–0.5 on the
+simulator, mispredicts exactly these cancellations); weighing other bays'
+siblings by role (the only part of another bay's reading this sensor
+shares is the zone air, which the zone-air sensor measures directly).
+
+**Detection time.** A reading frozen from `t0` is flagged at the latest
+at `max(t0 + stuck_s, t1 + stuck_s / 2)` plus two decimation intervals
+(`2 · stuck_decimate · dt`) once its zone's relative airflow has stepped
+by more than `stuck_airflow_net` at `t1 ≥ t0 + stuck_s / 4` and stayed
+there, and not before the step is a quarter window old; a step less than
+a quarter window after the freeze counts only by the share of the first
+quarter window that precedes it (`tests/test_gate.py`). A same-bay sibling
+that moves plausibly by more than `stuck_sibling_dT_c` flags it as well.
+Not evidence any more: a frozen proximal reading while its zone's airflow
+stays within `stuck_airflow_net` (fans pinned at `pwm_max`, a slow trim)
+or moves against a zone-air move above `stuck_air_oppose_c`. Such a
+reading hides its own drive's heat until the airflow moves; the old rule
+caught it only when another drive's activity happened to move a
+neighbour's reading. On the `rich` simulator 21 of 48 proximal readings
+frozen 20 minutes into a 2.5-hour PI-like DAS run were flagged (the old
+rule: all 48, at the price of the false faults above); of the other 27,
+25 had no window with a zone airflow move above `stuck_airflow_net` in
+their recorded commands (5 with every fan at full speed) and 2 had the
+zone air against it.
 
 Long windows are **decimated**: a sensor whose window has `n` ticks keeps
 one sample every `stuck_decimate` ticks (default `max(1, n // 60)`, so
 1800 s at `dt = 5` keeps 60 samples, one every 6 ticks) in
 `solver_memory["stuck_slow"]`, fed from the previous tick's dense sample
 (which carries the applied command). The check interpolates nothing; a
-sibling's single step is bounded by `k × dT_max_tick`. An excursion
-shorter than `k` ticks can go unseen, which can only flag Stuck more
-readily (its zone faults, cooling rises), never less. A malformed stored
+sibling's or zone-air sensor's single step is bounded by
+`k × dT_max_tick`. A reading's excursion shorter than `k` ticks can go
+unseen by the band check, which can only flag Stuck more readily (its
+zone faults, cooling rises), never less. A malformed stored
 window starts over, as after a gap.
 
 **Mode and saturation.** `fallback` while every zone is in fault,
@@ -1607,6 +1672,7 @@ aqua-bridge/
     test_estimator.py
     test_associate.py
     test_hotswap.py
+    test_stuck_sim.py        # Stuck evidence on sim/das (sweeps: nightly)
     test_pi_das.py
     test_thermal_model.py
     test_thermal_ident.py    # identifiability on sim/das (sweeps: nightly)
@@ -1902,8 +1968,9 @@ Inject on top of an otherwise nominal closed-loop:
 | Raw garbage | 32767 / 0xFFFF leftovers, millidegree passed as °C | out of range → untrusted. With `median3=true` a single sample is filtered, so the test injects 2–3 consecutive samples and the first untrusted tick shifts by one |
 | Flicker | alternate good/bad every step (spike, missing, `None`) | `mode` stays `fallback` (streak never reaches `confirm_ticks`); PWM must not chatter at `d_pwm_max` each tick; hold timer must not reset |
 | Constant noise | Gaussian **σ = 0.2 °C** (aquaero-scale, not ±2 °C) | gate reject rate under 1 % over a long run; `mode` stays auto; no PWM chatter. A companion test shows σ = 2 °C would trip the slew gate constantly. Median-of-3 is extra filtering, not a substitute for a realistic σ |
-| DS18B20 plateau (DAS) | a proximal DS18B20 on one 1/16 °C code for minutes while its zone's fans move | stays trusted: its window is `stuck_s` 1800 s decimated, its band `1.5 × 0.0625 °C`, its evidence only its zone's channels and same-role siblings (`tests/test_gate.py`) |
-| Frozen sensor (DAS) | a sensor frozen for its whole (decimated) window while its zone's channels moved net | Stuck, **only its zone** faults (hold, then high on its reach), other zones keep regulating (`degraded`); a frozen value hidden behind median3 glitches is still flagged (`tests/test_gate.py`) |
+| DS18B20 plateau (DAS) | a proximal DS18B20 on one 1/16 °C code for minutes while its zone's fans move | stays trusted: its window is `stuck_s` 1800 s decimated, its band `1.5 × 0.0625 °C`, its evidence only its zone's relative airflow and same-bay siblings (`tests/test_gate.py`) |
+| Idle bay beside a busy bay (DAS) | an idle bay's DS18B20 on one code for longer than `stuck_s` while a neighbouring bay's reading climbs 3 °C and the fans answer a little; zone air warming against more airflow; zone channels moved apart; a one-tick fan dip | stays trusted, no zone fault (`tests/test_gate.py`; `rich` truth-sim runs in `tests/test_stuck_sim.py`, §3 Stuck sizing) |
+| Frozen sensor (DAS) | a sensor frozen for its whole (decimated) window while its zone's relative airflow moved net by more than `stuck_airflow_net` | Stuck within `max(t0 + stuck_s, t1 + stuck_s / 2)` plus two decimation intervals, DS18B20 and thermistor alike; **only its zone** faults (hold, then high on its reach), other zones keep regulating (`degraded`); a redundant member's flag faults nothing; a frozen value hidden behind median3 glitches is still flagged (`tests/test_gate.py`, `tests/test_stuck_sim.py`) |
 | Lie in one zone (DAS) | any row above on a sensor of one zone | only that zone (and its declared neighbours' channels) under fallback policy; a Flicker there never resets another zone's streak; a dropout inside a redundant group is no fault (`tests/test_mpc_zone_fallback.py`) |
 | Swapped proximal sensors (DAS) | ROM ids of two bays exchanged | a Jump on both at onset (their zones hold), confirmed like any Jump; caught at commissioning, not by the gate (§3) |
 
@@ -1911,7 +1978,9 @@ The **sensor gate** is explicit (`control/gate.py`) and uses the
 trusted-tick rule of §3. Tests target that gate (`tests/test_gate.py`,
 and the gate-level cases here) **and** the full `step`. They include:
 Jump must not stay in fallback forever; Stuck must flag when **net** PWM
-or a sibling sensor moves, and must **not** flag at equilibrium with
+(DAS: the zone's relative airflow, unless the zone air moved against it
+for a proximal sensor) or a sibling sensor moves, and must **not** flag at
+equilibrium with
 small PWM dithering or on a sibling Spike / Jump; noise σ = 0.2 °C must
 not flicker `mode`; every gate test runs with `median3` both `false` and
 `true`. Do not hide filtering only inside numpy and leave it untested.
@@ -2116,6 +2185,7 @@ tests carry the `nightly` marker.
 | `tests/test_pi_das.py`, `tests/test_estimates.py`, `tests/test_das_config.py` | the margin-deficit PI (served zones, unconstrained channels, fixed channels, occupancy), the estimates block and prior map, `noise` / `limit_c` / served-zone config | PR |
 | `tests/test_estimator.py` | exact discretisation and Joseph form (random sequences keep P symmetric PSD); first tick and constant readings; σ grows while a bay is unobserved and shrinks back; redundant members; the occupancy machine incl. "never empty while zone air is unobserved"; SMART calibration acceptance, rejection, serial change and expiry after `calibration_max_age_days`; a guessed serial never relaxes a class; determinism, JSON round trip, malformed memory | PR |
 | `tests/test_associate.py` | detrended correlation, greedy assignment with margins, confirmation, full-window history, drops on silence / jump / empty, a declared serial wins; on the truth sim the right bays are found and indistinguishable bays refused | PR |
+| `tests/test_stuck_sim.py` | Stuck evidence on the truth sim (§3 Stuck sizing, §8 item 3): healthy `rich` runs flag no sensor and fault no zone; a frozen DS18B20 or thermistor proximal reading is flagged once its zone's airflow moves, and only a bay's last proximal sensor faults its zone | PR: 2 seeds, 2 frozen runs; nightly: 48 seeds, 2.5-hour runs of both DAS solvers |
 | `tests/test_hotswap.py` | slow swap, quick swap (never through `empty`, margin widens, class follows the new drive) and empty-at-boot on the truth sim: no limit violation, no zone fault, fans rise, constraints removed on empty | PR |
 | `tests/test_thermal_model.py` | structure, fan groups, parameter table, Jacobians vs finite differences, `eig` vs matrix exponential and the Euler fallback, windows, lag correction, RLS safeguards, status machine, never raising in `step`, shadow never changes the command | PR |
 | `tests/test_thermal_ident.py` | identifiability with group experiments on the truth sim: in-zone `E` within 15 % (PR seed), per-bay `k` within 25 %, `leak` / `κ` at prior, convergence; regulation only never converges; the seed sweep (bound 25 %), sensor offsets, the rich preset | PR: 4 cases; nightly: sweeps |

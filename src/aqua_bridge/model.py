@@ -1317,13 +1317,27 @@ class StuckParams:
     * ``decimate`` -- the window keeps one sample every ``decimate`` ticks (1: the
       dense ``MpcState.window``; > 1: a decimated window kept in ``solver_memory``)
     * ``samples``  -- stored samples the check needs (``ceil(ticks / decimate)``)
-    * ``channels`` -- channels whose net PWM move counts as evidence
+    * ``channels`` -- channels whose moves count as evidence (each on its own when
+      ``airflow`` is empty, else through ``airflow``)
     * ``siblings`` -- temperatures whose plausible net move counts as evidence
+    * ``airflow``  -- ``(channel, weight, deadband, exponent)`` per channel of the
+      sensor's zone: the evidence is the net move of the zone's relative airflow
+      ``sum weight * phi(u)`` above ``stuck_airflow_net``; empty means each
+      channel's own net PWM move above ``stuck_pwm_net``
+    * ``air``      -- zone-air sensors whose plausible net move *against* that
+      airflow move (warmer air after more airflow, cooler after less) by more
+      than ``stuck_air_oppose_c`` voids it as evidence
 
-    Legacy mode: the global ``stuck_s`` / ``stuck_eps_c``, every channel and every
-    other temperature. With ``topology``: the sensor's own values, the channels
-    of its zone (none for a sensor without a zone) and the other sensors of the
-    same zone and role.
+    Legacy mode: the global ``stuck_s`` / ``stuck_eps_c``, every channel (each on
+    its own), every other temperature, no ``airflow`` and no ``air``. With
+    ``topology``: the sensor's own window and band; the channels of its zone,
+    weighted by ``fans.<ch>.count`` split evenly over the zones that list the
+    channel (the estimator's airflow prior) and normalised to a sum of 1 (a
+    sensor without a zone has none); the other sensors of the same zone and
+    role as siblings, for a ``drive_proximal`` sensor only those of its own bay
+    (another bay's reading follows that bay's drive heat, which does not reach
+    this sensor); and for a ``drive_proximal`` sensor the zone-air sensors of its
+    zone as ``air`` (empty for every other role).
     """
 
     ticks: int
@@ -1332,6 +1346,8 @@ class StuckParams:
     samples: int
     channels: tuple[str, ...]
     siblings: tuple[str, ...]
+    air: tuple[str, ...] = ()
+    airflow: tuple[tuple[str, float, float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1439,6 +1455,11 @@ class MpcConfig:
       each rate limited to at most one line per ``budget_log_interval_s`` carrying
       the count of exceedances since the last line. Both modes; both apply
       regardless of ``dt``.
+    * ``stuck_airflow_net`` / ``stuck_air_oppose_c`` -- DAS Stuck evidence (gate rule 3,
+      ``aqua_bridge.control.gate``): the net move of a zone's relative airflow that
+      counts for its sensors instead of ``stuck_pwm_net``, and the zone-air move against
+      it (degrees C) that voids it for the zone's ``drive_proximal`` sensors. Validated
+      always, inert in legacy mode.
     * ``model_shadow`` / ``model_window_s`` / ``model_lambda`` / ``model_p_trace_max`` /
       ``model_converged_rel_se`` / ``model_max_pred_err_c`` / ``model_use_rpm`` -- the
       zoned thermal model's online identification (``control/thermal.py``): shadow
@@ -1507,6 +1528,8 @@ class MpcConfig:
     budget_ms: float = 600.0
     budget_alarm_ms: float = 750.0
     budget_log_interval_s: float = 60.0
+    stuck_airflow_net: float = 0.15
+    stuck_air_oppose_c: float = 0.3
     topology: Topology | None = None
     sensors: dict[str, SensorSpec] = field(default_factory=dict)
     drive_classes: dict[str, DriveClass] = field(default_factory=dict)
@@ -1607,6 +1630,8 @@ class MpcConfig:
             "budget_log_interval_s",
             _cfg_num("budget_log_interval_s", self.budget_log_interval_s),
         )
+        s(self, "stuck_airflow_net", _cfg_num("stuck_airflow_net", self.stuck_airflow_net))
+        s(self, "stuck_air_oppose_c", _cfg_num("stuck_air_oppose_c", self.stuck_air_oppose_c))
         for name in ("model_shadow", "model_use_rpm", "model_accept_prior"):
             _cfg_bool(name, getattr(self, name))
         for name in (
@@ -1835,6 +1860,12 @@ class MpcConfig:
             raise ConfigError(
                 f"mpc.budget_log_interval_s must be > 0, got {self.budget_log_interval_s}"
             )
+        if not 0.0 < self.stuck_airflow_net <= 1.0:
+            raise ConfigError(
+                f"mpc.stuck_airflow_net must be in (0, 1], got {self.stuck_airflow_net}"
+            )
+        if self.stuck_air_oppose_c <= 0:
+            raise ConfigError(f"mpc.stuck_air_oppose_c must be > 0, got {self.stuck_air_oppose_c}")
         if self.solver is SolverKind.MPC and self.regulates_drive_limits:
             # The DAS MPC (control/solver_das.py) tracks no setpoint: its QP is strictly
             # convex through the noise surrogate or the move penalty.
@@ -2266,6 +2297,7 @@ class MpcConfig:
                     zone_groups.append((f"setpoint:{t}", (t,)))
             groups[z] = tuple(zone_groups)
 
+        channel_zones = {ch: tuple(z for z in zones if ch in zone_channels[z]) for ch in channels}
         stuck: dict[str, StuckParams] = {}
         for t in self.temps:
             sp = sensors[t]
@@ -2278,6 +2310,23 @@ class MpcConfig:
                     f"mpc.sensors.{t}.stuck_decimate={k} leaves fewer than 2 samples in a "
                     f"{n}-tick Stuck window"
                 )
+            proximal = sp.role == "drive_proximal"
+            airflow: tuple[tuple[str, float, float, float], ...] = ()
+            if sp.zone is not None:
+                shares = {
+                    ch: self.fans[ch].count / len(channel_zones[ch])
+                    for ch in zone_channels[sp.zone]
+                }
+                total = sum(shares.values())
+                airflow = tuple(
+                    (
+                        ch,
+                        share / total,
+                        self.fan_models[self.fans[ch].model].deadband,
+                        self.fan_models[self.fans[ch].model].exponent,
+                    )
+                    for ch, share in shares.items()
+                )
             stuck[t] = StuckParams(
                 ticks=n,
                 eps_c=sp.stuck_eps_c,
@@ -2287,8 +2336,21 @@ class MpcConfig:
                 siblings=tuple(
                     o
                     for o in self.temps
-                    if o != t and sensors[o].zone == sp.zone and sensors[o].role == sp.role
+                    if o != t
+                    and sensors[o].zone == sp.zone
+                    and sensors[o].role == sp.role
+                    and (not proximal or sensors[o].bay == sp.bay)
                 ),
+                air=(
+                    tuple(
+                        o
+                        for o in self.temps
+                        if sensors[o].role == "zone_air" and sensors[o].zone == sp.zone
+                    )
+                    if proximal
+                    else ()
+                ),
+                airflow=airflow,
             )
         # At least 3: the decimated windows take their median3 value from the newest
         # three dense samples, so that value equals the one the gate checked.
@@ -2302,9 +2364,7 @@ class MpcConfig:
             zones=zones,
             zone_channels=zone_channels,
             coupled=coupled,
-            channel_zones={
-                ch: tuple(z for z in zones if ch in zone_channels[z]) for ch in channels
-            },
+            channel_zones=channel_zones,
             sensor_zone={t: sensors[t].zone for t in self.temps},
             required_groups=groups,
             reach=reach,
