@@ -42,6 +42,12 @@ commanded the way the driver does it: Quadro channel ``k`` has its duty at
 minimum power (``+0x04``) to 0 and maximum power (``+0x06``) to 100 %. Every
 control report SET is followed by a secondary feature report (the official
 software sends it too).
+
+The aquaero controller block also holds the output mode, a ``u16`` at
+``+0x0E``: low byte ``0x01`` drives the output as a DC voltage, ``0x02`` as PWM
+(verified on the Pi 2026-09-15 by switching one output; the high byte is not
+interpreted). It is decoded for diagnostics only; nothing here writes it. The
+Quadro's mode field is not known.
 """
 
 from __future__ import annotations
@@ -61,6 +67,7 @@ __all__ = [
     "ChannelState",
     "ControlChannel",
     "DeviceKind",
+    "OutputMode",
     "FanLayout",
     "FanStatus",
     "ReportError",
@@ -75,6 +82,7 @@ __all__ = [
     "finalize_control_report",
     "is_status_report",
     "kind_by_name",
+    "output_mode",
     "patch_duties",
     "restore_channel",
 ]
@@ -119,6 +127,8 @@ class ControlChannel:
     preset_id: int | None = None
     min_power: int | None = None
     max_power: int | None = None
+    #: aquaero: the ``u16`` output mode word (read only, :func:`output_mode`).
+    mode: int | None = None
 
     def pinned(self) -> tuple[tuple[int, int], ...]:
         """``(offset, value)`` of every ``u16`` besides the duty that must hold
@@ -203,6 +213,7 @@ AQUAERO = DeviceKind(
             preset_id=_AQUAERO_PRESET_ID + k,
             min_power=base + 0x04,
             max_power=base + 0x06,
+            mode=base + 0x0E,
         )
         for k, base in enumerate(_AQUAERO_CTRL_BLOCKS)
     ),
@@ -415,6 +426,27 @@ def _channel(kind: DeviceKind, k: int) -> ControlChannel:
     return kind.ctrl_channels[k]
 
 
+#: Low byte of the aquaero output mode word.
+OUTPUT_MODE_DC = 0x01
+OUTPUT_MODE_PWM = 0x02
+
+
+@dataclass(frozen=True)
+class OutputMode:
+    """An aquaero output's mode word: ``name`` is ``"pwm"``, ``"dc"`` or ``"unknown"``."""
+
+    raw: int
+
+    @property
+    def name(self) -> str:
+        low = self.raw & 0xFF
+        return {OUTPUT_MODE_PWM: "pwm", OUTPUT_MODE_DC: "dc"}.get(low, "unknown")
+
+    @property
+    def is_pwm(self) -> bool:
+        return self.name == "pwm"
+
+
 @dataclass(frozen=True)
 class ChannelState:
     """One output's fields in a control report (``None`` where the kind has none)."""
@@ -425,6 +457,8 @@ class ChannelState:
     max_power: int | None
     #: The duty is in effect: aquaero on its own preset with limits 0 / 100 %.
     on_duty: bool
+    #: aquaero: PWM or DC voltage (``None`` on the Quadro, whose mode field is unknown).
+    mode: OutputMode | None = None
 
 
 def control_duty(kind: DeviceKind, data: bytes | bytearray, k: int) -> int:
@@ -444,7 +478,14 @@ def channel_state(kind: DeviceKind, data: bytes | bytearray, k: int) -> ChannelS
         min_power=field(channel.min_power),
         max_power=field(channel.max_power),
         on_duty=all(_u16(data, offset) == value for offset, value in channel.pinned()),
+        mode=output_mode(kind, data, k),
     )
+
+
+def output_mode(kind: DeviceKind, data: bytes | bytearray, k: int) -> OutputMode | None:
+    """Channel ``k``'s output mode, or ``None`` where the kind has no known mode field."""
+    offset = _channel(kind, k).mode
+    return None if offset is None else OutputMode(_u16(data, offset))
 
 
 def channel_holds(kind: DeviceKind, data: bytes | bytearray, k: int, duty: int) -> bool:

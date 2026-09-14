@@ -56,6 +56,9 @@ Keeping the cache honest
        error and listed in ``stuck_channels``; it is not rewritten for the
        mismatch again until the device reports its duty (its normal writes on
        a changed command continue);
+       the aquaero's output mode is only reported: every commanded output
+       not in PWM mode gets one warning per open, and the mode is never
+       written;
     b) a change of the Quadro's power-cycle count invalidates the same way;
     c) every ``ctrl_refresh_s`` (0 disables) ``apply()`` GETs the report again
        and rewrites any channel that no longer holds its duty.
@@ -95,6 +98,7 @@ from aqua_bridge.hw.aquacomputer import (
     decode_status,
     finalize_control_report,
     is_status_report,
+    output_mode,
     patch_duties,
     restore_channel,
 )
@@ -370,6 +374,8 @@ class AquacomputerAdapter:
         #: Fields captured by the first GET, restored by release().
         self._originals: dict[int, ChannelSnapshot] | None = None
         self._ever_written: set[int] = set()
+        #: The output modes were checked on this open's first control report.
+        self._modes_checked = False
 
     # -- diagnostics -------------------------------------------------------
 
@@ -423,6 +429,7 @@ class AquacomputerAdapter:
         self._power_cycles = None
         self._ctrl = None
         self._mismatch_since.clear()
+        self._modes_checked = False
         _LOG.info("%s: opened %s", self.binding.label, transport.info.node)
         return transport
 
@@ -722,6 +729,24 @@ class AquacomputerAdapter:
             lambda transport, deadline: self._apply_once(transport, duties, deadline),
         )
 
+    def _warn_about_modes(self, ctrl: bytes) -> None:
+        """One warning per open for every commanded output not in PWM mode. The mode is
+        only reported, never changed (PROJECT.md section 8 item 81)."""
+        self._modes_checked = True
+        for k in sorted(self._names):
+            mode = output_mode(self.kind, ctrl, k)
+            if mode is None or mode.is_pwm:
+                continue
+            _LOG.warning(
+                "%s: pwm%d (%s) is in %s mode (mode word 0x%04X), not PWM; the daemon does not "
+                "change the mode, set it with the controller's own software",
+                self.binding.label,
+                k + 1,
+                self._names[k],
+                "DC voltage" if mode.name == "dc" else "an unknown",
+                mode.raw,
+            )
+
     def _falls_may_be_written(self) -> bool:
         last = self._last_write_t
         return last is None or self._clock() - last >= self.timing.write_min_interval_s
@@ -756,6 +781,8 @@ class AquacomputerAdapter:
         if self._ctrl is None:
             self._adopt(self._fetch(transport, deadline))
         ctrl = self._ctrl
+        if not self._modes_checked and ctrl is not None:
+            self._warn_about_modes(ctrl)
         assert ctrl is not None
         send = self._plan(ctrl, duties)
         if not send:

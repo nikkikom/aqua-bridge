@@ -12,8 +12,9 @@ report -- temperatures, each output's rpm, output duty, voltage, current and
 power, flow, and the Quadro's power-cycle count -- and each output's duty in
 the control report, with the aquaero's control source and power limits (the
 daemon's duty is in effect only while the channel follows its own preset with
-limits 0 / 100 %). Use it to pick ``tempN`` / ``fanN`` / ``pwmN`` for the
-config and a ``serial:`` when several of one kind are attached.
+limits 0 / 100 %), and the aquaero output mode (PWM or DC voltage). Use it to
+pick ``tempN`` / ``fanN`` / ``pwmN`` for the config and a ``serial:`` when
+several of one kind are attached.
 
 It never writes: it reads input reports and fetches the control report
 (``HIDIOCGFEATURE``), nothing else. The fetch is a control operation like the
@@ -113,6 +114,8 @@ def _print_control(kind: DeviceKind, data: bytes, out: TextIO) -> None:
                 f"  source 0x{state.source:02X}  min {_percent(state.min_power)}"
                 f"  max {_percent(state.max_power)}  ({follows})"
             )
+        if state.mode is not None:
+            line += f"  mode {state.mode.name} (0x{state.mode.raw:04X})"
         print(line, file=out)
 
 

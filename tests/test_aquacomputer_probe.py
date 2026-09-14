@@ -77,6 +77,7 @@ def test_lists_and_decodes_both_devices_without_writing(rig) -> None:
     assert "fan5 (flow)  0" in text
     # aquaero control report: source and limits
     assert "pwm2  duty   0.00 %  source 0x59  min 50.00 %  max 100.00 %  (does not follow" in text
+    assert "preset)  mode pwm (0x0502)" in text and "mode dc (0x0501)" in text
     # Quadro: power cycles, duty from the control report
     assert "power cycles:" in text and "pwm3  duty 100.00 %" in text
     for controller in rig[3].values():

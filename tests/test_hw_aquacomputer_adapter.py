@@ -348,6 +348,41 @@ def test_extra_channels_in_the_command_are_ignored() -> None:
     assert control_duty(QUADRO, device.ctrl, 0) == 5000
 
 
+def test_aquaero_outputs_not_in_pwm_mode_are_reported_once_per_open(caplog) -> None:
+    """Hardware 2026-09-15: the mode word at block +0x0E (0x0502 PWM, 0x0501 DC voltage).
+    The firmware fixture has outputs 3 and 4 in DC mode. Reported, never written."""
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={f"xt{n}": n for n in range(1, 5)})
+    adapter, device, bus, clock, _ = _setup(binding)
+    with caplog.at_level("WARNING", logger=LOGGER):
+        adapter.apply(_cmd(xt1=0.5, xt2=0.5, xt3=0.5, xt4=0.5))
+        clock.advance(1.0)
+        adapter.apply(_cmd(xt1=0.6, xt2=0.6, xt3=0.6, xt4=0.6))
+    warnings = [m for m in _messages(caplog, "WARNING") if "mode" in m]
+    assert len(warnings) == 2
+    assert "pwm3 (xt3) is in DC voltage mode (mode word 0x0501)" in warnings[0]
+    assert "pwm4 (xt4)" in warnings[1]
+    assert [device.ctrl[b + 0x0E : b + 0x10].hex() for b in (0x20C, 0x220, 0x234, 0x248)] == [
+        "0502",
+        "0502",
+        "0501",
+        "0501",
+    ]  # the mode is never written
+    caplog.clear()
+    adapter.close()
+    clock.advance(1.0)
+    with caplog.at_level("WARNING", logger=LOGGER):
+        adapter.apply(_cmd(xt1=0.7, xt2=0.7, xt3=0.7, xt4=0.7))
+    assert len([m for m in _messages(caplog, "WARNING") if "mode" in m]) == 2  # a new open
+
+
+def test_quadro_outputs_get_no_mode_warning(caplog) -> None:
+    binding = DeviceBinding(kind=QUADRO, pwm_map={"qd1": 1})
+    adapter, _device, _bus, _clock, _ = _setup(binding)
+    with caplog.at_level("WARNING", logger=LOGGER):
+        adapter.apply(_cmd(qd1=0.5))
+    assert not [m for m in _messages(caplog, "WARNING") if "mode" in m]
+
+
 # --- the gap between control operations ------------------------------------------------------
 
 
