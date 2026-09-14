@@ -3,9 +3,9 @@
 # output), 25 sensors (8 thermistors on the aquaero inputs, 17 DS18B20 on
 # 1-Wire; the Quadro's inputs are not bound: how many are usable is known only
 # once it is connected). Copy to /etc/aqua-bridge/config.yaml on the Pi and
-# replace the names, hwmon attributes and ROM ids with your own.
+# replace the names, controller inputs and ROM ids with your own.
 #
-# Run it with --source hwmon (hwmon: + onewire: below; the systemd unit needs
+# Run it with --source composite (aquacomputer: + onewire: below; the systemd unit needs
 # a drop-in for that -- deploy/install-pi.sh --das installs one, PROJECT.md
 # section 10) or, without hardware, with
 # --source sim --sim-plant das (the DAS truth simulator built from the topology
@@ -299,10 +299,15 @@ mpc:
   ident_max_over_c: 3.0  # abort when a drive's estimate + k sigma exceeds soft + this
   ident_seed: 1
 
-# Hardware bindings for --source hwmon: every mpc.temps name bound exactly once
-# across the hwmon temp_maps and onewire.sensors, every channel by one fans map.
-hwmon:
-  - name: aquaero
+# Hardware bindings for --source composite: every mpc.temps name bound exactly once
+# across the controllers' temp_maps and onewire.sensors, every channel by one fans map.
+# Each controller is found under /sys/class/hidraw by USB id; tools/aquacomputer_probe.py
+# lists what is attached. Input numbers: aquaero temp1-8 thermistor inputs, temp9-16
+# virtual, temp17-20 calculated, fan1-4 outputs, fan5-6 flow; Quadro temp1-4 inputs,
+# temp5-20 virtual, fan1-4 outputs, fan5 flow; pwm1-4 on both.
+aquacomputer:
+  - device: aquaero
+    # serial: "12345-67890"  # only needed when several of one kind are attached
     fans:
       xt1: {pwm: pwm1, rpm: fan1}
       xt2: {pwm: pwm2, rpm: fan2}
@@ -317,13 +322,20 @@ hwmon:
       prox_b03b: temp6
       exhaust_z0: temp7
       exhaust_z2: temp8
-  - name: quadro         # its own USB port if its PWM is not writable through the aquaero
+    # Timing per controller, defaults shown (PROJECT.md section 3, Track B):
+    status_max_age_s: 3.0         # an older status report is no observation: fallback (> 0)
+    ctrl_gap_ms: 200              # wait after a control report write before the next control operation (>= 0)
+    ctrl_retries: 1               # retries of a failed control operation, each from a fresh read (int >= 0)
+    ctrl_refresh_s: 60.0          # read the control report again this often (>= 0, 0 disables)
+    duty_mismatch_tolerance: 100  # output duty this far from the command is a mismatch, 1/100 % (0..10000)
+    duty_mismatch_s: 5.0          # a mismatch lasting longer re-reads and rewrites every channel (> 0)
+  - device: quadro       # on its own USB port
     fans:
       qd1: {pwm: pwm1, rpm: fan1}
       qd2: {pwm: pwm2, rpm: fan2}
       qd3: {pwm: pwm3, rpm: fan3}
       qd4: {pwm: pwm4, rpm: fan4}
-    temp_map: {}         # bind Quadro inputs only once they show up in hwmon
+    temp_map: {}         # bind Quadro inputs only once they are connected
 
 # 1-Wire: two w1-gpio buses (dtoverlay=w1-gpio,gpiopin=4 and gpiopin=17 in
 # config.txt); bus masters are discovered under root (default /sys/bus/w1/devices).

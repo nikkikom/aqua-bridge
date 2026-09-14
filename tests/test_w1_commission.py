@@ -124,27 +124,15 @@ def test_cmd_list_bus_with_no_roms(tmp_path: Path, capsys: pytest.CaptureFixture
 # --- cmd_check -----------------------------------------------------------------------
 
 
-def _example_mpc_and_xt6(tmp_path: Path) -> tuple[dict, Path]:
-    """The example config's mpc/xt6 sections, xt6 pointed at a fresh fake hwmon tree."""
-    data = yaml.safe_load(EXAMPLE_CONFIG.read_text())
-    hwmon_root = tmp_path / "hwmon"
-    dev = hwmon_root / "hwmon0"
-    dev.mkdir(parents=True)
-    (dev / "name").write_text("aquaero\n")
-    (dev / "temp1_input").write_text("30000")
-    (dev / "temp2_input").write_text("25000")
-    (dev / "pwm1").write_text("128")
-    (dev / "pwm2").write_text("64")
-    (dev / "fan1_input").write_text("900")
-    (dev / "fan2_input").write_text("800")
-    data["xt6"]["root"] = str(hwmon_root)
-    return data, hwmon_root
+def _example_mpc_and_xt6() -> dict:
+    """The example config's sections; building the composite opens no controller."""
+    return yaml.safe_load(EXAMPLE_CONFIG.read_text())
 
 
 def test_cmd_check_reports_cycle_time_and_crc_rate(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    data, _hwmon_root = _example_mpc_and_xt6(tmp_path)
+    data = _example_mpc_and_xt6()
     w1_root = tmp_path / "w1"
     bus = _make_bus(w1_root, "w1_bus_master1")
     _make_slave(bus, "28-000000000001", "21000")
@@ -167,7 +155,7 @@ def test_cmd_check_reports_cycle_time_and_crc_rate(
 def test_cmd_check_no_onewire_sensors_is_fine(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    data, _hwmon_root = _example_mpc_and_xt6(tmp_path)
+    data = _example_mpc_and_xt6()
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(data))
 
@@ -180,7 +168,7 @@ def test_cmd_check_no_onewire_sensors_is_fine(
 def test_cmd_check_missing_rom_is_a_warning_not_a_failure(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    data, _hwmon_root = _example_mpc_and_xt6(tmp_path)
+    data = _example_mpc_and_xt6()
     data["mpc"]["temps"] = ["coolant", "air", "prox_b01"]
     data["onewire"] = {"sensors": {"prox_b01": "28-absent"}, "root": str(tmp_path / "w1_empty")}
     config_path = tmp_path / "config.yaml"
@@ -195,7 +183,7 @@ def test_cmd_check_missing_rom_is_a_warning_not_a_failure(
 def test_cmd_check_binding_error_exits_2(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    data, _hwmon_root = _example_mpc_and_xt6(tmp_path)
+    data = _example_mpc_and_xt6()
     data["mpc"]["temps"] = ["coolant", "air", "unbound_temp"]
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(data))

@@ -22,9 +22,9 @@ Fit: a small grid over ``deadband`` x ``exponent`` (the table's own bounds); at 
 grid point ``rpm_max`` has a closed form (``phi`` fixed, plain weighted least
 squares in the one remaining linear parameter), so the whole search is a few
 hundred closed-form evaluations, no iterative solver, no scipy. The recorded
-``pwm``/``rpm`` fields are the source/hwmon readback pair, not the controller's
-command -- both read by the same source at the same tick, unlike ``prev``/``cmd``,
-which are controller-side.
+``pwm``/``rpm`` fields are the source's readback pair (the output duty and speed the
+aquaero or Quadro reports), not the controller's command -- both read by the same
+source at the same tick, unlike ``prev``/``cmd``, which are controller-side.
 """
 
 from __future__ import annotations

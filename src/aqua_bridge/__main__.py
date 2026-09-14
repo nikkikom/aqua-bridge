@@ -6,13 +6,14 @@ handler (which only sets the stop event and records the signal number; the
 main thread then runs the section 9 stop path -- log, write ``fallback_pwm``,
 ``STOPPING=1``), and ticks at ``cfg.dt`` on ``time.monotonic``.
 
-``--source xt6`` (default) imports :mod:`aqua_bridge.hw.xt6` lazily -- the
-hardware adapter is the only place that knows sysfs. ``--source hwmon``
+``--source xt6`` (default) imports :mod:`aqua_bridge.hw.aquacomputer_adapter`
+lazily and drives the single device of the ``xt6:`` section over hidraw -- the
+hardware adapters are the only place that knows USB. ``--source composite``
 imports :mod:`aqua_bridge.hw.sources` instead and builds the DAS composite
-source/sink (several hwmon devices from ``hwmon:``/``xt6:`` plus an optional
-1-Wire bus from ``onewire:``, plan section 1 and section 12 Q1); it is a
-separate choice rather than a generalisation of ``xt6`` so a config without
-the new sections drives ``--source xt6`` bit for bit as today ("legacy
+source/sink (several Aqua Computer controllers from ``aquacomputer:``/``xt6:``
+plus an optional 1-Wire bus from ``onewire:``, plan section 1 and section 12
+Q1); it is a separate choice rather than a generalisation of ``xt6`` so a
+config without the new sections keeps its single-device behaviour ("legacy
 mode"). ``--source sim`` drives a simulated plant instead, for a laptop or
 CI; ``--sim-plant`` picks it:
 
@@ -37,7 +38,7 @@ HTTP (``http.enabled``) and MQTT (``mqtt.enabled``) run next to the loop via
 down, or a bad scalar anywhere in its section -- item 57) is logged and the
 daemon keeps controlling the fans without it (:func:`start_publishers`). One
 :class:`~aqua_bridge.publishers.inputs.SmartInbox` is built here every run
-and threaded through both: ``build_io`` gives it to ``--source hwmon``'s
+and threaded through both: ``build_io`` gives it to ``--source composite``'s
 ``CompositeSource``, ``start_publishers`` wires ``POST /api/in/smart`` and
 the MQTT ``{node_id}/in/smart/+`` topic into it (plan section 1).
 
@@ -239,7 +240,7 @@ def build_io(
     """``(source, sink, release)`` for ``--source``; ``release`` runs at exit if not None.
 
     ``smart`` (a :class:`~aqua_bridge.publishers.inputs.SmartInbox` or
-    ``None``) is only meaningful for ``--source hwmon``, where it becomes
+    ``None``) is only meaningful for ``--source composite``, where it becomes
     ``CompositeSource.smart`` and so shows up in ``PlantObservation.inputs
     ["smart"]`` every tick; the ``sim``/``xt6`` sources have no ``inputs``
     concept and silently ignore it (SMART data with no drive-adjacent DAS
@@ -259,24 +260,23 @@ def build_io(
         return io, io, None
     if source == "xt6":
         try:
-            from aqua_bridge.hw import xt6
+            from aqua_bridge.hw import aquacomputer_adapter
         except ImportError as exc:
             raise RuntimeError(f"hardware adapter unavailable: {exc}") from exc
-        builder = getattr(xt6, "build_map_from_config", None)
-        if builder is None:
-            raise RuntimeError("aqua_bridge.hw.xt6.build_map_from_config is missing")
         # Cross-check xt6.fans / xt6.temp_map against mpc.channels / mpc.temps
-        # here, before the loop starts (ConfigError, exit code 2).
-        hwmon_map = builder(app.section("xt6"), channels=app.mpc.channels, temps=app.mpc.temps)
-        adapter = xt6.Xt6Adapter(hwmon_map, clock=clock)
+        # here, before the loop starts (ConfigError, exit code 2). Opens nothing:
+        # the first read() finds the device.
+        adapter = aquacomputer_adapter.build_adapter_from_config(
+            app.section("xt6"), channels=app.mpc.channels, temps=app.mpc.temps, clock=clock
+        )
         return adapter, adapter, None
-    if source == "hwmon":
+    if source == "composite":
         try:
             from aqua_bridge.hw import sources as hw_sources
         except ImportError as exc:
             raise RuntimeError(f"hardware adapter unavailable: {exc}") from exc
         composite, release = hw_sources.build_composite_from_config(
-            hwmon_section=app.hwmon,
+            aquacomputer_section=app.aquacomputer,
             xt6_section=app.section("xt6"),
             onewire_section=app.section("onewire"),
             channels=app.mpc.channels,
@@ -335,11 +335,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", required=True, help="path to config.yaml")
     p.add_argument(
         "--source",
-        choices=("xt6", "hwmon", "sim"),
+        choices=("xt6", "composite", "sim"),
         default="xt6",
         help=(
-            "xt6: single aquaero over hwmon (default); hwmon: the DAS composite "
-            "(hwmon: devices + onewire:); sim: RC plant simulator"
+            "xt6: the single device of xt6: over hidraw (default); composite: the DAS "
+            "composite (aquacomputer: devices + onewire:); sim: RC plant simulator"
         ),
     )
     p.add_argument(
@@ -409,7 +409,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
 
     # Built regardless of --source: the MQTT/HTTP inbound side (below) works
-    # the same whichever plant is behind the loop, and only --source hwmon's
+    # the same whichever plant is behind the loop, and only --source composite's
     # CompositeSource actually reads it into PlantObservation.inputs (the
     # module docstring on build_io).
     smart_inbox = SmartInbox()
