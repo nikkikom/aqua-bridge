@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Idempotent provisioning for a Raspberry Pi running aqua-bridge
 # (PROJECT.md §10, steps 8-9). Does NOT enable or start the service:
-# the USB spike (Quadro writable via XT6? does XT6 revert without the
-# daemon writing?) must be confirmed manually first.
+# the hardware checks (tools/aquacomputer_probe.py; does the aquaero revert
+# without the daemon writing?) must be confirmed manually first.
 #
 # Usage:
 #   deploy/install-pi.sh --user <account> [--tls-days <days>] [--das]
@@ -16,9 +16,9 @@
 # (still only when /etc/aqua-bridge/config.yaml is absent; an existing config
 # is never overwritten either way), and install a systemd drop-in
 # (deploy/aqua-bridge-das.conf -> aqua-bridge.service.d/das.conf) that adds
-# --source hwmon to the unit's ExecStart= (PROJECT.md section 10). Without
-# --das the unit runs --source xt6 as before, matching the legacy behaviour
-# bit for bit. Either way the service is only installed and verified, never
+# --source composite to the unit's ExecStart= (PROJECT.md section 10).
+# Without --das the unit runs --source xt6, the single controller of the xt6:
+# section. Either way the service is only installed and verified, never
 # enabled or started.
 #
 # Run this from the checked-out repo on the Pi (e.g. after
@@ -27,10 +27,10 @@
 # /opt/aqua-bridge and rsync/clone the code into it afterwards, then
 # re-run to install the venv, config, udev rule and unit.
 #
-# The aquacomputer_d5next hwmon driver is built and installed with DKMS by
-# deploy/install-aquacomputer-dkms.sh (downloads the driver source from
-# kernel.org for the running kernel); a module that is already installed is
-# left as is.
+# The daemon talks to the aquaero and the Quadro over hidraw and needs no
+# kernel driver beyond hid-generic. The optional aquacomputer_d5next hwmon
+# driver package (deploy/install-aquacomputer-dkms.sh) is not installed here;
+# see PROJECT.md section 9 before running it by hand.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -102,11 +102,6 @@ else
   echo "error: $PACKAGES_FILE not found" >&2
   exit 1
 fi
-
-echo "== aquacomputer_d5next driver =="
-# The Raspberry Pi OS kernel ships without this hwmon driver; build it with
-# DKMS from the matching kernel.org source plus deploy/dkms patches (PROJECT.md §9).
-"$SCRIPT_DIR/install-aquacomputer-dkms.sh"
 
 echo "== install directory =="
 sudo install -d -o "$USER_ACCOUNT" -g "$USER_ACCOUNT" "$INSTALL_DIR"
@@ -193,20 +188,20 @@ fi
 echo "== udev rule =="
 sudo install -m 644 "$UDEV_RULE_SRC" "$UDEV_RULE_DST"
 sudo udevadm control --reload-rules
-# Re-run the rules for a device that is already attached: the hwmon rule
-# (group write on pwmK) only fires on an add event.
-sudo udevadm trigger --action=add --subsystem-match=hwmon
+# Re-run the rules for a device that is already attached: the hidraw rule
+# (group plugdev on /dev/hidrawN) only applies on an add event.
+sudo udevadm trigger --action=add --subsystem-match=hidraw
 sudo udevadm trigger --action=add --subsystem-match=usb --attr-match=idVendor=0c70
 sudo udevadm settle || true
 
 echo "== systemd unit =="
 sudo sed -e "s/^User=.*/User=$USER_ACCOUNT/" "$UNIT_SRC" | sudo tee "$UNIT_DST" > /dev/null
 if [[ "$DAS_MODE" -eq 1 ]]; then
-  # --source hwmon (the DAS composite hwmon: + onewire: source) instead of
-  # the base unit's implicit --source xt6; PROJECT.md section 10.
+  # --source composite (the DAS composite aquacomputer: + onewire: source)
+  # instead of the base unit's implicit --source xt6; PROJECT.md section 10.
   sudo install -d -m 755 "$DROPIN_DIR"
   sudo install -m 644 "$DAS_DROPIN_SRC" "$DAS_DROPIN_DST"
-  echo "installed drop-in: $DAS_DROPIN_DST (--source hwmon)"
+  echo "installed drop-in: $DAS_DROPIN_DST (--source composite)"
 fi
 sudo systemctl daemon-reload
 # systemd-analyze verify resolves the unit's drop-in directory the same way
@@ -215,8 +210,8 @@ sudo systemd-analyze verify "$UNIT_DST"
 
 DAS_NOTE=""
 if [[ "$DAS_MODE" -eq 1 ]]; then
-  DAS_NOTE="  DAS mode: $DAS_DROPIN_DST makes the unit run --source hwmon;
-     fill in hwmon: / onewire: in $CONFIG_DIR/config.yaml before enabling."
+  DAS_NOTE="  DAS mode: $DAS_DROPIN_DST makes the unit run --source composite;
+     fill in aquacomputer: / onewire: in $CONFIG_DIR/config.yaml before enabling."
 fi
 
 cat <<EOF
@@ -224,9 +219,11 @@ cat <<EOF
 == done ==
 Provisioning complete. The service is installed but NOT enabled or
 started. Before "systemctl enable --now aqua-bridge":
-  1. Confirm the USB spike (PROJECT.md §2, §13): lsusb, sensors, pwm
-     list; is the Quadro writable via the XT6; does the XT6 revert to
-     its own curve once the Pi stops writing.
+  1. Check the controllers (PROJECT.md §2, §10): lsusb, then
+       $INSTALL_DIR/.venv/bin/python $INSTALL_DIR/tools/aquacomputer_probe.py
+     lists each aquaero / Quadro with its temperatures, outputs and
+     control settings (read-only); does the aquaero revert to its own
+     curve once the Pi stops writing.
   2. Edit $CONFIG_DIR/config.yaml (host, MQTT credentials, channel
      names) to match this Pi.
 $DAS_NOTE

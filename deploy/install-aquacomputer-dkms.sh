@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 # Build and install the aquacomputer_d5next hwmon driver with DKMS
-# (PROJECT.md §9, "Kernel module aquacomputer_d5next").
+# (PROJECT.md §9, "Kernel module aquacomputer_d5next (optional)").
+#
+# OPTIONAL. The daemon talks to the aquaero and the Quadro over hidraw and does
+# not use this driver; deploy/install-pi.sh does not run this script. It is
+# kept for experiments through hwmon and in case the driver path is revived.
+# A loaded driver still leaves the hidraw nodes to the daemon, but reading a
+# pwmN attribute issues a control report read of its own.
+#
+# Needs (not in deploy/packages-rpi.txt):
+#   sudo apt-get install -y dkms patch curl linux-headers-rpi-v6 make gcc
+# curl only when the source is downloaded (no --source).
 #
 # Raspberry Pi OS kernels are built without CONFIG_SENSORS_AQUACOMPUTER_D5NEXT,
 # so the aquaero and the Quadro show up only as raw HID devices and there is
@@ -68,6 +78,21 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+required=(dkms patch)
+if [[ -z "$SOURCE_FILE" ]]; then
+  required+=(curl)
+fi
+missing=()
+for tool in "${required[@]}"; do
+  # dkms lives in /usr/sbin, which is not on every user's PATH.
+  command -v "$tool" > /dev/null 2>&1 || [[ -x "/usr/sbin/$tool" ]] || missing+=("$tool")
+done
+if [[ ${#missing[@]} -gt 0 ]]; then
+  echo "error: missing ${missing[*]}; install with: sudo apt-get install -y ${missing[*]}" \
+    "(this optional driver's packages are not in deploy/packages-rpi.txt)" >&2
+  exit 1
+fi
 
 if [[ -z "$TAG" ]]; then
   if [[ "$KREL" =~ ^([0-9]+)\.([0-9]+)(\.([0-9]+))? ]]; then

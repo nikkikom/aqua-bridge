@@ -10,9 +10,9 @@ NotifyAccess=main
 # service account name at install time (site-specific names stay out of git).
 User=aqua
 # plugdev: the udev rule in deploy/99-aquacomputer.rules gives that group
-# write access to the aquaero's hwmon pwmK / pwmK_enable attributes (the
-# kernel creates them root:root 0644; without the rule every apply() fails
-# with EACCES and the unit loops on the start timeout). dialout: HID path.
+# read/write access to the aquaero's and the Quadro's /dev/hidrawN nodes (the
+# kernel creates them root:root 0600; without the rule the daemon cannot open
+# them and the unit loops on the start timeout). dialout: the Digole UART.
 SupplementaryGroups=dialout plugdev
 # NotifyAccess=main + no shell wrapper: ExecStart= must be the venv
 # interpreter running -m aqua_bridge directly, so the main PID is the
@@ -26,13 +26,13 @@ StateDirectory=aqua-bridge
 Restart=always
 WatchdogSec=30
 # READY=1 is sent after the first tick whose command reached the device, so
-# a device that is absent at boot (USB not yet enumerated, hwmon permissions
+# a device that is absent at boot (USB not yet enumerated, hidraw permissions
 # wrong) shows up as a start timeout followed by Restart=always -- the
 # visible "device absent" state. Long enough for a slow USB enumeration on
 # the Zero W, short enough that the journal shows the problem quickly.
 TimeoutStartSec=120
 # No ExecStop=: systemd would run it while the main process is still
-# alive (then send SIGTERM), giving two writers to hwmon at once. The
+# alive (then send SIGTERM), giving two writers to the controllers at once. The
 # daemon's own SIGTERM handler writes fallback_pwm and exits; that is
 # the only stop path.
 #
