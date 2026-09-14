@@ -2471,7 +2471,7 @@ them as "§8 item N".
 
 ### 8.2 Open — no DAS hardware needed (dev machine, CI, the Pi, the PC)
 
-1. **Done (PR #__PR__):** the PI-like DAS error is now `max(t̂ − soft)`, counting `k·σ` once inside `soft`. PI-like DAS: count `k·σ` once. The per-channel error becomes
+1. **Done (PR #22):** the PI-like DAS error is now `max(t̂ − soft)`, counting `k·σ` once inside `soft`. PI-like DAS: count `k·σ` once. The per-channel error becomes
    `max(t̂ − soft)` with `soft = limit − comfort − k·σ` (today `k·σ` is also
    added to `t̂`). Regenerate only the DAS goldens `das_*.pi_das.json`; keep
    every per-zone invariant.
