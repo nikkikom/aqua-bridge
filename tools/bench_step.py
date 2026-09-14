@@ -52,7 +52,7 @@ from aqua_bridge.sim.plant import Plant, PlantParams
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 #: Plan section 4: hard per-tick gate at dt = 5 s (10 % of the tick) and its alarm.
-BUDGET_MS = 500.0
+BUDGET_MS = 600.0  # owner decision 2026-09-14 after the Zero W measurement (was 500)
 BUDGET_ALARM_MS = 750.0
 
 

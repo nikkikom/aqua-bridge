@@ -42,8 +42,9 @@ from conftest import EXAMPLE_CONFIG, EXAMPLE_DAS_CONFIG, REPO_ROOT
 
 #: Plan section 9: DAS step p99 <= 12x the legacy MPC step p99.
 RELATIVE_FACTOR = 12.0
-#: Plan section 4: per-tick gate at dt = 5 s on the Zero W, ms.
-BUDGET_MS = 500.0
+#: Per-tick gate at dt = 5 s on the Zero W, ms. Raised from the plan's 500 ms to 600 ms by the
+#: owner (2026-09-14) after the Zero W measured a DAS MPC step p99 of 507-552 ms.
+BUDGET_MS = 600.0
 REPEATS = 3
 TICKS = 240
 WARMUP = 20

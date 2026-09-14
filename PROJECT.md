@@ -413,7 +413,7 @@ long `dt`):
 | `ident_start_band_c` / `ident_max_over_c` | 1.0 / 3.0 | > 0 |
 | `ident_seed` | 1 | int ≥ 0 |
 
-There are no `budget_ms` keys: the per-tick budget (500 ms, alarm
+There are no `budget_ms` keys: the per-tick budget (600 ms, alarm
 750 ms at `dt = 5 s`) is a benchmark gate (`tools/bench_step.py`,
 `tests/test_bench_budget.py`), not a runtime check.
 
@@ -845,7 +845,8 @@ memory).
   `soft = limit − comfort − k·σ` from the estimates. Integrator,
   anti-windup and bumpless start are the PI above. The formula counts
   `k·σ` twice (inside `soft` and added to `t`), so a drive settles
-  `2k·σ` below `limit − comfort`: louder, never hotter. A channel whose
+  `2k·σ` below `limit − comfort`: louder, never hotter. **Decided (owner,
+  2026-09-14):** count `k·σ` once (§8 item 1). A channel whose
   served zones hold no constrained bay of a trusted zone has `e = 0`
   (holds its command, listed in `diagnostics["unconstrained"]`); a
   constrained bay of a trusted zone without an estimate raises, which
@@ -1096,7 +1097,7 @@ maximum. Rows `y` are the predicted drive temperatures of every
 constrained bay of a trusted zone at every prediction step, plus
 **terminal equilibrium rows** `T_d,ss(u_last) = −C A⁻¹(B u_last + c)`: a
 10-minute horizon is one drive time constant. `k·σ` counts once here
-(PI-like DAS counts it twice). Soft constraints are slack penalties; the
+(PI-like DAS counts it twice until §8 item 1 lands). Soft constraints are slack penalties; the
 small steady violation of the soft target they leave is absorbed by the
 comfort band.
 
@@ -1151,8 +1152,8 @@ first block per driven channel.
 
 **Budget at `dt = 5 s`.** The Zero W is about 100× slower than the
 development machine for numpy-heavy code (legacy MPC: p99 0.3–0.4 ms
-there, 34.5 ms on the Zero W). Hard gate per tick 500 ms (10 % of `dt`),
-alarm 750 ms. Measured with `tools/bench_step.py` on the development
+there, 34.5 ms on the Zero W). Hard gate per tick 600 ms (12 % of `dt`; raised from 500 ms by the owner
+after the Zero W measured a DAS MPC p99 of 507–552 ms), alarm 750 ms. Measured with `tools/bench_step.py` on the development
 machine (`--sim-plant das` for the DAS rows); the Zero W column is the
 100× extrapolation, to be replaced by the hardware validation:
 
@@ -1163,7 +1164,7 @@ machine (`--sim-plant das` for the DAS rows); the Zero W column is the
 | PI-like DAS form + estimator, same layout | ~1.4 ms | ~140 ms | always available |
 
 CI checks the ratio (DAS MPC p99 ≤ 12× legacy MPC p99 in the same
-process, `tests/test_bench_budget.py`); the absolute 500 ms gate runs only
+process, `tests/test_bench_budget.py`); the absolute 600 ms gate runs only
 on the Pi (marker `pi`). If the Pi measures worse, the reductions in
 order: `mpc_every_ticks: 4`, fewer or longer blocks with a shorter
 horizon, a Zero 2 W.
@@ -1286,7 +1287,7 @@ needed: a model converges only with them.
   34.5 ms (the first MPC step builds its matrices, about 55 ms); both
   under 2 % of `dt`. DAS mode is not yet measured on the Pi: the budget
   table above extrapolates the development machine by 100× (DAS MPC
-  ~350 ms on a solve tick, PI-like DAS ~140 ms, against the 500 ms gate at
+  ~350 ms on a solve tick, PI-like DAS ~140 ms, against the 600 ms gate at
   `dt = 5 s`); the hardware validation replaces those numbers
   (`tools/bench_step.py --sim-plant das` on the Pi). numpy only, no
   CasADi/IPOPT, no scipy; acados after 2W.
@@ -2071,7 +2072,7 @@ tests carry the `nightly` marker.
 | `tests/test_thermal_ident.py` | identifiability with group experiments on the truth sim: in-zone `E` within 15 % (PR seed), per-bay `k` within 25 %, `leak` / `κ` at prior, convergence; regulation only never converges; the seed sweep (bound 25 %), sensor offsets, the rich preset | PR: 4 cases; nightly: sweeps |
 | `tests/test_solver_das.py` | active-piece SQP vs a projected-gradient reference, monotone objective, iteration cap, forbidden-band snap and hysteresis, zero-order hold, prediction vs thermal Jacobians, noise index and surrogate, bumpless offset, fixed channels, validity gate and model fallback with dwell, a clock stepped back, horizon and block extremes | PR |
 | `tests/test_noise_regression.py` | calibrated DAS MPC noise ≤ 0.8× the quietest uniform curve at equal or better worst true margin (measured 0.31–0.48×); uncalibrated bound 2.0 (0.30–0.69×); rich preset bound 1.3 (up to 1.21×); MPC vs PI-DAS reported, not asserted (PI-DAS has not settled within the window on several seeds) | PR: 2 seeds; nightly: 8-seed sweeps |
-| `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× the legacy MPC p99 in the same process; `bench_step.py` runs both DAS solvers; absolute p99 ≤ 500 ms only on `armv6l` | PR / Pi |
+| `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× the legacy MPC p99 in the same process; `bench_step.py` runs both DAS solvers; absolute p99 ≤ 600 ms only on `armv6l` | PR / Pi |
 | `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise | PR |
 | `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes; legacy refuses | PR |
 | `tests/test_sim_das.py` | the truth plant: energy balance through transients and hot swap, steady state, more airflow never warms anything, dead band and exponent, quantisation per sensor type, lags, SMART cadence, determinism per seed | PR |
@@ -2135,8 +2136,10 @@ Config `http:` — `enabled` (must be `true` to start; `false` in the
 example), `bind` (default `0.0.0.0`), `port` (default `8080`). The server
 runs on its own asyncio loop in a daemon thread
 (`publishers/runtime.py`); a bind failure is logged and the daemon keeps
-controlling the fans without the API. LAN only for v1. No auth on the
-local network in MVP; add a bearer token before exposing the API further.
+controlling the fans without the API. LAN only for v1. **Decided (owner, 2026-09-14):** the API must be served
+over HTTPS with HTTP basic auth (§8 item 4). Until that lands, keep
+`http.enabled: false` or bind to `127.0.0.1`: several routes relax
+cooling (`/api/bay`, `/api/limit`, `/api/pwm`, `/api/ident`).
 
 Runtime control state (mode, overrides, setpoints, preset, runtime limits
 and bay declarations, a running experiment) lives in memory only: the
@@ -2423,7 +2426,166 @@ exercised against a live broker or Home Assistant (§8).
 
 ## 8. TODO
 
-### Docs / repo
+Open items are numbered once and keep their number; a finished item moves
+to §8.5 with its number, new items take the next free number. Refer to
+them as "§8 item N".
+
+### 8.1 Owner decisions (2026-09-14)
+
+- PI-like DAS counts the uncertainty margin `k·σ` **once** (item 1).
+- `topology.zones.<z>.coupled_to` stays symmetric: an asymmetric or self
+  coupling is rejected (implemented).
+- The HTTP API is served over **HTTPS with basic auth** (item 4).
+- The DAS step budget on the Zero W is **600 ms** p99 (was 500 ms), alarm
+  750 ms (implemented in `tools/bench_step.py` and
+  `tests/test_bench_budget.py`; `pytest -m pi` passes on the Zero W, where
+  the DAS MPC measured p99 507–552 ms).
+- Live MQTT and Home Assistant checks use the owner's Home Assistant
+  broker; its host name is in `private.md` (item 21).
+- An experiment holding back a cooling increase is deferred to the
+  Zero 2 W upgrade (item 52).
+
+### 8.2 Open — no DAS hardware needed (dev machine, CI, the Pi, the PC)
+
+1. PI-like DAS: count `k·σ` once. The per-channel error becomes
+   `max(t̂ − soft)` with `soft = limit − comfort − k·σ` (today `k·σ` is also
+   added to `t̂`). Regenerate only the DAS goldens `das_*.pi_das.json`; keep
+   every per-zone invariant.
+2. `tests/test_hw_xt6.py::test_live_read_and_writeback` writes `0.0` to a
+   channel whose PWM read returns `None`; on the real aquaero that stops a
+   fan. Skip such channels. **Must land before item 36.**
+3. False zone fault on a healthy enclosure: the Stuck rule's sibling
+   evidence faults a zone when an idle bay's DS18B20 stays inside its
+   1.5-LSB band for `stuck_s` while a sibling's activity changes and the
+   controller compensates (about one in three 75-minute `sim/das.py`
+   runs). Fix the evidence rule; regression: long DAS sim runs with zero
+   false zone faults.
+4. HTTPS with basic auth for the API and the page: certificate and key
+   paths in `http:`, hashed credentials in a root-owned 0640 file under
+   `/etc/aqua-bridge`, every route authenticated, plain HTTP refused.
+   Document that the MQTT counterparts (`cmd/bay`, `cmd/limit`,
+   `cmd/ident`) rely on broker authentication.
+5. Runtime budget alarm: log when a tick's `step` exceeds 600 ms and
+   750 ms (today only the benchmark and the `pi` test check it).
+6. The relative budget gate in CI is thin (DAS MPC p99 9–11× the legacy
+   MPC against 12×); make it robust on slow runners.
+7. DAS install path: `ExecStart=` with `--source hwmon` for DAS configs
+   (a drop-in today, §10) and an `install-pi.sh` option that installs
+   `config.example-das.yaml`.
+8. `zones.trust_rule: sigma` (zone trust from the estimator's σ); the
+   config accepts it, `strict` applies today.
+9. A Jump on a redundant group member is accepted after one tick without
+   `confirm_ticks`.
+10. The drift check's hysteresis can hold the PI-DAS model fallback for
+    tens of minutes after a load step (return threshold 0.25 °C/min against
+    0.26–0.29 °C/min physical transients); tune it.
+11. The prediction-error guard also scores drives in faulted zones (extra,
+    louder fallbacks only); restrict it to eligible zones.
+12. Reset a bay's thermal coefficients on a hot swap to a different drive
+    (kept today; the MPC's settle exclusion covers only the transient).
+13. Split a fan group's shared `E` into per-channel coefficients from the
+    single-channel experiment phases.
+14. Online fan-curve fit: `fan_curves` in the store is validated but
+    nothing produces or reads it; `tools/fit_fans.py` output is copied into
+    `fan_models` by hand.
+15. Load `tools/fit_model.py`'s `model.json` into the model store
+    (different file shape today).
+16. A switch that freezes online adaptation of a converged model (today
+    only a fresh store file loads zones `frozen`).
+17. Estimator accuracy on the `rich` sim preset: calibrated estimates up to
+    2 °C off make the MPC up to 1.21× the uniform-curve noise.
+18. Serial → bay association: a wrong correlation pair can still feed
+    another drive's SMART into a bay's calibration (bounded by
+    `smart_reject_c`); tighten acceptance.
+19. Occupancy debounce: a one-tick proximal dropout on an empty bay (CRC
+    failure, clock glitch) moves it to `unknown` with drive variance
+    25 °C² (louder, not unsafe).
+20. Experiments: settle timers are not persisted (after a restart a start
+    waits `ident_settle_s` + `bay_settle_s`); a start that arrives between
+    `plan_tick` and `record_tick` shifts the levels by one tick.
+21. Live MQTT and Home Assistant check against the owner's Home Assistant
+    broker (host in `private.md`): discovery entities appear, limit and
+    setpoint numbers work, PWM numbers exist only in manual, `in/smart`
+    arrives through the broker. Needs the Pi and Home Assistant, not the
+    DAS.
+22. `GET /api/zones` and the HA entity `zone_status_<zone>` (zone state is
+    only in `cmd.diagnostics` today).
+23. `POST /api/calibrate {bay, drive_temp_c}`: calibration with a handheld
+    thermometer when SMART is absent.
+24. HTML page: drive estimates, bays, zone and model status (the JSON views
+    exist).
+25. HTML Host section shows dashes: `/api/state` carries no host metrics.
+26. CI time: `test (latest)` reaches 10–10.5 min on slow runners against
+    the 11-minute guideline; move heavy PR tests to `nightly` or split the
+    job.
+27. Test gap: the DS18B20 plateau test uses an 1800 s sine, so no plateau
+    is longer than `stuck_s`; add one.
+28. `tools/bench_step.py` reports `plant.preset: basic` for
+    `--sim-plant das`.
+29. Stale docstrings: `thermal.py` and `noise.py` still call experiments
+    and `fit_fans` a later milestone; `FanSpec` says `forbidden_pwm` is not
+    honoured.
+30. README: bring-up on a fresh Pi (checklist §10).
+
+### 8.3 Open — needs the DAS hardware
+
+31. USB host: `dtoverlay=dwc2,dr_mode=host` (`deploy/host-usb.sh`), powered
+    hub.
+32. Spike: is the Quadro's PWM writable through the XT6? If not, the Quadro
+    goes on its own USB port (`--source hwmon`).
+33. Spike: does the XT6 revert after the Pi stops writing? If not, software
+    sensor plus firmware timeout (§2); then decide whether `release()` runs
+    at exit.
+34. Spike: which Quadro temperature inputs appear in hwmon; bind them in
+    its `temp_map`.
+35. Confirm the hwmon ABI on the real device (`tempK_input` millidegrees,
+    `pwmK` 0..255, `pwmK_enable` semantics) and that the udev rule makes
+    `pwmK` / `pwmK_enable` group-writable for the service user.
+36. `pytest -m hardware` on the Pi with the aquaero attached (after
+    item 2).
+37. Verify every `temp_map` entry against its physical sensor (warm one,
+    watch it move).
+38. `w1-gpio` overlays on GPIO 4 and 17; confirm the `w1_therm` sysfs
+    layout the reader assumes (`therm_bulk_read`, per-slave `temperature`
+    and `resolution`).
+39. Wire the DS18B20 buses (3-wire, 4.7 kΩ), bind every ROM id with
+    `tools/w1_commission.py --identify`, measure cycle time and CRC error
+    rate with `--check` (< 1 %; 11 bit if a cycle exceeds `0.4 dt`).
+40. Cross-check zone-air against inlet sensor offsets at commissioning
+    (0.1 °C of offset biases `E` by 15–35 %).
+41. Run the SMART agent on the PC against the real drives (smartctl
+    permissions, standby behaviour, NVMe namespaces); watch the
+    association find the bays.
+42. Enable the service once the spike is answered
+    (`systemctl enable --now aqua-bridge`).
+43. `control/loop.py` on the Pi against the aquaero with the service
+    running.
+44. Priors against the real enclosure (33 W/K per fan, `g0` / `k`, drive
+    and sensor time constants, the prior sensor map `β = 0.3`,
+    `b = −2.1 °C`).
+45. Tune the PI-like DAS gains (`pi_kp`, `pi_ki`).
+46. Promotion ladder (§13): record, fit, SMART calibration, shadow with
+    experiments, MPC; decide when `config.example-das.yaml` switches to
+    `solver: mpc`.
+47. Move the spare thermistor inputs to the bays `tools/fit_model.py` ranks
+    tightest.
+48. Time `model.json` writes on the Pi's SD card.
+49. Digole: protocol, pages (Overview, Drives, Zones/Fans, Model, Host),
+    touch, hit-test.
+
+### 8.4 Open — Zero 2 W upgrade
+
+50. Run on a Zero 2 W with the same config.
+51. 64-bit Lite if needed, with no API change.
+52. Experiments: with `above` levels the low level is the solver's base
+    frozen at start, so a solver that later wants more cooling on that
+    channel is held back until the +3 °C envelope trips. Deferred to the
+    Zero 2 W (owner, 2026-09-14): re-plan the levels from the live solver
+    demand, which the Zero 2 W's compute allows every tick.
+
+### 8.5 Done
+
+#### Docs / repo
 
 - [x] Create the GitHub repo (`gh`, §12)
 - [x] `pyproject.toml` (ruff, pytest), `config.example.yaml`
@@ -2433,7 +2595,7 @@ exercised against a live broker or Home Assistant (§8).
 - [x] `nightly` marker: heavy sweeps out of PR CI (`-m "not hardware and not nightly"`), into the nightly job
 - [x] `config.example-das.yaml` and this document describe the merged DAS code (docs pass)
 
-### Track A — MPC (dev machine, parallel with hardware)
+#### Track A — MPC (dev machine, parallel with hardware)
 
 - [x] `model.py`: Observation / Config / Command / State
 - [x] `mpc.step(obs, config, state) -> (command, state)`: PI first
@@ -2462,7 +2624,7 @@ exercised against a live broker or Home Assistant (§8).
 - [x] Small linear MPC (numpy) behind the same `Solver` protocol; every core suite runs for `pi` and `mpc`
 - [x] Legacy placeholder names (`coolant`, `air`, `radiator`, `intake`): kept only in legacy mode (`config.example.yaml`, legacy suites and goldens) as the bit-identity reference; the DAS example uses its own names
 
-### Track A2 — DAS target (dev machine)
+#### Track A2 — DAS target (dev machine)
 
 - [x] Config schema for the DAS: zones, bays, fans and fan groups, fan models, sensors with role (inlet, zone air, drive-proximal, exhaust), drive classes HDD 50/5, SATA SSD 65/10, NVMe 70/10 (`model.py`)
 - [x] DAS truth simulator: zones, drives with activity-dependent heat, hot swap and empty bays, placement offsets, per-sensor quantisation, SMART, tach-less outputs, splitters, `rich` preset (`sim/das.py`, `--sim-plant das`)
@@ -2476,85 +2638,36 @@ exercised against a live broker or Home Assistant (§8).
 - [x] Model store with calibration and bays sections, fresh → `frozen`, stale → shadow hold re-confirmed for `model_reconfirm_s`, `StateDirectory=` (`modelstore.py`, `control/persist.py`)
 - [x] Active identification experiments per fan group with the +3 °C envelope on estimates, `POST /api/ident`, MQTT `cmd/ident`, HA `ident_running` (`control/ident.py`)
 - [x] Runtime drive limits: `POST /api/limit`, MQTT `cmd/limit/...`, HA `limit_<class>`; DAS presets (comfort band, noise weight)
-- [ ] `zones.trust_rule: sigma` (zone trust from the estimator's σ against `sigma_fault_c` / `sigma_air_fault_c`); accepted by the config, applies `strict` today
-- [ ] Split a fan group's shared `E` into per-channel coefficients from the single-channel experiment phases (the thermal model shares one coefficient per group)
-- [ ] Online fan-curve fit (`fan_curves` in the store is validated and kept, but nothing produces or reads it); today `tools/fit_fans.py` output is copied into `fan_models` by hand
-- [ ] Load `tools/fit_model.py`'s `model.json` into the model store (different file shape today)
-- [ ] A switch that freezes online adaptation of a converged model (today only a fresh store file loads zones `frozen`)
-- [ ] Reset a bay's thermal coefficients on a hot swap to a different drive (they are kept; the MPC's settle exclusion covers the transient)
-- [ ] A Jump on a redundant group member is accepted after one tick without `confirm_ticks` (no current solver reads redundant members directly; revisit with `sigma`)
-- [ ] Runtime budget alarm: log when a tick's `step` exceeds 500 / 750 ms (today a benchmark and test gate only)
-- [ ] Owner decision: PI-like DAS counts `k·σ` twice (as the plan wrote it); counting it once would make the fallback quieter
-- [ ] HTML page: drive estimates, bays and model status (the JSON views exist)
 
-### Track B — hardware (Pi USB; fake sysfs anywhere)
+#### Track B — hardware (Pi USB; fake sysfs anywhere)
 
-- [ ] USB host: `dtoverlay=dwc2,dr_mode=host` (`deploy/host-usb.sh`), powered hub
-- [ ] Spike: `lsusb`, `sensors`, pwm list; **is Quadro writable via XT6** (if not: Quadro on its own USB port, `--source hwmon`)
-- [ ] Spike: **does XT6 revert after the Pi stops writing?** If not, software
-      sensor + firmware timeout (see §2); then decide whether `release()` runs at exit
-- [ ] Spike: which Quadro temperature inputs appear in hwmon; bind them in its `temp_map`
 - [x] `hw/xt6.py` read/apply, udev `0c70`, sysfs root injectable
 - [x] `hw/xt6.py`: `pwmK_enable` re-checked on every apply (re-plug)
 - [x] Startup rejection: `xt6.fans` keys == `mpc.channels`, `xt6.temp_map` keys == `mpc.temps`
 - [x] `xt6.fans`: one entry per fan with `pwm` and optional `rpm`; legacy `map` / `fan_map` rejected
 - [x] `test_hw_map.py` / fake hwmon in CI
 - [x] `hw/sources.py`: several hwmon devices + 1-Wire, every name bound exactly once (`--source hwmon`)
-- [ ] Confirm the hwmon ABI on the real device (`tempK_input` millidegrees, `pwmK` 0..255,
-      `pwmK_enable` semantics) and that the udev rule makes `pwmK` / `pwmK_enable`
-      group-writable for the service user (`ls -l /sys/class/hwmon/hwmon*/pwm*`)
-- [ ] `pytest.mark.hardware` live device test on the Pi with the aquaero attached
-      (the test exists; so far it only skips)
-- [ ] Verify every `temp_map` entry against the physical sensor (warm one, watch it move)
 - [x] systemd unit: `Type=notify`, `Wants=`+`After=network-online.target`,
       `Restart=always`, `WatchdogSec`, `TimeoutStartSec`,
       `ExecStart=/opt/aqua-bridge/.venv/bin/python -m aqua_bridge --config /etc/aqua-bridge/config.yaml`,
       SIGTERM stop path writes `fallback_pwm` (no `ExecStop=`), `StateDirectory=aqua-bridge`
 - [x] udev rule for hwmon `pwm*` group write (`plugdev`)
 - [x] `deploy/install-pi.sh`; provisioning verified on a Zero W (service left disabled)
-- [ ] Enable the service on the Pi once the spike is answered (`systemctl enable --now aqua-bridge`)
-- [ ] DAS install path: the unit's `ExecStart=` has no `--source hwmon` (a drop-in today, §10) and `install-pi.sh` installs only `config.example.yaml`
 
-### Track B2 — 1-Wire and SMART (fake sysfs and fixtures anywhere; hardware on the Pi / PC)
+#### Track B2 — 1-Wire and SMART (fake sysfs and fixtures anywhere; hardware on the Pi / PC)
 
 - [x] `hw/onewire.py`: `w1_therm` bulk-read reader threads, CRC / stall / age → `None`, resolution written once
 - [x] `tools/w1_commission.py`: `--list`, `--identify`, `--check`
 - [x] `tools/smart_agent.py` (`smartctl -j -n standby`), `deploy/aqua-bridge-smart-agent.service`, `publishers/inputs.py` (`SmartInbox`), MQTT `in/smart/<serial>`, `POST /api/in/smart`
-- [ ] `w1-gpio` overlays on GPIO 4 and 17 on the Pi; confirm the `w1_therm` sysfs layout (`therm_bulk_read`, per-slave `temperature` / `resolution`) the reader assumes
-- [ ] Wire the DS18B20 buses (3-wire, 4.7 kΩ), bind every ROM id with `--identify`, measure cycle time and CRC error rate with `--check` (< 1 %; drop to 11 bit if a cycle exceeds `0.4 dt`)
-- [ ] Run the SMART agent on the PC against the real drives (smartctl permissions, standby behaviour, NVMe namespaces); watch the association find the bays
-- [ ] MQTT `in/smart` against a live broker
 
-### Hardware validation (needs the DAS, controllers and sensors)
-
-- [ ] Step budget on the Zero W: `tools/bench_step.py --sim-plant das` and
-      `pytest tests/test_bench_budget.py -m pi` (p99 ≤ 500 ms at `dt = 5 s` with `mpc_every_ticks: 2`), replacing the extrapolated table in §3
-- [ ] Priors against the real enclosure (33 W/K per fan, `g0` / `k`, drive and sensor time constants, the prior sensor map `β = 0.3`, `b = −2.1 °C`)
-- [ ] Tune the PI-like DAS gains (`pi_kp`, `pi_ki`) on the real enclosure
-- [ ] Promotion ladder (§13): record, fit, SMART calibration, shadow with experiments, MPC; decide when `config.example-das.yaml` switches to `solver: mpc`
-- [ ] Move the spare thermistors to the bays `tools/fit_model.py` ranks tightest
-
-### Glue and UI
+#### Glue and UI
 
 - [x] `control/loop.py`: read → step → compose → apply → watchdog; smoke-run on the Pi with `--source sim`
-- [ ] `control/loop.py` on the Pi against the aquaero (service running)
 - [x] MQTT + HA discovery code (host + temps + fans), publisher thread, reconnects
 - [x] MQTT + HA DAS entities: drive temperature / margin / σ, bay occupancy, noise index, model status, limits, experiments
-- [ ] MQTT against a live broker; HA discovery check (entities appear, setpoint and limit numbers work,
-      PWM numbers appear only in manual and disappear when leaving it)
 - [x] HTTP API: `GET /api/state`, `/api/health`, `/api/estimate`, `/api/bays`, `/api/model`; `POST /api/mode`, `/api/setpoint`, `/api/limit`, `/api/bay`, `/api/pwm`, `/api/preset`, `/api/auto`, `/api/ident`, `/api/in/smart`
 - [x] HTTP HTML: same five pages as Digole, poll `/api/state`; DEGRADED banner naming the zones
-- [ ] HTTP HTML Host section: `/api/state` carries no host metrics, so it shows dashes
 - [x] Tests: HTTP talks to the command sink, not hwmon; Auto rejects raw PWM; fuzz JSON → 4xx
-- [ ] Digole: protocol, pages (Overview, Drives, Zones/Fans, Model, Host), touch, hit-test
-- [ ] README: bring-up on a **fresh** Pi (checklist §10)
-
-### Upgrade
-
-- [ ] Run on Zero 2 W, same config
-- [ ] 64-bit Lite if needed — no API change
-
----
 
 ## 9. Raspberry Pi packages and settings
 
@@ -2950,7 +3063,7 @@ ssh USER@PI-HOST 'cd /opt/aqua-bridge && .venv/bin/python tools/bench_step.py --
 ssh USER@PI-HOST 'cd /opt/aqua-bridge && HYPOTHESIS_PROFILE=pi .venv/bin/python -m pytest tests/test_bench_budget.py -m pi'
 ```
 
-The DAS bench on the Pi is the budget check of §3: p99 ≤ 500 ms at
+The DAS bench on the Pi is the budget check of §3: p99 ≤ 600 ms at
 `dt = 5 s` with `mpc_every_ticks: 2`, else apply the reductions listed
 there.
 
@@ -3058,7 +3171,7 @@ about 11 minutes of the 15-minute job timeout: a new heavy sweep or long
 simulation gets the `nightly` marker, with a cheap PR-sized case next to
 it. The **budget gate** in PR CI is relative: `tests/test_bench_budget.py`
 asserts the DAS MPC step p99 ≤ 12× the legacy MPC p99 measured in the
-same process, which a shared runner can check; the absolute 500 ms gate
+same process, which a shared runner can check; the absolute 600 ms gate
 (marker `pi`) runs only on the Pi.
 
 The ruff pin in `pyproject.toml` `[dev]` and in the workflow move
