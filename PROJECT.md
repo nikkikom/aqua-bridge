@@ -2670,7 +2670,7 @@ them as "§8 item N".
    longer writes `0.0` to a channel whose PWM read returns `None`; such
    channels are excluded from the write-back and reported, and the test
    skips with a clear reason if none is readable. **Must land before item 36.**
-3. False zone fault on a healthy enclosure: the Stuck rule's sibling
+3. **Done:** a zoned sensor's Stuck evidence is now its zone's relative airflow (`stuck_airflow_net`, void for a proximal sensor when the zone air moved against it by more than `stuck_air_oppose_c`) and a proximal sensor's siblings are on its own bay (§3). False zone fault on a healthy enclosure: the Stuck rule's sibling
    evidence faults a zone when an idle bay's DS18B20 stays inside its
    1.5-LSB band for `stuck_s` while a sibling's activity changes and the
    controller compensates (about one in three 75-minute `sim/das.py`
