@@ -148,6 +148,17 @@ http:
   auth_fail_limit: 5
   auth_backoff_s: 1
   auth_backoff_max_s: 300
+  # Global limit on uncached password checks (one PBKDF2 each, about 1.2 s of the
+  # Zero W's single core at 100000 iterations), across every client address: at most
+  # auth_verify_max start per auth_verify_window_s (0 = no window limit) and at most
+  # auth_verify_pending_max are admitted and unfinished at once; beyond either a
+  # request that needs a check gets 429. A cached login is never limited.
+  auth_verify_max: 6
+  auth_verify_window_s: 60
+  auth_verify_pending_max: 2
+  # Added to the nice value of the thread that runs the checks (Linux, 0-19; 0 = same
+  # priority as the control loop).
+  auth_verify_nice: 10
 
 digole:
   device: /dev/serial0

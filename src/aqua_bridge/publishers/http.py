@@ -76,8 +76,12 @@ HTTPS and basic auth (section 6, :mod:`aqua_bridge.publishers.httpauth`):
 :class:`~aqua_bridge.publishers.httpauth.BasicAuthenticator` and puts every
 route behind it, ``GET /`` and unknown paths included: no or wrong credentials
 answer ``401`` with ``WWW-Authenticate: Basic realm=...``, a client backing off
-after repeated failures answers ``429`` with ``Retry-After``. A credentials
-check that needs PBKDF2 runs in a worker thread so the event loop keeps serving.
+after repeated failures, or a request that needs an uncached password check
+while the global limit on those checks refuses (``http.auth_verify_max``,
+``http.auth_verify_pending_max``), answers ``429`` with ``Retry-After``; a
+cached login waits for neither. An admitted check (PBKDF2) runs on the
+authenticator's one low-priority worker thread, so the event loop keeps
+serving.
 
 ``POST /api/in/smart`` (the DAS plan, section 1 "SMART path") is the
 non-MQTT twin of the PC-side SMART agent: same JSON body
@@ -112,6 +116,7 @@ from aqua_bridge.control.intents import (
 from aqua_bridge.control.thermal import PARAMETERS
 from aqua_bridge.hostinfo import CachedHostInfo, collect_hostinfo
 from aqua_bridge.publishers.httpauth import (
+    AuthDecision,
     BasicAuthenticator,
     HttpSettings,
     build_ssl_context,
@@ -160,14 +165,19 @@ async def _auth_middleware(request: web.Request, handler: Any) -> web.StreamResp
     auth: BasicAuthenticator = request.app[_AUTH_KEY]
     header = request.headers.get("Authorization")
     client = request.remote or ""
-    decision = auth.fast(header, client)
-    if decision is None:
-        decision = await asyncio.to_thread(auth.verify, header, client)
+    outcome = auth.begin(header, client)
+    if isinstance(outcome, AuthDecision):
+        decision = outcome
+    else:
+        # The admitted PBKDF2 check runs on the authenticator's one low-priority worker
+        # thread. Shielded: a cancelled request still lets the check run and free its slot.
+        future = auth.executor.submit(auth.check, outcome)
+        decision = await asyncio.shield(asyncio.wrap_future(future))
     if decision.ok:
         return await handler(request)
     if decision.retry_after_s is not None:
         return web.json_response(
-            {"error": "too many failed logins; retry later"},
+            {"error": "too many login attempts; retry later"},
             status=429,
             headers={"Retry-After": str(max(1, math.ceil(decision.retry_after_s)))},
         )
@@ -349,6 +359,11 @@ def create_app(
         raise TypeError("create_app needs a BasicAuthenticator")
     app = web.Application(middlewares=[_auth_middleware])
     app[_AUTH_KEY] = auth
+
+    async def _close_auth(_app: web.Application) -> None:
+        auth.close()
+
+    app.on_cleanup.append(_close_auth)
     app[_SURFACE_KEY] = surface
     app[_CFG_KEY] = cfg
     app[_SMART_KEY] = smart_inbox
