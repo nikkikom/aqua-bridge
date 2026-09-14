@@ -385,7 +385,7 @@ def test_smart_offset_cadence_and_lag():
 def test_tachless_output_and_splitter():
     plant = build_das_plant(default_topology(), dt=2.0)
     obs = plant.observe()
-    assert "qd4" not in obs.rpm  # no tach wire: absent, like the hwmon adapter
+    assert "qd4" not in obs.rpm  # no tach wire: absent, like the hardware adapter
     assert set(obs.pwm) == set(plant.channels)
     run_open(plant, 3, 0.8)
     q0 = plant.airflow()["z0"]
