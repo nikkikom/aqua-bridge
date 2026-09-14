@@ -25,8 +25,8 @@ time constant: without them a slow drive would look safe until it is too late)::
 
 with the quadratic noise surrogate of :func:`aqua_bridge.control.noise.surrogate` at
 ``u = prev`` (normalised to 1 at full speed), ``soft = limit - comfort - k sigma`` and
-``hard = limit - k sigma`` from the estimates block. ``k sigma`` counts once (the
-PI-like DAS form counts it twice, see ``solver_pi``). The soft constraints are slack
+``hard = limit - k sigma`` from the estimates block. ``k sigma`` counts once, as in the
+PI-like DAS form (``solver_pi``). The soft constraints are slack
 penalties: quadratic penalties leave a small steady violation of the soft target that
 the comfort band absorbs (plan section 12, risk 9). A tiny ridge
 (:data:`RIDGE` per variable) keeps the Hessian positive definite when a fan has

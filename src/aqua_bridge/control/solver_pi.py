@@ -40,22 +40,22 @@ With ``topology`` and no ``setpoints`` (:attr:`MpcConfig.regulates_drive_limits`
 the error is the *margin deficit* of the worst drive the channel cools, read
 from ``SolverRequest.estimates`` (:mod:`aqua_bridge.control.estimates`)::
 
-    e = max(est[b].t + est[b].margin - est[b].soft
+    e = max(est[b].t - est[b].soft
             for b in the constrained bays of cfg.zone_layout.served[ch]
             whose zone is trusted this tick)
 
-with ``margin = k * sigma`` and ``soft = limit - comfort - k * sigma``; the rest
-(integrator, anti-windup, bumpless start) is exactly the PI above, and the
-solver keeps ``name = "pi"``. A bay is constrained unless it is declared
-``occupied: false`` or the estimator reports it ``empty`` this tick
-(``SolverRequest.occupancy``). The served zones are the zones that list the
-channel plus their declared ``coupled_to``: the drives next door feel the
+with ``soft = limit - comfort - k * sigma``; the rest (integrator, anti-windup,
+bumpless start) is exactly the PI above, and the solver keeps ``name = "pi"``. A bay
+is constrained unless it is declared ``occupied: false`` or the estimator reports it
+``empty`` this tick (``SolverRequest.occupancy``). The served zones are the zones that
+list the channel plus their declared ``coupled_to``: the drives next door feel the
 channel's air too, so the channel works for them as well; drives of unknown
-occupancy count. The formula is the plan's as written, and it counts
-``k * sigma`` twice (once inside ``soft``, once added to ``t``), so the
-drive settles ``2 k sigma`` below ``limit - comfort``. That errs toward more
-cooling; the DAS MPC (``solver_das.py``) counts ``k * sigma`` once (its soft rows
-are ``T_d <= soft``), so its model fallback to this form is louder, never hotter.
+occupancy count. The uncertainty margin ``k * sigma`` counts **once**, inside
+``soft`` (owner decision, PROJECT.md section 8.1): the estimate ``t`` is compared
+with ``soft`` as it is, so the worst drive settles at ``limit - comfort - k sigma``,
+the same target as the DAS MPC's soft rows ``T_d <= soft`` (``solver_das.py``). The
+plan's original formula also added ``k * sigma`` to ``t`` and settled ``2 k sigma``
+below ``limit - comfort``.
 
 Two edge cases, both documented choices:
 
@@ -230,7 +230,7 @@ def channel_margin_errors(
             if occupancy is not None and occupancy.get(bay) == "empty":
                 continue
             est = estimates[bay]
-            e = float(est["t"]) + float(est["margin"]) - float(est["soft"])
+            e = float(est["t"]) - float(est["soft"])  # k*sigma is inside soft: once
             if best is None or e > best[0]:
                 best = (e, bay)
         if best is None:

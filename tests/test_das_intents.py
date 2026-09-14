@@ -240,18 +240,29 @@ def test_limits_survive_a_preset_change(dcfg):
 
 
 def test_quiet_asks_for_less_fan_than_cool_on_the_same_drives(dcfg):
-    """Same observation: the quiet soft target is 4 degC above the cool one."""
+    """Same observation: the quiet soft target is 4 degC above the cool one.
+
+    The estimator sees each preset's own previous command, so after the first tick the
+    two runs' estimates (and sigma, inside soft) differ by a few thousandths of a degree:
+    the target ``limit - comfort`` differs by exactly 4, the error by 4 up to that."""
     obs = das_obs(dcfg, 0.0, pwm=0.5, **{f"prox_b{n:02d}": 42.0 for n in range(1, 16)})
-    out = {}
+    out, target = {}, {}
     for preset in (Preset.QUIET, Preset.COOL):
         eff = apply_preset(dcfg, {}, preset)
         state = MpcState.cold()
         for i in range(3):
             obs = dataclasses.replace(obs, ts=float(i) * eff.dt)
             cmd, state = step(obs, eff, state)
-        out[preset] = cmd.diagnostics["solver_diag"]["error"]
+        diag = cmd.diagnostics["solver_diag"]
+        out[preset] = diag["error"]
+        target[preset] = {}
+        for ch, bay in diag["worst_bay"].items():
+            entry = cmd.diagnostics["estimates"][bay]
+            assert diag["error"][ch] == pytest.approx(entry["t_c"] - entry["soft_c"])
+            target[preset][ch] = entry["soft_c"] + entry["margin_c"]
     for ch in dcfg.channels:
-        assert out[Preset.COOL][ch] == pytest.approx(out[Preset.QUIET][ch] + 4.0)
+        assert target[Preset.QUIET][ch] == pytest.approx(target[Preset.COOL][ch] + 4.0)
+        assert out[Preset.COOL][ch] == pytest.approx(out[Preset.QUIET][ch] + 4.0, abs=0.01)
 
 
 # ---------------------------------------------------------------------------

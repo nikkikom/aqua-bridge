@@ -843,14 +843,14 @@ memory).
 - **PI-like DAS form** (same `PiSolver`, `name = "pi"`, when
   `regulates_drive_limits`): the error is the **margin deficit** of the
   worst drive the channel cools,
-  `e = max(t + k·σ − soft)` over the constrained bays (occupied or
+  `e = max(t − soft)` over the constrained bays (occupied or
   unknown, not found empty this tick) of the zones in
   `zone_layout.served[ch]` whose zone is trusted, with
   `soft = limit − comfort − k·σ` from the estimates. Integrator,
-  anti-windup and bumpless start are the PI above. The formula counts
-  `k·σ` twice (inside `soft` and added to `t`), so a drive settles
-  `2k·σ` below `limit − comfort`: louder, never hotter. **Decided (owner,
-  2026-09-14):** count `k·σ` once (§8 item 1). A channel whose
+  anti-windup and bumpless start are the PI above. `k·σ` counts once
+  (owner decision, §8.1): it is inside `soft` and not added to `t`, so
+  the worst drive settles at `soft = limit − comfort − k·σ`, the same
+  target as the DAS MPC's soft rows. A channel whose
   served zones hold no constrained bay of a trusted zone has `e = 0`
   (holds its command, listed in `diagnostics["unconstrained"]`); a
   constrained bay of a trusted zone without an estimate raises, which
@@ -1100,8 +1100,8 @@ by the power at full speed `P_ref` (dimensionless), with the per-fan
 maximum. Rows `y` are the predicted drive temperatures of every
 constrained bay of a trusted zone at every prediction step, plus
 **terminal equilibrium rows** `T_d,ss(u_last) = −C A⁻¹(B u_last + c)`: a
-10-minute horizon is one drive time constant. `k·σ` counts once here
-(PI-like DAS counts it twice until §8 item 1 lands). Soft constraints are slack penalties; the
+10-minute horizon is one drive time constant. `k·σ` counts once here,
+as in PI-like DAS. Soft constraints are slack penalties; the
 small steady violation of the soft target they leave is absorbed by the
 comfort band.
 
@@ -1244,9 +1244,15 @@ and any human intent. An abort releases the channels; the solver
 re-initialises bumplessly on them and moves at most `d_pwm_max` per tick.
 The control mode stays `auto` during an experiment; its status is in
 `snapshot().extra["experiment"]`. A restart never resumes an experiment.
-Because PI-DAS regulates `upper` to `soft`, experiments in practice run
-under PI-DAS (or the MPC's PI-DAS fallback), which is also where they are
-needed: a model converges only with them.
+The envelope still adds `k·σ` to `T̂_d` on top of `soft` and `hard`, which
+already subtract it. PI-DAS counts `k·σ` once and rides `T̂_d = soft`, so a
+settled enclosure under PI-DAS (or the MPC's PI-DAS fallback) has
+`upper = soft + k·σ`: with the uncalibrated σ (`k·σ` about 3 °C) that is
+outside `ident_start_band_c` and on the edge of `ident_max_over_c`, and an
+experiment starts only while the drives sit at least `k·σ −
+ident_start_band_c` below their soft targets (open, not changed by the
+PI-DAS change). Experiments are needed where PI-DAS acts: a model
+converges only with them.
 
 ### Track A — core (dev machine / CI, no Pi)
 
@@ -2465,7 +2471,7 @@ them as "§8 item N".
 
 ### 8.2 Open — no DAS hardware needed (dev machine, CI, the Pi, the PC)
 
-1. PI-like DAS: count `k·σ` once. The per-channel error becomes
+1. **Done (PR #__PR__):** the PI-like DAS error is now `max(t̂ − soft)`, counting `k·σ` once inside `soft`. PI-like DAS: count `k·σ` once. The per-channel error becomes
    `max(t̂ − soft)` with `soft = limit − comfort − k·σ` (today `k·σ` is also
    added to `t̂`). Regenerate only the DAS goldens `das_*.pi_das.json`; keep
    every per-zone invariant.

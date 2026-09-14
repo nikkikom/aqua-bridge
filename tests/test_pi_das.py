@@ -28,8 +28,8 @@ from aqua_bridge.model import Mode, MpcConfig, MpcState
 from das_fixtures import PROX_C, SP, das_cfg, das_mapping, das_obs, default_temps
 from invariants import TOL, checked_step
 
-HDD_E = est.prior_drive_temp(PROX_C, SP) + 3.0 - 42.0  # default temps, hdd bay
-SSD_E = est.prior_drive_temp(PROX_C, SP) + 3.0 - 52.0
+HDD_E = est.prior_drive_temp(PROX_C, SP) - 42.0  # default temps, hdd bay: t - soft
+SSD_E = est.prior_drive_temp(PROX_C, SP) - 52.0
 
 
 @pytest.fixture
@@ -91,18 +91,26 @@ def test_margin_deficit_is_the_worst_served_bay(lcfg):
     # a hot SSD in a2 takes over fa1 once its deficit is larger
     hot = block(lcfg, prox_a2=prox_for(60.0))
     errors, worst = channel_margin_errors(lcfg, hot, ALL_TRUSTED)
-    assert worst["fa1"] == "a2" and errors["fa1"] == pytest.approx(60.0 + 3.0 - 52.0)
+    assert worst["fa1"] == "a2" and errors["fa1"] == pytest.approx(60.0 - 52.0)
     # ... and so does a hot drive next door (b1 in the coupled zone zb)
     hot = block(lcfg, prox_b1=prox_for(48.0))
     errors, worst = channel_margin_errors(lcfg, hot, ALL_TRUSTED)
-    assert worst["fa2"] == "b1" and errors["fa2"] == pytest.approx(48.0 + 3.0 - 42.0)
+    assert worst["fa2"] == "b1" and errors["fa2"] == pytest.approx(48.0 - 42.0)
 
 
-def test_formula_counts_k_sigma_as_the_plan_writes_it(lcfg):
-    """e = t + k*sigma - soft with soft = limit - comfort - k*sigma (plan section 4)."""
+def test_formula_counts_k_sigma_once(lcfg):
+    """e = t - soft with soft = limit - comfort - k*sigma (owner decision, PROJECT.md 8.1)."""
     b = block(lcfg)["a1"]
+    k_sigma = b["k_sigma"] * b["sigma"]
+    assert b["margin"] == pytest.approx(k_sigma) and k_sigma > 0
     errors, _ = channel_margin_errors(lcfg, {"a1": b, "a2": b, "b1": b}, ALL_TRUSTED)
-    assert errors["fa1"] == pytest.approx(b["t"] - (50.0 - 5.0) + 2 * 2.0 * 1.5)
+    assert errors["fa1"] == pytest.approx(b["t"] - (b["limit"] - b["comfort"]) + k_sigma)
+    assert errors["fa1"] == pytest.approx(b["t"] - b["soft"])
+    # the margin is not added to the estimate a second time: a bump in margin alone,
+    # with soft unchanged, leaves the error as it is
+    wide = dict(b, margin=b["margin"] + 1.0)
+    errors_wide, _ = channel_margin_errors(lcfg, {"a1": wide, "a2": wide, "b1": wide}, ALL_TRUSTED)
+    assert errors_wide["fa1"] == pytest.approx(errors["fa1"])
 
 
 def test_untrusted_zones_bays_do_not_count(lcfg):
@@ -267,7 +275,7 @@ def test_unconstrained_channel_holds_through_many_ticks(lcfg):
 def test_hot_ssd_is_regulated_against_its_own_class():
     """a2 is ssd_sata (65 / 10): 55 degC is below its soft target, above an hdd's."""
     cfg = das_cfg(setpoints={})
-    ok = {"prox_a2": prox_for(40.0 - 3.0)}  # 37 + 3 - 52 < 0: no deficit from a2
+    ok = {"prox_a2": prox_for(40.0 - 3.0)}  # 37 - 52 < 0: no deficit from a2
     cmd, _ = run_ticks(
         cfg, 10, prox_a1=prox_for(30.0), prox_a1b=prox_for(30.0), prox_b1=prox_for(30.0), **ok
     )
@@ -287,6 +295,4 @@ def test_hot_ssd_is_regulated_against_its_own_class():
     a2 = cmd.diagnostics["estimates"]["a2"]
     assert a2["class"] == "hdd" and a2["t_c"] == pytest.approx(44.0, abs=0.5)
     assert cmd.diagnostics["solver_diag"]["worst_bay"]["fa1"] == "a2"
-    assert cmd.diagnostics["solver_diag"]["error"]["fa1"] == pytest.approx(
-        a2["t_c"] + a2["margin_c"] - a2["soft_c"]
-    )
+    assert cmd.diagnostics["solver_diag"]["error"]["fa1"] == pytest.approx(a2["t_c"] - a2["soft_c"])
