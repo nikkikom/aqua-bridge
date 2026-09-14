@@ -2758,6 +2758,17 @@ them as "§8 item N".
 - An experiment holding back a cooling increase is deferred to the
   Zero 2 W upgrade (item 52).
 
+Owner decisions (2026-09-14, later the same day):
+
+- Item 73: optimise the DAS step on the Zero W; if that does not bring
+  the DAS MPC under `mpc.budget_ms` 600, raise the budget to 1000 ms.
+  The DAS MPC solves every third tick (`mpc_every_ticks: 3`).
+- Item 68: replace the hard sigma floor with a soft floor.
+- Item 56: no token cookie. A verified login is cached for
+  `http.auth_cache_s` (300 s by default), so PBKDF2 runs once per cache
+  period per credential, not per request; the page's 2 s poll reads the
+  cache.
+
 ### 8.2 Open — no DAS hardware needed (dev machine, CI, the Pi, the PC)
 
 11. The prediction-error guard also scores drives in faulted zones (extra,
@@ -2819,9 +2830,11 @@ them as "§8 item N".
     the limit.
 56. HTTPS auth cost on the Zero W: one PBKDF2 check at
     `http.hash_iterations: 100000` takes 1.15–1.4 s on the single core.
-    Clients on many source addresses (easy with IPv6) can each force an
-    uncached check; bound the global rate of uncached checks and choose
-    a Zero W default for the iteration count.
+    Legitimate use pays it once per `http.auth_cache_s` per credential
+    (owner: acceptable, no cookie needed). Remaining risk: every failed
+    or uncached attempt runs PBKDF2, serialised by one lock; clients on
+    many source addresses (easy with IPv6) could keep the core busy.
+    Bound the global rate of uncached checks.
 57. `http.enabled: "true"` as a string silently leaves the API off with
     no log line; validate booleans in the `http:` section (and other
     sections read with `is True`).
@@ -2859,12 +2872,12 @@ them as "§8 item N".
     stays at 4–7 °C, which faults healthy zones on the `rich` sim.
     `trust_rule: sigma` is not usable with the example's redundant pairs
     until this is fixed.
-68. Owner decision: the sigma floor (a zone with a lost sensor group
-    keeps its fans at or above `prev`) ratchets the DAS MPC's fans up
-    until the zone faults when a bay's only sensor is lost for good
-    (32.5 dB against 27.1 dB without the floor). A softer floor, for
-    example one that ends after σ has grown by a set amount, is
-    possible.
+68. Soft sigma floor (owner decision 2026-09-14). Today a zone with a
+    lost sensor group keeps its fans at or above `prev`, which ratchets
+    the DAS MPC's fans up until the zone faults when a bay's only sensor
+    is lost for good (32.5 dB against 27.1 dB without the floor). Replace
+    it with a soft floor whose thresholds are config keys, for example one
+    that ends after σ has grown by a set amount.
 69. Under `sigma` a hot swap faults its zone for 1 tick plus
     `confirm_ticks` (the estimator's deliberate variance inflation), and
     a sensor missing on the estimator's first tick trips the fast-swap
@@ -2881,11 +2894,13 @@ them as "§8 item N".
     (`control/ident.py` precondition).
 73. DAS step budget on the Zero W after items 3, 8, 9 and 10: DAS MPC
     p99 609–615 ms (solve ticks 643 ms) against `mpc.budget_ms` 600, so
-    `pytest -m pi` fails again (it was 507–552 ms). PI-like DAS p99 322
-    ms. Decide between optimising (the estimator now runs before zone
-    trust every tick), `mpc_every_ticks: 3`, or a higher budget. The
-    20-minute daemon run used the example's PI-like DAS, so the runtime
-    alarm has not run against the DAS MPC on the Pi.
+    `pytest -m pi` fails again (it was 507–552 ms); PI-like DAS p99
+    322 ms. Owner decision 2026-09-14: optimise; if the DAS MPC still
+    misses 600 ms, raise `mpc.budget_ms` to 1000; solve every third tick
+    (`mpc_every_ticks: 3`). Note that p99 over all ticks is set by the
+    solve ticks while they are more than 1 % of ticks, so solving less
+    often lowers the mean, not the p99. Run the runtime alarm against the
+    DAS MPC on the Pi (the 20-minute run used PI-like DAS).
 
 ### 8.3 Open — needs the DAS hardware
 
