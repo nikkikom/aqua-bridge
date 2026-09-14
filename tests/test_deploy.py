@@ -86,10 +86,23 @@ def test_unit_gives_the_model_store_a_state_directory(unit):
 # --- udev rules vs the service account's groups (review finding F2) ---------------------
 
 
-def test_hwmon_pwm_attributes_are_made_writable_for_a_service_group(unit, rules):
-    """The daemon writes /sys/class/hwmon/hwmonN/pwmK (root:root 0644 by default) as a
-    non-root user. A udev rule on the aquaero's hwmon device must hand the pwm attributes
-    to a group the unit actually puts the service user in."""
+def test_hidraw_nodes_are_readable_and_writable_for_a_service_group(unit, rules):
+    """The daemon opens /dev/hidrawN (root:root 0600 by default) read/write as a non-root
+    user: a udev rule on the Aqua Computer hidraw nodes must give a group the unit puts the
+    service user in both permissions."""
+    groups = set()
+    for value in unit.get("SupplementaryGroups", []):
+        groups.update(value.split())
+    (rule,) = [r for r in rules if 'SUBSYSTEM=="hidraw"' in r]
+    assert 'ATTRS{idVendor}=="0c70"' in rule
+    assert 'MODE="0660"' in rule
+    group = re.search(r'GROUP="([^"]+)"', rule)
+    assert group and group.group(1) in groups
+
+
+def test_optional_driver_hwmon_rule_still_grants_a_service_group(unit, rules):
+    """Kept for the optional aquacomputer_d5next driver (not installed by install-pi.sh):
+    its pwm attributes go to a group the unit puts the service user in."""
     groups = set()
     for value in unit.get("SupplementaryGroups", []):
         groups.update(value.split())
@@ -118,7 +131,7 @@ def test_usb_and_hidraw_rules_use_a_unit_group(unit, rules):
 def test_install_script_triggers_udev_for_an_already_attached_device():
     text = (DEPLOY / "install-pi.sh").read_text()
     assert "udevadm control --reload-rules" in text
-    assert "udevadm trigger" in text and "subsystem-match=hwmon" in text
+    assert "udevadm trigger" in text and "subsystem-match=hidraw" in text
 
 
 # --- SMART agent example unit (milestone smart-agent) -----------------------------------
@@ -176,14 +189,14 @@ def test_das_dropin_only_overrides_execstart(das_dropin):
     assert "[Unit]" not in text and "[Install]" not in text
 
 
-def test_das_dropin_clears_then_sets_execstart_with_source_hwmon(unit, das_dropin):
+def test_das_dropin_clears_then_sets_execstart_with_source_composite(unit, das_dropin):
     """An empty ExecStart= clears the base unit's before the real one is set (systemd
     drop-in semantics); the replacement is the base unit's ExecStart= plus exactly
-    ``--source hwmon``, nothing else changed (PROJECT.md section 10)."""
+    ``--source composite``, nothing else changed (PROJECT.md section 10)."""
     cleared, replacement = das_dropin["ExecStart"]
     assert cleared == "", "a drop-in must clear ExecStart= before setting a new one"
     (base_exec,) = unit["ExecStart"]
-    assert replacement == f"{base_exec} --source hwmon"
+    assert replacement == f"{base_exec} --source composite"
 
 
 def test_install_script_das_flag_installs_das_config_and_dropin_never_enabling():
@@ -220,7 +233,7 @@ def test_shell_scripts_parse(script):
     subprocess.run([shellcheck, str(DEPLOY / script)], check=True)
 
 
-# --- aquacomputer_d5next DKMS package (section 9) --------------------------------------
+# --- optional aquacomputer_d5next DKMS package (section 9) -----------------------------
 
 DKMS_PKG = DEPLOY / "dkms" / "aquacomputer_d5next"
 DKMS_SCRIPT = DEPLOY / "install-aquacomputer-dkms.sh"
@@ -234,18 +247,55 @@ def _packages() -> list[str]:
     ]
 
 
-def test_packages_include_what_the_driver_build_needs():
+def test_install_script_does_not_run_the_driver_build():
+    """The daemon uses hidraw; the DKMS package stays in deploy/ for later, run by hand."""
+    for line in (DEPLOY / "install-pi.sh").read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        assert "install-aquacomputer-dkms" not in stripped, line
+        assert "dkms" not in stripped.split(), line
+
+
+def test_packages_leave_out_the_optional_driver_build_tools():
     packages = _packages()
-    for name in ("dkms", "curl", "patch", "linux-headers-rpi-v6", "make", "gcc"):
-        assert name in packages, name
+    for name in ("dkms", "curl", "patch"):
+        assert name not in packages, name
 
 
-def test_install_script_builds_the_driver_after_apt_and_before_udev():
-    text = (DEPLOY / "install-pi.sh").read_text()
-    apt_pos = text.index("apt-get install -y")
-    driver_pos = text.index('"$SCRIPT_DIR/install-aquacomputer-dkms.sh"')
-    udev_pos = text.index('echo "== udev rule =="')
-    assert apt_pos < driver_pos < udev_pos
+def test_dkms_script_names_its_packages_and_fails_early_without_them():
+    script = DKMS_SCRIPT.read_text()
+    header, body = script.split("set -euo pipefail", 1)
+    assert "OPTIONAL" in header and "install-pi.sh does not run this script" in header
+    assert "apt-get install -y dkms patch curl linux-headers-rpi-v6" in header
+    check = body.index("required=(dkms patch)")
+    assert check < body.index("dkms status") and check < body.index("curl -fsSL")
+    assert "required+=(curl)" in body and "error: missing" in body
+
+
+def test_dkms_script_exits_with_a_clear_message_when_dkms_is_missing(tmp_path):
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash not available")
+    if Path("/usr/sbin/dkms").exists():
+        pytest.skip("dkms is installed in /usr/sbin on this machine")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in ("uname", "dirname"):
+        found = shutil.which(tool)
+        if found is None:
+            pytest.skip(f"{tool} not available")
+        (bin_dir / tool).symlink_to(found)
+    result = subprocess.run(
+        [bash, str(DKMS_SCRIPT), "--source", str(tmp_path / "driver.c")],
+        env={"PATH": str(bin_dir)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1, result.stderr
+    assert "error: missing dkms patch" in result.stderr
+    assert "apt-get install" in result.stderr
 
 
 def test_dkms_conf_is_a_template_the_script_fills_in():

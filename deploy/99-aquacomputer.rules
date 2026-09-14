@@ -1,16 +1,18 @@
-# Aqua Computer devices (USB VID 0c70): aquaero 6 XT (+ Quadro over aquabus).
+# Aqua Computer devices (USB VID 0c70): aquaero 6 XT and Quadro.
 #
-# Raw USB / hidraw nodes -- the HID path (liquidctl, the USB spike, tests).
+# hidraw nodes -- the path the daemon reads and writes (aqua_bridge.hw.hidraw:
+# status reports, control feature reports on /dev/hidrawN). The kernel creates
+# them root:root 0600, so the non-root service user (SupplementaryGroups=plugdev
+# in aqua-bridge.service) could not open them: every read() would fail, no
+# READY=1, start timeout, restart loop, fans never controlled. Group plugdev,
+# read/write. The raw USB rule serves liquidctl and lsusb -v.
 SUBSYSTEM=="usb", ATTR{idVendor}=="0c70", MODE="0660", GROUP="plugdev"
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c70", MODE="0660", GROUP="plugdev"
 #
-# hwmon path (aquacomputer_d5next driver) -- the path the daemon actually
-# writes (aqua_bridge.hw.xt6 -> /sys/class/hwmon/hwmonN/pwmK). The kernel
-# creates pwmK and pwmK_enable as root:root 0644, so the non-root service
-# user (SupplementaryGroups=plugdev in aqua-bridge.service) could not write
-# them and every apply() would fail with EACCES: no READY=1, start timeout,
-# restart loop, fans never controlled. Hand the pwm attributes to plugdev
-# with group write. tempK_input / fanK_input are world-readable already.
-# %p is the device path under /sys; the attributes exist when the add
-# event fires (they are created before the device is announced).
+# hwmon path -- only matters with the optional aquacomputer_d5next driver
+# (deploy/install-aquacomputer-dkms.sh, not run by install-pi.sh; the daemon
+# does not use it). The kernel creates pwmK as root:root 0644; this hands the
+# pwm attributes to plugdev with group write, for experiments through hwmon.
+# %p is the device path under /sys; the attributes exist when the add event
+# fires (they are created before the device is announced).
 ACTION=="add", SUBSYSTEM=="hwmon", ATTRS{idVendor}=="0c70", RUN+="/bin/sh -c 'for f in /sys%p/pwm*; do [ -e $f ] && chgrp plugdev $f && chmod g+w $f; done'"

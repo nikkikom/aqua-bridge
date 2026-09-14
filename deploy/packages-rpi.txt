@@ -15,10 +15,8 @@ bison
 libssl-dev
 bc
 linux-headers-rpi-v6
-# aquacomputer_d5next hwmon driver, built by deploy/install-aquacomputer-dkms.sh
-dkms
-curl
-patch
+# The optional aquacomputer_d5next DKMS package (deploy/install-aquacomputer-dkms.sh,
+# not run by install-pi.sh) additionally needs: dkms curl patch
 i2c-tools
 python3
 python3-dev
