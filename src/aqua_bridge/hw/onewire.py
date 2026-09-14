@@ -331,6 +331,13 @@ def build_onewire_from_config(
     """
     if not isinstance(section, Mapping):
         raise ConfigError(f"onewire section must be a mapping, got {type(section).__name__}")
+    if "enabled" in section and not isinstance(section["enabled"], bool):
+        # Item 57: the key is a legacy placeholder (see the docstring above) that
+        # nothing here reads to decide anything, but a string such as "true" is
+        # still a config mistake worth naming rather than passing through silently.
+        raise ConfigError(
+            f"onewire.enabled must be true or false, got {type(section['enabled']).__name__}"
+        )
     sensors = section.get("sensors")
     if not sensors:
         return None

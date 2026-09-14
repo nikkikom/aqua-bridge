@@ -17,6 +17,7 @@ from aqua_bridge.control.intents import (
 from aqua_bridge.control.supervisor import Supervisor
 from aqua_bridge.model import MpcConfig
 from aqua_bridge.publishers.mqtt_ha import (
+    MqttSetupError,
     availability_topic,
     build_discovery_entities,
     command_topics,
@@ -25,6 +26,7 @@ from aqua_bridge.publishers.mqtt_ha import (
     state_payload,
     state_topic,
     topic_matches,
+    validate_mqtt_section,
 )
 
 NODE_ID = "aqua-bridge"
@@ -466,3 +468,61 @@ def test_a_retained_ident_start_never_starts_an_experiment() -> None:
     stop.retain = True  # type: ignore[attr-defined]
     client._on_message(client.client, None, stop)
     assert rig.sup.experiment is None
+
+
+# --- validate_mqtt_section (item 57) ----------------------------------------------------
+
+
+def test_validate_mqtt_section_defaults_when_absent() -> None:
+    assert validate_mqtt_section(None) == {
+        "enabled": False,
+        "host": "localhost",
+        "username": "",
+        "password": "",
+        "discovery_prefix": "homeassistant",
+        "node_id": "aqua-bridge",
+        "port": 1883,
+    }
+    assert validate_mqtt_section({}) == validate_mqtt_section(None)
+
+
+def test_validate_mqtt_section_accepts_every_key_explicit() -> None:
+    section = {
+        "enabled": True,
+        "host": "broker.local",
+        "username": "u",
+        "password": "p",
+        "discovery_prefix": "ha",
+        "node_id": "node1",
+        "port": 1884,
+    }
+    assert validate_mqtt_section(section) == section
+
+
+def test_validate_mqtt_section_null_string_falls_back_to_default() -> None:
+    # A bare `username:` line in YAML parses as None; that has always meant "unset",
+    # not a type error, unlike a wrong-typed value such as a number or a bool.
+    values = validate_mqtt_section({"username": None, "password": None})
+    assert values["username"] == "" and values["password"] == ""
+
+
+@pytest.mark.parametrize(
+    ("section", "match"),
+    [
+        ({"enabled": "true"}, "mqtt.enabled"),  # the item 57 example, verbatim
+        ({"enabled": "yes"}, "mqtt.enabled"),
+        ({"enabled": 1}, "mqtt.enabled"),
+        ({"host": 5}, "mqtt.host"),
+        ({"username": 5}, "mqtt.username"),
+        ({"password": 5}, "mqtt.password"),
+        ({"discovery_prefix": 5}, "mqtt.discovery_prefix"),
+        ({"node_id": 5}, "mqtt.node_id"),
+        ({"port": "1883"}, "mqtt.port"),
+        ({"port": 0}, "mqtt.port"),
+        ({"port": 70000}, "mqtt.port"),
+        ({"port": True}, "mqtt.port"),
+    ],
+)
+def test_validate_mqtt_section_rejects_bad_types(section: dict, match: str) -> None:
+    with pytest.raises(MqttSetupError, match=match):
+        validate_mqtt_section(section)

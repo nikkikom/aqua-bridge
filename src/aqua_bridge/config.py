@@ -7,6 +7,20 @@ the other sections (``mqtt``, ``host``, ``xt6``, ``http``, ``digole``,
 *inside* ``mpc`` are an error; unknown top-level sections are kept in
 ``AppConfig.extra`` so a typo there is visible without being fatal.
 
+Each owner validates its own scalars against a *bad type*, not only a
+missing key (item 57: ``enabled: "true"`` is a string, not the ``bool``
+every reader compares against, and must not silently behave like
+``false``): ``http:`` in :class:`~aqua_bridge.publishers.httpauth.HttpSettings`,
+``mqtt:`` in :func:`~aqua_bridge.publishers.mqtt_ha.validate_mqtt_section`, and
+``onewire:`` inline in :func:`~aqua_bridge.hw.onewire.build_onewire_from_config` --
+each raises naming the key, at the point that section is actually used (config
+load for ``onewire`` since a DAS temperature source cannot start without it;
+service start for ``http``/``mqtt`` so a typo in one optional publisher's
+section never stops the daemon from controlling the fans). ``digole:`` has no
+owner yet (section 5, "after Command is stable"), so ``_warn_bad_digole_enabled``
+below only logs a warning at config load -- nothing reads the section, so there
+is nowhere yet to raise.
+
 ``hwmon`` is the one section shaped as a *list* rather than a mapping (one
 entry per hwmon device, plan section 12 Q1: the Quadro possibly needing its
 own USB port and hwmon device alongside the aquaero) and so is parsed
@@ -18,6 +32,7 @@ lives, section 1).
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -29,6 +44,8 @@ import yaml
 from aqua_bridge.model import ConfigError, MpcConfig
 
 __all__ = ["AppConfig", "ConfigError", "KNOWN_SECTIONS", "load_config"]
+
+_LOG = logging.getLogger(__name__)
 
 # Top-level sections with a dedicated attribute on AppConfig (besides "mpc").
 KNOWN_SECTIONS: tuple[str, ...] = ("mqtt", "host", "xt6", "http", "digole", "onewire")
@@ -65,6 +82,21 @@ def _hwmon_section(value: object) -> tuple[dict[str, Any], ...]:
     return tuple(devices)
 
 
+def _warn_bad_digole_enabled(section: Mapping[str, Any]) -> None:
+    """``digole:`` has no owner module yet (PROJECT.md section 5, "after Command is
+    stable"): unlike ``http:``/``mqtt:``/``onewire:`` there is nowhere to raise a
+    service-start :class:`ConfigError` for it (item 57). Log now, at config load, so
+    a value such as ``enabled: "true"`` (a string, not a bool) does not sit unnoticed
+    until that code exists -- this never raises: a cosmetic section must not stop the
+    daemon from controlling the fans.
+    """
+    if "enabled" in section and not isinstance(section["enabled"], bool):
+        _LOG.warning(
+            "config: digole.enabled must be true or false, got %r (no effect yet)",
+            section["enabled"],
+        )
+
+
 @dataclass(frozen=True)
 class AppConfig:
     """The whole ``config.yaml``: a validated ``mpc`` plus raw sections."""
@@ -99,6 +131,7 @@ class AppConfig:
             raise ConfigError("config is missing the required 'mpc' section")
         mpc = MpcConfig.from_mapping(_section("mpc", data["mpc"]))
         sections = {name: _section(name, data.get(name)) for name in KNOWN_SECTIONS}
+        _warn_bad_digole_enabled(sections["digole"])
         hwmon = _hwmon_section(data.get("hwmon"))
         extra = {
             str(name): value

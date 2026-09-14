@@ -102,6 +102,7 @@ from aqua_bridge.model import MpcConfig
 __all__ = [
     "MqttClient",
     "MqttEntity",
+    "MqttSetupError",
     "availability_topic",
     "build_discovery_entities",
     "command_topics",
@@ -110,9 +111,59 @@ __all__ = [
     "state_payload",
     "state_topic",
     "topic_matches",
+    "validate_mqtt_section",
 ]
 
 _LOG = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Config validation (item 57): stdlib-only like httpauth.HttpSettings, so a
+# minimal install without paho-mqtt can still tell a bad mqtt: section from a
+# deliberately disabled one before anything here is used against a broker.
+# ---------------------------------------------------------------------------
+
+
+class MqttSetupError(ValueError):
+    """The ``mqtt:`` section has a bad value; the caller logs it and leaves MQTT off."""
+
+
+#: (key, default) for every mqtt: string scalar; a YAML-null value falls back
+#: to the default rather than erroring (a bare ``username:`` line is common).
+_MQTT_STRING_KEYS: tuple[tuple[str, str], ...] = (
+    ("host", "localhost"),
+    ("username", ""),
+    ("password", ""),
+    ("discovery_prefix", "homeassistant"),
+    ("node_id", "aqua-bridge"),
+)
+
+
+def validate_mqtt_section(section: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Type-checks the ``mqtt:`` section, :class:`MqttSetupError` naming the key.
+
+    Item 57: ``mqtt.enabled: "true"`` (a string, not a bool) must not silently
+    read as *off* -- every scalar is checked, not only ``enabled``. Returns a
+    plain ``dict`` (defaults filled in) rather than a dataclass, since
+    :class:`MqttClient` already owns the rest of the connection's shape.
+    """
+    data = dict(section or {})
+    enabled = data.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise MqttSetupError(f"mqtt.enabled must be true or false, got {enabled!r}")
+    values: dict[str, Any] = {"enabled": enabled}
+    for name, default in _MQTT_STRING_KEYS:
+        value = data.get(name, default)
+        if value is None:
+            value = default
+        if not isinstance(value, str):
+            raise MqttSetupError(f"mqtt.{name} must be a string, got {type(value).__name__}")
+        values[name] = value
+    port = data.get("port", 1883)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise MqttSetupError(f"mqtt.port must be an integer in [1, 65535], got {port!r}")
+    values["port"] = port
+    return values
 
 
 # ---------------------------------------------------------------------------

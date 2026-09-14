@@ -45,7 +45,7 @@ from aqua_bridge.control.intents import ControlMode, ControlSurface
 from aqua_bridge.control.supervisor import Supervisor
 from aqua_bridge.hostinfo import collect_hostinfo
 from aqua_bridge.publishers.http import run_http
-from aqua_bridge.publishers.mqtt_ha import MqttClient
+from aqua_bridge.publishers.mqtt_ha import MqttClient, validate_mqtt_section
 
 __all__ = ["HttpService", "MqttClientLike", "MqttService"]
 
@@ -206,10 +206,16 @@ class MqttService:
         client_factory: Callable[..., MqttClientLike] | None = None,
         **kwargs: Any,
     ) -> MqttService:
-        """Build the client from the ``mqtt:`` / ``host:`` sections."""
+        """Build the client from the ``mqtt:`` / ``host:`` sections.
+
+        Raises :class:`~aqua_bridge.publishers.mqtt_ha.MqttSetupError` (item 57) for a
+        mistyped scalar -- ``host.interval_s`` is the one value not covered by
+        :func:`~aqua_bridge.publishers.mqtt_ha.validate_mqtt_section` (it belongs to
+        ``host:``, not ``mqtt:``) and keeps its looser ``float()`` coercion.
+        """
         if client_factory is None:
             client_factory = MqttClient  # looked up at call time (monkeypatchable)
-        mqtt_cfg = app_cfg.section("mqtt")
+        mqtt_cfg = validate_mqtt_section(app_cfg.section("mqtt"))
         host_cfg = app_cfg.section("host")
         service: MqttService | None = None
 
@@ -219,13 +225,13 @@ class MqttService:
                 service.connection_changed(connected)
 
         client = client_factory(
-            node_id=str(mqtt_cfg.get("node_id", "aqua-bridge")),
-            discovery_prefix=str(mqtt_cfg.get("discovery_prefix", "homeassistant")),
+            node_id=mqtt_cfg["node_id"],
+            discovery_prefix=mqtt_cfg["discovery_prefix"],
             cfg=supervisor.base_config,
-            host=str(mqtt_cfg.get("host", "localhost")),
-            port=int(mqtt_cfg.get("port", 1883)),
-            username=str(mqtt_cfg.get("username") or ""),
-            password=str(mqtt_cfg.get("password") or ""),
+            host=mqtt_cfg["host"],
+            port=mqtt_cfg["port"],
+            username=mqtt_cfg["username"],
+            password=mqtt_cfg["password"],
             on_intent=supervisor.submit,
             on_connection_change=on_connection_change,
         )

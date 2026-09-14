@@ -490,6 +490,52 @@ def test_main_keeps_controlling_when_https_has_no_certificate_or_credentials(
     )
 
 
+def test_main_http_enabled_bad_type_is_logged_and_api_stays_off(
+    tmp_path, example_config_path, restore_signals, recorded_applies, caplog
+):
+    """Item 57: http.enabled: "true" (a string, not a bool) used to compare unequal to
+    ``True`` and leave the API off with no log line at all; it must now be reported by
+    name, same as any other bad ``http:`` value, while the loop keeps running."""
+    import yaml
+
+    data = yaml.safe_load(example_config_path.read_text())
+    data["http"]["enabled"] = "true"
+    conf = tmp_path / "http-bad-enabled.yaml"
+    conf.write_text(yaml.safe_dump(data))
+    with caplog.at_level(logging.ERROR):
+        rc = main_mod.main(
+            ["--config", str(conf), "--source", "sim", "--ticks", "2", "--sim-speed", "0"]
+        )
+    assert rc == 0
+    assert len(recorded_applies) == 3  # 2 ticks + shutdown: the loop ran regardless
+    assert any("http.enabled must be true or false" in r.getMessage() for r in caplog.records)
+
+
+def test_main_mqtt_enabled_bad_type_is_logged_and_mqtt_stays_off(
+    tmp_path, example_config_path, restore_signals, recorded_applies, caplog, monkeypatch
+):
+    """Item 57: same silent-off bug as http.enabled, for mqtt.enabled -- and the
+    daemon must never even attempt to reach the configured broker over it."""
+    import yaml
+
+    import aqua_bridge.publishers.runtime as runtime
+
+    _FakeMqttClient.instances.clear()
+    monkeypatch.setattr(runtime, "MqttClient", _FakeMqttClient)
+    data = yaml.safe_load(example_config_path.read_text())
+    data["mqtt"]["enabled"] = "true"
+    conf = tmp_path / "mqtt-bad-enabled.yaml"
+    conf.write_text(yaml.safe_dump(data))
+    with caplog.at_level(logging.ERROR):
+        rc = main_mod.main(
+            ["--config", str(conf), "--source", "sim", "--ticks", "2", "--sim-speed", "0"]
+        )
+    assert rc == 0
+    assert len(recorded_applies) == 3
+    assert not _FakeMqttClient.instances  # never even tried to connect
+    assert any("mqtt.enabled must be true or false" in r.getMessage() for r in caplog.records)
+
+
 # --- SIGTERM stop path (section 9) ------------------------------------------------------
 
 
