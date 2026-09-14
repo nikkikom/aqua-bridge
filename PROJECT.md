@@ -2621,9 +2621,7 @@ them as "§8 item N".
    9–11× the legacy MPC against 12×); `tests/test_bench_budget.py` now
    interleaves, discards a warm-up repeat and gates on the 75th percentile
    of several per-repeat ratios instead of one min/min pair.
-7. DAS install path: `ExecStart=` with `--source hwmon` for DAS configs
-   (a drop-in today, §10) and an `install-pi.sh` option that installs
-   `config.example-das.yaml`.
+7. **Done (PR #25):** `install-pi.sh --das` installs `config.example-das.yaml` and the `deploy/aqua-bridge-das.conf` systemd drop-in (`ExecStart=` with `--source hwmon`); without `--das` the legacy path is unchanged.
 8. `zones.trust_rule: sigma` (zone trust from the estimator's σ); the
    config accepts it, `strict` applies today.
 9. A Jump on a redundant group member is accepted after one tick without
