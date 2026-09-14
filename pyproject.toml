@@ -36,7 +36,7 @@ testpaths = ["tests"]
 pythonpath = ["src", "tests"]
 addopts = "--strict-markers"
 markers = [
-  "hardware: needs a live aquaero hwmon device (USB on the Pi); skipped elsewhere",
+  "hardware: needs a live aquaero hidraw device (USB 0c70:f001 on the Pi); skipped elsewhere",
   "fuzzy: Hypothesis property tests; may be slow, still required in CI",
   "slow: long-running test (closed-loop sims, long fuzz runs)",
   "nightly: heavy sweeps and long simulations; excluded from PR/main CI, run by nightly-fuzz",

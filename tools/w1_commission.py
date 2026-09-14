@@ -15,7 +15,7 @@ to a name (``prox_b01``, ``air_z0``, ...) with confidence. ``--check
 --config ...`` builds the exact composite hardware source the daemon would
 build (:func:`aqua_bridge.hw.sources.build_composite_from_config`), so every
 startup binding error (a name not bound exactly once across
-hwmon/onewire) is caught here first, then runs a few dozen bulk-read cycles
+controllers/onewire) is caught here first, then runs a few dozen bulk-read cycles
 per bus and prints the measured cycle time and the CRC error rate per
 sensor (plan section 12 risk 5: "measure with w1_commission.py --check").
 
@@ -152,7 +152,7 @@ def cmd_check(config_path: str, *, cycles: int = 20) -> int:
 
     try:
         composite, release = build_composite_from_config(
-            hwmon_section=app.hwmon,
+            aquacomputer_section=app.aquacomputer,
             xt6_section=app.section("xt6"),
             onewire_section=app.section("onewire"),
             channels=app.mpc.channels,

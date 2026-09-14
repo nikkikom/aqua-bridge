@@ -14,13 +14,19 @@ import pytest
 from hypothesis import HealthCheck, settings
 
 from aqua_bridge.config import load_config
+from aqua_bridge.hw.aquacomputer import AQUAERO
+from aqua_bridge.hw.hidraw import (
+    DEFAULT_DEV_DIR,
+    DEFAULT_SYSFS_ROOT,
+    HidrawInfo,
+    list_hidraw_devices,
+    matches_kind,
+)
 from aqua_bridge.model import MpcConfig, SolverKind
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLE_CONFIG = REPO_ROOT / "config.example.yaml"
 EXAMPLE_DAS_CONFIG = REPO_ROOT / "config.example-das.yaml"
-HWMON_ROOT = Path("/sys/class/hwmon")
-AQUAERO_HWMON_NAME = "aquaero"
 
 # --- Hypothesis profiles ----------------------------------------------------
 # Select with HYPOTHESIS_PROFILE=dev|ci|nightly|pi (default: dev).
@@ -58,24 +64,24 @@ settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "dev"))
 # --- hardware discovery -----------------------------------------------------
 
 
-def find_aquaero_hwmon(root: Path = HWMON_ROOT) -> Path | None:
-    """Directory of the hwmon device whose ``name`` is ``aquaero``, or ``None``."""
-    if not root.is_dir():
-        return None
-    for dev in sorted(root.iterdir()):
-        try:
-            if (dev / "name").read_text().strip() == AQUAERO_HWMON_NAME:
-                return dev
-        except OSError:
-            continue
+def find_aquaero_hidraw(
+    sysfs_root: Path = DEFAULT_SYSFS_ROOT, dev_dir: Path = DEFAULT_DEV_DIR
+) -> HidrawInfo | None:
+    """The aquaero's status/control hidraw node (USB 0c70:f001, interface 2), or ``None``.
+
+    Several attached aquaeros: the first one. Discovery only; nothing is opened.
+    """
+    for info in list_hidraw_devices(sysfs_root, dev_dir):
+        if matches_kind(info, AQUAERO):
+            return info
     return None
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip ``hardware`` tests when no aquaero hwmon device is present."""
-    if find_aquaero_hwmon() is not None:
+    """Skip ``hardware`` tests when no aquaero hidraw device is present."""
+    if find_aquaero_hidraw() is not None:
         return
-    skip = pytest.mark.skip(reason="no aquaero hwmon device under /sys/class/hwmon")
+    skip = pytest.mark.skip(reason=f"no aquaero hidraw device under {DEFAULT_SYSFS_ROOT}")
     for item in items:
         if "hardware" in item.keywords:
             item.add_marker(skip)
@@ -143,12 +149,12 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 
 
 @pytest.fixture
-def aquaero_hwmon() -> Path:
-    """Path of the live aquaero hwmon device; skips when absent."""
-    dev = find_aquaero_hwmon()
-    if dev is None:
-        pytest.skip("no aquaero hwmon device under /sys/class/hwmon")
-    return dev
+def aquaero_hidraw() -> HidrawInfo:
+    """The live aquaero hidraw node; skips when absent."""
+    info = find_aquaero_hidraw()
+    if info is None:
+        pytest.skip(f"no aquaero hidraw device under {DEFAULT_SYSFS_ROOT}")
+    return info
 
 
 @pytest.fixture(scope="session")

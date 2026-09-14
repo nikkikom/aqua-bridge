@@ -261,34 +261,33 @@ def test_build_io_sim_and_unknown(example_config_path):
 
 
 def test_build_io_xt6_constructs_adapter_without_touching_hardware(example_config_path):
-    pytest.importorskip("aqua_bridge.hw.xt6")
+    from aqua_bridge.hw.aquacomputer_adapter import AquacomputerAdapter
+
     app = load_config(example_config_path)
-    try:
-        src, sink, _ = main_mod.build_io(app, "xt6")
-    except RuntimeError as exc:
-        pytest.skip(f"hw adapter API not final: {exc}")
-    assert hasattr(src, "read") and hasattr(sink, "apply")
+    src, sink, release = main_mod.build_io(app, "xt6")
+    assert isinstance(src, AquacomputerAdapter) and src is sink and release is None
+    assert not src.is_open  # the first read() finds the device
+    assert src.binding.pwm_map == {"radiator": 1, "intake": 2}
 
 
-def test_build_io_hwmon_constructs_composite_without_touching_hardware(example_config_path):
-    """The example config's xt6: section alone (no hwmon:/onewire.sensors) is a valid
-    single-device composite -- the DAS plan section 12 Q1 generalisation of xt6."""
-    pytest.importorskip("aqua_bridge.hw.sources")
+def test_build_io_composite_constructs_composite_without_touching_hardware(example_config_path):
+    """The example config's xt6: section alone (no aquacomputer:/onewire.sensors) is a
+    valid single-device composite -- the DAS plan section 12 Q1 generalisation of xt6."""
     app = load_config(example_config_path)
-    src, sink, release = main_mod.build_io(app, "hwmon")
+    src, sink, release = main_mod.build_io(app, "composite")
     assert hasattr(src, "read") and hasattr(sink, "apply")
+    assert [device.is_open for device in src.devices] == [False]
     assert release is None  # no onewire.sensors in config.example.yaml -> nothing to stop
 
 
-def test_build_io_hwmon_forwards_smart_into_the_composite(example_config_path):
+def test_build_io_composite_forwards_smart_into_the_composite(example_config_path):
     """milestone smart-agent: build_io's smart= reaches CompositeSource.smart
-    (and so PlantObservation.inputs["smart"]) for --source hwmon."""
-    pytest.importorskip("aqua_bridge.hw.sources")
+    (and so PlantObservation.inputs["smart"]) for --source composite."""
     from aqua_bridge.publishers.inputs import SmartInbox
 
     app = load_config(example_config_path)
     smart = SmartInbox()
-    src, _sink, _release = main_mod.build_io(app, "hwmon", smart=smart)
+    src, _sink, _release = main_mod.build_io(app, "composite", smart=smart)
     assert src.smart is smart
 
 
@@ -301,7 +300,18 @@ def test_build_io_sim_ignores_smart(example_config_path):
     assert src is sink and release is None
 
 
-def test_hwmon_source_missing_binding_exits_2(tmp_path, example_config_path, restore_signals):
+def test_source_hwmon_is_no_longer_a_choice(example_config_path, capsys):
+    with pytest.raises(SystemExit) as exc:
+        main_mod.build_parser().parse_args(
+            ["--config", str(example_config_path), "--source", "hwmon"]
+        )
+    assert exc.value.code == 2
+    assert "'composite'" in capsys.readouterr().err
+    with pytest.raises(RuntimeError):
+        main_mod.build_io(load_config(example_config_path), "hwmon")
+
+
+def test_composite_source_missing_binding_exits_2(tmp_path, example_config_path, restore_signals):
     """The same F4-style guarantee as xt6, now enforced across the whole device fleet."""
     import yaml
 
@@ -309,7 +319,27 @@ def test_hwmon_source_missing_binding_exits_2(tmp_path, example_config_path, res
     data["xt6"]["fans"] = {"radiator": {"pwm": "pwm1", "rpm": "fan1"}}
     bad = tmp_path / "bad_map.yaml"
     bad.write_text(yaml.safe_dump(data))
-    assert main_mod.main(["--config", str(bad), "--source", "hwmon"]) == 2
+    assert main_mod.main(["--config", str(bad), "--source", "composite"]) == 2
+
+
+def test_hwmon_era_config_exits_2_with_the_rename_hint(
+    tmp_path, example_config_path, restore_signals, caplog
+):
+    import yaml
+
+    data = yaml.safe_load(example_config_path.read_text())
+    data["xt6"]["hwmon_name"] = "aquaero"
+    bad = tmp_path / "hwmon_name.yaml"
+    bad.write_text(yaml.safe_dump(data))
+    with caplog.at_level("ERROR"):
+        assert main_mod.main(["--config", str(bad), "--source", "xt6"]) == 2
+    assert "xt6.hwmon_name is no longer supported" in caplog.text
+
+    data = yaml.safe_load(example_config_path.read_text())
+    data["hwmon"] = [{"name": "quadro", "fans": {}}]
+    bad2 = tmp_path / "hwmon_section.yaml"
+    bad2.write_text(yaml.safe_dump(data))
+    assert main_mod.main(["--config", str(bad2), "--source", "composite"]) == 2
 
 
 def test_xt6_map_not_matching_mpc_channels_exits_2(tmp_path, example_config_path, restore_signals):

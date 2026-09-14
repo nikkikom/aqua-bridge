@@ -32,7 +32,7 @@ output's airflow splits over zones by ``share``. ``Qn_z`` is ``Q_z``
 normalised by the zone's clean full-speed airflow. ``kappa`` is symmetric
 (inter-zone leakage conserves energy). Only the first fan of an output
 drives the tachometer (splitter sense wire), and an output may have none
-(its key is then absent from ``obs.rpm``, exactly as the hwmon adapter does
+(its key is then absent from ``obs.rpm``, exactly as the hardware adapter does
 without ``rpm:``).
 
 Integration: within one ``dt`` the system is linear (the fan state is

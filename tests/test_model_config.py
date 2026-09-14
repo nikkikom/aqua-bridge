@@ -62,7 +62,7 @@ def test_example_config_loads_and_validates(example_config_path):
     assert app.mpc.channels == ("radiator", "intake")
     assert app.mpc.temps == ("coolant", "air")
     assert app.mpc.solver is SolverKind.PI
-    assert app.xt6["hwmon_name"] == "aquaero"
+    assert app.xt6["device"] == "aquaero"
     assert "port" in app.section("http")  # validated in tests/test_http_auth.py
     assert app.source == str(example_config_path)
 
@@ -221,6 +221,40 @@ def test_app_config_from_mapping_and_errors(cfg):
         AppConfig.from_mapping({"mpc": cfg.to_dict(), "http": "not a mapping"})
     with pytest.raises(ConfigError):
         AppConfig.from_mapping([])  # type: ignore[arg-type]
+
+
+def test_aquacomputer_section_is_a_list_of_mappings(cfg):
+    entries = [{"device": "aquaero", "fans": {}}, {"device": "quadro"}]
+    app = AppConfig.from_mapping({"mpc": cfg.to_dict(), "aquacomputer": entries})
+    assert app.aquacomputer == tuple(entries)
+    assert "aquacomputer" not in app.extra
+    assert AppConfig.from_mapping({"mpc": cfg.to_dict()}).aquacomputer == ()
+    for bad, match in (
+        ({"device": "aquaero"}, "'aquacomputer' must be a list"),
+        (["aquaero"], r"'aquacomputer'\[0\] must be a mapping"),
+        ([{1: "x"}], r"'aquacomputer'\[0\] has a non-string key"),
+    ):
+        with pytest.raises(ConfigError, match=match):
+            AppConfig.from_mapping({"mpc": cfg.to_dict(), "aquacomputer": bad})
+
+
+def test_former_hwmon_section_names_its_replacement(cfg):
+    with pytest.raises(ConfigError, match="'hwmon' was renamed to 'aquacomputer'.*'device:'"):
+        AppConfig.from_mapping({"mpc": cfg.to_dict(), "hwmon": [{"name": "aquaero"}]})
+
+
+def test_example_configs_show_every_timing_key_at_its_default(
+    example_config_path, example_das_config_path
+):
+    """The example files document each controller timing key with the one default
+    the config model holds (AquacomputerTiming)."""
+    from aqua_bridge.hw.aquacomputer_adapter import TIMING_KEYS, AquacomputerTiming
+
+    defaults = dataclasses.asdict(AquacomputerTiming())
+    legacy = load_config(example_config_path).xt6
+    das = load_config(example_das_config_path).aquacomputer[0]
+    for entry in (legacy, das):
+        assert {key: entry[key] for key in TIMING_KEYS} == defaults
 
 
 def test_digole_enabled_bad_type_logs_a_warning_and_does_not_raise(cfg, caplog):

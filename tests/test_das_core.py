@@ -90,11 +90,11 @@ def test_example_das_config_layout(cfg):
 
 
 def test_example_das_config_binds_every_name_once(tmp_path):
-    """--source hwmon's startup check (hw/sources.py) accepts the example bindings."""
+    """--source composite's startup check (hw/sources.py) accepts the example bindings."""
     app = load_config(EXAMPLE_DAS_CONFIG)
     onewire = dict(app.section("onewire"), root=str(tmp_path))  # no buses: nothing starts
     composite, release = hw_sources.build_composite_from_config(
-        hwmon_section=app.hwmon,
+        aquacomputer_section=app.aquacomputer,
         xt6_section=app.section("xt6"),
         onewire_section=onewire,
         channels=app.mpc.channels,
@@ -102,9 +102,9 @@ def test_example_das_config_binds_every_name_once(tmp_path):
         dt=app.mpc.dt,
     )
     try:
-        assert len(composite.hwmon) == 2
+        assert [device.kind.name for device in composite.devices] == ["aquaero", "quadro"]
         # The Quadro's temperature inputs are not assumed: only the aquaero binds thermistors.
-        quadro = app.hwmon[1]
+        quadro = app.aquacomputer[1]
         assert quadro["temp_map"] == {}
     finally:
         if release is not None:
