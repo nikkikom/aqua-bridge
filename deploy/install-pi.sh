@@ -5,12 +5,21 @@
 # daemon writing?) must be confirmed manually first.
 #
 # Usage:
-#   deploy/install-pi.sh --user <account> [--tls-days <days>]
+#   deploy/install-pi.sh --user <account> [--tls-days <days>] [--das]
 #
 # --tls-days: validity of the self-signed HTTPS certificate created when
 # /etc/aqua-bridge/tls/ has none (default 3650). Existing TLS files and the
 # HTTP credentials file are never overwritten; users are not created (the
 # script prints the tools/http_user.py command).
+#
+# --das: install config.example-das.yaml instead of config.example.yaml
+# (still only when /etc/aqua-bridge/config.yaml is absent; an existing config
+# is never overwritten either way), and install a systemd drop-in
+# (deploy/aqua-bridge-das.conf -> aqua-bridge.service.d/das.conf) that adds
+# --source hwmon to the unit's ExecStart= (PROJECT.md section 10). Without
+# --das the unit runs --source xt6 as before, matching the legacy behaviour
+# bit for bit. Either way the service is only installed and verified, never
+# enabled or started.
 #
 # Run this from the checked-out repo on the Pi (e.g. after
 # `rsync -az ./ USER@PI-HOST:/opt/aqua-bridge/`, see PROJECT.md §11) with
@@ -27,6 +36,9 @@ UDEV_RULE_SRC="$SCRIPT_DIR/99-aquacomputer.rules"
 UDEV_RULE_DST="/etc/udev/rules.d/99-aquacomputer.rules"
 UNIT_SRC="$SCRIPT_DIR/aqua-bridge.service"
 UNIT_DST="/etc/systemd/system/aqua-bridge.service"
+DAS_DROPIN_SRC="$SCRIPT_DIR/aqua-bridge-das.conf"
+DROPIN_DIR="$UNIT_DST.d"
+DAS_DROPIN_DST="$DROPIN_DIR/das.conf"
 PACKAGES_FILE="$SCRIPT_DIR/packages-rpi.txt"
 # Must match the http: defaults in src/aqua_bridge/publishers/httpauth.py
 # (HttpSettings; tests/test_deploy.py checks it).
@@ -36,9 +48,10 @@ TLS_KEY="$TLS_DIR/key.pem"
 TLS_DAYS=3650
 
 USER_ACCOUNT=""
+DAS_MODE=0
 
 usage() {
-  echo "Usage: $0 --user <account> [--tls-days <days>]" >&2
+  echo "Usage: $0 --user <account> [--tls-days <days>] [--das]" >&2
   exit 2
 }
 
@@ -54,6 +67,10 @@ while [[ $# -gt 0 ]]; do
       [[ "$2" =~ ^[1-9][0-9]*$ ]] || usage
       TLS_DAYS="$2"
       shift 2
+      ;;
+    --das)
+      DAS_MODE=1
+      shift
       ;;
     *)
       usage
@@ -124,8 +141,13 @@ fi
 echo "== config =="
 sudo install -d -m 755 "$CONFIG_DIR"
 if [[ ! -f "$CONFIG_DIR/config.yaml" ]]; then
+  if [[ "$DAS_MODE" -eq 1 ]]; then
+    CONFIG_EXAMPLE="$REPO_DIR/config.example-das.yaml"
+  else
+    CONFIG_EXAMPLE="$REPO_DIR/config.example.yaml"
+  fi
   sudo install -m 640 -o root -g "$USER_ACCOUNT" \
-    "$REPO_DIR/config.example.yaml" "$CONFIG_DIR/config.yaml"
+    "$CONFIG_EXAMPLE" "$CONFIG_DIR/config.yaml"
   echo "installed: $CONFIG_DIR/config.yaml (edit host, credentials, channel names)"
 else
   echo "already present, left untouched: $CONFIG_DIR/config.yaml"
@@ -169,8 +191,23 @@ sudo udevadm settle || true
 
 echo "== systemd unit =="
 sudo sed -e "s/^User=.*/User=$USER_ACCOUNT/" "$UNIT_SRC" | sudo tee "$UNIT_DST" > /dev/null
+if [[ "$DAS_MODE" -eq 1 ]]; then
+  # --source hwmon (the DAS composite hwmon: + onewire: source) instead of
+  # the base unit's implicit --source xt6; PROJECT.md section 10.
+  sudo install -d -m 755 "$DROPIN_DIR"
+  sudo install -m 644 "$DAS_DROPIN_SRC" "$DAS_DROPIN_DST"
+  echo "installed drop-in: $DAS_DROPIN_DST (--source hwmon)"
+fi
 sudo systemctl daemon-reload
+# systemd-analyze verify resolves the unit's drop-in directory the same way
+# systemd itself does, so a --das install is checked with das.conf merged in.
 sudo systemd-analyze verify "$UNIT_DST"
+
+DAS_NOTE=""
+if [[ "$DAS_MODE" -eq 1 ]]; then
+  DAS_NOTE="  DAS mode: $DAS_DROPIN_DST makes the unit run --source hwmon;
+     fill in hwmon: / onewire: in $CONFIG_DIR/config.yaml before enabling."
+fi
 
 cat <<EOF
 
@@ -182,6 +219,7 @@ started. Before "systemctl enable --now aqua-bridge":
      its own curve once the Pi stops writing.
   2. Edit $CONFIG_DIR/config.yaml (host, MQTT credentials, channel
      names) to match this Pi.
+$DAS_NOTE
   3. For the HTTPS API (http.enabled: true), create a user; the password
      is prompted for, never passed on the command line:
        sudo $INSTALL_DIR/.venv/bin/python $INSTALL_DIR/tools/http_user.py \\

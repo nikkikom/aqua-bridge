@@ -6,7 +6,8 @@
 # replace the names, hwmon attributes and ROM ids with your own.
 #
 # Run it with --source hwmon (hwmon: + onewire: below; the systemd unit needs
-# a drop-in for that, PROJECT.md section 10) or, without hardware, with
+# a drop-in for that -- deploy/install-pi.sh --das installs one, PROJECT.md
+# section 10) or, without hardware, with
 # --source sim --sim-plant das (the DAS truth simulator built from the topology
 # below; an optional top-level "sim: {das: {preset: basic|rich, seed: 0}}"
 # section tunes it). --record PATH (or a top-level record_path, with

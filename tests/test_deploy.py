@@ -13,6 +13,7 @@ import pytest
 DEPLOY = Path(__file__).resolve().parent.parent / "deploy"
 UNIT = DEPLOY / "aqua-bridge.service"
 RULES = DEPLOY / "99-aquacomputer.rules"
+DAS_DROPIN = DEPLOY / "aqua-bridge-das.conf"
 
 
 def _unit_values(text: str) -> dict[str, list[str]]:
@@ -29,6 +30,11 @@ def _unit_values(text: str) -> dict[str, list[str]]:
 @pytest.fixture(scope="module")
 def unit() -> dict[str, list[str]]:
     return _unit_values(UNIT.read_text())
+
+
+@pytest.fixture(scope="module")
+def das_dropin() -> dict[str, list[str]]:
+    return _unit_values(DAS_DROPIN.read_text())
 
 
 @pytest.fixture(scope="module")
@@ -155,6 +161,51 @@ def test_install_script_creates_a_self_signed_certificate_but_never_overwrites_o
     assert "tools/http_user.py" in text
     assert "--stdin" not in text and "http-users" not in text
     assert "openssl" in (DEPLOY / "packages-rpi.txt").read_text().split()
+
+
+# --- DAS install path (section 8 item 7) -------------------------------------------------
+
+
+def test_das_dropin_only_overrides_execstart(das_dropin):
+    """The drop-in must change nothing but ExecStart=: everything else (Type=,
+    NotifyAccess=, StateDirectory=, Restart=, WatchdogSec=, ...) is inherited from the
+    base unit unchanged."""
+    assert set(das_dropin) == {"ExecStart"}
+    text = DAS_DROPIN.read_text()
+    assert "[Service]" in text
+    assert "[Unit]" not in text and "[Install]" not in text
+
+
+def test_das_dropin_clears_then_sets_execstart_with_source_hwmon(unit, das_dropin):
+    """An empty ExecStart= clears the base unit's before the real one is set (systemd
+    drop-in semantics); the replacement is the base unit's ExecStart= plus exactly
+    ``--source hwmon``, nothing else changed (PROJECT.md section 10)."""
+    cleared, replacement = das_dropin["ExecStart"]
+    assert cleared == "", "a drop-in must clear ExecStart= before setting a new one"
+    (base_exec,) = unit["ExecStart"]
+    assert replacement == f"{base_exec} --source hwmon"
+
+
+def test_install_script_das_flag_installs_das_config_and_dropin_never_enabling():
+    text = (DEPLOY / "install-pi.sh").read_text()
+    assert "--das" in text
+    assert "DAS_DROPIN_SRC=" in text and "aqua-bridge-das.conf" in text
+    assert 'DAS_DROPIN_DST="$DROPIN_DIR/das.conf"' in text
+    assert "config.example-das.yaml" in text
+    # The config step still only installs when config.yaml is absent, --das or not.
+    assert text.count('if [[ ! -f "$CONFIG_DIR/config.yaml" ]]; then') == 1
+    assert 'sudo install -m 644 "$DAS_DROPIN_SRC" "$DAS_DROPIN_DST"' in text
+    # The drop-in install is gated on --das and precedes daemon-reload/verify.
+    unit_section = text[text.index("== systemd unit ==") :]
+    gate_pos = unit_section.index('if [[ "$DAS_MODE" -eq 1 ]]; then')
+    dropin_pos = unit_section.index("DAS_DROPIN_DST")
+    verify_pos = unit_section.index("systemd-analyze verify")
+    assert gate_pos < dropin_pos < verify_pos
+    # Never enables or starts the service, --das or not: the only "systemctl enable"
+    # text in the whole script is the printed instructions after provisioning.
+    before_summary = text.split("cat <<EOF")[0]
+    assert "systemctl enable" not in before_summary
+    assert "systemctl start" not in before_summary
 
 
 @pytest.mark.parametrize("script", ["install-pi.sh", "host-usb.sh"])

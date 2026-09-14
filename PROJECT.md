@@ -1533,10 +1533,11 @@ aqua-bridge/
   deploy/
     packages-rpi.txt         # apt packages (§9)
     aqua-bridge.service      # systemd unit, StateDirectory=aqua-bridge (§9)
+    aqua-bridge-das.conf     # drop-in: ExecStart= --source hwmon (§9, §10, install-pi.sh --das)
     aqua-bridge-smart-agent.service  # systemd *user* unit example for the PC
     99-aquacomputer.rules    # udev: usb, hidraw, hwmon pwm group write (§9)
     host-usb.sh              # dwc2 host overlay, idempotent (§10)
-    install-pi.sh            # provisioning, self-signed HTTPS certificate (§10)
+    install-pi.sh            # provisioning, self-signed HTTPS certificate, --das (§10)
   src/aqua_bridge/
     __main__.py              # python -m aqua_bridge: wiring, signals, exit codes
     model.py                 # the contract, incl. the DAS config sections
@@ -3006,6 +3007,17 @@ most every `model_store_interval_s` and once at the clean stop. A legacy
 config ignores it. Delete `model.json` for a clean prior (the
 calibrations go with it).
 
+The unit's `ExecStart=` above has no `--source`, i.e. `xt6` (a single
+aquaero over hwmon, §3): that is the legacy install path, unchanged.
+The DAS install path (`--source hwmon`, the composite `hwmon:` +
+`onewire:` source) adds `deploy/aqua-bridge-das.conf` as a systemd
+drop-in, `/etc/systemd/system/aqua-bridge.service.d/das.conf`, changing
+only `ExecStart=` (an empty `ExecStart=` line clears the base unit's
+before the real one is set — repeated-directive semantics,
+`systemd.unit(5)`). `install-pi.sh --das` installs it (§10) and
+`tests/test_deploy.py` checks that the drop-in's `ExecStart=` is the
+base unit's plus exactly `--source hwmon`, nothing else.
+
 (The file itself carries the reasoning as comments.) `After=` does not
 pull in the target; `Wants=network-online.target` must sit next to it.
 `Type=notify` is required or `READY=1` is ignored. `NotifyAccess=main`
@@ -3097,27 +3109,38 @@ on a Zero W; the hardware steps are waiting for the aquaero.
 5. Code: `sudo install -d -o USER -g USER /opt/aqua-bridge`, then rsync
    or clone the repo **there** (§11; no root needed after the chown).
    Then, from `/opt/aqua-bridge`: `deploy/install-pi.sh --user USER`
-   (`USER` is the service account and its group). Idempotent. It
+   (`USER` is the service account and its group; add `--das` for a DAS
+   enclosure, see below). Idempotent. It
    installs the apt packages, creates the install dir and the
    `--system-site-packages` venv, runs `pip install -e . --no-deps` as
    the service user (aborting if pip tries to fetch numpy), installs
-   `config.example.yaml` as `/etc/aqua-bridge/config.yaml` mode 640
+   `config.example.yaml` (`config.example-das.yaml` with `--das`) as
+   `/etc/aqua-bridge/config.yaml` mode 640
    `root:USER` **only if absent** (the MQTT password must not be
    world-readable), creates a self-signed HTTPS certificate
    `/etc/aqua-bridge/tls/cert.pem` with key `key.pem` (mode 640
    `root:USER`, valid `--tls-days` days, default 3650) **only if neither
    file exists** (an owner-provided certificate is never overwritten;
    `openssl` comes from the package list), installs the udev rule and
-   re-triggers it, installs the unit with `User=` substituted, reloads
-   systemd and verifies the unit. It does **not** enable or start the
+   re-triggers it, installs the unit with `User=` substituted and, with
+   `--das`, the `deploy/aqua-bridge-das.conf` drop-in (`--source hwmon`,
+   §9) into `aqua-bridge.service.d/das.conf`, reloads
+   systemd and verifies the unit (drop-in included). It does **not**
+   enable or start the
    service, and it creates no HTTPS users (it prints the
    `tools/http_user.py` command). Run before the
    code is in place, it creates the directory, warns, skips the pip step,
-   and finishes; rerun it after the rsync.
-6. Config. For the DAS, copy the example by hand (the installer only
-   installs `config.example.yaml`, and only when no config exists):
+   and finishes; rerun it after the rsync (`--das` on a rerun still only
+   installs the config if none exists, but always re-installs the
+   drop-in, so switching an existing legacy install to DAS is
+   `install-pi.sh --user USER --das` plus step 6's hand-edit if
+   `config.yaml` already existed).
+6. Config. Without `--das` at step 5 (or to start from a fresh copy),
+   install the DAS example by hand (the installer only installs
+   `config.example.yaml` unless `--das` was given, and only when no
+   config exists):
    `sudo install -m 640 -o root -g USER config.example-das.yaml
-   /etc/aqua-bridge/config.yaml`. Edit `mpc.channels` / `mpc.temps` /
+   /etc/aqua-bridge/config.yaml`. Either way, edit `mpc.channels` / `mpc.temps` /
    `mpc.sensors` / `mpc.topology` for the enclosure, the `hwmon:` devices
    (`fans` with `{pwm: pwmN, rpm: fanN}` per output, `temp_map` per
    thermistor input actually present), `onewire.sensors` (step 9), MQTT
@@ -3160,10 +3183,15 @@ on a Zero W; the hardware steps are waiting for the aquaero.
     source, prints the observation and the command, applies it, and ends
     with the stop write: the fans are left at `fallback_pwm` with
     `pwmK_enable` in manual mode.
-11. DAS: the unit's `ExecStart=` has no `--source`, i.e. `xt6`. Add
-    `--source hwmon` with a drop-in (`sudo systemctl edit aqua-bridge`:
-    an empty `ExecStart=` line, then the full `ExecStart=` line with
-    `--source hwmon`). Optionally add `--record
+11. DAS: the unit's `ExecStart=` has no `--source`, i.e. `xt6`. `--das`
+    at step 5 already installed the `--source hwmon` drop-in
+    (`deploy/aqua-bridge-das.conf`, §9); confirm with `systemctl cat
+    aqua-bridge` (its `ExecStart=` lines show the override). Without
+    `--das`, add it by hand: `sudo systemctl edit aqua-bridge` — an
+    empty `ExecStart=` line, then the full `ExecStart=` line with
+    `--source hwmon` — then `sudo systemctl daemon-reload` and `sudo
+    systemd-analyze verify /etc/systemd/system/aqua-bridge.service`.
+    Optionally add `--record
     /var/lib/aqua-bridge/rec.jsonl` or set `record_path` for the model
     ladder (§13).
 12. `sudo systemctl enable --now aqua-bridge`; `journalctl -u aqua-bridge`
