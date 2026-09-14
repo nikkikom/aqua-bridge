@@ -54,6 +54,7 @@ from aqua_bridge.hw.aquacomputer_adapter import (
     Opener,
     parse_device_section,
 )
+from aqua_bridge.hw.hidraw import DeviceUnavailable
 from aqua_bridge.hw.onewire import W1Source, build_onewire_from_config
 from aqua_bridge.model import ConfigError, MpcCommand, PlantObservation
 
@@ -96,26 +97,57 @@ class CompositeSource:
         self.smart = smart
         self._clock = clock
 
+    def _each_device(self, what: str, call: Callable[[AquacomputerAdapter], Any]) -> list[Any]:
+        """Runs ``call`` on every device, even after one of them raised.
+
+        A device that fails must not keep the others from being read (each
+        read drains that controller's hidraw queue) or written (the loop's
+        fallback ramp and the SIGTERM ``fallback_pwm`` write must reach every
+        healthy controller). Failures are collected and raised afterwards as
+        one :class:`~aqua_bridge.hw.hidraw.DeviceUnavailable` naming every
+        failed device, chained to the first exception; when every failure is
+        a ``ValueError`` (a bad command) a ``ValueError`` is raised instead.
+        """
+        results: list[Any] = []
+        failures: list[tuple[AquacomputerAdapter, Exception]] = []
+        for device in self.devices:
+            try:
+                results.append(call(device))
+            except Exception as exc:  # collected, raised after the loop
+                failures.append((device, exc))
+        if not failures:
+            return results
+        detail = "; ".join(
+            f"{device.binding.label}: {type(exc).__name__}: {exc}" for device, exc in failures
+        )
+        message = f"{what} failed on {len(failures)} of {len(self.devices)} device(s): {detail}"
+        first = failures[0][1]
+        if all(isinstance(exc, ValueError) for _, exc in failures):
+            raise ValueError(message) from first
+        raise DeviceUnavailable(message) from first
+
     def read(self) -> PlantObservation:
         """Reads every controller, then the latest 1-Wire samples, then (if
         configured) the latest SMART snapshot into ``inputs["smart"]``.
 
-        A controller that is unavailable (``DeviceUnavailable``: gone, or no
-        status report within its ``status_max_age_s``) propagates exactly as it
-        does for a single-device ``xt6`` source: the whole observation is lost
-        this tick and the loop's blank-observation fallback runs (safe
-        direction -- fans ramp toward ``fallback_pwm``, never down). A 1-Wire
+        Every controller is read even when an earlier one fails, so every
+        hidraw queue is drained each tick. If any controller is unavailable
+        (``DeviceUnavailable``: gone, or no status report within its
+        ``status_max_age_s``) the whole observation is lost this tick, as for a
+        single-device ``xt6`` source, and the loop's blank-observation fallback
+        runs (safe direction -- fans ramp toward ``fallback_pwm``, never down);
+        the raised ``DeviceUnavailable`` names every failed device. A 1-Wire
         sensor's own loss is finer-grained and never escalates here:
         :meth:`W1Source.read` already reports ``None`` for the sensor(s) it
         affects, which the gate handles per sensor. SMART is never gated at
         all (plan section 1): a stale or empty inbox just means
         ``inputs["smart"]`` is empty or missing that serial this tick.
         """
+        observations = self._each_device("read", lambda device: device.read())
         temps: dict[str, float | None] = {}
         rpm: dict[str, float | None] = {}
         pwm: dict[str, float | None] = {}
-        for device in self.devices:
-            obs = device.read()
+        for obs in observations:
             temps.update(obs.temps)
             rpm.update(obs.rpm)
             pwm.update(obs.pwm)
@@ -127,19 +159,19 @@ class CompositeSource:
         return PlantObservation(temps=temps, rpm=rpm, pwm=pwm, ts=self._clock(), inputs=inputs)
 
     def apply(self, cmd: MpcCommand) -> None:
-        """Writes ``cmd`` to every controller in turn.
+        """Writes ``cmd`` to every controller.
 
         Each adapter only commands the channels its own ``fans`` map claims
         (extra keys in ``cmd.pwm`` are ignored by design) and sends at most one
         control report for all of them, so passing the whole command to every
-        device is exactly "write each channel to its device". If one device
-        raises, the ones already written this tick keep their new PWM while the
-        remaining ones do not -- the partial write ``control/loop.py`` already
-        documents; the loop treats the whole tick as not applied and reads the
-        real output duty back next tick either way.
+        device is exactly "write each channel to its device". Every device is
+        written even when an earlier one fails, so a fallback command (and the
+        stop write) reaches every healthy controller; the failures are raised
+        afterwards. The loop then treats the whole tick as not applied -- the
+        conservative reading of a partial write ``control/loop.py`` documents
+        -- and reads the real output duty back next tick either way.
         """
-        for device in self.devices:
-            device.apply(cmd)
+        self._each_device("apply", lambda device: device.apply(cmd))
 
 
 #: Alias: the sink half of a CompositeSource is the same object (its own

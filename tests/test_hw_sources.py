@@ -80,8 +80,41 @@ def test_read_propagates_a_vanished_device() -> None:
     composite.read()
 
     quadro.gone = True
-    with pytest.raises(DeviceUnavailable):
+    with pytest.raises(DeviceUnavailable, match="quadro"):
         composite.read()
+
+
+def test_read_with_the_first_device_gone_still_drains_the_others() -> None:
+    """Review finding: a failing first device must not leave the next device's hidraw
+    queue undrained; the observation is still lost, the error names the failed device."""
+    a, q, aquaero, quadro, clock = _fleet()
+    composite = CompositeSource([a, q], clock=clock)
+    composite.read()
+    aquaero.gone = True
+    quadro.emit(3)
+    clock.advance(1.0)
+
+    with pytest.raises(
+        DeviceUnavailable, match=r"read failed on 1 of 2 device\(s\): aquaero"
+    ) as exc:
+        composite.read()
+
+    assert quadro.pending == []  # read anyway
+    assert "quadro" not in str(exc.value)
+    assert isinstance(exc.value.__cause__, DeviceUnavailable)
+    assert q.last_status is not None
+
+
+def test_read_names_every_failed_device_and_chains_the_first() -> None:
+    a, q, aquaero, quadro, clock = _fleet()
+    composite = CompositeSource([a, q], clock=clock)
+    composite.read()
+    aquaero.gone = True
+    quadro.gone = True
+    with pytest.raises(DeviceUnavailable, match="2 of 2") as exc:
+        composite.read()
+    assert "aquaero" in str(exc.value) and "quadro" in str(exc.value)
+    assert "hidraw2" in str(exc.value.__cause__)  # the aquaero, first in the list
 
 
 def test_apply_writes_each_channel_to_its_own_device_with_one_set_each() -> None:
@@ -95,15 +128,41 @@ def test_apply_writes_each_channel_to_its_own_device_with_one_set_each() -> None
     assert control_duty(QUADRO, quadro.ctrl, 0) == 2500
 
 
-def test_apply_stops_at_the_first_failing_device_but_earlier_writes_stand() -> None:
+def test_apply_with_the_first_device_gone_still_writes_the_others() -> None:
+    """Review finding: the fallback ramp and the stop write must reach every healthy
+    controller even when an earlier one in the list has vanished."""
+    a, q, aquaero, quadro, clock = _fleet()
+    composite = CompositeSource([a, q], clock=clock)
+    aquaero.gone = True
+
+    fallback = MpcCommand(pwm={"radiator": 0.8, "exhaust": 0.8}, mode=Mode.FALLBACK)
+    with pytest.raises(
+        DeviceUnavailable, match=r"apply failed on 1 of 2 device\(s\): aquaero"
+    ) as exc:
+        composite.apply(fallback)
+
+    assert control_duty(QUADRO, quadro.ctrl, 0) == 8000  # the healthy device got it
+    assert len(quadro.sets()) == 1
+    assert isinstance(exc.value.__cause__, DeviceUnavailable)
+
+
+def test_apply_with_the_last_device_gone_keeps_the_earlier_write() -> None:
     a, q, aquaero, quadro, clock = _fleet()
     composite = CompositeSource([a, q], clock=clock)
     quadro.gone = True
 
-    with pytest.raises(DeviceUnavailable):
+    with pytest.raises(DeviceUnavailable, match="quadro"):
         composite.apply(MpcCommand(pwm={"radiator": 0.5, "exhaust": 1.0}, mode=Mode.AUTO))
 
-    assert control_duty(AQUAERO, aquaero.ctrl, 1) == 5000  # device A's write stands
+    assert control_duty(AQUAERO, aquaero.ctrl, 1) == 5000
+
+
+def test_apply_with_a_bad_command_raises_value_error_and_sends_nothing() -> None:
+    a, q, aquaero, quadro, clock = _fleet()
+    composite = CompositeSource([a, q], clock=clock)
+    with pytest.raises(ValueError, match="2 of 2"):
+        composite.apply(MpcCommand(pwm={"radiator": float("nan")}, mode=Mode.AUTO))
+    assert aquaero.ops == [] and quadro.ops == []
 
 
 # --- CompositeSource: SMART wiring (plan section 1, milestone smart-agent) --------------
