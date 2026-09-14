@@ -1,0 +1,762 @@
+"""aquaero / Quadro source and sink over hidraw (PROJECT.md section 3, Track B).
+
+:class:`AquacomputerAdapter` is one controller: ``read() -> PlantObservation``,
+``apply(MpcCommand)`` and ``release()``, the contract ``control/loop.py`` and
+:class:`~aqua_bridge.hw.sources.CompositeSource` use. The Linux hwmon driver
+is not involved: through hwmon every ``pwmN`` read cost 210 ms and every write
+420 ms, about 5 s per tick with 8 outputs (PROJECT.md section 2). Here a read
+drains the unsolicited status report (about 1 ms) and a changed command is one
+control report SET per controller.
+
+Reading
+    Every ``read()`` drains the input reports and uses the newest status
+    report: temperatures in degC (``None`` where nothing is connected), rpm,
+    and ``obs.pwm`` from the status report's *output duty* -- what the device
+    actually drives, not the cached command. No status report for longer than
+    ``status_max_age_s`` raises :class:`~aqua_bridge.hw.hidraw.DeviceUnavailable`
+    (the loop's blank-observation fallback ramps the fans up). A vanished node
+    closes the device; the next call finds it again, possibly as a new
+    ``hidrawN``, and waits up to ``status_max_age_s`` for its first report.
+
+Writing
+    The control report is read (GET) once after opening and kept as a cache;
+    a normal tick does no control read. ``apply()`` writes nothing when every
+    configured channel already holds its duty (and, on the aquaero, follows
+    its preset with limits 0 / 100 %); otherwise it patches every changed
+    channel into the cached report and sends one SET plus the secondary
+    report. Before any control operation it waits until ``ctrl_gap_ms`` has
+    passed since the previous SET. A failed operation invalidates the cache
+    and is retried from a fresh GET up to ``ctrl_retries`` times, then raises
+    ``DeviceUnavailable``.
+
+Keeping the cache honest
+    The status report shows speed, duty, voltage, current and power every
+    second, so drift of the fans themselves is visible without a control read.
+    What a one-time read misses is a configuration changed behind the daemon's
+    back (front panel, aquasuite, liquidctl, a controller reset):
+
+    a) for every channel this adapter commands, a status duty further than
+       ``duty_mismatch_tolerance`` from the command for longer than
+       ``duty_mismatch_s`` (counted from the later of the mismatch start and
+       the last SET, on reports received after that SET) invalidates the
+       cache and makes the next ``apply()`` GET and rewrite every channel;
+    b) a change of the Quadro's power-cycle count does the same;
+    c) every ``ctrl_refresh_s`` (0 disables) ``apply()`` GETs the report
+       again and rewrites any commanded channel that no longer holds its duty.
+
+Releasing
+    ``release()`` restores, for every channel this adapter has written, the
+    fields captured by the first GET after the daemon started (aquaero:
+    preset, source, minimum and maximum power; Quadro: duty) with one SET.
+    It is not called at exit (PROJECT.md section 2).
+
+This module must not import :mod:`aqua_bridge.control`.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import logging
+import math
+import re
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any, TypeVar
+
+from aqua_bridge.hw.aquacomputer import (
+    DUTY_MAX,
+    KINDS,
+    ChannelSnapshot,
+    DeviceKind,
+    ReportError,
+    StatusReport,
+    capture_channel,
+    channel_holds,
+    check_control_report,
+    decode_status,
+    finalize_control_report,
+    is_status_report,
+    patch_duties,
+    restore_channel,
+)
+from aqua_bridge.hw.hidraw import (
+    DeviceUnavailable,
+    FeatureReportError,
+    HidTransport,
+    open_device,
+)
+from aqua_bridge.model import ConfigError, MpcCommand, PlantObservation
+
+__all__ = [
+    "ENTRY_KEYS",
+    "TIMING_KEYS",
+    "AquacomputerAdapter",
+    "AquacomputerTiming",
+    "DeviceBinding",
+    "DeviceUnavailable",
+    "Opener",
+    "build_adapter_from_config",
+    "parse_device_section",
+]
+
+_LOG = logging.getLogger("aqua_bridge.hw.aquacomputer")
+
+#: ``(kind, serial) -> open transport``; the default discovers and opens hidraw.
+Opener = Callable[[DeviceKind, str | None], HidTransport]
+
+_T = TypeVar("_T")
+
+
+# ---------------------------------------------------------------------------
+# Configuration model
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AquacomputerTiming:
+    """Operator-tunable timing of one device; each default is the documented one
+    (config.example.yaml, config.example-das.yaml, PROJECT.md section 3)."""
+
+    #: A status report older than this is no observation, seconds (> 0).
+    status_max_age_s: float = 3.0
+    #: Wait after a control report SET before the next control operation, ms (>= 0).
+    ctrl_gap_ms: float = 200.0
+    #: Retries of a failed control operation, each from a fresh GET (int >= 0).
+    ctrl_retries: int = 1
+    #: Read the control report again this often, seconds (>= 0; 0 disables).
+    ctrl_refresh_s: float = 60.0
+    #: Status duty further than this from the command is a mismatch, centi-percent.
+    duty_mismatch_tolerance: int = 100
+    #: A mismatch lasting longer than this rewrites the channels, seconds (> 0).
+    duty_mismatch_s: float = 5.0
+
+    def __post_init__(self) -> None:
+        _number("status_max_age_s", self.status_max_age_s, positive=True)
+        _number("ctrl_gap_ms", self.ctrl_gap_ms, positive=False)
+        _integer("ctrl_retries", self.ctrl_retries, 0, None)
+        _number("ctrl_refresh_s", self.ctrl_refresh_s, positive=False)
+        _integer("duty_mismatch_tolerance", self.duty_mismatch_tolerance, 0, DUTY_MAX)
+        _number("duty_mismatch_s", self.duty_mismatch_s, positive=True)
+
+    @classmethod
+    def from_section(cls, section: Mapping[str, Any], label: str) -> AquacomputerTiming:
+        values = {f.name: section[f.name] for f in dataclasses.fields(cls) if f.name in section}
+        try:
+            return cls(**values)
+        except ConfigError as exc:
+            raise ConfigError(f"{label}.{exc}") from exc
+
+
+TIMING_KEYS: tuple[str, ...] = tuple(f.name for f in dataclasses.fields(AquacomputerTiming))
+
+
+def _number(name: str, value: Any, *, positive: bool) -> None:
+    ok = isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+    if ok and (value > 0 if positive else value >= 0):
+        return
+    bound = "> 0" if positive else ">= 0"
+    raise ConfigError(f"{name} must be a finite number {bound}, got {value!r}")
+
+
+def _integer(name: str, value: Any, minimum: int, maximum: int | None) -> None:
+    ok = isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+    if ok and (maximum is None or value <= maximum):
+        return
+    bound = f">= {minimum}" if maximum is None else f"in {minimum}..{maximum}"
+    raise ConfigError(f"{name} must be an integer {bound}, got {value!r}")
+
+
+@dataclass(frozen=True)
+class DeviceBinding:
+    """Which device, and where the logical names live on it.
+
+    ``pwm_map`` is channel -> output number (``pwmN``), ``fan_map`` channel ->
+    ``fanN`` (keys must be ``pwm_map`` channels), ``temp_map`` logical
+    temperature -> ``tempN``. Numbers are 1-based as in the config.
+    """
+
+    kind: DeviceKind
+    pwm_map: Mapping[str, int]
+    fan_map: Mapping[str, int] = field(default_factory=dict)
+    temp_map: Mapping[str, int] = field(default_factory=dict)
+    serial: str | None = None
+    timing: AquacomputerTiming = field(default_factory=AquacomputerTiming)
+
+    def __post_init__(self) -> None:
+        kind = self.kind
+        for what, mapping, count in (
+            ("pwm", self.pwm_map, kind.pwm_count),
+            ("fan", self.fan_map, kind.fan_input_count),
+            ("temp", self.temp_map, kind.temp_count),
+        ):
+            for name, number in mapping.items():
+                if isinstance(number, bool) or not isinstance(number, int):
+                    raise ValueError(f"{what} number for {name!r} must be an int, got {number!r}")
+                if not 1 <= number <= count:
+                    raise ValueError(
+                        f"{name!r}: {kind.name} has {what}1..{what}{count}, not {what}{number}"
+                    )
+            if len(set(mapping.values())) != len(mapping):
+                raise ValueError(f"two names share one {kind.name} {what} input: {dict(mapping)}")
+        stray = sorted(set(self.fan_map) - set(self.pwm_map))
+        if stray:
+            raise ValueError(f"fan_map keys {stray} are not pwm_map channels")
+
+    @property
+    def label(self) -> str:
+        return self.kind.name if self.serial is None else f"{self.kind.name} {self.serial}"
+
+
+# ---------------------------------------------------------------------------
+# Adapter
+# ---------------------------------------------------------------------------
+
+
+def _default_opener(kind: DeviceKind, serial: str | None) -> HidTransport:
+    return open_device(kind, serial)
+
+
+class AquacomputerAdapter:
+    """One aquaero or Quadro over hidraw (module docstring).
+
+    ``clock`` (monotonic seconds) stamps observations and drives every timer;
+    ``sleep`` waits out ``ctrl_gap_ms``; ``opener`` finds and opens the device.
+    Nothing is opened at construction: the first ``read()`` / ``apply()`` does.
+    """
+
+    def __init__(
+        self,
+        binding: DeviceBinding,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        opener: Opener | None = None,
+    ) -> None:
+        self.binding = binding
+        self.kind = binding.kind
+        self.timing = binding.timing
+        self._clock = clock
+        self._sleep = sleep
+        self._opener: Opener = opener if opener is not None else _default_opener
+        self._index = {ch: number - 1 for ch, number in binding.pwm_map.items()}
+        self._names = {k: ch for ch, k in self._index.items()}
+
+        self._transport: HidTransport | None = None
+        self._status: StatusReport | None = None
+        self._status_t: float | None = None
+        self._power_cycles: int | None = None
+
+        #: Cached control report; ``None`` means invalid (GET before the next write).
+        self._ctrl: bytes | None = None
+        self._ctrl_t: float | None = None
+        #: The next write sends every configured channel, held or not.
+        self._rewrite = False
+        self._last_set_t: float | None = None
+        #: Channel index -> duty this adapter commands (verified against status).
+        self._commanded: dict[int, int] = {}
+        self._mismatch_since: dict[int, float] = {}
+        #: Fields captured by the first GET, restored by release().
+        self._originals: dict[int, ChannelSnapshot] | None = None
+        self._written: set[int] = set()
+
+    # -- diagnostics -------------------------------------------------------
+
+    @property
+    def last_status(self) -> StatusReport | None:
+        """The newest decoded status report (kept after the device goes away)."""
+        return self._status
+
+    @property
+    def control_report(self) -> bytes | None:
+        """The cached control report, ``None`` while invalid."""
+        return self._ctrl
+
+    @property
+    def is_open(self) -> bool:
+        return self._transport is not None
+
+    def close(self) -> None:
+        """Closes the device node (the next call opens it again)."""
+        if self._transport is not None:
+            transport, self._transport = self._transport, None
+            transport.close()
+        self._status_t = None
+        self._ctrl = None
+
+    # -- open / status -----------------------------------------------------
+
+    def _newest_status(self, reports: Sequence[bytes]) -> StatusReport | None:
+        newest = None
+        for report in reports:
+            if is_status_report(self.kind, report):
+                newest = report
+        return None if newest is None else decode_status(self.kind, newest)
+
+    def _ensure_open(self) -> HidTransport:
+        if self._transport is not None:
+            return self._transport
+        label = self.binding.label
+        max_age = self.timing.status_max_age_s
+        transport = self._opener(self.kind, self.binding.serial)
+        try:
+            deadline = self._clock() + max_age
+            while True:
+                status = self._newest_status(transport.read_reports())
+                if status is not None:
+                    break
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise DeviceUnavailable(
+                        f"{label}: {transport.info.node} sent no status report within "
+                        f"status_max_age_s = {max_age:g} s of opening"
+                    )
+                transport.wait_readable(remaining)
+        except BaseException:
+            transport.close()
+            raise
+        self._transport = transport
+        self._status, self._status_t = status, self._clock()
+        self._power_cycles = status.power_cycles
+        self._ctrl = None
+        self._mismatch_since.clear()
+        _LOG.info(
+            "%s: opened %s (serial %s, firmware %d)",
+            label,
+            transport.info.node,
+            status.serial,
+            status.firmware,
+        )
+        return transport
+
+    def _drain(self, transport: HidTransport) -> bool:
+        """Takes queued reports; True when a new status report arrived."""
+        try:
+            status = self._newest_status(transport.read_reports())
+        except DeviceUnavailable:
+            self.close()
+            raise
+        if status is None:
+            return False
+        self._status, self._status_t = status, self._clock()
+        return True
+
+    # -- read --------------------------------------------------------------
+
+    def read(self) -> PlantObservation:
+        """One observation from the newest status report (module docstring)."""
+        transport = self._ensure_open()
+        fresh = self._drain(transport)
+        now = self._clock()
+        status = self._status
+        assert status is not None and self._status_t is not None
+        age = now - self._status_t
+        if age > self.timing.status_max_age_s:
+            raise DeviceUnavailable(
+                f"{self.binding.label}: no status report from {transport.info.node} for "
+                f"{age:.1f} s (status_max_age_s = {self.timing.status_max_age_s:g})"
+            )
+        if fresh:
+            self._check_power_cycles(status)
+        self._verify_duties(status, now)
+        b = self.binding
+        return PlantObservation(
+            temps={name: status.temp(n) for name, n in b.temp_map.items()},
+            rpm={ch: float(status.fan_input(n)) for ch, n in b.fan_map.items()},
+            pwm={ch: status.duty(n) / DUTY_MAX for ch, n in b.pwm_map.items()},
+            ts=now,
+        )
+
+    def _invalidate(self, *, rewrite: bool) -> None:
+        self._ctrl = None
+        if rewrite:
+            self._rewrite = True
+
+    def _check_power_cycles(self, status: StatusReport) -> None:
+        count = status.power_cycles
+        if count is None:
+            return
+        if self._power_cycles is not None and count != self._power_cycles:
+            _LOG.warning(
+                "%s: power-cycle count changed from %d to %d; reading the control report "
+                "again and rewriting every channel",
+                self.binding.label,
+                self._power_cycles,
+                count,
+            )
+            self._invalidate(rewrite=True)
+        self._power_cycles = count
+
+    def _verify_duties(self, status: StatusReport, now: float) -> None:
+        if self._ctrl is None or not self._commanded:
+            return
+        last_set = self._last_set_t
+        assert self._status_t is not None
+        if last_set is not None and self._status_t <= last_set:
+            return  # no report since the last SET: no evidence either way
+        tolerance = self.timing.duty_mismatch_tolerance
+        for k, duty in sorted(self._commanded.items()):
+            reported = status.fans[k].duty
+            if abs(reported - duty) <= tolerance:
+                self._mismatch_since.pop(k, None)
+                continue
+            start = self._mismatch_since.setdefault(k, now)
+            since = start if last_set is None else max(start, last_set)
+            if now - since > self.timing.duty_mismatch_s:
+                _LOG.warning(
+                    "%s: pwm%d (%s) is commanded to %.2f %% but the device has reported "
+                    "%.2f %% for %.1f s; reading the control report again and rewriting "
+                    "every channel",
+                    self.binding.label,
+                    k + 1,
+                    self._names.get(k, "?"),
+                    duty / 100.0,
+                    reported / 100.0,
+                    now - since,
+                )
+                self._mismatch_since.clear()
+                self._invalidate(rewrite=True)
+                return
+
+    # -- control report ----------------------------------------------------
+
+    def _wait_gap(self) -> None:
+        if self._last_set_t is None:
+            return
+        remaining = self.timing.ctrl_gap_ms / 1000.0 - (self._clock() - self._last_set_t)
+        if remaining > 0:
+            self._sleep(remaining)
+
+    def _get(self, transport: HidTransport) -> bytes:
+        self._ctrl = None
+        self._wait_gap()
+        data = transport.get_feature(self.kind.ctrl_report_id, self.kind.ctrl_size)
+        check_control_report(self.kind, data)
+        self._ctrl, self._ctrl_t = bytes(data), self._clock()
+        if self._originals is None:
+            self._originals = {k: capture_channel(self.kind, data, k) for k in self._names}
+        return self._ctrl
+
+    def _set(self, transport: HidTransport, report: bytes) -> None:
+        self._wait_gap()
+        try:
+            transport.set_feature(report)
+            transport.set_feature(self.kind.secondary_report)
+        finally:
+            self._last_set_t = self._clock()
+
+    def _with_retries(self, what: str, operation: Callable[[HidTransport], _T]) -> _T:
+        transport = self._ensure_open()
+        attempts = self.timing.ctrl_retries + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return operation(transport)
+            except (FeatureReportError, ReportError) as exc:
+                self._invalidate(rewrite=False)
+                _LOG.warning(
+                    "%s: %s failed (attempt %d of %d): %s",
+                    self.binding.label,
+                    what,
+                    attempt,
+                    attempts,
+                    exc,
+                )
+                if attempt == attempts:
+                    raise DeviceUnavailable(
+                        f"{self.binding.label}: {what} failed {attempts} time(s): {exc}"
+                    ) from exc
+            except DeviceUnavailable:
+                self.close()
+                raise
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _refresh_due(self) -> bool:
+        period = self.timing.ctrl_refresh_s
+        return (
+            period > 0
+            and self._ctrl is not None
+            and self._ctrl_t is not None
+            and self._clock() - self._ctrl_t >= period
+        )
+
+    # -- apply -------------------------------------------------------------
+
+    def _duties(self, cmd: MpcCommand) -> dict[int, int]:
+        duties: dict[int, int] = {}
+        for channel, k in self._index.items():
+            if channel not in cmd.pwm:
+                raise ValueError(f"apply: command has no pwm value for channel {channel!r}")
+            value = cmd.pwm[channel]
+            if not isinstance(value, int | float) or isinstance(value, bool):
+                raise ValueError(f"apply: pwm[{channel!r}] must be a number, got {value!r}")
+            if not math.isfinite(value):
+                raise ValueError(f"apply: pwm[{channel!r}] is not finite: {value!r}")
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"apply: pwm[{channel!r}] out of range [0, 1]: {value!r}")
+            duties[k] = round(value * DUTY_MAX)
+        return duties
+
+    def apply(self, cmd: MpcCommand) -> None:
+        """Commands ``cmd.pwm`` for every configured channel (module docstring).
+
+        Every configured channel needs a finite value in ``[0, 1]`` or
+        :class:`ValueError` is raised before anything is sent (no silent
+        clamping). Channels of other devices in ``cmd.pwm`` are ignored.
+        """
+        duties = self._duties(cmd)
+        self._with_retries("control report write", lambda t: self._apply_once(t, duties))
+
+    def _apply_once(self, transport: HidTransport, duties: dict[int, int]) -> None:
+        if self._refresh_due():
+            self._refresh(transport)
+        ctrl = self._ctrl if self._ctrl is not None else self._get(transport)
+        if self._rewrite:
+            changed = sorted(duties)
+        else:
+            changed = [
+                k for k in sorted(duties) if not channel_holds(self.kind, ctrl, k, duties[k])
+            ]
+        if changed:
+            buf = bytearray(ctrl)
+            patch_duties(self.kind, buf, {k: duties[k] for k in changed})
+            finalize_control_report(self.kind, buf)
+            # Until SET and secondary report both succeed, a retry rewrites everything.
+            self._rewrite = True
+            self._set(transport, bytes(buf))
+            self._ctrl = bytes(buf)
+            self._rewrite = False
+            self._written.update(changed)
+            for k in changed:
+                self._mismatch_since.pop(k, None)
+        self._commanded = dict(duties)
+
+    def _refresh(self, transport: HidTransport) -> None:
+        self._get(transport)
+        assert self._ctrl is not None
+        drifted = [
+            k
+            for k, duty in sorted(self._commanded.items())
+            if not channel_holds(self.kind, self._ctrl, k, duty)
+        ]
+        if drifted:
+            _LOG.warning(
+                "%s: periodic control report read: %s no longer hold the commanded duty; rewriting",
+                self.binding.label,
+                ", ".join(f"pwm{k + 1} ({self._names.get(k, '?')})" for k in drifted),
+            )
+
+    # -- release -----------------------------------------------------------
+
+    def release(self) -> None:
+        """Restores the captured control fields of every channel this adapter
+        wrote, with one SET (module docstring). No-op when nothing was written."""
+        if not self._written or not self._originals:
+            return
+        restore = {k: self._originals[k] for k in sorted(self._written) if k in self._originals}
+        self._with_retries("control report restore", lambda t: self._release_once(t, restore))
+
+    def _release_once(self, transport: HidTransport, restore: dict[int, ChannelSnapshot]) -> None:
+        buf = bytearray(self._get(transport))
+        for snapshot in restore.values():
+            restore_channel(buf, snapshot)
+        finalize_control_report(self.kind, buf)
+        self._set(transport, bytes(buf))
+        self._ctrl = bytes(buf)
+        self._written.clear()
+        self._commanded.clear()
+        self._mismatch_since.clear()
+        self._rewrite = False
+        _LOG.info(
+            "%s: restored the captured control settings of %s",
+            self.binding.label,
+            ", ".join(f"pwm{k + 1}" for k in restore),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+#: Keys of one device entry (``aquacomputer:`` list entry or ``xt6:``).
+ENTRY_KEYS: tuple[str, ...] = ("device", "serial", "fans", "temp_map", *TIMING_KEYS)
+_FAN_ENTRY_KEYS = ("pwm", "rpm")
+_FANS_EXAMPLE = "radiator: {pwm: pwm1, rpm: fan1}"
+_SERIAL_HINT = "'serial:' when several of one kind are attached"
+#: Keys of the hwmon era and what replaced them.
+_REMOVED_KEYS = {
+    "hwmon_name": (
+        "is no longer supported: the daemon talks to the controllers over hidraw, not the "
+        "hwmon driver; use 'device: aquaero' (or quadro), plus " + _SERIAL_HINT
+    ),
+    "root": (
+        "is no longer supported: devices are discovered under /sys/class/hidraw by USB id; "
+        "remove it and use " + _SERIAL_HINT
+    ),
+    "name": "was renamed to 'device' (aquaero or quadro)",
+}
+_LEGACY_MAP_KEYS = {"map": "fans.<channel>.pwm", "fan_map": "fans.<channel>.rpm"}
+_ROLE_PATTERN = {role: re.compile(rf"{role}([1-9][0-9]*)") for role in ("pwm", "fan", "temp")}
+
+
+def _input_number(where: str, role: str, value: Any, kind: DeviceKind) -> int:
+    count = {"pwm": kind.pwm_count, "fan": kind.fan_input_count, "temp": kind.temp_count}[role]
+    match = _ROLE_PATTERN[role].fullmatch(value) if isinstance(value, str) else None
+    if match is None or not 1 <= int(match.group(1)) <= count:
+        raise ConfigError(
+            f"{where} must be one of the {kind.name}'s inputs {role}1..{role}{count}, got {value!r}"
+        )
+    return int(match.group(1))
+
+
+def _claim_input(seen: dict[int, str], number: int, owner: str, where: str, role: str) -> None:
+    if number in seen:
+        raise ConfigError(
+            f"{where}: {seen[number]} and {owner} name the same input '{role}{number}'"
+        )
+    seen[number] = owner
+
+
+def _parse_fans(
+    section: Mapping[str, Any], label: str, kind: DeviceKind
+) -> tuple[dict[str, int], dict[str, int]]:
+    fans = section.get("fans")
+    if fans is None:
+        raise ConfigError(
+            f"{label}.fans is required: one entry per fan channel, e.g. '{_FANS_EXAMPLE}'"
+        )
+    if not isinstance(fans, Mapping):
+        raise ConfigError(f"{label}.fans must be a mapping, got {type(fans).__name__}")
+    pwm_map: dict[str, int] = {}
+    fan_map: dict[str, int] = {}
+    pwm_seen: dict[int, str] = {}
+    fan_seen: dict[int, str] = {}
+    for channel, entry in fans.items():
+        if not isinstance(channel, str) or not channel:
+            raise ConfigError(f"{label}.fans keys must be non-empty channel names, got {channel!r}")
+        where = f"{label}.fans.{channel}"
+        if not isinstance(entry, Mapping):
+            raise ConfigError(
+                f"{where} must be a mapping like {{pwm: pwm1, rpm: fan1}}, "
+                f"got {type(entry).__name__} {entry!r}"
+            )
+        unknown = sorted(str(k) for k in entry if k not in _FAN_ENTRY_KEYS)
+        if unknown:
+            raise ConfigError(
+                f"{where}: unknown key(s) {unknown}; allowed: {list(_FAN_ENTRY_KEYS)}"
+            )
+        if "pwm" not in entry:
+            raise ConfigError(f"{where}.pwm is required (the output, e.g. 'pwm1')")
+        pwm_map[channel] = _input_number(f"{where}.pwm", "pwm", entry["pwm"], kind)
+        _claim_input(pwm_seen, pwm_map[channel], channel, f"{label}.fans", "pwm")
+        if entry.get("rpm") is not None:
+            fan_map[channel] = _input_number(f"{where}.rpm", "fan", entry["rpm"], kind)
+            _claim_input(fan_seen, fan_map[channel], channel, f"{label}.fans", "fan")
+    return pwm_map, fan_map
+
+
+def _check_keys(label: str, mapping: Mapping[str, Any], expected: Sequence[str], what: str) -> None:
+    missing = sorted(set(expected) - set(mapping))
+    extra = sorted(set(mapping) - set(expected))
+    if missing or extra:
+        raise ConfigError(
+            f"{label} keys must equal {what} {sorted(expected)}: missing {missing}, extra {extra}"
+        )
+
+
+def parse_device_section(
+    section: Mapping[str, Any],
+    *,
+    label: str,
+    channels: Sequence[str] | None = None,
+    temps: Sequence[str] | None = None,
+    ignored_keys: Sequence[str] = (),
+) -> DeviceBinding:
+    """One device entry -> :class:`DeviceBinding`; :class:`ConfigError` naming ``label``.
+
+    Entry shape (``xt6:`` or one ``aquacomputer:`` list entry)::
+
+        device: aquaero               # required: aquaero | quadro
+        serial: "12345-67890"         # optional; required when several of one kind are attached
+        fans:                         # one entry per fan channel
+          radiator: {pwm: pwm1, rpm: fan1}
+          intake:   {pwm: pwm2}       # rpm optional
+        temp_map: {coolant: temp1}    # logical temperature -> tempN
+        ctrl_gap_ms: 200              # optional timing keys, see AquacomputerTiming
+
+    Channel numbers are checked against the device kind. ``hwmon_name``,
+    ``root`` and ``name`` (the hwmon era) and ``map`` / ``fan_map`` are
+    rejected with a hint; any other unknown key is rejected too, so a
+    misspelt timing key cannot silently fall back to its default.
+    ``ignored_keys`` are accepted and ignored (``xt6.prefer``).
+
+    ``channels`` / ``temps`` (the ``mpc`` tuples, as plain sequences) make
+    the ``fans`` keys equal ``channels`` and the ``temp_map`` keys equal
+    ``temps``: a channel missing from ``fans`` would silently never be
+    written, and a temperature missing from or extra in ``temp_map`` would
+    keep the gate in permanent fallback with no visible error.
+    """
+    if not isinstance(section, Mapping):
+        raise ConfigError(f"{label} must be a mapping, got {type(section).__name__}")
+    for key, hint in _REMOVED_KEYS.items():
+        if key in section:
+            raise ConfigError(f"{label}.{key} {hint}")
+    for key, replacement in _LEGACY_MAP_KEYS.items():
+        if key in section:
+            raise ConfigError(
+                f"{label}.{key} is no longer supported; use {label}.{replacement}, one entry "
+                f"per fan: 'fans: {{{_FANS_EXAMPLE}}}'"
+            )
+    unknown = sorted(str(k) for k in section if k not in ENTRY_KEYS and k not in ignored_keys)
+    if unknown:
+        raise ConfigError(f"{label}: unknown key(s) {unknown}; allowed: {list(ENTRY_KEYS)}")
+    device = section.get("device")
+    if device is None:
+        raise ConfigError(f"{label}.device is required: one of {sorted(KINDS)}")
+    if not isinstance(device, str) or device not in KINDS:
+        raise ConfigError(f"{label}.device must be one of {sorted(KINDS)}, got {device!r}")
+    kind = KINDS[device]
+    serial = section.get("serial")
+    if serial is not None and (not isinstance(serial, str) or not serial.strip()):
+        raise ConfigError(
+            f'{label}.serial must be a non-empty string such as "12345-67890", got {serial!r}'
+        )
+    pwm_map, fan_map = _parse_fans(section, label, kind)
+    temp_section = section.get("temp_map")
+    if temp_section is not None and not isinstance(temp_section, Mapping):
+        raise ConfigError(f"{label}.temp_map must be a mapping, got {type(temp_section).__name__}")
+    temp_map: dict[str, int] = {}
+    temp_seen: dict[int, str] = {}
+    for name, value in dict(temp_section or {}).items():
+        temp_map[name] = _input_number(f"{label}.temp_map.{name}", "temp", value, kind)
+        _claim_input(temp_seen, temp_map[name], name, f"{label}.temp_map", "temp")
+    if channels is not None:
+        _check_keys(f"{label}.fans", pwm_map, channels, "mpc.channels")
+    if temps is not None:
+        _check_keys(f"{label}.temp_map", temp_map, temps, "mpc.temps")
+    timing = AquacomputerTiming.from_section(section, label)
+    return DeviceBinding(
+        kind=kind,
+        pwm_map=pwm_map,
+        fan_map=fan_map,
+        temp_map=temp_map,
+        serial=None if serial is None else serial.strip(),
+        timing=timing,
+    )
+
+
+def build_adapter_from_config(
+    section: Mapping[str, Any],
+    *,
+    label: str = "xt6",
+    channels: Sequence[str] | None = None,
+    temps: Sequence[str] | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    opener: Opener | None = None,
+) -> AquacomputerAdapter:
+    """``--source xt6``: the single-device ``xt6:`` section (``prefer`` ignored).
+    Opens nothing; the first ``read()`` / ``apply()`` does."""
+    binding = parse_device_section(
+        section, label=label, channels=channels, temps=temps, ignored_keys=("prefer",)
+    )
+    return AquacomputerAdapter(binding, clock=clock, sleep=sleep, opener=opener)
