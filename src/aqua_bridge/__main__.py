@@ -76,7 +76,7 @@ from aqua_bridge.publishers.httpauth import HttpSettings, HttpSetupError
 from aqua_bridge.publishers.inputs import SmartInbox, smart_topic_filter
 from aqua_bridge.publishers.mqtt_ha import MqttSetupError, validate_mqtt_section
 from aqua_bridge.recorder import DEFAULT_BACKUP_COUNT, DEFAULT_MAX_BYTES, Recorder, chain_on_tick
-from aqua_bridge.sdnotify import SdNotifier
+from aqua_bridge.sdnotify import SdNotifier, watchdog_seconds
 
 __all__ = [
     "PlantIO",
@@ -236,6 +236,7 @@ def build_io(
     clock: Callable[[], float] = time.monotonic,
     sim_plant: str = "basic",
     smart: Any = None,
+    watchdog_s: float | None = None,
 ) -> tuple[Source, Sink, Callable[[], None] | None]:
     """``(source, sink, release)`` for ``--source``; ``release`` runs at exit if not None.
 
@@ -246,6 +247,10 @@ def build_io(
     concept and silently ignore it (SMART data with no drive-adjacent DAS
     hardware to correlate it against is a later milestone's problem, not a
     reason to error here).
+
+    ``watchdog_s`` is the systemd watchdog period (``watchdog_seconds()``;
+    ``None`` without one): the hardware sources refuse a configuration whose
+    worst-case blocking per tick is not below it (``ConfigError``, exit 2).
     """
     if source == "sim":
         if sim_plant == "basic":
@@ -267,7 +272,11 @@ def build_io(
         # here, before the loop starts (ConfigError, exit code 2). Opens nothing:
         # the first read() finds the device.
         adapter = aquacomputer_adapter.build_adapter_from_config(
-            app.section("xt6"), channels=app.mpc.channels, temps=app.mpc.temps, clock=clock
+            app.section("xt6"),
+            channels=app.mpc.channels,
+            temps=app.mpc.temps,
+            clock=clock,
+            watchdog_s=watchdog_s,
         )
         return adapter, adapter, None
     if source == "composite":
@@ -284,6 +293,7 @@ def build_io(
             dt=app.mpc.dt,
             smart=smart,
             clock=clock,
+            watchdog_s=watchdog_s,
         )
         return composite, composite, release
     raise RuntimeError(f"unknown source {source!r}")
@@ -416,7 +426,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         source, sink, release = build_io(
-            app, args.source, sim_plant=args.sim_plant or "basic", smart=smart_inbox
+            app,
+            args.source,
+            sim_plant=args.sim_plant or "basic",
+            smart=smart_inbox,
+            watchdog_s=watchdog_seconds(),
         )
     except ConfigError as exc:
         _LOG.error("config: %s", exc)

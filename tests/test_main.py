@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from aqua_bridge import __main__ as main_mod
-from aqua_bridge.config import load_config
+from aqua_bridge.config import ConfigError, load_config
 from aqua_bridge.model import Mode, MpcCommand
 
 REPO = Path(__file__).resolve().parent.parent
@@ -309,6 +309,30 @@ def test_source_hwmon_is_no_longer_a_choice(example_config_path, capsys):
     assert "'composite'" in capsys.readouterr().err
     with pytest.raises(RuntimeError):
         main_mod.build_io(load_config(example_config_path), "hwmon")
+
+
+def test_build_io_checks_the_hardware_worst_case_against_the_watchdog(example_config_path):
+    """Review finding: a tick blocked by usbhid timeouts must not outlast WatchdogSec,
+    or systemd kills the daemon without its fallback write."""
+    from aqua_bridge.hw.aquacomputer_adapter import AquacomputerTiming
+
+    app = load_config(example_config_path)
+    worst = AquacomputerTiming.for_kind(app.xt6["device"]).worst_case_tick_s()
+    for source in ("xt6", "composite"):
+        with pytest.raises(ConfigError, match="systemd watchdog"):
+            main_mod.build_io(app, source, watchdog_s=worst)
+        main_mod.build_io(app, source, watchdog_s=worst + 1.0)
+    main_mod.build_io(app, "sim", watchdog_s=0.001)  # no hardware: nothing to check
+
+
+def test_main_reads_the_watchdog_from_the_environment(
+    tmp_path, example_config_path, restore_signals, monkeypatch, caplog
+):
+    monkeypatch.setenv("WATCHDOG_USEC", "1000000")  # 1 s: far below the worst case
+    monkeypatch.delenv("WATCHDOG_PID", raising=False)
+    with caplog.at_level("ERROR"):
+        assert main_mod.main(["--config", str(example_config_path), "--source", "xt6"]) == 2
+    assert "systemd watchdog" in caplog.text
 
 
 def test_composite_source_missing_binding_exits_2(tmp_path, example_config_path, restore_signals):
