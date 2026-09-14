@@ -3685,8 +3685,12 @@ The ruff pin in `pyproject.toml` `[dev]` and in the workflow move
 together. `shellcheck` is present on the runners, so `tests/test_deploy.py`
 runs it. First runs took about 8 s for `lint`, 4–6 min for
 `test (latest)` and 3–5 min for `test (pi-parity)`; with the DAS suites
-the PR jobs take about 7–10.5 min (`test (latest)`, runner speed varies)
-and 5–9 min (`test (pi-parity)`), close to the 11-minute guideline. A nightly failure prints a `@reproduce_failure`
+the PR jobs reached 7–11+ min (`test (latest)`, runner speed varies) and
+5–10 min (`test (pi-parity)`), at or past the 11-minute guideline (§8 item
+26). Sharded (4 shards, `os.cpu_count()` on the GitHub-hosted runner): a
+same-day before/after comparison measured `test (latest)` at 11m 13s
+before and 6m 11s after (-45%), `test (pi-parity)` at 10m 3s before and
+3m 42s after (-63%). A nightly failure prints a `@reproduce_failure`
 blob in the log.
 
 ---
