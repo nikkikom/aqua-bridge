@@ -54,6 +54,12 @@ DAS mode also publishes the binary sensor ``ident_running``
 (``value_json.extra.experiment.running``, :mod:`aqua_bridge.control.ident`): on while
 an identification experiment commands fans.
 
+DAS mode also publishes one sensor ``zone_status_<zone>`` per zone (plan section 8,
+``GET /api/zones``): state from ``value_json.cmd.diagnostics.zones.<zone>.policy``
+(``solver`` while the zone is trusted and fault-free, ``hold`` / ``ramp_high`` while
+its own fault holds or ramps its channels, ``coupled`` while it only carries another
+faulted zone's channels), ``off`` before the first DAS tick.
+
 Discovery config topics follow the standard
 ``{discovery_prefix}/{component}/{node_id}/{object_id}/config``.
 
@@ -395,6 +401,20 @@ def build_discovery_entities(
         }
         topic = f"{discovery_prefix}/binary_sensor/{node_id}/{object_id}/config"
         entities.append(MqttEntity("binary_sensor", object_id, topic, payload))
+
+        for zone in cfg.topology.zones:
+            entities.append(
+                _sensor(
+                    discovery_prefix=discovery_prefix,
+                    node_id=node_id,
+                    object_id=f"zone_status_{zone}",
+                    name=f"{zone} zone status",
+                    value_template=(
+                        f"{{{{ value_json.cmd.diagnostics.zones.{zone}.policy | default('off') }}}}"
+                    ),
+                    state_class=None,
+                )
+            )
 
     bays = {} if cfg.topology is None else cfg.topology.bays
     for bay in bays:  # empty in legacy mode

@@ -431,6 +431,7 @@ _GET_ROUTES = (
     "/api/health",
     "/api/estimate",
     "/api/bays",
+    "/api/zones",
     "/api/model",
     "/index.html",
     "/static/index.html",

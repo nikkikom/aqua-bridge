@@ -16,7 +16,7 @@ mqtt:
   node_id: aqua-bridge
 
 host:
-  interval_s: 5
+  interval_s: 5          # refresh, s (MQTT host sensors, /api/state's "host" key)
 
 mpc:
   solver: pi             # "pi" (first cut) or "mpc" (small linear MPC, numpy)

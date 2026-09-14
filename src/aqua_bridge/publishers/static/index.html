@@ -26,6 +26,9 @@
 <section id="overview"><h2>Overview</h2><table></table></section>
 <section id="temps"><h2>Temps</h2><table></table></section>
 <section id="fans"><h2>Fans</h2><table></table></section>
+<section id="drives" hidden><h2>Drives</h2><table></table></section>
+<section id="zones" hidden><h2>Zones</h2><table></table></section>
+<section id="model" hidden><h2>Model</h2><table></table></section>
 <section id="mpc"><h2>MPC</h2><table></table></section>
 <section id="host"><h2>Host</h2><table></table></section>
 
@@ -41,6 +44,57 @@ function fmt(v, digits) {
 function table(id, rows) {
   document.querySelector("#" + id + " table").innerHTML = rows.join("");
 }
+async function getJson(path) {
+  const res = await fetch(path);
+  return res.ok ? res.json() : null;
+}
+
+// Drives: /api/estimate (live temperature, margin, sigma) joined with
+// /api/bays (the declared occupancy and class) -- the two existing DAS views.
+function renderDrives(est, bayView) {
+  const estimates = (est || {}).estimates || {};
+  const declared = (bayView || {}).bays || {};
+  const rows = Object.keys(declared).sort().map(function (bay) {
+    const d = declared[bay].declared || {};
+    const e = estimates[bay];
+    const label = bay + " (" + fmt(d.class) + ", " + fmt(d.occupied) + ")";
+    const value = e
+      ? fmt(e.t_c) + " C, margin " + fmt(e.limit_margin_c) + " C, sigma " + fmt(e.sigma_c)
+      : "-";
+    return row(label, value);
+  });
+  table("drives", rows);
+}
+
+// Zones: /api/zones -- per-zone trust, fault state and which channels are
+// currently held or ramped under that zone's (or a coupled zone's) fault.
+function renderZones(zoneView) {
+  const zones = (zoneView || {}).zones || {};
+  const rows = Object.keys(zones).sort().map(function (zone) {
+    const zi = zones[zone];
+    const flags = (zi.fault ? " FAULT" : "") + (!zi.fault && zi.in_closure ? " coupled" : "");
+    const fallback = zi.channels_under_fallback || [];
+    const value = fmt(zi.policy) + (fallback.length ? " [" + fallback.join(", ") + "]" : "");
+    return row(zone + flags, value);
+  });
+  table("zones", rows);
+}
+
+// Model: /api/model (thermal identification, model store) plus the noise index
+// already carried in /api/state's cmd.diagnostics.
+function renderModel(model, diag) {
+  const thermal = (model || {}).thermal || {};
+  const store = (model || {}).store || {};
+  const experiment = (model || {}).experiment || {};
+  const noise = (diag || {}).noise || {};
+  table("model", [
+    row("Thermal model", fmt(thermal.status)),
+    row("Prediction error", fmt(thermal.pred_err_c) + " C"),
+    row("Model store", fmt(store.source)),
+    row("Noise index", fmt(noise.db_index) + " dB"),
+    row("Experiment running", fmt(experiment.running)),
+  ]);
+}
 
 async function poll() {
   try {
@@ -54,11 +108,12 @@ async function poll() {
 
     const obs = state.obs || {};
     const cmd = state.cmd || {};
+    const diag = cmd.diagnostics || {};
 
     // Some zones in fault: their fans (and coupled zones' fans) are on fallback policy.
     const degraded = document.getElementById("degraded");
     if (health.solver === "degraded") {
-      const zones = (cmd.diagnostics || {}).zones_in_fault || [];
+      const zones = diag.zones_in_fault || [];
       degraded.textContent = "DEGRADED: zone" + (zones.length === 1 ? " " : "s ") +
         (zones.length ? zones.join(", ") : "?") + " in fault";
       degraded.className = "show";
@@ -87,12 +142,28 @@ async function poll() {
     }
     table("fans", fanRows);
 
+    // DAS mode only: /api/state carries "bays" (the declarations in force)
+    // exactly when the config has a topology (section 6); legacy configs
+    // never have that key, so it doubles as the mode switch here.
+    const isDas = "bays" in state;
+    for (const id of ["drives", "zones", "model"]) {
+      document.getElementById(id).hidden = !isDas;
+    }
+    if (isDas) {
+      const [est, bayView, zoneView, model] = await Promise.all([
+        getJson("/api/estimate"), getJson("/api/bays"), getJson("/api/zones"), getJson("/api/model"),
+      ]);
+      renderDrives(est, bayView);
+      renderZones(zoneView);
+      renderModel(model, diag);
+    }
+
     table("mpc", [
       row("PWM min/max", fmt(state.pwm_min) + " / " + fmt(state.pwm_max)),
-      row("Diagnostics", fmt(JSON.stringify(cmd.diagnostics || {}))),
+      row("Diagnostics", fmt(JSON.stringify(diag))),
     ]);
 
-    const host = (state.extra || {}).host || {};
+    const host = state.host || {};
     table("host", [
       row("CPU temp", fmt(host.cpu_temp_c) + " C"),
       row("Load (1m)", fmt(host.load1)),

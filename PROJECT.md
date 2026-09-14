@@ -2451,6 +2451,7 @@ Config `http:` (parsed and validated by `HttpSettings` in
 | `GET` | `/api/health` | `ControlSnapshot.health_payload()` |
 | `GET` | `/api/estimate` | DAS: `{"estimates": {bay: …}, "estimator": {…}}` of the last command; legacy: 404 |
 | `GET` | `/api/bays` | DAS: `{"bays": {bay: {"declared": {zone, occupied, class, serial}, "estimator": {occupancy, class, serial, association, calibration, candidates, …} \| null}}}`; legacy: 404 |
+| `GET` | `/api/zones` | DAS: `{"zones": {zone: {…}}, "zones_in_fault": […], "degraded": bool}`; legacy: 404 |
 | `GET` | `/api/model` | DAS: `{"thermal", "parameters", "calibration", "store", "experiment"}`; legacy: 404 |
 | `GET` | `/` | `publishers/static/index.html` |
 
@@ -2475,6 +2476,23 @@ Config `http:` (parsed and validated by `HttpSettings` in
   limit_c}}`, the limits in force) and `bays` (`{bay: {zone, occupied,
   class, serial}}`, the declarations in force). A legacy payload keeps
   its shape.
+- `host` — host machine metrics (`aqua_bridge.hostinfo.collect_hostinfo`:
+  `cpu_temp_c`, `load1`, `load5`, `load15`, `mem_used_pct`, `mem_total_kb`,
+  `disk_used_pct`, `disk_free_gb`, `wifi_rssi_dbm`, `uptime_s`; `null` per
+  key when unreadable), refreshed at most every `host.interval_s` seconds
+  through a cache the HTTP app owns (`publishers/http.py`, item 25); present
+  in both modes
+
+`/api/zones`: per zone `trusted`, `reasons`, `fault`, `fault_reason`,
+`fault_since_ts`, `fault_elapsed_s`, `fault_ticks`, `trusted_streak`,
+`in_closure`, `channels`, `channels_under_fallback` (the zone's own
+`channels` that are currently held or ramped high, whether because this
+zone is in fault or because a coupled zone's fault reaches a channel the
+two zones share) and `policy` (`solver` | `hold` | `ramp_high` |
+`coupled`, `diagnostics["zones"]` verbatim plus the derived
+`channels_under_fallback`); `zones_in_fault` and `degraded` mirror
+`cmd.diagnostics.zones_in_fault` and `/api/health`'s `solver ==
+"degraded"` (item 22).
 
 `/api/estimate`: per constrained bay `t_c`, `sigma_c`, `margin_c`
 (`k·σ`), `soft_c`, `hard_c`, `limit_c`, `limit_margin_c` (`hard_c −
@@ -2513,13 +2531,18 @@ seconds, the last result and abort reason).
 
 JSON is the API. HTML is a thin, view-only client (the browser asks for
 the basic-auth credentials once and sends them with every poll): it polls
-`/api/state` and `/api/health` every 2 s (no websockets until 2W) and shows the five
-sections Overview, Temps, Fans, MPC, Host. The FAULT banner shows when
-`solver` is `fallback` or `fault`, or when a poll fails; a **DEGRADED**
-banner names the zones from `cmd.diagnostics.zones_in_fault` when
-`solver` is `degraded`. Controls are JSON-only for now. The Host section
-reads host metrics from `/api/state`, which does not carry them yet, so
-it shows dashes, and the page does not yet show the drive estimates (§8).
+`/api/state` and `/api/health` every 2 s (no websockets until 2W) and shows
+Overview, Temps, Fans, MPC and Host from those two; in DAS mode (`"bays" in
+state`) it also polls `/api/estimate`, `/api/bays`, `/api/zones` and
+`/api/model` and shows Drives (per-bay estimate joined with the declared
+occupancy and class), Zones (trust, fault and which channels are held or
+ramped) and Model (thermal identification status, model store, noise index,
+experiment running); those three sections stay hidden on a legacy config.
+The FAULT banner shows when `solver` is `fallback` or `fault`, or when a
+poll fails; a **DEGRADED** banner names the zones from
+`cmd.diagnostics.zones_in_fault` when `solver` is `degraded`. Controls are
+JSON-only for now. The Host section reads `/api/state`'s `host` key (items
+22, 24, 25).
 
 ### Control
 
@@ -2703,6 +2726,11 @@ availability topic and one device block. Entities:
   zone's one-window prediction error, °C); binary sensor `ident_running`;
   number `limit_<class>` per drive class (range `temp_min_c` .. the
   configured limit, state from `limits.classes.<class>`)
+- DAS mode, per zone: sensor `zone_status_<zone>` (`diagnostics.zones.
+  <zone>.policy`: `solver` while trusted and fault-free, `hold` /
+  `ramp_high` while its own fault holds or ramps its channels, `coupled`
+  while it only carries a coupled zone's channels under fallback; `off`
+  before the first DAS tick) (item 22)
 
 HA sends a **setpoint** (legacy) or a **limit** (DAS), not raw PWM, while
 Auto. A raw PWM command in `auto` is rejected by the supervisor exactly
@@ -2800,13 +2828,16 @@ Owner decisions (2026-09-14, later the same day):
     setpoint numbers work, PWM numbers exist only in manual, `in/smart`
     arrives through the broker. Needs the Pi and Home Assistant, not the
     DAS.
-22. `GET /api/zones` and the HA entity `zone_status_<zone>` (zone state is
-    only in `cmd.diagnostics` today).
+22. **Done:** `GET /api/zones` (§6 View) and the HA entity
+    `zone_status_<zone>` (§7), both reusing `diagnostics["zones"]`.
 23. `POST /api/calibrate {bay, drive_temp_c}`: calibration with a handheld
     thermometer when SMART is absent.
-24. HTML page: drive estimates, bays, zone and model status (the JSON views
-    exist).
-25. HTML Host section shows dashes: `/api/state` carries no host metrics.
+24. **Done:** the HTML page shows drive estimates, bays, zone and model
+    status (§6 View, `publishers/static/index.html`), reusing the existing
+    `/api/estimate`, `/api/bays`, `/api/model` views plus the new
+    `/api/zones`.
+25. **Done:** `/api/state` now carries a `host` key (§6 View); the HTML
+    Host section reads it instead of showing dashes.
 26. **Done:** `test (latest)` reached 10–11 min on slow runners against the
     11-minute guideline; `tools/ci_pytest_shards.py` now runs several
     pytest processes concurrently, each on a disjoint deterministic slice

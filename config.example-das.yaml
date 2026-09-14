@@ -44,7 +44,7 @@ mqtt:
   node_id: aqua-bridge
 
 host:
-  interval_s: 5
+  interval_s: 5          # refresh, s (MQTT host sensors, /api/state's "host" key)
 
 mpc:
   solver: pi             # pi: PI-like DAS solver (margin deficit per output); mpc: DAS MPC
