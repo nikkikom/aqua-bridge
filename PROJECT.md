@@ -23,7 +23,7 @@ described a watercooling loop (a coolant setpoint, radiator and intake
 fans). That was never the target; the plant is the DAS described in §1
 and §2. The safety core written for that draft is plant-agnostic and
 stayed: sensor gate, hold-then-high fallback, rate limit and clamp,
-supervisor, loop, hwmon adapter, HTTP/MQTT, deploy. The code now runs in
+supervisor, loop, hardware adapter, HTTP/MQTT, deploy. The code now runs in
 one of two modes, chosen by the config alone:
 
 - **DAS mode** — `mpc.topology` is present (`config.example-das.yaml`):
@@ -104,11 +104,11 @@ measure it.
   unknown), 4 PWM + 4 tach       (bus C: GPIO27 if needed)    │
   (qd1–qd4); aquabus to the XT6        │                      │
   or its own USB port                  │                      │
-          │ USB (hwmon)                │ 1-Wire (sysfs)       │
+          │ USB (HID)                  │ 1-Wire (sysfs)       │
           ▼                            ▼                      │
   ┌──────────────────────────── Raspberry Pi ─────────────────┴───┐
   │ gate per sensor → zone trust → estimator (latent drives)      │
-  │ → DAS MPC or PI-like DAS form → per-zone fallback → PWM (hwmon)│
+  │ → DAS MPC or PI-like DAS form → per-zone fallback → PWM (HID)  │
   └───────────────────────────────────────────────────────────────┘
           ▲                   │               │              │
           │ MQTT in/smart     ▼               ▼              ▼
@@ -131,18 +131,21 @@ measure it.
 - **Quadro:** on aquabus with the **XT6** as master, the XT6 on USB to the
   Pi (`lsusb`: vendor `0c70`, product `f001`). If the spike shows the
   Quadro's PWM is not writable through the aquaero, the **Quadro goes on
-  its own USB port** (`f00d`): the driver then exposes it as a second
-  hwmon device and the config lists both under `hwmon:` (§3 Track B).
-  How many Quadro temperature inputs show up in hwmon is known only once
-  it is connected; `config.example-das.yaml` binds none of them.
-- The daemon reads and writes through **hwmon sysfs**
-  (`aquacomputer_d5next`, `/sys/class/hwmon/hwmonN/{tempK_input,fanK_input,pwmK}`),
-  not raw HID. Raspberry Pi OS kernels are built without that driver;
-  `deploy/install-aquacomputer-dkms.sh` builds it with DKMS and a local
-  fix (§9). The HID udev rules stay for liquidctl and the spike. The
-  first spike results (§2 "USB spike results") confirm the attribute
-  names and units, and show there is no `pwmK_enable` and that the `pwmK`
-  attributes are slow.
+  its own USB port** (`f00d`): it is then a second hidraw device and the
+  config lists both under `aquacomputer:` (§3 Track B). How many Quadro
+  temperature inputs are usable is known only once it is connected;
+  `config.example-das.yaml` binds none of them.
+- The daemon reads and writes both controllers through **hidraw**
+  (`/dev/hidrawN`, `hw/hidraw.py`), not the Linux `aquacomputer_d5next`
+  hwmon driver (owner decision 2026-09-15, §8.1). It reads the status
+  report each controller sends about once per second (about 1 ms) and
+  writes every channel of one controller with a single control feature
+  report; through hwmon a `pwmK` read took 210 ms and a write 420 ms,
+  about 5 s per tick with 8 outputs (§2 "USB spike results"). No kernel
+  driver beyond `hid-generic` is needed. Raspberry Pi OS kernels do not
+  include the hwmon driver anyway; `deploy/install-aquacomputer-dkms.sh`
+  still builds it with DKMS and a local fix for later use, but
+  `install-pi.sh` does not run it (§9).
 - **Sensors per role** (recommended plan for 15 bays / 4 zones; the config
   binding is the only thing that changes):
 
@@ -182,34 +185,34 @@ measure it.
 **Status:** only the Pi is up. The aquaero 6 XT, Quadro, Digole, the
 DS18B20 buses and the DAS itself are not connected yet; the spike
 questions below and the whole hardware validation (§8, §13) are open.
-Everything else in this document runs against simulators and fake sysfs
-trees.
+Everything else in this document runs against simulators, fake sysfs
+trees and captured HID reports.
 
 ### Risk (first-evening USB spike)
 
-The `aquacomputer_d5next` driver (mainline, but not built into Raspberry
-Pi OS kernels; installed with DKMS, §9) exposes aquaero’s
-**own 4 fans**. Quadro channels over aquabus may be sensors only, with
-no PWM write. Until verified:
+Over USB the aquaero exposes its **own 4 fans** (status and control
+reports, §3 Track B). Quadro channels over aquabus may be sensors only,
+with no PWM write. Until verified:
 
-1. `sensors` and `/sys/class/hwmon/` — which `temp*`, `fan*`, `pwm*`
-   exist, their units, and whether `pwmK_enable` exists. Answered for
-   USB-attached devices (results below).
-2. Whether Quadro PWM is writable through XT6 (hwmon or HID).
+1. Which temperature, fan and PWM channels each controller reports, and
+   their units. Answered for USB-attached devices (results below);
+   `tools/aquacomputer_probe.py` shows them.
+2. Whether Quadro PWM is writable through XT6 (HID).
 3. **Does XT6 revert on its own after the Pi stops writing?** Write a PWM
-   via hwmon/HID, then stop. If the fan stays pinned, firmware curves are
+   over HID, then stop. If the fan stays pinned, firmware curves are
    *not* a watchdog. Then try the alternative: write the controller output
    into an aquaero **software / virtual sensor**, with the firmware’s
    timeout fallback and an identity curve onto PWM. That is a hardware
-   watchdog for free — only if the Linux driver or liquidctl can write
-   that sensor. Record which path works; the daemon follows it.
+   watchdog for free — only if the control report (or liquidctl) can
+   write that sensor. Record which path works; the daemon follows it.
 
-4. Which Quadro temperature inputs appear in hwmon (through the XT6, or
-   on the Quadro's own device), so they can be bound in `temp_map`.
+4. Which Quadro temperature inputs carry a reading in a status report
+   (through the XT6, or on the Quadro's own device), so they can be
+   bound in `temp_map`.
 
 If (2) fails: the Quadro goes on its own USB port (owner decision), a
-second hwmon device next to the aquaero, run with `--source hwmon` and a
-`hwmon:` list of both devices (§3 Track B). This blocks the hardware
+second hidraw device next to the aquaero, run with `--source composite`
+and an `aquacomputer:` list of both devices (§3 Track B). This blocks the hardware
 track only, not the control core.
 
 If (3) fails, a **software** watchdog inside the daemon (ramp to
@@ -232,14 +235,22 @@ Those shrink hang/crash windows. They do **not** cover Pi power loss.
 That is an **accepted risk** unless spike (3) proves XT6 firmware reverts
 on its own.
 
-At exit the adapter leaves `pwmK_enable` in manual mode with
-`fallback_pwm` on the fans. `Xt6Adapter.release()` (restore the original
-`pwmK_enable`, handing the channels back to firmware curves) exists but is
-**not** called, because it would undo the `fallback_pwm` write. If spike
-(3) shows the firmware curve is the better state after exit, calling it
-is a one-line change in `__main__.py`.
+At exit the adapter leaves every commanded channel at `fallback_pwm` (an
+aquaero channel assigned to its manual preset with power limits 0 / 100 %).
+`AquacomputerAdapter.release()` (restore the control settings the first
+control report read saw: the aquaero's preset, control source and power
+limits, handing its channels back to their firmware controllers, and the
+Quadro's duty) exists but is **not** called, because it would undo the
+`fallback_pwm` write. If spike (3) shows the firmware controller is the
+better state after exit, calling it is a one-line change in `__main__.py`
+(§8 items 33, 76).
 
 ### USB spike results (2026-09-14)
+
+Since 2026-09-15 the daemon no longer uses the hwmon driver described
+here: it reads and writes both controllers over hidraw (§8.1), because of
+the `pwmK` cost measured below. This section stays as the record of the
+spike; the HID layouts it led to are in §3 Track B.
 
 Temporary setup: the aquaero 6 XT and the Quadro each on its own USB port
 behind a powered hub, one fan and one thermistor on each, nothing on
@@ -263,8 +274,8 @@ open: they need the Quadro on aquabus.
   `fan5`, `pwm1..4`. Units as §3 Track B assumes (millidegrees, rpm,
   0..255). An input with nothing connected fails its read with `ENODATA`,
   which the adapter already turns into `None`.
-- **No `pwmK_enable`** on either device: `apply()` has nothing to switch
-  and `release()` nothing to restore.
+- **No `pwmK_enable`** on either device: the sysfs adapter's `apply()`
+  had nothing to switch and its `release()` nothing to restore.
 - **A `pwmK` write reconfigures the aquaero channel.** The driver points
   the channel's control source at its manual preset and sets its minimum
   power to 0 % and maximum to 100 %. The firmware controller that drove
@@ -276,6 +287,12 @@ open: they need the Quadro on aquabus.
   Save both control reports before the first write (HID feature reports
   `0x0b`, 2707 bytes, and `0x03`, 961 bytes): written back followed by the
   follow-up report, they restored the configuration byte for byte.
+- **Output duty in the status report** (verified 2026-09-15 over hidraw):
+  each aquaero fan block carries the duty the output actually drives at
+  offset `+0x02`, in 1/100 % (1412 on the channel commanded to 14.12 %,
+  10000 on the others, which ran their firmware controllers at 100 %).
+  The driver does not decode this field. The Quadro reports its duty at
+  `+0x00`. `obs.pwm` is this value on both controllers (§3 Track B).
 - **Cost.** `tempK_input` and `fanK_input` come from the cached status
   report. Every `pwmK` read fetches the whole control report, and every
   write fetches, patches and sends it, with the driver's 200 ms spacing
@@ -287,9 +304,9 @@ open: they need the Quadro on aquabus.
   | `pwmK` read | 210 ms |
   | `pwmK` write | 420 ms |
 
-  `Xt6Adapter.read()` reads every `pwmK` and `apply()` writes every channel
-  on every tick: with 8 outputs that is about 5 s per tick, the whole `dt`
-  of the DAS example (§8 item 74).
+  The sysfs adapter read every `pwmK` and wrote every channel on every
+  tick: with 8 outputs that is about 5 s per tick, the whole `dt` of the
+  DAS example (§8 item 74, done by moving to hidraw).
 - **The outputs run in PWM mode.** The output voltage stays at 12.1 V from
   5 % to 100 %; 0 % switches the output off. The aquaero reports 0 mA and
   0 W in this mode; the Quadro reports current and power.
@@ -326,7 +343,7 @@ open: they need the Quadro on aquabus.
 
 Hardware **must not** import control code; it may import only the
 contract (`model.py`). Control **must not** know USB, sysfs, Digole, HTTP
-or MQTT. `tests/test_hw_map.py` checks the import rule statically.
+or MQTT. `tests/test_hw_imports.py` checks the import rule statically.
 
 ### Contract (`src/aqua_bridge/model.py`)
 
@@ -540,10 +557,11 @@ spike” as default.
 
 The rest of `config.yaml` (`config.py`, `AppConfig`): `mpc` is required
 and typed; `mqtt`, `host`, `xt6`, `http`, `digole`, `onewire` go to their
-owners as plain dicts (each must be a mapping or absent); `hwmon` is the
-one section shaped as a list (one mapping per hwmon device); unknown
+owners as plain dicts (each must be a mapping or absent); `aquacomputer`
+is the one section shaped as a list (one mapping per controller; a
+leftover `hwmon:` section is a `ConfigError` naming the rename); unknown
 top-level sections are kept in `AppConfig.extra`, visible but not fatal.
-`xt6`, `hwmon` and `onewire` are read by Track B (below), `http` by §6,
+`xt6`, `aquacomputer` and `onewire` are read by Track B (below), `http` by §6,
 `mqtt` and `host` by §7. Read from `extra`: `record_path`,
 `record_max_bytes`, `record_backup_count` (the tick recorder, §3 Glue)
 and `sim.das` (`{topology?, preset?, seed?}`, the DAS simulator for
@@ -553,7 +571,7 @@ and `digole.enabled` are still type-checked -- a non-boolean value is a
 config mistake worth naming even where it decides nothing).
 
 Channel names are logical (`xt1`, `qd2`, …; `radiator` in legacy mode).
-Mapping onto `hwmon pwmN` lives only in the hardware adapter.
+Mapping onto a controller's `pwmN` lives only in the hardware adapter.
 
 One controller step is a pure function of observation, config, **and
 state**. It returns the command **and** the next state (integrator,
@@ -1061,7 +1079,7 @@ at `pwm_max`, so it cannot wind up; the demand on a stalled channel
 saturates honestly; fallback would add no cooling (a stalled fan moves no
 air at `fallback_pwm` either) and would stop regulating the healthy
 channels. Stall detection needs `obs.rpm` keyed by channel name: the
-`rpm` attribute of the channel's `xt6.fans` or `hwmon[].fans` entry
+`rpm` input of the channel's `xt6.fans` or `aquacomputer[].fans` entry
 (Track B); a tach-less output (no `rpm:`) is never flagged.
 
 **Bumpless transfer.** While `mode=fallback` the solver does not run, so
@@ -1590,78 +1608,177 @@ converges only with them.
 
 ### Track B — hardware (Pi for USB; mapping on any machine)
 
-- `hw/map.py`: `HwmonMap(hwmon_name, pwm_map, temp_map, fan_map={},
-  root="/sys/class/hwmon")` resolves logical names to sysfs files. The
-  device is found by reading every `hwmon*/name`, **on every call**:
-  `hwmonN` numbers are not stable across re-plugs. `pwm_map` values are
-  bare `pwmN` (the read/write file, with a `pwmN_enable` sibling);
-  `temp_map` / `fan_map` values are bare `tempN` / `fanN` and resolve to
-  the `*_input` file. Two logical names on one attribute are rejected,
-  and every `fan_map` key must be a `pwm_map` channel (RPM is consumed
-  per channel).
-  `resolve(check_files=True)` raises for a missing attribute (startup
-  check); the hot path resolves with `check_files=False`.
-- `hw/xt6.py`: `Xt6Adapter(hwmon_map, clock)` with
-  `read() -> PlantObservation` and `apply(MpcCommand)`. `ts` comes from
-  the injected monotonic clock.
-  - ABI: `tempK_input` millidegrees °C, `fanK_input` RPM, `pwmK`
-    0..255 read/write, optional `pwmK_enable` where `1` is manual. Names
-    and units are confirmed on USB-attached devices, where neither has
-    `pwmK_enable` (§2 "USB spike results").
-  - `read`: a single missing, unreadable or garbage file becomes `None`
-    for that value; a vanished device directory raises
-    `DeviceUnavailable`.
-  - `apply`: every mapped channel must have a finite value in `[0, 1]`
-    (else `ValueError`, nothing written; no silent clamping); writes
-    `round(pwm * 255)`. Before every write it re-reads each
-    `pwmK_enable` and writes `1` where it is not `1`, remembering the
-    first value seen: a USB dropout and re-plug resets `pwmK_enable` to
-    firmware control, and a write into a firmware-controlled channel
-    would look like success. A failed write raises `DeviceUnavailable`.
-  - `release()` restores the remembered `pwmK_enable` values (§2; not
-    called at exit).
-- `build_map_from_config(xt6, channels=mpc.channels, temps=mpc.temps)`:
-  `xt6.hwmon_name` is required. Each fan is **one** `xt6.fans` entry
-  that names the channel once and carries both attributes:
+- `hw/aquacomputer.py` (pure, stdlib only, no I/O): the aquaero 5/6 and
+  Quadro HID report layouts. `decode_status(kind, data)` returns a
+  `StatusReport` (serial, firmware, temperatures in °C or `None`, per
+  output rpm, output duty, voltage, current and power, flow, the Quadro's
+  power-cycle count). Control-report helpers: a channel's commanded duty
+  and, on the aquaero, whether it follows its preset (`channel_state`,
+  `channel_holds`), `patch_duties`, `finalize_control_report` (the
+  Quadro's checksum), `capture_channel` / `restore_channel`. A wrong id,
+  length or checksum raises `ReportError`. Protocol constants, not
+  tunables (big-endian, offsets count from the report id, sizes include
+  it):
+
+  | | aquaero (USB `0c70:f001`, interface 2) | Quadro (`0c70:f00d`, interface 1) |
+  |---|---|---|
+  | status report | input id `0x01`, 903 bytes, about once per second | input id `0x01`, 220 bytes |
+  | temperatures (1/100 °C, `0x7FFF` = none) | `temp1..8` at `0x65`, `temp9..16` virtual at `0x85`, `temp17..20` calculated at `0x95` | `temp1..4` at `0x34`, `temp5..20` virtual at `0x3C` |
+  | output blocks (`fan1..4`, `pwm1..4`) | `0x167 0x173 0x17F 0x18B`: rpm +0, duty +2, voltage +4, current +6, power +8 | `0x70 0x7D 0x8A 0x97`: duty +0, voltage +2, current +4, power +6, rpm +8 |
+  | flow (numbered `fanN` after the outputs) | `fan5..6` at `0xF9` | `fan5` at `0x6E` |
+  | identity | serial `u16` pair at `0x07`, firmware at `0x0B` | serial at `0x03`, firmware at `0x0D`, power cycles `u32` at `0x18` |
+  | control report | feature id `0x0B`, 2707 bytes, no checksum | feature id `0x03`, 961 bytes, CRC-16/USB over `[1, size − 2)` stored in the last two bytes |
+  | duty of output `k` (1/100 %) | preset `0x55C + 2k` = duty; control source (block `[0x20C 0x220 0x234 0x248][k]` + `0x10`) = `0x5C + k`; min power (+`0x04`) = 0; max power (+`0x06`) = 100 % | `[0x37 0x8C 0xE1 0x136][k]` |
+  | after every SET | feature report `06 00 02 00 00 00 00` | feature report `02 00 00 00 02 00 00 00 00 34 C6` |
+
+  Units: duty 1/100 %, voltage 1/100 V, current mA, power 1/100 W. The
+  channel numbers are the Linux driver's hwmon attribute numbers, so
+  `pwmN` / `fanN` / `tempN` in the config did not change. Temperatures
+  decode as signed 16-bit values (the driver decodes them unsigned, so
+  −1 °C would read 655 °C). The layouts are checked against captured
+  reports and the driver's readings in `tests/fixtures/aquacomputer/` (§2
+  "USB spike results"); a duty write patched into the captured firmware
+  reports reproduces the driver's write byte for byte. The official
+  software and the driver also send the secondary report after every
+  control report write; what it does is not known.
+- `hw/hidraw.py`: discovery and transport. Every `hidrawN` under
+  `/sys/class/hidraw` is described by its `device/uevent` (`HID_ID`
+  vendor and product, the trailing `inputN` of `HID_PHYS` as the USB
+  interface, `HID_UNIQ` as the serial; a line without `=` is skipped).
+  A device is selected by kind and optional serial, never by its
+  `hidrawN` number, which changes on re-plug; the aquaero's interfaces 0
+  and 1 (keyboard, mouse) never match. None found raises
+  `DeviceUnavailable`, several without a serial `AmbiguousDevice` naming
+  the serials found. `HidrawTransport` opens `/dev/hidrawN` non-blocking,
+  drains input reports, waits with `select`, and sends `HIDIOCGFEATURE`
+  / `HIDIOCSFEATURE` (`buf[0]` = report id); an errno meaning the node is
+  gone raises `DeviceUnavailable`, any other failed feature report
+  `FeatureReportError`. The adapter only needs the `HidTransport`
+  protocol, so tests run it against a fake controller.
+- `hw/aquacomputer_adapter.py`: `AquacomputerAdapter(binding, clock=,
+  sleep=, opener=)` is one controller with `read() -> PlantObservation`,
+  `apply(MpcCommand)` and `release()`. Nothing is opened at construction.
+  - `read()` drains the input reports and uses the newest status report:
+    `obs.temps` in °C (`None` where nothing is connected), `obs.rpm` from
+    `fanN`, `obs.pwm` in `[0, 1]` from the status report's **output
+    duty** on both kinds (what the device drives, not the cached
+    command). No status report for longer than `status_max_age_s` raises
+    `DeviceUnavailable` (the loop's blank-observation fallback ramps the
+    fans up). A vanished node closes the device and raises
+    `DeviceUnavailable`; the next call discovers it again (a re-plug may
+    bring a new `hidrawN`) and waits up to `status_max_age_s` for its
+    first report. `ts` comes from the injected monotonic clock.
+    `last_status` keeps the newest decoded report for tools and
+    diagnostics; voltage, current and power are not in the observation
+    (§8 item 79).
+  - **Control report cache.** The control report is read (GET) once after
+    opening and again after every invalidation, never on a normal tick.
+    `apply()` needs a finite value in `[0, 1]` for every configured
+    channel (else `ValueError`, nothing sent; no silent clamping) and
+    commands `round(pwm × 10000)`. When every configured channel already
+    holds its duty (on the aquaero: follows its preset with power limits
+    0 / 100 %) nothing is sent. Otherwise every changed channel is
+    patched into the cached report, which goes out with **one** SET plus
+    the secondary report. Before any control operation the adapter waits
+    until `ctrl_gap_ms` has passed since the last SET (Linux commit
+    56b930dc added 200 ms after it saw `EPIPE`; a GET right before a SET
+    needs no gap, an isolated GET takes 4–8 ms). A failed operation
+    invalidates the cache and is retried from a fresh GET up to
+    `ctrl_retries` times (one control GET in about 60 failed with
+    `ENODATA` in the spike), then raises `DeviceUnavailable`. The cache
+    counts as written only when SET and secondary report both succeeded;
+    a retry after a failed SET rewrites every configured channel. A
+    Quadro control report whose checksum does not match is a failed read.
+  - **Keeping the cache honest.** Speed, output duty, voltage, current and
+    power arrive in every status report, so drift of the fans themselves
+    is visible without any control read. A one-time read misses a
+    configuration changed behind the daemon's back (front panel,
+    aquasuite, liquidctl, a controller reset), hence three rules:
+    (a) *duty verification* — for every channel this adapter commands, a
+    status duty further than `duty_mismatch_tolerance` from the command,
+    continuously for longer than `duty_mismatch_s` (counted from the later
+    of the mismatch start and the last SET, and judged only on reports
+    received after that SET), invalidates the cache, logs a warning naming
+    device, channel, commanded and reported duty, and makes the next
+    `apply()` read the report again and rewrite every configured channel;
+    (b) *power cycles* — a change of the Quadro's power-cycle count from
+    the value seen at open does the same (logged);
+    (c) *periodic refresh* — every `ctrl_refresh_s` (0 disables) `apply()`
+    reads the control report again first; a commanded channel that no
+    longer holds its duty is logged and rewritten, other changes in the
+    report are adopted.
+  - `release()` restores, for every channel this adapter has written, the
+    fields captured by the first GET after the daemon started (aquaero:
+    preset, control source, minimum and maximum power; Quadro: duty) with
+    one SET plus the secondary report; a no-op when nothing was written.
+    Not called at exit (§2; §8 items 33, 76).
+- **The device entry**, `xt6:` or one `aquacomputer:` list entry
+  (`parse_device_section`; `build_adapter_from_config(xt6,
+  channels=mpc.channels, temps=mpc.temps)` for `--source xt6`):
 
   ```yaml
   xt6:
-    hwmon_name: aquaero
+    device: aquaero               # required: aquaero | quadro
+    serial: "12345-67890"         # optional; required when several of one kind are attached
     fans:
       radiator: {pwm: pwm1, rpm: fan1}
-      intake:   {pwm: pwm2}          # rpm optional
+      intake:   {pwm: pwm2}       # rpm optional
     temp_map:
       coolant: temp1
+    status_max_age_s: 3.0         # optional timing keys, defaults shown
+    ctrl_gap_ms: 200
+    ctrl_retries: 1
+    ctrl_refresh_s: 60.0
+    duty_mismatch_tolerance: 100
+    duty_mismatch_s: 5.0
   ```
 
-  A PWM output and its tachometer therefore cannot drift apart into two
-  differently spelt channels. Only `pwm` and `rpm` are allowed inside an
-  entry (a typo such as `rmp:` is rejected); `pwm` must look like `pwmN`,
-  `rpm` like `fanN`, `temp_map` values like `tempN`. The former
-  `xt6.map` / `xt6.fan_map` keys are rejected with a pointer to
-  `xt6.fans`. `xt6.fans` keys must **equal** `mpc.channels` and
-  `xt6.temp_map` keys must **equal** `mpc.temps`, or
-  the daemon exits with a `ConfigError` (code 2) before the loop starts.
-  Without that check a channel missing from the map is silently never
-  written, and a temperature missing from or extra in `temp_map` keeps
-  the gate in permanent fallback with no visible error. Optional
-  `xt6.root` (default `/sys/class/hwmon`). `--source xt6` is this single
-  device, unchanged for legacy configs.
-- `hw/sources.py` (`--source hwmon`, the DAS source): `CompositeSource`
-  merges any number of hwmon devices and an optional 1-Wire source into
-  one `PlantObservation` and puts the SMART inbox's snapshot into
-  `obs.inputs["smart"]`; `apply()` writes the whole command to every
-  device, each `Xt6Adapter` picking out its own channels.
-  `build_composite_from_config(hwmon_section=, xt6_section=, onewire_section=, channels=, temps=, dt=, smart=)`:
+  | Key | Default | Valid | Meaning |
+  |---|---|---|---|
+  | `status_max_age_s` | 3.0 | finite, > 0 | a newest status report older than this is no observation (`DeviceUnavailable`); an open waits this long for the first report |
+  | `ctrl_gap_ms` | 200 | finite, ≥ 0 | wait after a control report SET before the next control operation |
+  | `ctrl_retries` | 1 | integer ≥ 0 | retries of a failed control operation, each from a fresh GET |
+  | `ctrl_refresh_s` | 60.0 | finite, ≥ 0 | periodic control report read in `apply()`; 0 disables |
+  | `duty_mismatch_tolerance` | 100 | integer 0..10000 | 1/100 %: a status duty further from the command is a mismatch |
+  | `duty_mismatch_s` | 5.0 | finite, > 0 | a mismatch lasting longer re-reads the report and rewrites every channel |
+
+  The defaults live once, in `AquacomputerTiming`; both example configs
+  show every key at its default (`tests/test_model_config.py` checks
+  that). Each fan is **one** `fans` entry that names the channel once and
+  carries both inputs, so a PWM output and its tachometer cannot drift
+  apart into two differently spelt channels. Only `pwm` and `rpm` are
+  allowed inside an entry (a typo such as `rmp:` is rejected); `pwm` must
+  be one of the kind's outputs (`pwm1..4`), `rpm` one of its `fanN`
+  inputs (aquaero `fan1..6`, Quadro `fan1..5`), `temp_map` values one of
+  its `tempN` (`temp1..20`), and two names on one input are rejected.
+  Unknown keys are rejected too, so a misspelt timing key cannot fall
+  back to its default silently; `xt6.prefer` is accepted and ignored.
+  Keys of the hwmon era are rejected with a hint: `hwmon_name` (use
+  `device:`), `root` (devices are discovered by USB id; use `serial:`),
+  `name` (renamed to `device`), and the older `map` / `fan_map` (use
+  `fans`). For `xt6:` the `fans` keys must **equal** `mpc.channels` and
+  the `temp_map` keys must **equal** `mpc.temps`, or the daemon exits
+  with a `ConfigError` (code 2) before the loop starts. Without that
+  check a channel missing from the map is silently never written, and a
+  temperature missing from or extra in `temp_map` keeps the gate in
+  permanent fallback with no visible error. `--source xt6` is this single
+  device.
+- `hw/sources.py` (`--source composite`, the DAS source):
+  `CompositeSource` merges any number of `AquacomputerAdapter`s and an
+  optional 1-Wire source into one `PlantObservation` and puts the SMART
+  inbox's snapshot into `obs.inputs["smart"]`; `apply()` hands the whole
+  command to every device, each adapter commanding its own channels with
+  at most one SET.
+  `build_composite_from_config(aquacomputer_section=, xt6_section=, onewire_section=, channels=, temps=, dt=, smart=)`:
 
   ```yaml
-  hwmon:                      # a list, one entry per hwmon device
-    - name: aquaero           # alias of hwmon_name
+  aquacomputer:               # a list, one entry per controller
+    - device: aquaero
       fans: {xt1: {pwm: pwm1, rpm: fan1}, ...}
       temp_map: {inlet_a: temp1, air_z0: temp2, ...}
-    - name: quadro            # e.g. on its own USB port
+    - device: quadro          # on its own USB port
       fans: {qd1: {pwm: pwm1, rpm: fan1}, ...}
-      temp_map: {}            # bind Quadro inputs once they appear in hwmon
+      temp_map: {}            # bind Quadro inputs once they are connected
   onewire:
     sensors: {prox_b01: 28-0316a27a0aff, ...}   # logical name -> ROM id
     resolution_bits: 12       # 9..12
@@ -1672,11 +1789,14 @@ converges only with them.
   An `xt6:` section is still accepted as one more device. Every
   `mpc.temps` name must be bound exactly once across all `temp_map`s and
   `onewire.sensors`, every channel exactly once across all `fans` maps,
-  or the daemon exits 2 before the loop starts. A failing device's
-  exception propagates from `read()` / `apply()` (the loop's existing
-  partial-write and blank-observation policies apply). A ROM id missing
-  from every bus at start is a warning, not fatal: a sensor may be
-  unplugged with its drive.
+  and two entries of one kind need distinct serials (both would otherwise
+  open and command the same controller), or the daemon exits 2 before the
+  loop starts. A config that still has a `hwmon:` section exits 2 with a
+  message naming the rename to `aquacomputer:` and `device:`. A failing
+  device's exception propagates from `read()` / `apply()` (the loop's
+  existing partial-write and blank-observation policies apply). A ROM id
+  missing from every bus at start is a warning, not fatal: a sensor may
+  be unplugged with its drive.
 - `hw/onewire.py`: `W1Source`, DS18B20 over the kernel's `w1_therm`
   bulk-read ABI (assumed layout, unverified on hardware, kept name-based
   and rooted at `onewire.root`): `w1_bus_master<N>/therm_bulk_read`
@@ -1713,10 +1833,18 @@ converges only with them.
   rate while you warm one with a finger), `--check --config PATH` (builds
   the exact composite the daemon would, then reports the bulk-read cycle
   time per bus and the CRC error rate per sensor over `--cycles`).
-- Unit tests against a **fake hwmon tree** and a **fake w1 tree** in a temp
-  directory (CI, no Pi). `pytest.mark.hardware` only for the live device;
-  `tests/conftest.py` skips those tests when no hwmon device named
-  `aquaero` exists.
+- `tools/aquacomputer_probe.py` (Pi, bring-up; replaces `sensors`): lists
+  every discovered aquaero and Quadro (kind, serial, USB interface, node),
+  then prints each one's status report (temperatures; rpm, duty, voltage,
+  current and power per output; flow; the Quadro's power cycles) and each
+  output's control-report duty with the aquaero's control source and
+  power limits. Read-only: it never sends a SET. `--device`, `--serial`,
+  `--timeout` (default: the `status_max_age_s` default).
+- Unit tests against captured HID reports, a **fake controller**
+  (`tests/aquacomputer_fakes.py`), a fake hidraw sysfs tree and a **fake
+  w1 tree** in a temp directory (CI, no Pi). `pytest.mark.hardware` only
+  for the live device; `tests/conftest.py` skips those tests when no
+  aquaero hidraw node (`0c70:f001`, interface 2) exists.
 - **Does not import control** (`hw/*.py`, checked statically).
 
 ### Glue (`control/loop.py`, `control/supervisor.py`, `__main__.py`)
@@ -1730,7 +1858,7 @@ notifier.watchdog()
 ```
 
 The `Loop` talks to a `Source` (`read()`), a `Sink` (`apply()`) and a
-`Notifier`; it knows nothing about sysfs, HTTP or MQTT. Policies:
+`Notifier`; it knows nothing about USB, sysfs, HTTP or MQTT. Policies:
 
 - **`read()` raises or returns a non-observation:** the tick is not
   skipped. A blank observation (no temps) with `ts = last obs.ts + dt`
@@ -1780,8 +1908,9 @@ inside `step`, so the loop and the supervisor stay the same for both
 modes.
 
 `python -m aqua_bridge` (`__main__.py`): `--config PATH` (required),
-`--source xt6|hwmon|sim` (default `xt6`: one aquaero; `hwmon`: the DAS
-composite of `hwmon:` devices and `onewire:`; `sim`: a simulated plant
+`--source xt6|composite|sim` (default `xt6`: the one controller of
+`xt6:`; `composite`: the DAS composite of `aquacomputer:` devices and
+`onewire:`; `sim`: a simulated plant
 with names taken from the config), `--sim-plant basic|rich|das` (sim
 only: the RC plant, the RC plant with one tick of actuator delay and
 0.02 °C noise, or the DAS truth plant built from `sim.das.topology` or
@@ -1798,7 +1927,7 @@ xt6 map and composite binding checks, a DAS sim without topology,
 built. HTTP and MQTT start next to the loop when enabled (§6, §7); a
 publisher that fails to start is logged and the daemon keeps controlling
 the fans. One `SmartInbox` is built per run and wired into
-`--source hwmon`, `POST /api/in/smart` and the MQTT `in/smart` topic.
+`--source composite`, `POST /api/in/smart` and the MQTT `in/smart` topic.
 
 **Tick recorder** (`recorder.py`, `--record PATH` or top-level
 `record_path`, rotation by `record_max_bytes` / `record_backup_count`):
@@ -1820,12 +1949,12 @@ aqua-bridge/
   deploy/
     packages-rpi.txt         # apt packages (§9)
     aqua-bridge.service      # systemd unit, StateDirectory=aqua-bridge (§9)
-    aqua-bridge-das.conf     # drop-in: ExecStart= --source hwmon (§9, §10, install-pi.sh --das)
+    aqua-bridge-das.conf     # drop-in: ExecStart= --source composite (§9, §10, install-pi.sh --das)
     aqua-bridge-smart-agent.service  # systemd *user* unit example for the PC
-    99-aquacomputer.rules    # udev: usb, hidraw, hwmon pwm group write (§9)
+    99-aquacomputer.rules    # udev: hidraw plugdev 0660 (the daemon), usb, optional driver's hwmon pwm (§9)
     host-usb.sh              # dwc2 host overlay, idempotent (§10)
     install-pi.sh            # provisioning, self-signed HTTPS certificate, --das (§10)
-    install-aquacomputer-dkms.sh  # aquacomputer_d5next hwmon driver via DKMS (§9)
+    install-aquacomputer-dkms.sh  # optional aquacomputer_d5next hwmon driver via DKMS, not run by install-pi.sh (§9)
     dkms/aquacomputer_d5next/     # dkms.conf template, Makefile, driver patches (§9)
   src/aqua_bridge/
     __main__.py              # python -m aqua_bridge: wiring, signals, exit codes
@@ -1849,9 +1978,10 @@ aqua-bridge/
     control/intents.py       # intents, ControlSurface, ControlSnapshot, payloads
     control/supervisor.py    # control mode, overrides, setpoints, limits, bays, presets, experiments, compose
     control/loop.py          # read -> step -> compose -> apply -> watchdog
-    hw/map.py                # logical name -> hwmon sysfs file
-    hw/xt6.py                # aquaero adapter
-    hw/sources.py            # composite of several hwmon devices + 1-Wire + SMART inputs
+    hw/aquacomputer.py       # aquaero / Quadro HID report layouts (pure)
+    hw/hidraw.py             # hidraw discovery, input reports, feature report ioctls
+    hw/aquacomputer_adapter.py  # AquacomputerAdapter (read/apply/release), device entry config
+    hw/sources.py            # composite of several controllers + 1-Wire + SMART inputs
     hw/onewire.py            # DS18B20 w1_therm bulk-read reader threads
     sim/plant.py             # legacy RC plant (inside the package so `pip install -e .` sees it)
     sim/das.py               # DAS truth plant, run_das_closed_loop
@@ -1867,6 +1997,7 @@ aqua-bridge/
   tools/
     bench_step.py            # step() timing per solver: RC plant or --sim-plant das
     w1_commission.py         # --list, --identify, --check (Pi)
+    aquacomputer_probe.py    # read-only: attached controllers, status and control reports (Pi)
     smart_agent.py           # SMART over MQTT (PC)
     fit_model.py             # offline zoned model fit from recordings
     fit_fans.py              # PWM -> RPM curve per fan model
@@ -1919,9 +2050,15 @@ aqua-bridge/
     test_smart_agent.py
     test_hostinfo.py
     test_publishers_runtime.py
-    test_hw_map.py           # fake sysfs, CI; static no-control-import check
-    test_hw_xt6.py           # fake hwmon in CI; live device with pytest.mark.hardware
+    fixtures/aquacomputer/   # captured status and control reports, the driver's readings
+    aquacomputer_fakes.py    # fake clock, sleep and controller for the hidraw adapter
+    test_hw_aquacomputer.py  # report layouts against the captured reports
+    test_hw_hidraw.py        # discovery on a fake sysfs tree, ioctl numbers, transport
+    test_hw_aquacomputer_adapter.py  # fake controller in CI; live device with pytest.mark.hardware
+    test_hw_aquacomputer_config.py   # the device entry, timing keys, hwmon-era hints
+    test_hw_imports.py       # static no-control-import check
     test_hw_sources.py
+    test_aquacomputer_probe.py
     test_hw_onewire.py       # fake w1 tree
     test_w1_commission.py
     test_deploy.py           # units, udev rules, install script, shellcheck
@@ -1930,8 +2067,8 @@ aqua-bridge/
 CI on GitHub runs every test except `hardware` and `nightly` on every PR
 and push (§12), `fuzzy` and `slow` included; the nightly job adds the
 `nightly` sweeps. Hypothesis example counts are capped per profile, not
-unbounded. Live device tests run only on the Pi. Fake-hwmon tests run
-everywhere.
+unbounded. Live device tests run only on the Pi. Fake-controller tests
+run everywhere.
 
 ---
 
@@ -1969,13 +2106,14 @@ extremes); `test_solver_das.py` the DAS MPC's (§4.10).
 `fast_cfg` (`dt=1`, `confirm_ticks=2`, `fallback_hold_s=4`,
 `stuck_ticks=4`, PWM limits unchanged), `das_example_cfg` (the DAS example
 config), `solver_kind`, `example_config_path`, `example_das_config_path`,
-`aquaero_hwmon` (skips when absent). Gate suites use a `gcfg` fixture
+`aquaero_hidraw` (the live aquaero's hidraw node; skips when absent). Gate suites use a `gcfg` fixture
 parametrised over `median3`. `tests/das_fixtures.py` builds a small zoned
 config (`das_mapping`, `das_cfg`) and observations (`das_obs`,
 `default_temps`) for the zone, gate and fallback suites.
 
 **Markers** (`--strict-markers`): `hardware` (live aquaero; auto-skipped
-when no hwmon device named `aquaero` exists), `fuzzy` (Hypothesis), `slow`
+when no aquaero hidraw node, USB `0c70:f001` interface 2, exists), `fuzzy`
+(Hypothesis), `slow`
 (long closed-loop runs, subprocess SIGTERM), `nightly` (heavy sweeps and
 long simulations: excluded from PR and `main` runs, run by the nightly
 job), `solver_cases(*cases)` (restricts `solver_kind`), `pi` (only on the
@@ -2273,26 +2411,55 @@ range.
 
 ### 4.7 Hardware-adapter tests (track B)
 
-**No control import.** Mapping and the adapter must not wait for the board.
+**No control import.** Protocol, transport and adapter must not wait for
+the board.
 
-- `tests/test_hw_map.py` — logical names ↔ a fake hwmon directory tree
-  (temp files): device found by name not number, renumbering after a
-  re-plug, missing device / root / attribute, duplicate targets, default
-  root, and the static check that `hw/` never imports `control`. Runs in
-  CI.
-- `tests/test_hw_xt6.py` — same fake tree for `read`/`apply` (unit
-  conversion, garbage and missing files become `None`, device gone,
-  rounding, `pwmK_enable` set before the first write and re-checked on
-  every apply, re-plug that resets it, `release`, rejected NaN /
-  out-of-range / missing channel) and `build_map_from_config` key checks.
-  Live device is `pytest.mark.hardware` (`test_live_read_and_writeback`:
-  read once, write back the PWM already in effect, `release()`) and
-  skipped when no aquaero hwmon device exists.
-- `tests/test_hw_sources.py` — `CompositeSource` over two fake hwmon
-  devices and a fake 1-Wire source: merged reads, each channel written to
-  its own device, a failing device propagates, `xt6:` plus a `hwmon:` list,
-  every name bound exactly once (exit 2 otherwise), a missing ROM at start
-  does not block, `inputs["smart"]` only with an inbox.
+- `tests/test_hw_aquacomputer.py` — the report layouts against captured
+  reports (`tests/fixtures/aquacomputer/`, serial bytes zeroed): both
+  status reports decode to the Linux driver's hwmon readings
+  (temperatures within 20 m°C, the driver having taken the next report
+  for one input; everything else exact) and to the aquaero's output duty
+  field; signed temperatures; a wrong id, length or checksum is
+  rejected; `crc16_usb` on both Quadro control reports; patching the
+  firmware reports reproduces the driver's writes byte for byte (aquaero
+  channel 2 to 14.12 %, Quadro channel 3 to 9.02 %) and capture /
+  restore undo them; Hypothesis round trips of patched duties.
+- `tests/test_hw_hidraw.py` — discovery on a fake sysfs tree (interface
+  selection, serial selection, ambiguity naming the serials, not found,
+  uevent lines without `=`), the ioctl request numbers, draining reports
+  over a datagram socket pair, end of file, errno classification, open
+  errors (a permission error names the udev rule).
+- `tests/test_hw_aquacomputer_adapter.py` — `AquacomputerAdapter` against
+  a fake controller (`tests/aquacomputer_fakes.py`) with an injected
+  clock and sleep: read mapping (the output duty as `obs.pwm`), the
+  newest report wins, a stale status report and an open without one →
+  `DeviceUnavailable`, a re-plug with a new node reads the control report
+  again, an unchanged command sends nothing, a changed command sends one
+  SET plus one secondary report with the driver's bytes, the gap, retries
+  then `DeviceUnavailable`, a failed secondary report rewrites, a duty
+  mismatch beyond tolerance for longer than `duty_mismatch_s` re-reads
+  and rewrites (a brief one, one within tolerance or one seen only on a
+  report from before the SET does not), a Quadro power cycle, the
+  periodic refresh and `ctrl_refresh_s: 0`, `release()` restoring the
+  captured bytes, rejected NaN / out-of-range / missing channel with
+  nothing sent. The live device test is `pytest.mark.hardware`
+  (`test_live_read_and_reapply_what_the_device_holds`: reads a status
+  report, re-applies the duty of every channel that already follows its
+  preset and asserts that no SET went out) and is skipped when no aquaero
+  hidraw node exists.
+- `tests/test_hw_aquacomputer_config.py` — the device entry: kinds,
+  serial, input ranges per kind, `fans` / `temp_map` errors, keys equal
+  to `mpc.channels` / `mpc.temps`, every timing key's validation, the
+  hints for `hwmon_name`, `root`, `name`, `map` and `fan_map`.
+- `tests/test_hw_sources.py` — `CompositeSource` over two fake
+  controllers and a fake 1-Wire source: merged reads, each channel
+  written to its own device with one SET each, a failing device
+  propagates, `xt6:` plus an `aquacomputer:` list, timing keys per
+  device, distinct serials for one kind, every name bound exactly once
+  (exit 2 otherwise), a missing ROM at start does not block,
+  `inputs["smart"]` only with an inbox.
+- `tests/test_hw_imports.py` — `hw/` never imports `control`, and
+  `hw/aquacomputer.py` imports no I/O module.
 - `tests/test_hw_onewire.py` — a fake `w1_bus_master*` tree: discovery,
   the trigger/poll/read cycle, sensors of another bus ignored, CRC
   failure and garbage → `None` and counted, a bulk read that never
@@ -2300,13 +2467,16 @@ range.
   written once, stale samples → `None`, missing ROMs.
 - `tests/test_w1_commission.py` — `--list`, `--identify` ranking by
   warming rate, `--check` building the daemon's composite.
+- `tests/test_aquacomputer_probe.py` — the probe on a fake sysfs tree and
+  fake controllers: listing, decoded output, filters, failures reported,
+  no SET or secondary report sent.
 
 These never replace §4.1–4.6.
 
 ### 4.8 HTTP tests
 
 `tests/test_http_api.py`. See also §6. A stub `ControlSurface`; no
-hwmon. `/api/state` and `/api/health` bodies equal
+hardware. `/api/state` and `/api/health` bodies equal
 `ControlSnapshot.state_payload()` / `health_payload()` with exactly the
 documented keys. Auto mode: `POST /api/pwm` → 409. Malformed JSON, body
 not an object, missing field, unknown channel, PWM outside `[0, 1]` or
@@ -2369,7 +2539,9 @@ runners allow it.
   closed loops (`slow`).
 - `tests/test_main.py` — CLI parsing, exit codes, `--once`, sim wiring
   (`--sim-plant basic|rich|das`), xt6 map mismatch → exit 2, `--source
-  hwmon` wiring and a missing binding → exit 2, `--record` and
+  composite` wiring and a missing binding → exit 2, `--source hwmon`
+  rejected, a config of the hwmon era → exit 2 naming the replacement
+  keys, `--record` and
   `record_path`, `--model-store` and `STATE_DIRECTORY` (legacy: ignored /
   exit 2), publisher wiring and start failures, the
   SIGTERM stop path in-process, a SIGTERM delivered inside a stderr write,
@@ -2400,8 +2572,11 @@ runners allow it.
 - `tests/test_deploy.py` — unit file (`Type=notify`, `NotifyAccess=main`,
   `Restart=always`, watchdog, no `ExecStop=`, venv `ExecStart`,
   `TimeoutStartSec >= WatchdogSec`), udev rules against the unit’s
-  groups (hwmon pwm group write, usb, hidraw), install script triggers
-  udev, install script creates the self-signed certificate at the
+  groups (hidraw read/write, usb, the optional driver's hwmon pwm group
+  write), install script triggers udev for hidraw and does not run the
+  DKMS script, `dkms` / `curl` / `patch` not in the package list, the DKMS
+  script naming its packages and stopping early without them, install
+  script creates the self-signed certificate at the
   `http:` default paths only when absent and creates no users, `bash -n` and `shellcheck` on both scripts (shellcheck skipped
   when not installed; GitHub runners have it), `StateDirectory=` for the
   model store, and the SMART agent unit being a user unit that
@@ -2982,6 +3157,16 @@ Owner decisions (2026-09-14, later the same day):
   period per credential, not per request; the page's 2 s poll reads the
   cache.
 
+Owner decision (2026-09-15):
+
+- The daemon reads and writes the aquaero and the Quadro through
+  **hidraw**; the `aquacomputer_d5next` kernel module is not used.
+  Through hwmon every `pwmK` read cost 210 ms and every write 420 ms,
+  about 5 s per tick with 8 outputs; over hidraw a read takes the
+  unsolicited status report (about 1 ms) and one feature report writes
+  every channel of a controller (item 74, §3 Track B). The DKMS package
+  stays in `deploy/` for later; `install-pi.sh` no longer runs it (§9).
+
 ### 8.2 Open — no DAS hardware needed (dev machine, CI, the Pi, the PC)
 
 11. The prediction-error guard also scores drives in faulted zones (extra,
@@ -3124,23 +3309,41 @@ Owner decisions (2026-09-14, later the same day):
     solve ticks while they are more than 1 % of ticks, so solving less
     often lowers the mean, not the p99. Run the runtime alarm against the
     DAS MPC on the Pi (the 20-minute run used PI-like DAS).
+79. Fan-health drift monitoring. Every status report carries each
+    output's rpm, output duty, voltage (the 12 V rail) and current and
+    power (the Quadro reports both; the aquaero reports 0 in PWM mode).
+    `hw/aquacomputer.py` decodes them and `AquacomputerAdapter.last_status`
+    keeps them, but they are not in `PlantObservation` (adding them
+    changes the recorded observation format). Record them, publish them
+    (HTTP, MQTT / Home Assistant) and warn on drift: rpm at a given duty
+    against the fitted fan curve (`fan_models`, `tools/fit_fans.py`), a
+    sagging rail voltage, output current or power out of line with the
+    duty.
 
 ### 8.3 Open — needs the DAS hardware
 
 31. USB host: `dtoverlay=dwc2,dr_mode=host` (`deploy/host-usb.sh`), powered
     hub.
 32. Spike: is the Quadro's PWM writable through the XT6? If not, the Quadro
-    goes on its own USB port (`--source hwmon`).
+    goes on its own USB port (`--source composite`).
 33. Spike: does the XT6 revert after the Pi stops writing? If not, software
     sensor plus firmware timeout (§2); then decide whether `release()` runs
     at exit.
-34. Spike: which Quadro temperature inputs appear in hwmon; bind them in
-    its `temp_map`.
-35. Confirm the hwmon ABI on the real device (`tempK_input` millidegrees,
-    `pwmK` 0..255, `pwmK_enable` semantics) and that the udev rule makes
-    `pwmK` / `pwmK_enable` group-writable for the service user. Partly
-    answered (§2 "USB spike results"): names and units match and there is
-    no `pwmK_enable`; the udev group write is still unchecked.
+34. Spike: which Quadro temperature inputs carry a reading in its status
+    report (`tools/aquacomputer_probe.py`); bind them in its `temp_map`.
+35. Confirm the HID report layout of `hw/aquacomputer.py` on the real
+    devices in their final wiring (the Quadro on aquabus or on its own
+    USB port, every fan and sensor connected): the status report fields
+    of every input and output, the control-report duty fields of every
+    channel, and that the udev rule makes `/dev/hidrawN` readable and
+    writable for the service user. Partly answered (§2 "USB spike
+    results", 2026-09-14 and 2026-09-15): with one fan and one thermistor
+    on each controller, each on its own USB port, both status reports
+    decode to the Linux driver's readings, the aquaero's output duty field
+    is verified, and patching the control reports reproduces the driver's
+    writes byte for byte (`tests/fixtures/aquacomputer/`). Still open: the
+    udev rule for the service user, the other channels, and a sub-zero
+    temperature (decoded signed by design, not observed).
 36. `pytest -m hardware` on the Pi with the aquaero attached (after
     item 2).
 37. Verify every `temp_map` entry against its physical sensor (warm one,
@@ -3172,12 +3375,6 @@ Owner decisions (2026-09-14, later the same day):
 48. Time `model.json` writes on the Pi's SD card.
 49. Digole: protocol, pages (Overview, Drives, Zones/Fans, Model, Host),
     touch, hit-test.
-74. hwmon PWM cost (§2 "USB spike results"): a `pwmK` read takes 210 ms
-    and a write 420 ms, and `Xt6Adapter` reads every `pwmK` and writes every
-    channel on every tick, about 5 s per tick with 8 outputs. Report the
-    last commanded value instead of reading `pwmK` back, write only
-    channels whose raw value changed (and all of them again after a
-    re-plug), and time a full tick on the Pi.
 75. Fan stall and restart: a fan below its stall duty stops and starts
     again only at a higher duty (aquaero test fan: stops at 13 %, starts
     at 25 %), and a fan can speed up in a low-duty band (Quadro test fan:
@@ -3185,18 +3382,50 @@ Owner decisions (2026-09-14, later the same day):
     stall and start duties in the config, a start kick when a channel
     reads 0 rpm under a command above its stall duty, and
     `tools/fit_fans.py` finding both duties and the unstable band.
-76. What the aquaero channels hold after exit: without `pwmK_enable`,
-    `release()` does nothing and each channel keeps its manual preset. Decide
-    together with item 33 whether that stays (the stop write leaves
-    `fallback_pwm`) or the adapter restores the saved firmware controller
-    assignment through HID.
+76. What the aquaero channels hold after exit: each commanded channel
+    keeps its manual preset (the stop write leaves `fallback_pwm`).
+    `AquacomputerAdapter.release()` now restores the captured firmware
+    assignment over HID (the aquaero's preset, control source and power
+    limits, and the Quadro's duty, as the first control report read after
+    the daemon started saw them), but it is not called at exit. Decide
+    together with item 33 whether that stays or `release()` runs at exit.
+    Note that after a daemon restart the first read sees the previous
+    run's presets, not the firmware controllers, so a restore at exit also
+    needs the capture kept across restarts (for example in the state
+    directory).
 77. Find out whether a control-report write is stored in the aquaero's or
     the Quadro's non-volatile memory. If it is, a write every tick wears
-    it; item 74 cuts the rate, but the answer decides how far. Before
-    item 42.
+    it; item 74 (done) writes only on a tick whose duties changed, which
+    cuts the rate, but the answer decides how far (for example a minimum
+    duty step or write interval). Before item 42.
 78. Send the driver fix in `deploy/dkms/aquacomputer_d5next/` upstream
     (linux-hwmon), then drop the patch once a Raspberry Pi OS kernel
-    carries it.
+    carries it. Only relevant if the DKMS driver path is revived: the
+    daemon uses hidraw (§8.1, 2026-09-15).
+80. Time a full tick over hidraw on the Pi with both controllers: both
+    status report reads, a tick with a changed duty on each controller
+    (SET plus secondary report, no control read), the `ctrl_gap_ms` wait
+    after a SET, a periodic refresh tick and the reopen after a re-plug
+    (up to `status_max_age_s`). Confirm that `ctrl_gap_ms` 200 is needed
+    and enough (no `EPIPE` on an operation after a SET), and count how
+    often a control read fails (about one in 60 in the spike).
+81. Channel mode on the Quadro. The adapter writes only the Quadro's duty
+    field, as the driver does. If a channel has been switched to a curve
+    or another controller mode (aquasuite), the duty is ignored: duty
+    verification then re-reads and rewrites every `duty_mismatch_s`
+    without effect and logs a warning each time. Find the control-report
+    field that selects the channel mode, verify and set it the way the
+    aquaero's control source and power limits are, and escalate a
+    mismatch that a rewrite does not fix (one warning, then a health
+    flag) instead of rewriting forever. Check the aquaero for the same
+    (a fan in rpm mode, hold minimum power, start boost).
+82. The Pi that ran the USB spike still has the DKMS `aquacomputer_d5next`
+    module installed, which binds both controllers. The hidraw nodes
+    stay and the daemon works, but anything that reads a `pwmN` attribute
+    issues a control report read of its own, outside the daemon's
+    `ctrl_gap_ms`. Remove it (`sudo dkms remove aquacomputer_d5next
+    --all`, reboot) before item 42 and confirm the daemon runs with
+    `hid-generic`.
 
 ### 8.4 Open — Zero 2 W upgrade
 
@@ -3220,6 +3449,9 @@ Owner decisions (2026-09-14, later the same day):
    longer writes `0.0` to a channel whose PWM read returns `None`; such
    channels are excluded from the write-back and reported, and the test
    skips with a clear reason if none is readable. **Must land before item 36.**
+   (That test went with the sysfs adapter; its hidraw successor,
+   `tests/test_hw_aquacomputer_adapter.py::test_live_read_and_reapply_what_the_device_holds`,
+   re-applies only duties the device already holds.)
 3. **Done:** a zoned sensor's Stuck evidence is now its zone's relative airflow (`stuck_airflow_net`, void for a proximal sensor when the zone air moved against it by more than `stuck_air_oppose_c`) and a proximal sensor's siblings are on its own bay (§3). False zone fault on a healthy enclosure: the Stuck rule's sibling
    evidence faults a zone when an idle bay's DS18B20 stays inside its
    1.5-LSB band for `stuck_s` while a sibling's activity changes and the
@@ -3241,7 +3473,7 @@ Owner decisions (2026-09-14, later the same day):
    9–11× the legacy MPC against 12×); `tests/test_bench_budget.py` now
    interleaves, discards a warm-up repeat and gates on the 75th percentile
    of several per-repeat ratios instead of one min/min pair.
-7. **Done:** `install-pi.sh --das` installs `config.example-das.yaml` and the `deploy/aqua-bridge-das.conf` systemd drop-in (`ExecStart=` with `--source hwmon`); without `--das` the legacy path is unchanged.
+7. **Done:** `install-pi.sh --das` installs `config.example-das.yaml` and the `deploy/aqua-bridge-das.conf` systemd drop-in (`ExecStart=` with `--source hwmon`, since 2026-09-15 `--source composite`); without `--das` the legacy path is unchanged.
 8. **Done:** `zones.trust_rule: sigma` now trusts a zone on this tick's estimator σ (`sigma_fault_c`, `sigma_air_fault_c`) instead of its drive and air sensor groups, so a lost sensor widens the margin and only a σ past its threshold faults the zone (§3 per-zone trust). `zones.trust_rule: sigma` (zone trust from the estimator's σ); the
    config accepts it, `strict` applies today.
 9. **Done:** a sensor whose value the gate rejects now confirms over
@@ -3253,11 +3485,25 @@ Owner decisions (2026-09-14, later the same day):
     tens of minutes after a load step (return threshold 0.25 °C/min against
     0.26–0.29 °C/min physical transients); tune it.
 
+#### Finished from §8.3 (2026-09-15)
+
+74. **Done:** the daemon reads and writes over hidraw (§8.1, 2026-09-15):
+    `read()` uses the newest unsolicited status report and reports its
+    output duty, and `apply()` sends one control report SET per
+    controller, only on a tick whose duties changed, with no control
+    report read on a normal tick (§3 Track B). Timing a full tick on the
+    Pi is item 80. hwmon PWM cost (§2 "USB spike results"): a `pwmK` read
+    takes 210 ms and a write 420 ms, and `Xt6Adapter` reads every `pwmK`
+    and writes every channel on every tick, about 5 s per tick with 8
+    outputs. Report the last commanded value instead of reading `pwmK`
+    back, write only channels whose raw value changed (and all of them
+    again after a re-plug), and time a full tick on the Pi.
+
 #### Docs / repo
 
 - [x] Create the GitHub repo (`gh`, §12)
 - [x] `pyproject.toml` (ruff, pytest), `config.example.yaml`
-- [x] CI: ruff + pytest for track A (invariants, nominal, failures, sensor lies, fuzzy, closed-loop; fake hwmon; no live USB)
+- [x] CI: ruff + pytest for track A (invariants, nominal, failures, sensor lies, fuzzy, closed-loop; fake hardware; no live USB)
 - [x] Branch protection on `main` with required checks; rebase merges only (§12)
 - [x] Nightly randomized Hypothesis run (`nightly-fuzz`, §12)
 - [x] `nightly` marker: heavy sweeps out of PR CI (`-m "not hardware and not nightly"`), into the nightly job
@@ -3309,17 +3555,18 @@ Owner decisions (2026-09-14, later the same day):
 
 #### Track B — hardware (Pi USB; fake sysfs anywhere)
 
-- [x] `hw/xt6.py` read/apply, udev `0c70`, sysfs root injectable
-- [x] `hw/xt6.py`: `pwmK_enable` re-checked on every apply (re-plug)
+- [x] `hw/xt6.py` read/apply, udev `0c70`, sysfs root injectable (replaced 2026-09-15)
+- [x] `hw/xt6.py`: `pwmK_enable` re-checked on every apply (re-plug) (replaced 2026-09-15)
+- [x] hidraw adapter (2026-09-15, replaces the hwmon sysfs adapter): `hw/aquacomputer.py` report layouts against captured reports, `hw/hidraw.py` discovery and feature reports, `hw/aquacomputer_adapter.py` (status-report reads, one SET per controller on a changed tick, duty verification, power cycles, periodic refresh, `release()`), `aquacomputer:` config with timing keys, `--source composite`, `tools/aquacomputer_probe.py`
 - [x] Startup rejection: `xt6.fans` keys == `mpc.channels`, `xt6.temp_map` keys == `mpc.temps`
 - [x] `xt6.fans`: one entry per fan with `pwm` and optional `rpm`; legacy `map` / `fan_map` rejected
-- [x] `test_hw_map.py` / fake hwmon in CI
-- [x] `hw/sources.py`: several hwmon devices + 1-Wire, every name bound exactly once (`--source hwmon`)
+- [x] `test_hw_map.py` / fake hwmon in CI (replaced by the fake controller, 2026-09-15)
+- [x] `hw/sources.py`: several hwmon devices + 1-Wire, every name bound exactly once (`--source hwmon`; since 2026-09-15 controllers over hidraw, `--source composite`)
 - [x] systemd unit: `Type=notify`, `Wants=`+`After=network-online.target`,
       `Restart=always`, `WatchdogSec`, `TimeoutStartSec`,
       `ExecStart=/opt/aqua-bridge/.venv/bin/python -m aqua_bridge --config /etc/aqua-bridge/config.yaml`,
       SIGTERM stop path writes `fallback_pwm` (no `ExecStop=`), `StateDirectory=aqua-bridge`
-- [x] udev rule for hwmon `pwm*` group write (`plugdev`)
+- [x] udev rule for hwmon `pwm*` group write (`plugdev`; kept for the optional driver)
 - [x] `deploy/install-pi.sh`; provisioning verified on a Zero W (service left disabled)
 
 #### Track B2 — 1-Wire and SMART (fake sysfs and fixtures anywhere; hardware on the Pi / PC)
@@ -3335,7 +3582,7 @@ Owner decisions (2026-09-14, later the same day):
 - [x] MQTT + HA DAS entities: drive temperature / margin / σ, bay occupancy, noise index, model status, limits, experiments
 - [x] HTTP API: `GET /api/state`, `/api/health`, `/api/estimate`, `/api/bays`, `/api/model`; `POST /api/mode`, `/api/setpoint`, `/api/limit`, `/api/bay`, `/api/pwm`, `/api/preset`, `/api/auto`, `/api/ident`, `/api/in/smart`
 - [x] HTTP HTML: same five pages as Digole, poll `/api/state`; DEGRADED banner naming the zones
-- [x] Tests: HTTP talks to the command sink, not hwmon; Auto rejects raw PWM; fuzz JSON → 4xx
+- [x] Tests: HTTP talks to the command sink, not the hardware; Auto rejects raw PWM; fuzz JSON → 4xx
 
 ## 9. Raspberry Pi packages and settings
 
@@ -3356,12 +3603,15 @@ sudo apt-get install -y $(grep -vE '^#|^$' deploy/packages-rpi.txt | xargs)
 | python3 python3-dev python3-pip python3-venv | daemon |
 | python3-spidev python3-lgpio libgpiod-dev gpiod | GPIO/SPI |
 | minicom | Digole UART debug |
-| lm-sensors | `sensors`, hwmon |
+| lm-sensors | `sensors` (the controllers are read with `tools/aquacomputer_probe.py`) |
 | openssl | self-signed HTTPS certificate (`install-pi.sh`) |
-| python3-hid python3-usb liquidctl | HID path, spike |
+| python3-hid python3-usb liquidctl | liquidctl and ad-hoc USB checks (the daemon's hidraw code needs only the standard library) |
 | python3-numpy python3-yaml | controller (runtime deps) |
 | python3-aiohttp python3-paho-mqtt | HTTP, MQTT |
 | python3-pytest python3-hypothesis | tests on the Pi |
+
+`dkms`, `curl` and `patch` are not in the list: only the optional
+`aquacomputer_d5next` DKMS package needs them (below).
 
 The Python packages come from **apt**, so a venv with system
 site-packages imports them. Versions on Trixie as verified on a Zero W:
@@ -3469,13 +3719,30 @@ resolution that is a few percent of the CPU; measure with
 
 I2C userspace module: `/etc/modules-load.d/i2c-dev.conf` → `i2c-dev`.
 
-### Kernel module `aquacomputer_d5next` (DKMS)
+### HID access
 
-Raspberry Pi OS kernels are built without
-`CONFIG_SENSORS_AQUACOMPUTER_D5NEXT`, so the aquaero and the Quadro bind
-to `hid-generic` and have no hwmon device. `install-pi.sh` runs
-`deploy/install-aquacomputer-dkms.sh` right after the apt packages
-(`dkms`, `curl`, `patch`, `linux-headers-rpi-v6`). The script:
+The daemon opens the aquaero's and the Quadro's `/dev/hidrawN` read/write
+(`hw/hidraw.py`, §3 Track B); no kernel driver beyond `hid-generic` is
+needed. The kernel creates hidraw nodes `root:root 0600`: the udev rule
+(below) gives the `0c70` nodes to `plugdev` with mode `0660`, and the unit
+puts the service user in `plugdev` (`SupplementaryGroups=`). Check with
+`ls -l /dev/hidraw*` and `tools/aquacomputer_probe.py` as the service
+user. A permission error there, or a start-timeout loop whose journal
+says `cannot open /dev/hidrawN: ... Permission denied`, means the rule has
+not applied: re-plug, or `sudo udevadm trigger --action=add
+--subsystem-match=hidraw`.
+
+### Kernel module `aquacomputer_d5next` (DKMS, optional)
+
+**Optional, and not run by `install-pi.sh`:** the daemon uses hidraw
+(§8.1, 2026-09-15). The package stays in `deploy/` for experiments through
+hwmon and in case the driver path is revived. Raspberry Pi OS kernels are
+built without `CONFIG_SENSORS_AQUACOMPUTER_D5NEXT`, so the aquaero and the
+Quadro bind to `hid-generic` and have no hwmon device. To build the
+driver anyway, install `dkms patch curl linux-headers-rpi-v6` (the script
+stops early with that hint when `dkms` or `patch`, or `curl` without
+`--source`, is missing) and run `deploy/install-aquacomputer-dkms.sh`. The
+script:
 
 1. derives the stable tag from the kernel release
    (`6.18.39+rpt-rpi-v6` → `v6.18.39`; `--tag` overrides it) and
@@ -3508,7 +3775,10 @@ item 78).
 
 Check: `sudo dkms status` lists the module as installed, and
 `cat /sys/class/hwmon/hwmon*/name` shows `aquaero` (and `quadro` on its
-own USB port).
+own USB port). With the module loaded the hidraw nodes stay (the driver
+connects hidraw too) and the daemon still works, but anything that reads
+a `pwmN` attribute issues a control report read of its own, outside the
+daemon's `ctrl_gap_ms` (§8 item 82).
 
 UART: `cmdline.txt` has no `console=serial0,115200` — the line is free for
 Digole.
@@ -3564,16 +3834,16 @@ most every `model_store_interval_s` and once at the clean stop. A legacy
 config ignores it. Delete `model.json` for a clean prior (the
 calibrations go with it).
 
-The unit's `ExecStart=` above has no `--source`, i.e. `xt6` (a single
-aquaero over hwmon, §3): that is the legacy install path, unchanged.
-The DAS install path (`--source hwmon`, the composite `hwmon:` +
-`onewire:` source) adds `deploy/aqua-bridge-das.conf` as a systemd
+The unit's `ExecStart=` above has no `--source`, i.e. `xt6` (the single
+controller of `xt6:` over hidraw, §3): that is the legacy install path.
+The DAS install path (`--source composite`, the composite `aquacomputer:`
++ `onewire:` source) adds `deploy/aqua-bridge-das.conf` as a systemd
 drop-in, `/etc/systemd/system/aqua-bridge.service.d/das.conf`, changing
 only `ExecStart=` (an empty `ExecStart=` line clears the base unit's
 before the real one is set — repeated-directive semantics,
 `systemd.unit(5)`). `install-pi.sh --das` installs it (§10) and
 `tests/test_deploy.py` checks that the drop-in's `ExecStart=` is the
-base unit's plus exactly `--source hwmon`, nothing else.
+base unit's plus exactly `--source composite`, nothing else.
 
 (The file itself carries the reasoning as comments.) `After=` does not
 pull in the target; `Wants=network-online.target` must sit next to it.
@@ -3584,13 +3854,13 @@ script. `%h` would be the *manager*’s home (`/root` for a system unit),
 not `User=`’s, hence the fixed install dir `/opt/aqua-bridge`, owned by
 the service user.
 
-`plugdev` is the group the udev rule gives write access to the hwmon
-`pwmK` / `pwmK_enable` attributes (the kernel creates them `root:root
-0644`); without it every `apply()` fails with `EACCES`. `dialout` is for
-the HID path.
+`plugdev` is the group the udev rule gives read/write access to the
+controllers' `/dev/hidrawN` nodes (the kernel creates them `root:root
+0600`); without it the daemon cannot open them. `dialout` is for the
+Digole UART.
 
 `READY=1` waits for the first applied command, so a device that is
-absent at boot (USB not enumerated, hwmon permissions wrong) shows up as
+absent at boot (USB not enumerated, hidraw permissions wrong) shows up as
 a start timeout after `TimeoutStartSec=120` followed by `Restart=always`:
 the visible “device absent” state. `WATCHDOG=1` every tick (`dt` 2 s in
 the legacy example, 5 s in the DAS example), period far below
@@ -3608,7 +3878,7 @@ raise, never set the event, and leave systemd to SIGKILL the daemon
 without the fallback write. That happened on the Pi and is covered by
 `tests/test_main.py`.) Do **not** set `ExecStop=`. systemd runs
 `ExecStop=` while the main process is still alive and sends SIGTERM after
-that — two writers to hwmon at once.
+that — two writers to the controllers at once.
 
 **Deploy side effect (accepted):** `systemctl restart` is a clean stop, so
 fans go to `fallback_pwm` (0.8 in the example). Coming back down at
@@ -3631,7 +3901,7 @@ XT6 firmware reverts (spike §2.3) or the board comes back. Accepted if
 ### udev
 
 `deploy/99-aquacomputer.rules` → `/etc/udev/rules.d/` (`install-pi.sh`
-reloads the rules and re-triggers `hwmon` and the `0c70` USB devices so
+reloads the rules and re-triggers `hidraw` and the `0c70` USB devices so
 an attached device gets them without a re-plug):
 
 ```text
@@ -3640,11 +3910,12 @@ SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c70", MODE="0660", GROUP="plugdev"
 ACTION=="add", SUBSYSTEM=="hwmon", ATTRS{idVendor}=="0c70", RUN+="/bin/sh -c 'for f in /sys%p/pwm*; do [ -e $f ] && chgrp plugdev $f && chmod g+w $f; done'"
 ```
 
-The first two are the HID path (liquidctl, the spike). The third is the
-path the daemon writes: it hands `pwm*` (including `pwmK_enable`) of the
-aquaero’s hwmon device to `plugdev` with group write.
-`tempK_input` / `fanK_input` are world-readable already. Unverified on a
-real device (§8).
+The `hidraw` rule is the path the daemon reads and writes (group
+`plugdev`, mode `0660`, *HID access* above); the `usb` rule serves
+liquidctl and `lsusb -v`. The `hwmon` rule only matters for the optional
+`aquacomputer_d5next` driver (not installed by `install-pi.sh`): it hands
+the driver's `pwm*` attributes to `plugdev` with group write. Unverified
+on a real device (§8 item 35).
 
 ---
 
@@ -3668,8 +3939,9 @@ on a Zero W; the hardware steps are waiting for the aquaero.
    Then, from `/opt/aqua-bridge`: `deploy/install-pi.sh --user USER`
    (`USER` is the service account and its group; add `--das` for a DAS
    enclosure, see below). Idempotent. It
-   installs the apt packages, builds the `aquacomputer_d5next` driver
-   with DKMS (§9; downloads the driver source from kernel.org), creates the install dir and the
+   installs the apt packages (no kernel driver is built: the daemon uses
+   hidraw, and the optional DKMS package is not run, §9), creates the
+   install dir and the
    `--system-site-packages` venv, runs `pip install -e . --no-deps` as
    the service user (aborting if pip tries to fetch numpy), installs
    `config.example.yaml` (`config.example-das.yaml` with `--das`) as
@@ -3681,7 +3953,7 @@ on a Zero W; the hardware steps are waiting for the aquaero.
    file exists** (an owner-provided certificate is never overwritten;
    `openssl` comes from the package list), installs the udev rule and
    re-triggers it, installs the unit with `User=` substituted and, with
-   `--das`, the `deploy/aqua-bridge-das.conf` drop-in (`--source hwmon`,
+   `--das`, the `deploy/aqua-bridge-das.conf` drop-in (`--source composite`,
    §9) into `aqua-bridge.service.d/das.conf`, reloads
    systemd and verifies the unit (drop-in included). It does **not**
    enable or start the
@@ -3699,14 +3971,19 @@ on a Zero W; the hardware steps are waiting for the aquaero.
    config exists):
    `sudo install -m 640 -o root -g USER config.example-das.yaml
    /etc/aqua-bridge/config.yaml`. Either way, edit `mpc.channels` / `mpc.temps` /
-   `mpc.sensors` / `mpc.topology` for the enclosure, the `hwmon:` devices
-   (`fans` with `{pwm: pwmN, rpm: fanN}` per output, `temp_map` per
-   thermistor input actually present), `onewire.sensors` (step 9), MQTT
+   `mpc.sensors` / `mpc.topology` for the enclosure, the `aquacomputer:`
+   devices (`device: aquaero` or `quadro`, `serial:` when several of one
+   kind are attached, `fans` with `{pwm: pwmN, rpm: fanN}` per output,
+   `temp_map` per thermistor input actually present, the timing keys at
+   their defaults unless §8 item 80 says otherwise), `onewire.sensors`
+   (step 9), MQTT
    host and credentials (the MQTT command topics rely on the broker's
    authentication, §7), `http.enabled` / `mqtt.enabled`. Every name must
    be bound exactly once (the daemon exits 2 otherwise). Legacy mode:
-   `xt6.fans` and `xt6.temp_map` with exactly the keys of `mpc.channels` /
-   `mpc.temps`. Always pass `--config /etc/aqua-bridge/config.yaml`.
+   `xt6.device`, `xt6.fans` and `xt6.temp_map` with exactly the keys of
+   `mpc.channels` / `mpc.temps`. A config from before the hidraw adapter
+   (`hwmon:`, `xt6.hwmon_name`) exits 2 with a message naming the
+   replacement keys. Always pass `--config /etc/aqua-bridge/config.yaml`.
    **HTTPS users** (when `http.enabled: true`): `sudo
    /opt/aqua-bridge/.venv/bin/python /opt/aqua-bridge/tools/http_user.py
    --config /etc/aqua-bridge/config.yaml --group USER <name>` prompts for
@@ -3716,11 +3993,16 @@ on a Zero W; the hardware steps are waiting for the aquaero.
    says why; the fans are controlled regardless.
 7. USB: dwc2 host, powered hub, XT6 on USB; the Quadro on aquabus, or on
    its own USB port if its PWM is not writable through the aquaero (§2).
-8. `lsusb` / `sensors` — the USB spike (§2): attribute names and units,
-   Quadro PWM, which Quadro temperature inputs exist, firmware revert.
-   Check `ls -l /sys/class/hwmon/hwmon*/pwm*` shows group `plugdev` with
-   write; run `.venv/bin/python -m pytest -m hardware` as the service
-   user. Warm each mapped thermistor and watch the right `obs.temps` key
+8. `lsusb`, then `.venv/bin/python tools/aquacomputer_probe.py` as the
+   service user (read-only; no driver build and no `sensors`): each
+   aquaero and Quadro with serial, USB interface and `/dev/hidrawN`, its
+   temperatures, outputs (rpm, duty, voltage, current, power) and control
+   settings — the spike questions of §2 (Quadro PWM, which Quadro
+   temperature inputs exist, firmware revert) and the `tempN` / `fanN` /
+   `pwmN` and `serial:` for the config. A permission error means the
+   hidraw udev rule has not applied (`ls -l /dev/hidraw*` must show group
+   `plugdev` with read/write, §9 *HID access*). Run
+   `.venv/bin/python -m pytest -m hardware` as the service user. Warm each mapped thermistor and watch the right `obs.temps` key
    move (a swapped `temp_map` is invisible to the gate, §3).
 9. **Sensor commissioning** (DS18B20, once, before the daemon; `w1-gpio`
    overlays of §9 active):
@@ -3736,18 +4018,18 @@ on a Zero W; the hardware steps are waiting for the aquaero.
      bulk-read cycle time per bus and the CRC error rate per sensor over
      20 cycles: aim for < 1 % and a cycle under `0.4 × dt`.
 10. One diagnostic tick as the service user:
-    `.venv/bin/python -m aqua_bridge --config /etc/aqua-bridge/config.yaml --source hwmon --once`
+    `.venv/bin/python -m aqua_bridge --config /etc/aqua-bridge/config.yaml --source composite --once`
     (legacy: without `--source`, which defaults to `xt6`) reads every
     source, prints the observation and the command, applies it, and ends
-    with the stop write: the fans are left at `fallback_pwm` with
-    `pwmK_enable` in manual mode.
+    with the stop write: the fans are left at `fallback_pwm`, each aquaero
+    channel assigned to its manual preset (§2).
 11. DAS: the unit's `ExecStart=` has no `--source`, i.e. `xt6`. `--das`
-    at step 5 already installed the `--source hwmon` drop-in
+    at step 5 already installed the `--source composite` drop-in
     (`deploy/aqua-bridge-das.conf`, §9); confirm with `systemctl cat
     aqua-bridge` (its `ExecStart=` lines show the override). Without
     `--das`, add it by hand: `sudo systemctl edit aqua-bridge` — an
     empty `ExecStart=` line, then the full `ExecStart=` line with
-    `--source hwmon` — then `sudo systemctl daemon-reload` and `sudo
+    `--source composite` — then `sudo systemctl daemon-reload` and `sudo
     systemd-analyze verify /etc/systemd/system/aqua-bridge.service`.
     Optionally add `--record
     /var/lib/aqua-bridge/rec.jsonl` or set `record_path` for the model
@@ -3840,7 +4122,7 @@ the unit or the udev rule changed. Or `git pull` from GitHub on the Pi.
 Avoid committing from a Zero W (slow card, easy to mix up branches).
 
 Running the daemon by hand on the Pi (stop the service first: two
-processes would both write hwmon):
+processes would both write the controllers):
 
 ```bash
 ssh USER@PI-HOST
@@ -3908,8 +4190,9 @@ One topic per branch. Track B stays on its own branches, not mixed with
 the core. `main` only gets what is green in CI and does not break the
 `model.py` contract. A config without the DAS sections must behave bit for
 bit as before, and the legacy goldens never move. The code arrived as
-three PRs — `mpc-core` (contract, gate, PI and MPC, CI), `hw-xt6` (hwmon
-adapter), `glue` (loop, supervisor, entry point, HTTP, MQTT, deploy) —
+three PRs — `mpc-core` (contract, gate, PI and MPC, CI), `hw-xt6` (the
+hwmon adapter, since replaced by the hidraw adapter), `glue` (loop,
+supervisor, entry point, HTTP, MQTT, deploy) —
 followed by spec and config updates (`spec`, `readme-badges`, `xt6-fans`,
 `das-premise`) and the DAS milestones, one PR each: `das-truth-sim`,
 `onewire-source`, `zones-gate`, `smart-agent`, `pi-das`, `estimator`,
@@ -3988,7 +4271,7 @@ blob in the log.
 1. **Done.** GitHub repo exists, public, protected `main` (§12).
    Site-specific inventory in `private.md`.
 2. **In parallel:** the control core on the dev machine **and**, on the
-   Pi, the USB spike (hub, XT6, hwmon, Quadro PWM and inputs, **firmware
+   Pi, the USB spike (hub, XT6, HID reports, Quadro PWM and inputs, **firmware
    revert**) plus **DS18B20 and sensor commissioning** (`w1-gpio` buses,
    `tools/w1_commission.py --list / --identify / --check`, §10). Neither
    needs the other. Core **done** (legacy PI and MPC, and the whole DAS
@@ -3996,17 +4279,18 @@ blob in the log.
    store, experiments; CI). Spike and commissioning **open**: the
    aquaero, the Quadro and the sensors are not connected.
 3. Hardware adapters once the spike answers the Quadro PWM **and** revert
-   questions. **Written** against the assumed hwmon and `w1_therm` ABIs
-   and fake trees (`hw/xt6.py`, `hw/sources.py`, `hw/onewire.py`);
-   confirm on the devices, adjust the bindings or the adapters if the
-   spike disagrees.
+   questions. **Written**: the controllers over hidraw against captured
+   reports (`hw/aquacomputer.py`, `hw/hidraw.py`,
+   `hw/aquacomputer_adapter.py`, `hw/sources.py`), 1-Wire against the
+   assumed `w1_therm` ABI and fake trees (`hw/onewire.py`); confirm on the
+   devices, adjust the bindings or the adapters if the spike disagrees.
 4. Glue loop, MQTT. **Code done**; Pi provisioned with `install-pi.sh`,
    sim smoke run and benchmark on the Zero W; service left disabled; no
    live broker yet.
 5. HTTP API + HTML (same pages as Digole). **Done** (Host section and
    drive views gap, §8).
-6. Hardware bring-up of the DAS: spike, hwmon permissions, `-m hardware`,
-   bind every sensor, `--source hwmon` drop-in, DAS step budget on the
+6. Hardware bring-up of the DAS: spike, hidraw permissions, `-m hardware`,
+   bind every sensor, `--source composite` drop-in, DAS step budget on the
    Pi, enable the service, MQTT/HA live check, SMART agent on the PC.
 7. **Model ladder** on the running enclosure, each stage ≥ 24 h unless
    stated, one change at a time:
