@@ -439,13 +439,67 @@ def test_silently_unwritten_channel_is_caught_at_build_time(tmp_path: Path) -> N
         )
 
 
+def _writeback_plan(
+    pwm_map: dict[str, str], obs_pwm: dict[str, float | None]
+) -> tuple[dict[str, str], dict[str, float], list[str]]:
+    """Split a channel map into the subset safe to write back, given a read-back.
+
+    A channel whose PWM read came back ``None`` is dropped entirely: writing it
+    back as ``0.0`` would stop that fan on the real aquaero, so it is excluded
+    from both the returned ``pwm_map`` (used to build the write-side ``HwmonMap``)
+    and the returned values (used to build the ``MpcCommand``).
+
+    Returns ``(readable_pwm_map, values_to_write, skipped_channels)``.
+    """
+    readable_map = {ch: attr for ch, attr in pwm_map.items() if obs_pwm.get(ch) is not None}
+    skipped = sorted(ch for ch in pwm_map if ch not in readable_map)
+    values = {ch: obs_pwm[ch] for ch in readable_map}
+    return readable_map, values, skipped
+
+
+def test_writeback_plan_excludes_unreadable_pwm_channel_from_the_write(tmp_path: Path) -> None:
+    """Same helper the live test uses: a channel whose PWM read is ``None`` must
+    never be written back, since that would zero it and stop the fan on the real
+    aquaero. §8 item 2."""
+    root, dev = _basic_tree(tmp_path)
+    (dev / "pwm2").write_text("")  # garbage -> read() reports None for "intake"
+    adapter = _adapter(dev, root)
+
+    obs = adapter.read()
+    assert obs.pwm["intake"] is None
+    assert obs.pwm["radiator"] is not None
+
+    readable_pwm_map, values, skipped = _writeback_plan(
+        {"radiator": "pwm1", "intake": "pwm2"}, obs.pwm
+    )
+
+    assert skipped == ["intake"]
+    assert readable_pwm_map == {"radiator": "pwm1"}
+    assert "intake" not in values
+
+    before = (dev / "pwm2").read_text()
+    write_hmap = HwmonMap(
+        hwmon_name="aquaero",
+        pwm_map=readable_pwm_map,
+        temp_map={"coolant": "temp1", "air": "temp2"},
+        root=root,
+    )
+    Xt6Adapter(write_hmap, _FakeClock()).apply(MpcCommand(pwm=values, mode=Mode.AUTO))
+
+    assert (dev / "pwm2").read_text() == before  # untouched: never write what was not read
+    assert (dev / "pwm1").read_text() == str(round(values["radiator"] * 255))
+
+
 @pytest.mark.hardware
 def test_live_read_and_writeback(aquaero_hwmon: Path) -> None:
     """Live USB test: skipped off-Pi by conftest's aquaero_hwmon fixture.
 
     Reads the real device once and writes back only the PWM value already
     in effect (never changes fan speed), then releases control back to
-    firmware curves.
+    firmware curves. A channel whose PWM read came back ``None`` is excluded
+    from the write-back rather than written as ``0.0``, which would stop that
+    fan; if no channel reads back at all, the test skips instead of writing
+    nothing. §8 item 2.
     """
     pwm_files = sorted(aquaero_hwmon.glob("pwm[0-9]"))
     assert pwm_files, "expected at least one pwmN file on the live aquaero device"
@@ -454,18 +508,28 @@ def test_live_read_and_writeback(aquaero_hwmon: Path) -> None:
     temp_files = sorted(aquaero_hwmon.glob("temp[0-9]_input"))
     temp_map = {f"t{i}": p.name.removesuffix("_input") for i, p in enumerate(temp_files)}
 
-    hmap = HwmonMap(
+    read_hmap = HwmonMap(
         hwmon_name="aquaero",
         pwm_map=pwm_map,
         temp_map=temp_map,
         root=aquaero_hwmon.parent,
     )
-    adapter = Xt6Adapter(hmap, clock=lambda: 0.0)
-
-    obs = adapter.read()
+    obs = Xt6Adapter(read_hmap, clock=lambda: 0.0).read()
     assert obs.pwm  # at least the configured channels are present
 
-    current_pwm = {ch: (value if value is not None else 0.0) for ch, value in obs.pwm.items()}
+    readable_pwm_map, current_pwm, skipped = _writeback_plan(pwm_map, obs.pwm)
+    if skipped:
+        print(f"test_live_read_and_writeback: excluding unreadable PWM channels {skipped}")
+    if not readable_pwm_map:
+        pytest.skip(f"no PWM channel read back a value; nothing safe to write to {pwm_map}")
+
+    write_hmap = HwmonMap(
+        hwmon_name="aquaero",
+        pwm_map=readable_pwm_map,
+        temp_map=temp_map,
+        root=aquaero_hwmon.parent,
+    )
+    adapter = Xt6Adapter(write_hmap, clock=lambda: 0.0)
     cmd = MpcCommand(pwm=current_pwm, mode=Mode.AUTO)
     adapter.apply(cmd)
     adapter.release()

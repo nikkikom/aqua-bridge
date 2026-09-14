@@ -2451,9 +2451,10 @@ them as "§8 item N".
    `max(t̂ − soft)` with `soft = limit − comfort − k·σ` (today `k·σ` is also
    added to `t̂`). Regenerate only the DAS goldens `das_*.pi_das.json`; keep
    every per-zone invariant.
-2. `tests/test_hw_xt6.py::test_live_read_and_writeback` writes `0.0` to a
-   channel whose PWM read returns `None`; on the real aquaero that stops a
-   fan. Skip such channels. **Must land before item 36.**
+2. **Done (PR #<n>):** `tests/test_hw_xt6.py::test_live_read_and_writeback` no
+   longer writes `0.0` to a channel whose PWM read returns `None`; such
+   channels are excluded from the write-back and reported, and the test
+   skips with a clear reason if none is readable. **Must land before item 36.**
 3. False zone fault on a healthy enclosure: the Stuck rule's sibling
    evidence faults a zone when an idle bay's DS18B20 stays inside its
    1.5-LSB band for `stuck_s` while a sibling's activity changes and the
