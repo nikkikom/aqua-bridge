@@ -85,7 +85,9 @@ hardware.
    ```
 
    Idempotent; safe to rerun. It installs the apt packages
-   (`deploy/packages-rpi.txt`, §9), creates `/opt/aqua-bridge` and a
+   (`deploy/packages-rpi.txt`, §9), builds the `aquacomputer_d5next`
+   hwmon driver with DKMS (`deploy/install-aquacomputer-dkms.sh`; the
+   Raspberry Pi OS kernel does not include it, PROJECT.md §9), creates `/opt/aqua-bridge` and a
    `--system-site-packages` venv, `pip install -e . --no-deps` as the
    service user (aborts if pip tries to fetch/build numpy instead of
    using apt's), installs `config.example.yaml`
