@@ -372,6 +372,7 @@ ones get their defaults):
 | `fan_models.<m>` | – | `rpm_max` > 0; `deadband` in `[0, 0.5)` (0.1); `exponent` in `[0.5, 1.5]` (1.0); `noise_db_at_max` finite (0: an index) |
 | `zones.trust_rule` | `strict` | `strict` (sensor groups) \| `sigma` (the estimator's σ, §3 per-zone trust) |
 | `zones.fault_coupling` | `declared` | `declared` (a fault reaches the coupled zones' channels) \| `none` |
+| `zones.sigma_floor_hold_s` / `sigma_floor_growth_c` / `sigma_floor_release_per_min` | 1800 / 1.0 / 0.0025 | ≥ 0 s / > 0 °C / > 0 PWM per minute; `trust_rule: sigma` only: the soft sigma floor holds at most this long, or until the σ of every lost group has grown this much, then falls at this rate (§3 per-zone trust) |
 | `noise.exponent` / `weight_noise` / `band_hysteresis` | 5 / 1.0 / 0.02 | `[3, 7]` / ≥ 0 / ≥ 0 |
 | `estimator.k_sigma` | 2.0 | `[0, 4]`; margin `= k_sigma * sigma` |
 | `estimator.sigma_fault_c` / `sigma_air_fault_c` | 4.0 / 2.0 | > 0, °C; with `trust_rule: sigma` a zone is untrusted while a constrained bay's drive σ or its air σ is above them; `sigma_fault_c` must then exceed the uncalibrated floor 1.5 |
@@ -500,8 +501,9 @@ skipped in legacy mode):
      estimator, whose inputs depend on no verdict, so `trust_rule: sigma`
      reads this tick's σ.
 4. Fault bookkeeping per zone (timer, streak).
-   - 4b. DAS, `trust_rule: sigma`: the sigma floor (§3 per-zone trust) on
-     the reach of every solver-driven zone with a lost sensor group.
+   - 4b. DAS, `trust_rule: sigma`: the soft sigma floor (§3 per-zone
+     trust) on the reach of every solver-driven zone with a lost sensor
+     group.
 5. Solver, only for the zones that are trusted and fault-free or on their
    `confirm_ticks`-th consecutive trusted tick; the channels of the other
    zones reach it as fixed inputs.
@@ -548,16 +550,50 @@ holds:
   estimator predicts the unobserved node, its σ grows, the margin `k·σ`
   widens and the fans rise; the zone faults once a σ passes its threshold
   (observability loss), and then holds and ramps high like any zone
-  fault. **Sigma floor**: while such a zone runs on the solver with a
-  required group of the `strict` rule (zone air, a bay's proximal sensors)
-  lacking a gate-trusted, confirmed member, the solver's demand on every
-  channel of the zone's reach is raised to at least `prev`
-  (`diagnostics["sigma_floor_channels"]`); the floor is released with the
-  sensor. The estimator cannot show the heat a lost sensor would have
-  shown and `k·σ` grows slowly, so without the floor the DAS MPC, which
-  had followed the measured warming, lowered the fans on the tick of the
-  loss (PWM −0.04, up to 21 % less zone airflow than with the sensor in a
-  replay, 2.3 °C of true margin lost in closed loop). The verdict reads this tick's σ (step 3d runs after the
+  fault. **Soft sigma floor** (`zones.advance_sigma_floor`): the estimator
+  cannot show the heat a lost sensor would have shown and `k·σ` grows slowly,
+  so without a floor the DAS MPC, which had followed the measured warming,
+  lowers the fans on the tick of the loss (PWM −0.04, 21 % less zone airflow
+  than the run with the sensor within the first minute, closed loop) and over
+  65 minutes costs the bay 2.3–2.4 °C of true margin. When a zone-air or bay
+  group of a zone (a `strict` group the estimator replaces) has no
+  gate-trusted, confirmed member, an episode opens for the zone: every channel
+  of its reach keeps a floor at `prev` of that tick (the command before the
+  loss; a further group lost during an episode reopens it at the higher of
+  `prev` and the floor in force). The floor **holds** until
+  `zones.sigma_floor_hold_s` (1800 s, counted in ticks of `dt`) has passed or
+  the σ of every lost group (the bay's drive σ, the zone's air σ) has grown by
+  `zones.sigma_floor_growth_c` (1.0 °C, so `k_sigma` × 1.0 = 2 °C of extra
+  margin now carries the uncertainty), whichever comes first; it is then
+  **released**, lowered by `zones.sigma_floor_release_per_min` (0.0025 PWM per
+  minute) until it reaches `pwm_min` and is gone. A floor therefore ends at
+  most `sigma_floor_hold_s + 60 · (pwm_max − pwm_min) / sigma_floor_release_per_min`
+  seconds after its episode opened. The episode closes when the groups are held
+  again; it keeps advancing while its zone is in fault, but only an eligible
+  zone's floor applies, and a tick without an estimator update keeps it as it
+  is. The solver's demand is raised to the floor
+  (`diagnostics["sigma_floor_channels"]`, per zone `diagnostics["sigma_floor"]`:
+  lost groups, phase, time held, σ growth, floor). The floor is a level, not
+  `prev` of every tick: the hard floor it replaces (at or above `prev` on every
+  tick while the sensor was lost) turned the DAS MPC's swings into a ratchet,
+  32.5 dB against 27.1 dB without a floor until the zone faulted. Measured on
+  `sim/das.py` (example config, busy bays, b02's only proximal sensor lost at
+  10 minutes for 65 minutes, DAS MPC, `basic` seeds 1–5): the σ growth ends the
+  hold 14–15 minutes after the loss (13–18 over every nightly case); no drive over its limit; the true margin
+  lost against the run with the sensor stays within `k_sigma` × the bay's σ
+  growth (0.00 °C beyond it; 0.06 °C beyond it without a floor, in the first
+  minutes) and at most 1.03 °C (0.48 °C until the zone's σ fault) against
+  2.33–2.39 °C without a floor; the zone's command falls rather than rises
+  before that fault; mean noise until the fault 27.0–27.5 dB against
+  26.0–26.6 dB without a floor. With b13's sensor lost (DAS MPC) the soft floor
+  loses up to 0.33 °C (0.08 °C without a floor) at +0.1 dB; the PI-like DAS
+  never asks for less, so the floor changes nothing; on the saturated `rich`
+  runs (masked redundant pairs) no margin is lost and the noise is within
+  0.1 dB of no floor, or lower. Bounds asserted
+  nightly (`tests/test_sigma_trust.py`): 0.05 °C beyond `k·σ` growth, 1.25 °C
+  in total, 1.5 dB above no floor, no command rise beyond the run without a
+  floor plus 0.05.
+  The verdict reads this tick's σ (step 3d runs after the
   estimator); a zone in fault returns after `confirm_ticks` with σ within
   its thresholds, without waiting for confirmed members of the air and bay
   groups (a confirming sensor is not fused, so σ already carries it). On a
@@ -575,12 +611,7 @@ holds:
   `sigma_air_fault_c` rarely decides. A hot swap puts the bay's σ
   above 4 °C for a tick (the fast-swap rule on removal, the 25 °C² insert
   variance), so the zone faults for that tick plus its confirmation and its
-  channels hold (15–20 s, shorter than `fallback_hold_s`). With the floor
-  (same runs, b02's only proximal sensor lost at 10 minutes for 65
-  minutes): no margin lost on b02 with either solver, at a mean noise of
-  32.5 dB against 27.1 dB without the floor for the DAS MPC (31.3 against
-  31.2 dB PI-like DAS) until the zone faults; the 2 % dropout runs cost
-  under 0.02 dB. Caveat: on the `rich` preset a
+  channels hold (15–20 s, shorter than `fallback_hold_s`). Caveat: on the `rich` preset a
   bay with two proximal sensors at different placements keeps its σ
   inflated by the fast-swap rule (up to 7 °C) and faults its zone on a
   healthy plant.
@@ -2277,7 +2308,7 @@ tests carry the `nightly` marker.
 | `tests/test_zones.py` | DAS config parsing, defaults and rejections; `strict` trust per group (`sigma` without an estimator update); closure `F*` with `declared` / `none`; per-zone timers and confirmation; `degraded` vs `fallback`; legacy = one implicit zone; per-channel `compose`; per-role Stuck sizing; the DEGRADED banner and health field | PR |
 | `tests/test_mpc_zone_fallback.py` | a fault in zone A never lowers any channel of its reach below `prev` (hold, then `max(prev, fallback_pwm)`); channels outside keep regulating; the solver request never carries faulted-zone sensors and healthy commands do not depend on their values; per-zone recovery is bumpless; Flicker in one zone never resets another; a dropout in a redundant group is no fault; solver faults; legacy `mpc` turns a zone fault into whole fallback | PR (one sweep nightly) |
 | `tests/test_sensor_confirm.py` | sensor confirmation (§3): a jumping redundant member (proximal, zone air, inlet) is not fused until it confirms and the zone does not fault, the estimates of the DAS example config match a run without the member until then; a real level change is fused after `confirm_ticks`; restart on a new jump or a dropout; a sole member costs `confirm_ticks` once; a zone in fault waits for a confirmed member in every group; a property over random jumps, dropouts and time faults (median3 on and off) that the counts follow the gate alone and no confirming sensor reaches the estimator, the solver or `last_good_obs`; malformed memory; JSON and determinism; legacy keeps no state | PR |
-| `tests/test_sigma_trust.py` | `trust_rule: sigma` (§3, §8 item 8): thresholds inclusive, empty and undeclared bays, an uninitialised zone, a sigma that is not a number, time faults, unknown keys and setpoint groups still fault, `strict` ignores the estimator; the `sigma_fault_c` floor; switching rules by config only; the verdict reads this tick's σ across a crossing; an estimator fault applies `strict`; a zone in fault returns without its lost sensor only under `sigma`; on the truth sim 2 % DS18B20 dropouts fault far fewer zones than `strict` with no violation (both DAS solvers), a replay without a bay's only proximal sensor never lowers its zone's airflow beyond 2 % and raises it within ten minutes (PI-like DAS), a lost redundant member changes nothing, a bay's or a zone's sensors lost for good fault the zone once σ passes and it holds, then ramps high; a hot swap holds its zone for a few ticks; the sigma floor keeps a zone's reach at or above `prev` while one of its groups is lost and a replay of the DAS MPC without a bay's only sensor never lowers that reach | PR: `basic`; nightly: dropout sweep on `basic` and `rich` (redundant pairs masked), a sensor lost for good on both presets and solvers |
+| `tests/test_sigma_trust.py` | `trust_rule: sigma` (§3, §8 item 8): thresholds inclusive, empty and undeclared bays, an uninitialised zone, a sigma that is not a number, time faults, unknown keys and setpoint groups still fault, `strict` ignores the estimator; the `sigma_fault_c` floor; switching rules by config only; the verdict reads this tick's σ across a crossing; an estimator fault applies `strict`; a zone in fault returns without its lost sensor only under `sigma`; on the truth sim 2 % DS18B20 dropouts fault far fewer zones than `strict` with no violation (both DAS solvers), a replay without a bay's only proximal sensor never lowers its zone's airflow beyond 2 % and raises it within ten minutes (PI-like DAS), a lost redundant member changes nothing, a bay's or a zone's sensors lost for good fault the zone once σ passes and it holds, then ramps high; a hot swap holds its zone for a few ticks; the soft sigma floor (§8 item 68): it holds the command before the loss, ends on the σ growth or the hold time, falls at its rate, reopens on a further lost group, keeps its episode on an estimator fault, starts over from malformed memory, its config keys; on the DAS MPC without a bay's only sensor the no-floor run reproduces the drop (−0.04, about 21 % less airflow) and the soft floor holds, then releases | PR: `basic`; nightly: dropout sweep on `basic` and `rich` (redundant pairs masked), a sensor lost for good on both presets and solvers, the soft floor's margin, noise and no-ratchet bounds on `basic` seeds 1–5 and `rich` 0–2, both solvers, two sensors |
 | `tests/test_das_core.py` | the core invariants, closed loops and DAS goldens for `pi_das` and `mpc_das` (§4.2) | PR |
 | `tests/test_pi_das.py`, `tests/test_estimates.py`, `tests/test_das_config.py` | the margin-deficit PI (served zones, unconstrained channels, fixed channels, occupancy), the estimates block and prior map, `noise` / `limit_c` / served-zone config | PR |
 | `tests/test_estimator.py` | exact discretisation and Joseph form (random sequences keep P symmetric PSD); first tick and constant readings; σ grows while a bay is unobserved and shrinks back; redundant members; the occupancy machine incl. "never empty while zone air is unobserved"; SMART calibration acceptance, rejection, serial change and expiry after `calibration_max_age_days`; a guessed serial never relaxes a class; determinism, JSON round trip, malformed memory | PR |
@@ -2907,7 +2938,7 @@ Owner decisions (2026-09-14, later the same day):
     stays at 4–7 °C, which faults healthy zones on the `rich` sim.
     `trust_rule: sigma` is not usable with the example's redundant pairs
     until this is fixed.
-68. Soft sigma floor (owner decision 2026-09-14). Today a zone with a
+68. **Done:** the hard sigma floor is a soft floor that holds the command before the loss until `zones.sigma_floor_hold_s` or a `zones.sigma_floor_growth_c` σ growth, then falls at `zones.sigma_floor_release_per_min` (§3 per-zone trust). Soft sigma floor (owner decision 2026-09-14). Today a zone with a
     lost sensor group keeps its fans at or above `prev`, which ratchets
     the DAS MPC's fans up until the zone faults when a bay's only sensor
     is lost for good (32.5 dB against 27.1 dB without the floor). Replace

@@ -29,6 +29,7 @@ which faults the zone under ``sigma`` on a healthy plant (reported separately).
 from __future__ import annotations
 
 import dataclasses
+import json
 import math
 from collections import Counter
 from collections.abc import Callable, Mapping
@@ -44,6 +45,7 @@ from aqua_bridge.control.gate import evaluate_gate
 from aqua_bridge.control.mpc import step
 from aqua_bridge.control.solver_pi import PiSolver, SolverRequest, SolverResult
 from aqua_bridge.model import (
+    SIGMA_FLOOR_DEFAULTS,
     SIGMA_UNCALIBRATED_C,
     ConfigError,
     Mode,
@@ -402,13 +404,29 @@ def run_descending(
     return out
 
 
-def test_a_lost_group_under_sigma_never_lowers_its_zones_channels():
-    """``prox_a2`` is bay a2's only proximal sensor: under ``sigma`` zone za stays trusted,
-    and while the group is lost the channels of its reach (fa1, fa2 and, coupled, fb1)
-    never go below ``prev`` even when the solver asks for less; fc1 keeps descending. A
-    lost redundant member (``prox_a1``, ``prox_a1b`` still there) floors nothing, and the
-    floor is released when the sensor returns."""
-    cfg = lcfg()
+def floor_cfg(hold_s: float = 4.0, growth_c: float = 50.0, per_min: float = 0.6) -> MpcConfig:
+    """:func:`lcfg` under ``sigma`` with the soft floor's keys (``dt`` 1 s: ``per_min`` 0.6
+    lowers the floor by 0.01 per tick)."""
+    return das_cfg(
+        setpoints={},
+        zones={
+            "trust_rule": "sigma",
+            "sigma_floor_hold_s": hold_s,
+            "sigma_floor_growth_c": growth_c,
+            "sigma_floor_release_per_min": per_min,
+        },
+    )
+
+
+def test_the_soft_floor_holds_the_command_before_the_loss_then_releases_it():
+    """``prox_a2`` is bay a2's only proximal sensor: under ``sigma`` zone za stays trusted.
+    From the tick of the loss the channels of its reach (fa1, fa2 and, coupled, fb1) stay at
+    the command of the tick before the loss even though the solver asks for less, for
+    ``sigma_floor_hold_s``; then the floor falls by ``sigma_floor_release_per_min * dt / 60``
+    per tick. fc1 keeps descending throughout. The floor closes when the sensor returns, a
+    lost redundant member (``prox_a1``, ``prox_a1b`` still there) floors nothing, and a new
+    loss opens a new hold at the command of its own previous tick."""
+    cfg = floor_cfg()
     reach = set(cfg.zone_layout.reach["za"])
     assert reach == {"fa1", "fa2", "fb1"}
 
@@ -417,29 +435,159 @@ def test_a_lost_group_under_sigma_never_lowers_its_zones_channels():
             return lost(cfg, "prox_a2")
         if 15 <= i < 20:
             return lost(cfg, "prox_a1")
+        if 25 <= i < 28:
+            return lost(cfg, "prox_a2")
         return default_temps(cfg)
 
-    cmds = run_descending(cfg, temps_at, 25)
+    cmds = run_descending(cfg, temps_at, 30)
     for i, cmd in enumerate(cmds[1:], start=1):
         d = cmd.diagnostics
         assert d["zones_in_fault"] == [], i
         prev = cmds[i - 1].pwm
         floored = set(d["sigma_floor_channels"])
-        if 5 <= i < 15:
+        episode = d["sigma_floor"].get("za")
+        if 5 <= i < 15 or 25 <= i < 28:
+            opened = 5 if i < 15 else 25
             assert floored == reach, i
+            assert episode["lost"] == ["bay:a2"], i
+            held = i - opened
+            assert episode["held_s"] == held * cfg.dt
+            level = cmds[opened - 1].pwm["fa1"]
+            if held < 4:
+                assert episode["phase"] == zones.FLOOR_HOLD, i
+                want = level
+            else:
+                assert episode["phase"] == zones.FLOOR_RELEASE, i
+                want = level - 0.01 * (held - 3)
             for ch in reach:
-                assert cmd.pwm[ch] >= prev[ch] - 1e-12, (i, ch)
+                assert cmd.pwm[ch] == pytest.approx(max(want, prev[ch] - 0.05), abs=1e-12), (i, ch)
             assert cmd.pwm["fc1"] < prev["fc1"] or prev["fc1"] <= cfg.pwm_min, i
         else:
-            assert floored == set(), i
+            assert floored == set() and episode is None, i
             for ch in cfg.channels:
                 assert cmd.pwm[ch] < prev[ch] or prev[ch] <= cfg.pwm_min, (i, ch)
 
 
+def test_the_soft_floor_hold_ends_once_every_lost_groups_sigma_has_grown():
+    """The hold ends on the first tick on which the sigma of every lost group has grown by
+    ``sigma_floor_growth_c`` since the loss, before ``sigma_floor_hold_s``; a further group
+    lost during the episode opens a new hold at the higher of the floor and ``prev``, with a
+    new sigma reference; the air group's growth reads the zone's air sigma."""
+    cfg = floor_cfg(hold_s=1000.0, growth_c=0.5, per_min=6.0)
+    reach = cfg.zone_layout.reach["za"]
+    prev = dict.fromkeys(cfg.channels, 0.6)
+
+    def update(a2: float, air: float) -> estimator.EstimatorUpdate:
+        return estimator.EstimatorUpdate(
+            estimates={"a2": {"sigma": a2}},
+            memory={},
+            zones={"za": {"initialised": True, "sigma_air_c": air}},
+            bays={},
+            summary={},
+        )
+
+    def advance(memory, lost_now, upd, prev_now, eligible=("za",)):
+        return zones.advance_sigma_floor(
+            memory, cfg, lost={"za": lost_now}, estimator=upd, prev=prev_now, eligible=eligible
+        )
+
+    soft = advance(None, ("bay:a2",), update(1.5, 0.2), prev)
+    assert soft.zones["za"]["phase"] == zones.FLOOR_HOLD
+    assert soft.floor == dict.fromkeys(reach, 0.6)
+    soft = advance(soft.memory, ("bay:a2",), update(1.99, 0.2), dict.fromkeys(cfg.channels, 0.2))
+    assert soft.zones["za"]["phase"] == zones.FLOOR_HOLD and soft.floor["fa1"] == 0.6
+    soft = advance(soft.memory, ("bay:a2",), update(2.0, 0.2), prev)
+    assert soft.zones["za"]["phase"] == zones.FLOOR_RELEASE
+    assert soft.floor["fa1"] == pytest.approx(0.5)  # 6.0 per minute at dt = 1 s
+    assert soft.zones["za"]["sigma_growth_c"] == {"bay:a2": pytest.approx(0.5)}
+    # the zone air group is lost as well: a new hold at max(floor, prev), new references
+    soft = advance(
+        soft.memory, ("zone_air", "bay:a2"), update(2.1, 0.2), dict.fromkeys(cfg.channels, 0.45)
+    )
+    assert soft.zones["za"]["phase"] == zones.FLOOR_HOLD and soft.zones["za"]["held_s"] == 0.0
+    assert soft.floor["fa1"] == pytest.approx(0.5)
+    soft = advance(soft.memory, ("zone_air", "bay:a2"), update(2.7, 0.3), prev)
+    assert soft.zones["za"]["phase"] == zones.FLOOR_HOLD, "the air sigma has not grown"
+    # an estimator fault keeps the episode as it is; a zone in fault gets no floor
+    kept = advance(soft.memory, ("zone_air", "bay:a2"), None, prev)
+    assert kept.memory == soft.memory and kept.floor == soft.floor
+    assert advance(soft.memory, ("zone_air", "bay:a2"), update(2.7, 0.3), prev, ()).floor == {}
+    soft = advance(soft.memory, ("zone_air", "bay:a2"), update(2.7, 0.8), prev)
+    assert soft.zones["za"]["phase"] == zones.FLOOR_RELEASE
+    # the air sensor returns: the bay keeps the episode going; the floor falls to pwm_min
+    for _ in range(10):
+        soft = advance(soft.memory, ("bay:a2",), update(2.7, 0.3), prev)
+    assert soft.zones["za"]["phase"] == zones.FLOOR_RELEASED and soft.floor == {}
+    assert json.loads(json.dumps(soft.memory)) == soft.memory
+    # every group held again: the episode closes
+    assert advance(soft.memory, (), update(1.5, 0.2), prev).memory == {}
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        "garbage",
+        {"lost": "bay:a2", "ticks": 0, "phase": "hold", "sigma0": {}, "level": {}},
+        {"lost": ["bay:a2"], "ticks": -1, "phase": "hold", "sigma0": {}, "level": {}},
+        {"lost": ["bay:a2"], "ticks": 0, "phase": "later", "sigma0": {}, "level": {}},
+        {"lost": ["bay:a2"], "ticks": 0, "phase": "hold", "sigma0": {}, "level": {"fa1": 0.9}},
+        {
+            "lost": ["bay:a2"],
+            "ticks": 0,
+            "phase": "hold",
+            "sigma0": {},
+            "level": {"fa1": math.nan, "fa2": 0.9, "fb1": 0.9},
+        },
+    ],
+)
+def test_a_malformed_soft_floor_episode_opens_a_new_hold(stored):
+    cfg = floor_cfg()
+    upd = estimator.EstimatorUpdate(
+        estimates={"a2": {"sigma": 3.0}}, memory={}, zones={}, bays={}, summary={}
+    )
+    soft = zones.advance_sigma_floor(
+        {"za": stored},
+        cfg,
+        lost={"za": ("bay:a2",)},
+        estimator=upd,
+        prev=dict.fromkeys(cfg.channels, 0.4),
+        eligible=("za",),
+    )
+    assert soft.zones["za"]["phase"] == zones.FLOOR_HOLD and soft.zones["za"]["held_s"] == 0.0
+    assert soft.floor == dict.fromkeys(cfg.zone_layout.reach["za"], 0.4)
+
+
+def test_soft_floor_config_keys():
+    cfg = lcfg()
+    assert cfg.zones.sigma_floor_hold_s == SIGMA_FLOOR_DEFAULTS["sigma_floor_hold_s"] == 1800.0
+    assert cfg.zones.sigma_floor_growth_c == SIGMA_FLOOR_DEFAULTS["sigma_floor_growth_c"] == 1.0
+    assert (
+        cfg.zones.sigma_floor_release_per_min
+        == SIGMA_FLOOR_DEFAULTS["sigma_floor_release_per_min"]
+        == 0.0025
+    )
+    assert MpcConfig.from_mapping(floor_cfg(7.0, 0.3, 0.1).to_dict()).zones == ZonePolicy(
+        trust_rule="sigma",
+        sigma_floor_hold_s=7.0,
+        sigma_floor_growth_c=0.3,
+        sigma_floor_release_per_min=0.1,
+    )
+    assert floor_cfg(hold_s=0.0).zones.sigma_floor_hold_s == 0.0
+    for kw, match in (
+        ({"hold_s": -1.0}, "sigma_floor_hold_s must be >= 0"),
+        ({"growth_c": 0.0}, "sigma_floor_growth_c must be > 0"),
+        ({"per_min": 0.0}, "sigma_floor_release_per_min must be > 0"),
+        ({"per_min": math.inf}, "sigma_floor_release_per_min must be finite"),
+    ):
+        with pytest.raises(ConfigError, match=match):
+            floor_cfg(**kw)
+
+
 def test_strict_has_no_sigma_floor():
-    cfg = lcfg("strict")
-    cmds = run_descending(cfg, lambda i: default_temps(cfg), 6)
+    cfg = das_cfg(setpoints={}, zones={"trust_rule": "strict"})
+    cmds = run_descending(cfg, lambda i: lost(cfg, "air_c") if i >= 3 else default_temps(cfg), 6)
     assert all(c.diagnostics["sigma_floor_channels"] == [] for c in cmds)
+    assert all(c.diagnostics["sigma_floor"] == {} for c in cmds)
 
 
 # ---------------------------------------------------------------------------
@@ -613,23 +761,198 @@ def test_a_lost_proximal_sensor_never_lowers_cooling(healthy_sigma_run):
             assert q1 >= 1.02 * q0, (k, q0, q1)
 
 
-def test_a_lost_proximal_sensor_never_lowers_the_das_mpc_command():
-    """The DAS MPC replayed without b02's only proximal sensor: with the sensor it had
-    followed a measured warming the blind estimate does not show, and it planned less
-    airflow for z0 (up to 21 %, the PWM falling by 0.04 on the first tick); the sigma floor
-    keeps every channel of z0's reach at or above its previous command while the sensor
-    is lost."""
-    cfg = example_cfg("sigma", "mpc")
-    healthy = sim_run(cfg, int(LOSS_S / cfg.dt) + 1)
-    pairs = replay_without(cfg, healthy, "prox_b02")
-    reach = cfg.zone_layout.reach["z0"]
-    start = next(i for i, r in enumerate(healthy.records) if r.obs.ts >= LOSS_S)
-    prev = healthy.records[start - 1].cmd.pwm
-    for k, (_with_sensor, without_sensor) in enumerate(pairs):
-        assert without_sensor.diagnostics["zones_in_fault"] == [], k
-        for ch in reach:
-            assert without_sensor.pwm[ch] >= prev[ch] - 1e-12, (k, ch)
-        prev = without_sensor.pwm
+def no_sigma_floor(*_args: Any, **_kwargs: Any) -> zones.SigmaFloor:
+    """``zones.advance_sigma_floor`` replaced by no floor at all (the reference runs)."""
+    return zones.SigmaFloor(floor={}, memory={}, zones={})
+
+
+@dataclasses.dataclass(frozen=True)
+class FloorCase:
+    """One bay's only proximal sensor lost from ``LOSS_S`` on, closed loop, three runs on
+    the same seed: with the sensor, without it and no floor, without it and the soft floor."""
+
+    cfg: MpcConfig
+    bay: str
+    zone: str
+    start: int
+    healthy: DasRun
+    bare: DasRun
+    soft: DasRun
+
+    def margin_loss(self, run: DasRun) -> list[float]:
+        """The bay's true margin lost against the run with the sensor, per tick from the loss."""
+        h, r = self.healthy.array("margin_c", self.bay), run.array("margin_c", self.bay)
+        return [float(x) for x in (h - r)[self.start :]]
+
+    def uncovered_loss(self, run: DasRun) -> float:
+        """The largest margin loss beyond ``k_sigma`` times the sigma growth since the loss."""
+        sigma = [rec.cmd.diagnostics["estimates"][self.bay]["sigma_c"] for rec in run.records]
+        k, s0 = self.cfg.estimator.k_sigma, sigma[self.start - 1]
+        return max(
+            loss - k * max(0.0, s - s0)
+            for loss, s in zip(self.margin_loss(run), sigma[self.start :], strict=True)
+        )
+
+    def fault_at(self, run: DasRun) -> int:
+        """The first tick the zone is in fault after the loss (the run's length if never)."""
+        return next(
+            (
+                i
+                for i, rec in enumerate(run.records)
+                if i >= self.start and self.zone in rec.cmd.diagnostics["zones_in_fault"]
+            ),
+            len(run.records),
+        )
+
+    def mean_noise_db(self, run: DasRun, end: int | None = None) -> float:
+        """Mean modelled noise from the loss to ``end`` (default: the zone's first fault)."""
+        stop = self.fault_at(run) if end is None else end
+        seq = run.series["noise_db"][self.start : stop]
+        return sum(seq) / len(seq)
+
+    def mean_pwm(self, run: DasRun, lo: int, hi: int) -> float:
+        """Mean command over the zone's channels on ticks ``[lo, hi)``."""
+        chans = self.cfg.zone_layout.zone_channels[self.zone]
+        vals = [run.records[i].cmd.pwm[ch] for i in range(lo, hi) for ch in chans]
+        return sum(vals) / len(vals)
+
+
+def floor_case(
+    solver: str,
+    ticks: int,
+    sensor: str = "prox_b02",
+    preset: str = "basic",
+    seed: int = 1,
+    reference_ticks: int | None = None,
+) -> FloorCase:
+    """The three runs; ``reference_ticks`` shortens the runs with the sensor and without a
+    floor (the PR test only compares the first minutes after the loss) and then runs the
+    soft floor without the per-tick invariant checks, which the nightly sweep makes."""
+    cfg = example_cfg("sigma", solver)
+    masked = REDUNDANT if preset == "rich" else ()
+
+    def healthy_hook(i: int, obs: PlantObservation) -> PlantObservation:
+        return without(masked)(i, obs)
+
+    def lost_hook(i: int, obs: PlantObservation) -> PlantObservation:
+        return without((sensor,), since_s=LOSS_S)(i, without(masked)(i, obs))
+
+    kw: dict[str, Any] = {"preset": preset, "seed": seed}
+    short = ticks if reference_ticks is None else reference_ticks
+    healthy = sim_run(cfg, short, hook=healthy_hook, **kw)
+    with mock.patch.object(zones, "advance_sigma_floor", no_sigma_floor):
+        bare = sim_run(cfg, short, hook=lost_hook, **kw)
+    controller = step if reference_ticks is not None else checked_step
+    soft = sim_run(cfg, ticks, hook=lost_hook, controller=controller, **kw)
+    return FloorCase(
+        cfg=cfg,
+        bay=cfg.sensors[sensor].bay,
+        zone=cfg.sensors[sensor].zone,
+        start=next(i for i, t in enumerate(healthy.series["ts"]) if t >= LOSS_S),
+        healthy=healthy,
+        bare=bare,
+        soft=soft,
+    )
+
+
+#: Documented bounds of the soft sigma floor (PROJECT.md section 3 per-zone trust).
+#: The true margin a bay loses against the run with its sensor stays within ``k_sigma``
+#: times its sigma growth since the loss plus this much, degC (measured 0.00; without a
+#: floor 0.06, in the first minutes after the loss).
+UNCOVERED_LOSS_C = 0.05
+#: ...and within this much altogether over 65 minutes of loss, degC (measured up to 1.03
+#: on basic seeds 1-5; 2.39 without a floor).
+SOFT_FLOOR_LOSS_C = 1.25
+#: ...and the mean modelled noise until the zone's first fault within this much of the run
+#: without a floor, dB (the hard floor: 32.5 against 27.1 dB).
+SOFT_FLOOR_NOISE_DB = 1.5
+
+
+#: Ticks of the PR soft-floor test: the hold ends on the sigma growth about 15 minutes
+#: after the loss, and the reference runs cover the first 5 minutes after it.
+FLOOR_PR_TICKS = 320
+FLOOR_REFERENCE_TICKS = int(LOSS_S / 5.0) + 60
+
+
+def test_the_soft_sigma_floor_on_the_das_mpc():
+    """The DAS MPC loses b02's only proximal sensor after 10 minutes. Without a floor it
+    reproduces the case the floor exists for: it had followed a warming the blind estimate
+    does not show, lowers z0's command by about 0.04 on the tick of the loss and plans
+    about 21 % less z0 airflow than the run with the sensor within the first minutes. With
+    the soft floor nothing goes below the command before the loss while the floor holds,
+    the bay's sigma growth ends the hold before ``sigma_floor_hold_s``, the release lowers
+    the floor by at most its rate, and no drive exceeds its limit. The margin and noise
+    bounds over 65 minutes are the nightly sweep's."""
+    case = floor_case("mpc", FLOOR_PR_TICKS, reference_ticks=FLOOR_REFERENCE_TICKS)
+    cfg, start = case.cfg, case.start
+    reach = cfg.zone_layout.reach[case.zone]
+    before = case.soft.records[start - 1].cmd.pwm
+    assert before == case.bare.records[start - 1].cmd.pwm == case.healthy.records[start - 1].cmd.pwm
+    # without a floor
+    drop = before["xt1"] - case.bare.records[start].cmd.pwm["xt1"]
+    assert drop > 0.03, drop
+    ratio = min(
+        zone_airflow(cfg, case.zone, b.cmd.pwm) / zone_airflow(cfg, case.zone, h.cmd.pwm)
+        for b, h in zip(case.bare.records[start:], case.healthy.records[start:], strict=True)
+    )
+    assert ratio < 0.82, ratio
+    # the soft floor
+    step_down = cfg.zones.sigma_floor_release_per_min * cfg.dt / 60.0
+    phases, floors = [], []
+    for rec in case.soft.records[start:]:
+        d = rec.cmd.diagnostics
+        episode = d["sigma_floor"][case.zone]
+        phases.append(episode["phase"])
+        floors.append(episode["floor"])
+        assert episode["lost"] == [f"bay:{case.bay}"]
+        assert set(d["sigma_floor_channels"]) <= set(reach)
+        for ch, level in episode["floor"].items():
+            assert level >= before[ch] - step_down * len(phases) - 1e-9
+            if d["policy_by_channel"][ch] == "solver":
+                assert (
+                    rec.cmd.pwm[ch]
+                    >= min(level, rec.cmd.diagnostics["prev_pwm"][ch] - cfg.d_pwm_max) - 1e-12
+                )
+        if episode["phase"] == zones.FLOOR_HOLD:
+            assert episode["floor"] == {ch: before[ch] for ch in reach}
+            assert episode["sigma_growth_c"][f"bay:{case.bay}"] < cfg.zones.sigma_floor_growth_c
+    assert phases[0] == zones.FLOOR_HOLD and zones.FLOOR_RELEASE in phases
+    released = phases.index(zones.FLOOR_RELEASE)
+    assert released * cfg.dt < cfg.zones.sigma_floor_hold_s, "the sigma growth ended the hold"
+    for old, new in zip(floors[released - 1 :], floors[released:], strict=False):
+        for ch in new:
+            assert old[ch] - new[ch] == pytest.approx(step_down)
+    assert case.soft.violations() == 0
+
+
+@pytest.mark.nightly
+@pytest.mark.parametrize("solver", ["pi", "mpc"])
+@pytest.mark.parametrize(
+    ("preset", "seed"), [("basic", s) for s in range(1, 6)] + [("rich", s) for s in range(3)]
+)
+@pytest.mark.parametrize("sensor", ["prox_b02", "prox_b13"])
+def test_the_soft_sigma_floor_sweep(preset, seed, solver, sensor):
+    """65 minutes of loss at the default keys. Every drive within its limit; the margin
+    lost against the run with the sensor is covered by the k * sigma growth and within
+    ``SOFT_FLOOR_LOSS_C``; no ratchet: the zone's mean command over the 5 minutes before
+    its first fault (or the end) has not risen from the 5 minutes before the loss by more
+    than 0.05 beyond the rise without a floor (if any); the mean noise until that fault is within
+    ``SOFT_FLOOR_NOISE_DB`` of the run without a floor until its own fault. Without a floor
+    the DAS MPC on ``basic`` loses more than 2 degC of b02's margin (the 2.3 degC case)."""
+    case = floor_case(solver, LONG_TICKS, sensor, preset, seed)
+    assert case.soft.violations() == 0 and case.bare.violations() == 0
+    assert case.uncovered_loss(case.soft) <= UNCOVERED_LOSS_C
+    assert max(case.margin_loss(case.soft)) <= SOFT_FLOOR_LOSS_C
+
+    def rise(run: DasRun) -> float:
+        fault = case.fault_at(run)
+        before = case.mean_pwm(run, case.start - 60, case.start)
+        return case.mean_pwm(run, max(case.start, fault - 60), fault) - before
+
+    assert rise(case.soft) <= max(0.0, rise(case.bare)) + 0.05, (rise(case.soft), rise(case.bare))
+    assert case.mean_noise_db(case.soft) <= case.mean_noise_db(case.bare) + SOFT_FLOOR_NOISE_DB
+    if solver == "mpc" and preset == "basic" and sensor == "prox_b02":
+        assert max(case.margin_loss(case.bare)) > 2.0
 
 
 def test_a_lost_redundant_proximal_sensor_changes_nothing(healthy_sigma_run):

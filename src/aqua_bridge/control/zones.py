@@ -87,10 +87,35 @@ first to ramp high). Consequences, per zone and across coupling:
 
 Mode (``mpc.step``): ``fallback`` iff every zone is in fault, ``degraded``
 iff some but not all are, else ``auto`` / ``saturated``.
+
+Soft sigma floor (:func:`advance_sigma_floor`, ``zones.trust_rule: sigma``)
+---------------------------------------------------------------------------
+A zone with a zone-air or bay group without a gate-trusted, confirmed member
+(:func:`lost_groups`) stays on the solver under ``sigma``, but the estimator's blind
+estimate lags the heat the lost sensor would have shown while its sigma is still small.
+Per zone an *episode* opens on the tick a group is lost: the floor is ``prev`` on every
+channel of the zone's reach (the command of the tick before the loss; when a further
+group is lost during an episode, the higher of ``prev`` and the floor still in force),
+and the sigma of each lost group is recorded (:func:`group_sigma`: the bay's drive sigma,
+the zone's air sigma). The floor **holds** until ``zones.sigma_floor_hold_s`` has passed,
+counted in ticks of ``dt`` so a late tick never shortens it, or the sigma of every lost
+group has grown by ``zones.sigma_floor_growth_c``, whichever comes first: by then
+``k_sigma * growth`` of extra margin carries the uncertainty. It is then **released**:
+lowered by ``zones.sigma_floor_release_per_min * dt / 60`` per tick until it reaches
+``pwm_min`` and is gone (``released``), so a floor ends at most ``sigma_floor_hold_s +
+60 * (pwm_max - pwm_min) / sigma_floor_release_per_min`` seconds after its last opening.
+A group that returns while others stay lost drops out of the growth check; the episode
+closes when every group is held again. Episodes advance while their zone is in fault,
+but the floor applies to eligible zones only (a zone in fault holds and ramps high); on a
+tick without an estimator update the episodes are kept and not advanced. On a channel
+several zones reach, the floor is the highest of theirs. The floor is a level, not
+``prev`` on every tick: the solver may move above it and come back, so its swings do not
+ratchet the fans up.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -103,15 +128,22 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CONFIRM_REASONS",
+    "FLOOR_HOLD",
+    "FLOOR_RELEASE",
+    "FLOOR_RELEASED",
+    "SigmaFloor",
     "ZoneTrust",
     "advance_confirmation",
+    "advance_sigma_floor",
     "channel_fallback_elapsed",
     "closure",
     "effective_trust_rule",
     "evaluate",
     "fallback_channels",
     "fallback_target",
+    "group_sigma",
     "groups_confirmed",
+    "lost_groups",
     "sigma_reasons",
 ]
 
@@ -360,3 +392,175 @@ def fallback_target(
     if elapsed_s > cfg.fallback_hold_s:
         return max(prev, fallback_pwm), "ramp_high"
     return prev, "hold"
+
+
+#: Phases of a soft sigma floor episode (module docstring, *Soft sigma floor*).
+FLOOR_HOLD = "hold"
+FLOOR_RELEASE = "release"
+FLOOR_RELEASED = "released"
+_FLOOR_PHASES = (FLOOR_HOLD, FLOOR_RELEASE, FLOOR_RELEASED)
+
+
+@dataclass(frozen=True)
+class SigmaFloor:
+    """What :func:`advance_sigma_floor` returns.
+
+    * ``floor``  -- per channel, the soft floor under the solver's demand this tick
+      (channels without one are absent)
+    * ``memory`` -- the next ``solver_memory["sigma_floor"]`` (JSON-serialisable)
+    * ``zones``  -- per zone with an open episode, its state for the diagnostics
+    """
+
+    floor: dict[str, float]
+    memory: dict[str, dict[str, Any]]
+    zones: dict[str, dict[str, Any]]
+
+
+def lost_groups(
+    zone: str, gate: GateResult, confirming: Mapping[str, int], cfg: MpcConfig
+) -> tuple[str, ...]:
+    """Labels of the zone-air and bay groups of ``zone`` (the ``strict`` groups that the
+    ``sigma`` rule replaces by the estimator) without a gate-trusted, confirmed member."""
+    return tuple(
+        label
+        for label, members in cfg.zone_layout.required_groups[zone]
+        if not label.startswith(SETPOINT_GROUP_PREFIX)
+        and not any(_member_trusted(name, gate, confirming, False) for name in members)
+    )
+
+
+def _finite(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def group_sigma(label: str, zone: str, estimator: EstimatorUpdate) -> float | None:
+    """This tick's sigma of the node a group observes: the bay's drive sigma for
+    ``bay:<b>``, the zone's air sigma for ``zone_air``; ``None`` when there is none."""
+    if label.startswith("bay:"):
+        est = estimator.estimates.get(label[len("bay:") :])
+        return _finite(est.get("sigma")) if isinstance(est, Mapping) else None
+    air = estimator.zones.get(zone)
+    if isinstance(air, Mapping) and air.get("initialised"):
+        return _finite(air.get("sigma_air_c"))
+    return None
+
+
+def _stored_episode(raw: object, zone: str, cfg: MpcConfig) -> dict[str, Any] | None:
+    """A stored episode, or ``None`` when it is malformed (a malformed one starts over,
+    which only holds the floor longer)."""
+    if not isinstance(raw, Mapping):
+        return None
+    lost, ticks, phase = raw.get("lost"), raw.get("ticks"), raw.get("phase")
+    sigma0, level = raw.get("sigma0"), raw.get("level")
+    if (
+        not isinstance(lost, list)
+        or not all(isinstance(x, str) for x in lost)
+        or isinstance(ticks, bool)
+        or not isinstance(ticks, int)
+        or ticks < 0
+        or phase not in _FLOOR_PHASES
+        or not isinstance(sigma0, Mapping)
+        or not isinstance(level, Mapping)
+    ):
+        return None
+    reach = cfg.zone_layout.reach[zone]
+    levels = {ch: _finite(level.get(ch)) for ch in reach if ch in level}
+    if any(v is None for v in levels.values()) or (
+        phase != FLOOR_RELEASED and len(levels) != len(reach)
+    ):
+        return None
+    return {
+        "lost": list(lost),
+        "ticks": ticks,
+        "phase": phase,
+        "sigma0": {label: _finite(sigma0.get(label)) for label in lost},
+        "level": levels,
+    }
+
+
+def advance_sigma_floor(
+    memory: object,
+    cfg: MpcConfig,
+    *,
+    lost: Mapping[str, tuple[str, ...]],
+    estimator: EstimatorUpdate | None,
+    prev: Mapping[str, float],
+    eligible: Iterable[str],
+) -> SigmaFloor:
+    """The soft sigma floor after this tick (module docstring, *Soft sigma floor*).
+
+    ``memory`` is the previous ``solver_memory["sigma_floor"]``, ``lost`` the
+    :func:`lost_groups` of every zone this tick, ``estimator`` this tick's update
+    (``None`` on an estimator fault: the open episodes are kept and not advanced),
+    ``prev`` the command the tick is rate-limited against and ``eligible`` the zones
+    the solver drives this tick (the only ones whose floor applies).
+    """
+    policy = cfg.zones
+    assert policy is not None
+    old = memory if isinstance(memory, Mapping) else {}
+    step_down = policy.sigma_floor_release_per_min * cfg.dt / 60.0
+    out: dict[str, dict[str, Any]] = {}
+    for zone in cfg.zone_layout.zones:
+        now_lost = list(lost.get(zone, ()))
+        if not now_lost:
+            continue  # every group is held again: the episode closes
+        episode = _stored_episode(old.get(zone), zone, cfg)
+        if estimator is None:
+            if episode is not None:
+                out[zone] = episode
+            continue
+        sigma_now = {label: group_sigma(label, zone, estimator) for label in now_lost}
+        if episode is None or not set(now_lost) <= set(episode["lost"]):
+            carried = {} if episode is None else episode["level"]
+            episode = {
+                "lost": now_lost,
+                "ticks": 0,
+                "phase": FLOOR_HOLD,
+                "sigma0": sigma_now,
+                "level": {
+                    ch: max(float(prev[ch]), carried.get(ch, -math.inf))
+                    for ch in cfg.zone_layout.reach[zone]
+                },
+            }
+        else:
+            episode["lost"] = now_lost
+            episode["ticks"] += 1
+            episode["sigma0"] = {label: episode["sigma0"].get(label) for label in now_lost}
+            if episode["phase"] == FLOOR_HOLD:
+                grown = all(
+                    sigma_now[label] is not None
+                    and episode["sigma0"][label] is not None
+                    and sigma_now[label] - episode["sigma0"][label] >= policy.sigma_floor_growth_c
+                    for label in now_lost
+                )
+                if episode["ticks"] * cfg.dt >= policy.sigma_floor_hold_s or grown:
+                    episode["phase"] = FLOOR_RELEASE
+            if episode["phase"] == FLOOR_RELEASE:
+                episode["level"] = {ch: v - step_down for ch, v in episode["level"].items()}
+                if all(v <= cfg.pwm_min for v in episode["level"].values()):
+                    episode["phase"] = FLOOR_RELEASED
+                    episode["level"] = {}
+        out[zone] = episode
+    floor: dict[str, float] = {}
+    for zone in eligible:
+        for ch, value in out.get(zone, {}).get("level", {}).items():
+            floor[ch] = max(floor.get(ch, -math.inf), value)
+    diag: dict[str, dict[str, Any]] = {}
+    for zone, ep in out.items():
+        growth: dict[str, float | None] = {}
+        for label in ep["lost"]:
+            now = None if estimator is None else group_sigma(label, zone, estimator)
+            start = ep["sigma0"].get(label)
+            growth[label] = None if now is None or start is None else now - start
+        diag[zone] = {
+            "lost": list(ep["lost"]),
+            "phase": ep["phase"],
+            "held_s": ep["ticks"] * cfg.dt,
+            "sigma_growth_c": growth,
+            "floor": dict(ep["level"]),
+        }
+    return SigmaFloor(
+        floor={ch: floor[ch] for ch in cfg.channels if ch in floor}, memory=out, zones=diag
+    )
