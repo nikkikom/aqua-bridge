@@ -37,7 +37,7 @@ every declared sensor, or ``None`` when the sensor has never reported, its
 last read failed, or the sample is older than ``max_age_s``.
 
 This module must not import :mod:`aqua_bridge.control` (or anything MPC) --
-see the static AST check in ``tests/test_hw_map.py``. It imports only
+see the static AST check in ``tests/test_hw_imports.py``. It imports only
 :mod:`aqua_bridge.model` (for :class:`~aqua_bridge.model.ConfigError`), per
 the plan's Track B constraint.
 """
