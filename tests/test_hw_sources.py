@@ -1,7 +1,7 @@
 """Tests for aqua_bridge.hw.sources: CompositeSource + build_composite_from_config.
 
 PROJECT.md section 3 (Track B) / the DAS plan section 1 and section 12 Q1
-(the Quadro possibly needing its own USB device).
+(the Quadro on its own USB port).
 """
 
 from __future__ import annotations
@@ -10,238 +10,100 @@ from pathlib import Path
 
 import pytest
 
-from aqua_bridge.hw.map import DeviceUnavailable, HwmonMap
+from aqua_bridge.hw.aquacomputer import AQUAERO, QUADRO, control_duty
+from aqua_bridge.hw.aquacomputer_adapter import AquacomputerAdapter, DeviceBinding
+from aqua_bridge.hw.hidraw import DeviceUnavailable
 from aqua_bridge.hw.onewire import W1Source
 from aqua_bridge.hw.sources import CompositeSource, build_composite_from_config
-from aqua_bridge.hw.xt6 import Xt6Adapter
 from aqua_bridge.model import ConfigError, Mode, MpcCommand
+from aquacomputer_fakes import FakeBus, FakeClock, FakeController, FakeSleep
 
 
-class _FakeClock:
-    def __init__(self, t: float = 100.0) -> None:
-        self.t = t
-
-    def __call__(self) -> float:
-        return self.t
-
-
-def _make_hwmon_device(root: Path, dev_name: str, name: str, files: dict[str, str]) -> Path:
-    dev = root / dev_name
-    dev.mkdir(parents=True)
-    (dev / "name").write_text(name + "\n")
-    for fname, content in files.items():
-        (dev / fname).write_text(content)
-    return dev
-
-
-def _adapter(dev_dir: Path, root: Path, hwmon_name: str, pwm_map, temp_map, fan_map=None):
-    hmap = HwmonMap(
-        hwmon_name=hwmon_name, pwm_map=pwm_map, temp_map=temp_map, fan_map=fan_map or {}, root=root
+def _fleet(clock: FakeClock | None = None):
+    clock = clock or FakeClock()
+    aquaero = FakeController(AQUAERO, clock, node="/dev/hidraw2")
+    quadro = FakeController(QUADRO, clock, node="/dev/hidraw5", serial="00000-11111")
+    bus = FakeBus(aquaero, quadro)
+    sleep = FakeSleep(clock)
+    a = AquacomputerAdapter(
+        DeviceBinding(
+            kind=AQUAERO, pwm_map={"radiator": 2}, fan_map={"radiator": 2}, temp_map={"air_z0": 6}
+        ),
+        clock=clock,
+        sleep=sleep,
+        opener=bus,
     )
-    return Xt6Adapter(hmap, clock=_FakeClock())
+    q = AquacomputerAdapter(
+        DeviceBinding(kind=QUADRO, pwm_map={"exhaust": 1}, temp_map={"air_z1": 2}),
+        clock=clock,
+        sleep=sleep,
+        opener=bus,
+    )
+    return a, q, aquaero, quadro, clock
 
 
 # --- CompositeSource: read/apply merging ------------------------------------------------
 
 
-def test_requires_at_least_one_hwmon_device() -> None:
-    with pytest.raises(ValueError, match="at least one hwmon device"):
+def test_requires_at_least_one_device() -> None:
+    with pytest.raises(ValueError, match="at least one Aqua Computer device"):
         CompositeSource([])
 
 
-def test_read_merges_two_hwmon_devices(tmp_path: Path) -> None:
-    root = tmp_path / "hwmon"
-    dev_a = _make_hwmon_device(
-        root, "hwmon0", "aquaero", {"temp1_input": "35000", "pwm1": "128", "fan1_input": "900"}
-    )
-    dev_b = _make_hwmon_device(root, "hwmon1", "quadro", {"temp1_input": "28000", "pwm1": "64"})
-    adapter_a = _adapter(
-        dev_a, root, "aquaero", {"radiator": "pwm1"}, {"air_z0": "temp1"}, {"radiator": "fan1"}
-    )
-    adapter_b = _adapter(dev_b, root, "quadro", {"exhaust": "pwm1"}, {"air_z1": "temp1"})
-    composite = CompositeSource([adapter_a, adapter_b], clock=_FakeClock(50.0))
+def test_read_merges_two_controllers() -> None:
+    a, q, _aquaero, _quadro, clock = _fleet(FakeClock(50.0))
+    composite = CompositeSource([a, q], clock=clock)
 
     obs = composite.read()
 
-    assert obs.temps == {"air_z0": pytest.approx(35.0), "air_z1": pytest.approx(28.0)}
-    assert obs.pwm == {"radiator": pytest.approx(128 / 255), "exhaust": pytest.approx(64 / 255)}
-    assert obs.rpm == {"radiator": pytest.approx(900.0)}
+    assert obs.temps == {"air_z0": pytest.approx(22.26), "air_z1": pytest.approx(21.89)}
+    assert obs.pwm == {"radiator": pytest.approx(0.1412), "exhaust": 1.0}
+    assert obs.rpm == {"radiator": 120.0}
     assert obs.ts == 50.0
 
 
-def test_read_merges_onewire_temps(tmp_path: Path) -> None:
-    root = tmp_path / "hwmon"
-    dev = _make_hwmon_device(root, "hwmon0", "aquaero", {"temp1_input": "35000", "pwm1": "128"})
-    adapter = _adapter(dev, root, "aquaero", {"radiator": "pwm1"}, {"air_z0": "temp1"})
+def test_read_merges_onewire_temps() -> None:
+    a, _q, _aquaero, _quadro, clock = _fleet()
 
     class _FakeOnewire:
         def read(self):
             return {"prox_b01": 41.5}
 
-    composite = CompositeSource([adapter], _FakeOnewire(), clock=_FakeClock(1.0))
+    composite = CompositeSource([a], _FakeOnewire(), clock=clock)
     obs = composite.read()
-    assert obs.temps == {"air_z0": pytest.approx(35.0), "prox_b01": pytest.approx(41.5)}
+    assert obs.temps == {"air_z0": pytest.approx(22.26), "prox_b01": pytest.approx(41.5)}
 
 
-def test_read_propagates_a_vanished_device(tmp_path: Path) -> None:
-    import shutil
+def test_read_propagates_a_vanished_device() -> None:
+    a, q, _aquaero, quadro, clock = _fleet()
+    composite = CompositeSource([a, q], clock=clock)
+    composite.read()
 
-    root = tmp_path / "hwmon"
-    dev = _make_hwmon_device(root, "hwmon0", "aquaero", {"temp1_input": "35000", "pwm1": "128"})
-    adapter = _adapter(dev, root, "aquaero", {"radiator": "pwm1"}, {"air_z0": "temp1"})
-    composite = CompositeSource([adapter], clock=_FakeClock())
-    composite.read()  # resolves fine once
-
-    shutil.rmtree(dev)
+    quadro.gone = True
     with pytest.raises(DeviceUnavailable):
         composite.read()
 
 
-def test_apply_writes_each_channel_to_its_own_device(tmp_path: Path) -> None:
-    root = tmp_path / "hwmon"
-    dev_a = _make_hwmon_device(root, "hwmon0", "aquaero", {"pwm1": "0", "temp1_input": "1000"})
-    dev_b = _make_hwmon_device(root, "hwmon1", "quadro", {"pwm1": "0", "temp1_input": "1000"})
-    adapter_a = _adapter(dev_a, root, "aquaero", {"radiator": "pwm1"}, {})
-    adapter_b = _adapter(dev_b, root, "quadro", {"exhaust": "pwm1"}, {})
-    composite = CompositeSource([adapter_a, adapter_b], clock=_FakeClock())
+def test_apply_writes_each_channel_to_its_own_device_with_one_set_each() -> None:
+    a, q, aquaero, quadro, clock = _fleet()
+    composite = CompositeSource([a, q], clock=clock)
 
-    composite.apply(MpcCommand(pwm={"radiator": 0.5, "exhaust": 1.0}, mode=Mode.AUTO))
+    composite.apply(MpcCommand(pwm={"radiator": 0.5, "exhaust": 0.25}, mode=Mode.AUTO))
 
-    assert (dev_a / "pwm1").read_text() == str(round(0.5 * 255))
-    assert (dev_b / "pwm1").read_text() == str(round(1.0 * 255))
+    assert len(aquaero.sets()) == 1 and len(quadro.sets()) == 1
+    assert control_duty(AQUAERO, aquaero.ctrl, 1) == 5000
+    assert control_duty(QUADRO, quadro.ctrl, 0) == 2500
 
 
-def test_apply_stops_at_first_failing_device_but_earlier_writes_stand(tmp_path: Path) -> None:
-    import shutil
-
-    root = tmp_path / "hwmon"
-    dev_a = _make_hwmon_device(root, "hwmon0", "aquaero", {"pwm1": "0", "temp1_input": "1000"})
-    dev_b = _make_hwmon_device(root, "hwmon1", "quadro", {"pwm1": "0", "temp1_input": "1000"})
-    adapter_a = _adapter(dev_a, root, "aquaero", {"radiator": "pwm1"}, {})
-    adapter_b = _adapter(dev_b, root, "quadro", {"exhaust": "pwm1"}, {})
-    composite = CompositeSource([adapter_a, adapter_b], clock=_FakeClock())
-    shutil.rmtree(dev_b)
+def test_apply_stops_at_the_first_failing_device_but_earlier_writes_stand() -> None:
+    a, q, aquaero, quadro, clock = _fleet()
+    composite = CompositeSource([a, q], clock=clock)
+    quadro.gone = True
 
     with pytest.raises(DeviceUnavailable):
         composite.apply(MpcCommand(pwm={"radiator": 0.5, "exhaust": 1.0}, mode=Mode.AUTO))
 
-    assert (dev_a / "pwm1").read_text() == str(round(0.5 * 255))  # device A's write stands
-
-
-# --- build_composite_from_config: binding checks -----------------------------------------
-
-
-_XT6_SECTION = {
-    "hwmon_name": "aquaero",
-    "fans": {"radiator": {"pwm": "pwm1", "rpm": "fan1"}},
-    "temp_map": {"air_z0": "temp1"},
-}
-
-
-def test_single_xt6_device_is_accepted(tmp_path: Path) -> None:
-    section = dict(_XT6_SECTION, root=str(tmp_path / "hwmon"))
-    composite, release = build_composite_from_config(
-        hwmon_section=(),
-        xt6_section=section,
-        onewire_section={},
-        channels=("radiator",),
-        temps=("air_z0",),
-        dt=5.0,
-    )
-    assert isinstance(composite, CompositeSource)
-    assert len(composite.hwmon) == 1
-    assert composite.onewire is None
-    assert release is None
-
-
-def test_hwmon_list_of_two_devices_is_accepted(tmp_path: Path) -> None:
-    root = str(tmp_path / "hwmon")
-    hwmon_section = (
-        {
-            "name": "aquaero",
-            "fans": {"radiator": {"pwm": "pwm1"}},
-            "temp_map": {"air_z0": "temp1"},
-            "root": root,
-        },
-        {
-            "name": "quadro",
-            "fans": {"exhaust": {"pwm": "pwm1"}},
-            "temp_map": {"air_z1": "temp1"},
-            "root": root,
-        },
-    )
-    composite, release = build_composite_from_config(
-        hwmon_section=hwmon_section,
-        xt6_section={},
-        onewire_section={},
-        channels=("radiator", "exhaust"),
-        temps=("air_z0", "air_z1"),
-        dt=5.0,
-    )
-    assert len(composite.hwmon) == 2
-    assert release is None
-
-
-def test_xt6_and_hwmon_list_combine(tmp_path: Path) -> None:
-    root = str(tmp_path / "hwmon")
-    hwmon_section = (
-        {
-            "name": "quadro",
-            "fans": {"exhaust": {"pwm": "pwm1"}},
-            "temp_map": {"air_z1": "temp1"},
-            "root": root,
-        },
-    )
-    xt6_section = dict(_XT6_SECTION, root=root)
-    composite, _release = build_composite_from_config(
-        hwmon_section=hwmon_section,
-        xt6_section=xt6_section,
-        onewire_section={},
-        channels=("radiator", "exhaust"),
-        temps=("air_z0", "air_z1"),
-        dt=5.0,
-    )
-    assert len(composite.hwmon) == 2
-
-
-def test_onewire_fills_remaining_temps_and_release_stops_it(tmp_path: Path) -> None:
-    root = str(tmp_path / "hwmon")
-    w1_root = tmp_path / "w1"
-    (w1_root / "w1_bus_master1" / "28-000000000001").mkdir(parents=True)
-    (w1_root / "w1_bus_master1" / "therm_bulk_read").write_text("1")
-    (w1_root / "w1_bus_master1" / "28-000000000001" / "temperature").write_text("22000")
-    xt6_section = dict(_XT6_SECTION, root=root)
-    onewire_section = {"sensors": {"prox_b01": "28-000000000001"}, "root": str(w1_root)}
-
-    composite, release = build_composite_from_config(
-        hwmon_section=(),
-        xt6_section=xt6_section,
-        onewire_section=onewire_section,
-        channels=("radiator",),
-        temps=("air_z0", "prox_b01"),
-        dt=5.0,
-    )
-    assert isinstance(composite.onewire, W1Source)
-    assert release is not None
-    release()  # stops the reader thread(s); must not raise
-
-
-def test_missing_rom_at_startup_does_not_block_the_build(tmp_path: Path) -> None:
-    root = str(tmp_path / "hwmon")
-    xt6_section = dict(_XT6_SECTION, root=root)
-    onewire_section = {"sensors": {"prox_b01": "28-nope"}, "root": str(tmp_path / "w1_empty")}
-
-    composite, release = build_composite_from_config(
-        hwmon_section=(),
-        xt6_section=xt6_section,
-        onewire_section=onewire_section,
-        channels=("radiator",),
-        temps=("air_z0", "prox_b01"),
-        dt=5.0,
-    )
-    assert composite.onewire.missing_roms() == ["28-nope"]
-    if release is not None:
-        release()
+    assert control_duty(AQUAERO, aquaero.ctrl, 1) == 5000  # device A's write stands
 
 
 # --- CompositeSource: SMART wiring (plan section 1, milestone smart-agent) --------------
@@ -255,144 +117,198 @@ class _FakeSmart:
         return self._data
 
 
-def test_read_has_no_inputs_key_when_smart_is_not_configured(tmp_path: Path) -> None:
-    root = tmp_path / "hwmon"
-    dev = _make_hwmon_device(root, "hwmon0", "aquaero", {"temp1_input": "35000", "pwm1": "128"})
-    adapter = _adapter(dev, root, "aquaero", {"radiator": "pwm1"}, {"air_z0": "temp1"})
-    composite = CompositeSource([adapter], clock=_FakeClock())
-    obs = composite.read()
-    assert obs.inputs == {}
+def test_read_has_no_inputs_key_when_smart_is_not_configured() -> None:
+    a, _q, _aquaero, _quadro, clock = _fleet()
+    composite = CompositeSource([a], clock=clock)
+    assert composite.read().inputs == {}
     assert composite.smart is None
 
 
-def test_read_puts_smart_snapshot_into_inputs(tmp_path: Path) -> None:
-    root = tmp_path / "hwmon"
-    dev = _make_hwmon_device(root, "hwmon0", "aquaero", {"temp1_input": "35000", "pwm1": "128"})
-    adapter = _adapter(dev, root, "aquaero", {"radiator": "pwm1"}, {"air_z0": "temp1"})
+def test_read_puts_smart_snapshot_into_inputs() -> None:
+    a, _q, _aquaero, _quadro, clock = _fleet()
     smart = _FakeSmart({"WD-ABC123": {"temp_c": 34.0, "age_s": 5.0, "model": "WDC WD40"}})
-    composite = CompositeSource([adapter], smart=smart, clock=_FakeClock())
-
-    obs = composite.read()
-
-    assert obs.inputs == {
+    composite = CompositeSource([a], smart=smart, clock=clock)
+    assert composite.read().inputs == {
         "smart": {"WD-ABC123": {"temp_c": 34.0, "age_s": 5.0, "model": "WDC WD40"}}
     }
 
 
-def test_read_reflects_an_empty_smart_snapshot(tmp_path: Path) -> None:
-    root = tmp_path / "hwmon"
-    dev = _make_hwmon_device(root, "hwmon0", "aquaero", {"temp1_input": "35000", "pwm1": "128"})
-    adapter = _adapter(dev, root, "aquaero", {"radiator": "pwm1"}, {"air_z0": "temp1"})
-    composite = CompositeSource([adapter], smart=_FakeSmart({}), clock=_FakeClock())
-    obs = composite.read()
-    assert obs.inputs == {"smart": {}}
+def test_read_reflects_an_empty_smart_snapshot() -> None:
+    a, _q, _aquaero, _quadro, clock = _fleet()
+    composite = CompositeSource([a], smart=_FakeSmart({}), clock=clock)
+    assert composite.read().inputs == {"smart": {}}
 
 
-def test_build_composite_from_config_passes_smart_through(tmp_path: Path) -> None:
-    root = tmp_path / "hwmon"
-    _make_hwmon_device(root, "hwmon0", "aquaero", {"temp1_input": "35000", "pwm1": "128"})
-    section = dict(_XT6_SECTION, root=str(root))
-    smart = _FakeSmart({"S1": {"temp_c": 30.0, "age_s": 1.0, "model": None}})
-    composite, _release = build_composite_from_config(
-        hwmon_section=(),
-        xt6_section=section,
+# --- build_composite_from_config: binding checks -----------------------------------------
+
+
+_XT6_SECTION = {
+    "device": "aquaero",
+    "fans": {"radiator": {"pwm": "pwm1", "rpm": "fan1"}},
+    "temp_map": {"air_z0": "temp1"},
+}
+_QUADRO_ENTRY = {
+    "device": "quadro",
+    "fans": {"exhaust": {"pwm": "pwm1"}},
+    "temp_map": {"air_z1": "temp1"},
+}
+
+
+def _build(**overrides):
+    kwargs = dict(
+        aquacomputer_section=(),
+        xt6_section={},
         onewire_section={},
         channels=("radiator",),
         temps=("air_z0",),
         dt=5.0,
-        smart=smart,
     )
+    kwargs.update(overrides)
+    return build_composite_from_config(**kwargs)
+
+
+def test_single_xt6_device_is_accepted_and_nothing_is_opened() -> None:
+    bus = FakeBus()
+    composite, release = _build(xt6_section=dict(_XT6_SECTION, prefer="hwmon"), opener=bus)
+    assert isinstance(composite, CompositeSource)
+    assert len(composite.devices) == 1 and composite.devices[0].kind is AQUAERO
+    assert composite.onewire is None and release is None
+    assert bus.opened == []
+
+
+def test_aquacomputer_list_of_two_devices_is_accepted() -> None:
+    composite, release = _build(
+        aquacomputer_section=(dict(_XT6_SECTION), _QUADRO_ENTRY),
+        channels=("radiator", "exhaust"),
+        temps=("air_z0", "air_z1"),
+    )
+    assert [d.kind for d in composite.devices] == [AQUAERO, QUADRO]
+    assert release is None
+
+
+def test_timing_keys_reach_each_adapter() -> None:
+    composite, _ = _build(
+        aquacomputer_section=(
+            dict(_XT6_SECTION, ctrl_gap_ms=50),
+            dict(_QUADRO_ENTRY, ctrl_retries=4),
+        ),
+        channels=("radiator", "exhaust"),
+        temps=("air_z0", "air_z1"),
+    )
+    assert composite.devices[0].timing.ctrl_gap_ms == 50
+    assert composite.devices[1].timing.ctrl_retries == 4
+
+
+def test_xt6_and_aquacomputer_list_combine() -> None:
+    composite, _release = _build(
+        aquacomputer_section=(_QUADRO_ENTRY,),
+        xt6_section=_XT6_SECTION,
+        channels=("radiator", "exhaust"),
+        temps=("air_z0", "air_z1"),
+    )
+    assert len(composite.devices) == 2
+
+
+def test_two_devices_of_one_kind_need_distinct_serials() -> None:
+    second = {"device": "aquaero", "fans": {"exhaust": {"pwm": "pwm1"}}, "temp_map": {}}
+    kwargs = dict(channels=("radiator", "exhaust"), temps=("air_z0",))
+    with pytest.raises(ConfigError, match="can both open the same aquaero.*distinct 'serial:'"):
+        _build(aquacomputer_section=(_XT6_SECTION, second), **kwargs)
+    with pytest.raises(ConfigError, match="can both open the same aquaero"):
+        _build(
+            aquacomputer_section=(
+                dict(_XT6_SECTION, serial="12345-67890"),
+                dict(second, serial="12345-67890"),
+            ),
+            **kwargs,
+        )
+    with pytest.raises(ConfigError, match="can both open the same aquaero"):
+        _build(
+            aquacomputer_section=(dict(second, serial="12345-67890"),),
+            xt6_section=_XT6_SECTION,
+            **kwargs,
+        )
+    composite, _ = _build(
+        aquacomputer_section=(
+            dict(_XT6_SECTION, serial="12345-67890"),
+            dict(second, serial="00000-00001"),
+        ),
+        **kwargs,
+    )
+    assert [d.binding.serial for d in composite.devices] == ["12345-67890", "00000-00001"]
+
+
+def test_onewire_fills_remaining_temps_and_release_stops_it(tmp_path: Path) -> None:
+    w1_root = tmp_path / "w1"
+    (w1_root / "w1_bus_master1" / "28-000000000001").mkdir(parents=True)
+    (w1_root / "w1_bus_master1" / "therm_bulk_read").write_text("1")
+    (w1_root / "w1_bus_master1" / "28-000000000001" / "temperature").write_text("22000")
+    onewire_section = {"sensors": {"prox_b01": "28-000000000001"}, "root": str(w1_root)}
+
+    composite, release = _build(
+        xt6_section=_XT6_SECTION, onewire_section=onewire_section, temps=("air_z0", "prox_b01")
+    )
+    assert isinstance(composite.onewire, W1Source)
+    assert release is not None
+    release()  # stops the reader thread(s); must not raise
+
+
+def test_missing_rom_at_startup_does_not_block_the_build(tmp_path: Path) -> None:
+    onewire_section = {"sensors": {"prox_b01": "28-nope"}, "root": str(tmp_path / "w1_empty")}
+    composite, release = _build(
+        xt6_section=_XT6_SECTION, onewire_section=onewire_section, temps=("air_z0", "prox_b01")
+    )
+    assert composite.onewire.missing_roms() == ["28-nope"]
+    if release is not None:
+        release()
+
+
+def test_build_composite_from_config_passes_smart_clock_sleep_and_opener_through() -> None:
+    clock = FakeClock(7.0)
+    device = FakeController(AQUAERO, clock)
+    bus = FakeBus(device)
+    smart = _FakeSmart({"S1": {"temp_c": 30.0, "age_s": 1.0, "model": None}})
+    composite, _release = _build(xt6_section=_XT6_SECTION, smart=smart, clock=clock, opener=bus)
     assert composite.smart is smart
-    assert composite.read().inputs == {
-        "smart": {"S1": {"temp_c": 30.0, "age_s": 1.0, "model": None}}
-    }
+    obs = composite.read()
+    assert obs.inputs == {"smart": {"S1": {"temp_c": 30.0, "age_s": 1.0, "model": None}}}
+    assert obs.ts == 7.0 and bus.opened == [device.node]
 
 
 def test_no_device_configured_is_config_error() -> None:
-    with pytest.raises(ConfigError, match="no hwmon device configured"):
-        build_composite_from_config(
-            hwmon_section=(),
-            xt6_section={},
-            onewire_section={},
-            channels=("a",),
-            temps=("t",),
-            dt=5.0,
-        )
+    with pytest.raises(ConfigError, match="no Aqua Computer device configured.*'aquacomputer:'"):
+        _build(channels=("a",), temps=("t",))
 
 
-def test_missing_temp_binding_is_config_error(tmp_path: Path) -> None:
-    section = dict(_XT6_SECTION, root=str(tmp_path / "hwmon"))
+def test_missing_temp_binding_is_config_error() -> None:
     with pytest.raises(ConfigError, match=r"\['air_z1'\]"):
-        build_composite_from_config(
-            hwmon_section=(),
-            xt6_section=section,
-            onewire_section={},
-            channels=("radiator",),
-            temps=("air_z0", "air_z1"),
-            dt=5.0,
-        )
+        _build(xt6_section=_XT6_SECTION, temps=("air_z0", "air_z1"))
 
 
-def test_missing_channel_binding_is_config_error(tmp_path: Path) -> None:
-    section = dict(_XT6_SECTION, root=str(tmp_path / "hwmon"))
+def test_missing_channel_binding_is_config_error() -> None:
     with pytest.raises(ConfigError, match=r"\['intake'\]"):
-        build_composite_from_config(
-            hwmon_section=(),
-            xt6_section=section,
-            onewire_section={},
-            channels=("radiator", "intake"),
-            temps=("air_z0",),
-            dt=5.0,
-        )
+        _build(xt6_section=_XT6_SECTION, channels=("radiator", "intake"))
 
 
-def test_temp_bound_twice_across_devices_is_config_error(tmp_path: Path) -> None:
-    root = str(tmp_path / "hwmon")
-    hwmon_section = (
-        {
-            "name": "aquaero",
-            "fans": {"radiator": {"pwm": "pwm1"}},
-            "temp_map": {"air_z0": "temp1"},
-            "root": root,
-        },
-        {
-            "name": "quadro",
-            "fans": {"exhaust": {"pwm": "pwm1"}},
-            "temp_map": {"air_z0": "temp1"},
-            "root": root,
-        },
-    )
-    with pytest.raises(ConfigError, match="bound twice"):
-        build_composite_from_config(
-            hwmon_section=hwmon_section,
-            xt6_section={},
-            onewire_section={},
+def test_temp_bound_twice_across_devices_is_config_error() -> None:
+    with pytest.raises(ConfigError, match="bound twice.*aquacomputer\\[0\\] \\(aquaero\\)"):
+        _build(
+            aquacomputer_section=(_XT6_SECTION, dict(_QUADRO_ENTRY, temp_map={"air_z0": "temp1"})),
             channels=("radiator", "exhaust"),
-            temps=("air_z0",),
-            dt=5.0,
         )
 
 
-def test_extra_bound_temp_name_is_config_error(tmp_path: Path) -> None:
-    section = dict(_XT6_SECTION, root=str(tmp_path / "hwmon"))
+def test_extra_bound_temp_name_is_config_error() -> None:
     with pytest.raises(ConfigError, match="not in mpc.temps"):
-        build_composite_from_config(
-            hwmon_section=(),
-            xt6_section=section,
-            onewire_section={},
-            channels=("radiator",),
-            temps=(),  # air_z0 bound but not declared
-            dt=5.0,
-        )
+        _build(xt6_section=_XT6_SECTION, temps=())  # air_z0 bound but not declared
 
 
 def test_malformed_device_spec_is_config_error() -> None:
-    with pytest.raises(ConfigError, match="hwmon\\[0\\] must be a mapping"):
-        build_composite_from_config(
-            hwmon_section=("not-a-mapping",),
-            xt6_section={},
-            onewire_section={},
-            channels=(),
-            temps=(),
-            dt=5.0,
-        )
+    with pytest.raises(ConfigError, match="aquacomputer\\[0\\] must be a mapping"):
+        _build(aquacomputer_section=("not-a-mapping",), channels=(), temps=())
+
+
+def test_hwmon_style_entry_gets_the_rename_hint() -> None:
+    entry = {"name": "quadro", "fans": {"exhaust": {"pwm": "pwm1"}}, "temp_map": {}}
+    with pytest.raises(ConfigError, match="aquacomputer\\[0\\].name was renamed to 'device'"):
+        _build(aquacomputer_section=(entry,), channels=("exhaust",), temps=())
