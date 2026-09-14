@@ -13,10 +13,10 @@ config); then the DAS truth simulator: sensor dropouts fault far fewer zones tha
 under ``strict`` with every drive within its limit, a lost proximal sensor does not
 lower the PI-like DAS solver's cooling (a replay of the same observations without
 it), and losing a bay's or a zone's sensors for good still faults the zone once
-sigma passes its threshold, with its channels held and then raised. The DAS MPC is
-held to every drive within its limit only: in the same replay it plans up to 21 %
-less zone airflow for the first minutes, because with the sensor it had followed a
-measured warming that the blind estimate does not show (reported separately).
+sigma passes its threshold, with its channels held and then raised. The sigma floor
+(``mpc.step`` 4b) keeps the reach of a zone with a lost group at or above ``prev``:
+without it the DAS MPC, which had followed a measured warming that the blind estimate
+does not show, lowered the fans on the tick of the loss.
 
 The simulator runs use the ``basic`` preset with each sensor type's noise (the
 DAS golden physics). The ``rich`` sweep (nightly) masks the example's two
@@ -42,6 +42,7 @@ from aqua_bridge.config import load_config
 from aqua_bridge.control import estimator, zones
 from aqua_bridge.control.gate import evaluate_gate
 from aqua_bridge.control.mpc import step
+from aqua_bridge.control.solver_pi import PiSolver, SolverRequest, SolverResult
 from aqua_bridge.model import (
     SIGMA_UNCALIBRATED_C,
     ConfigError,
@@ -369,6 +370,78 @@ def test_a_zone_in_fault_returns_without_its_lost_sensor_only_under_sigma(rule, 
     assert "za" not in faults and "zc" not in faults
 
 
+class DescendingSolver:
+    """The PI solver's result with every demand 0.05 below ``prev``: a solver that wants
+    less cooling everywhere, whatever the estimates say."""
+
+    name = "pi"
+
+    def __init__(self) -> None:
+        self.inner = PiSolver()
+
+    def initialise(self, cfg: MpcConfig, req: SolverRequest):
+        return self.inner.initialise(cfg, req)
+
+    def solve(self, cfg: MpcConfig, req: SolverRequest) -> SolverResult:
+        res = self.inner.solve(cfg, req)
+        pwm = {ch: float(req.prev_pwm[ch]) - 0.05 for ch in cfg.channels}
+        return dataclasses.replace(res, pwm=pwm)
+
+
+def run_descending(
+    cfg: MpcConfig, temps_at: Callable[[int], Mapping[str, float | None]], ticks: int
+) -> list[Any]:
+    solver = DescendingSolver()
+    state = MpcState.cold()
+    out = []
+    for i in range(ticks):
+        pwm = dict(state.last_cmd.pwm) if state.last_cmd is not None else 0.9
+        obs = das_obs(cfg, float(i) * cfg.dt, temps=dict(temps_at(i)), pwm=pwm)
+        cmd, state = checked_step(obs, cfg, state, solver=solver)
+        out.append(cmd)
+    return out
+
+
+def test_a_lost_group_under_sigma_never_lowers_its_zones_channels():
+    """``prox_a2`` is bay a2's only proximal sensor: under ``sigma`` zone za stays trusted,
+    and while the group is lost the channels of its reach (fa1, fa2 and, coupled, fb1)
+    never go below ``prev`` even when the solver asks for less; fc1 keeps descending. A
+    lost redundant member (``prox_a1``, ``prox_a1b`` still there) floors nothing, and the
+    floor is released when the sensor returns."""
+    cfg = lcfg()
+    reach = set(cfg.zone_layout.reach["za"])
+    assert reach == {"fa1", "fa2", "fb1"}
+
+    def temps_at(i: int) -> dict[str, float | None]:
+        if 5 <= i < 15:
+            return lost(cfg, "prox_a2")
+        if 15 <= i < 20:
+            return lost(cfg, "prox_a1")
+        return default_temps(cfg)
+
+    cmds = run_descending(cfg, temps_at, 25)
+    for i, cmd in enumerate(cmds[1:], start=1):
+        d = cmd.diagnostics
+        assert d["zones_in_fault"] == [], i
+        prev = cmds[i - 1].pwm
+        floored = set(d["sigma_floor_channels"])
+        if 5 <= i < 15:
+            assert floored == reach, i
+            for ch in reach:
+                assert cmd.pwm[ch] >= prev[ch] - 1e-12, (i, ch)
+            assert cmd.pwm["fc1"] < prev["fc1"] or prev["fc1"] <= cfg.pwm_min, i
+        else:
+            assert floored == set(), i
+            for ch in cfg.channels:
+                assert cmd.pwm[ch] < prev[ch] or prev[ch] <= cfg.pwm_min, (i, ch)
+
+
+def test_strict_has_no_sigma_floor():
+    cfg = lcfg("strict")
+    cmds = run_descending(cfg, lambda i: default_temps(cfg), 6)
+    assert all(c.diagnostics["sigma_floor_channels"] == [] for c in cmds)
+
+
 # ---------------------------------------------------------------------------
 # the DAS truth simulator
 # ---------------------------------------------------------------------------
@@ -538,6 +611,25 @@ def test_a_lost_proximal_sensor_never_lowers_cooling(healthy_sigma_run):
         assert q1 >= 0.98 * q0, (k, q0, q1)
         if k >= ten_minutes:
             assert q1 >= 1.02 * q0, (k, q0, q1)
+
+
+def test_a_lost_proximal_sensor_never_lowers_the_das_mpc_command():
+    """The DAS MPC replayed without b02's only proximal sensor: with the sensor it had
+    followed a measured warming the blind estimate does not show, and it planned less
+    airflow for z0 (up to 21 %, the PWM falling by 0.04 on the first tick); the sigma floor
+    keeps every channel of z0's reach at or above its previous command while the sensor
+    is lost."""
+    cfg = example_cfg("sigma", "mpc")
+    healthy = sim_run(cfg, int(LOSS_S / cfg.dt) + 1)
+    pairs = replay_without(cfg, healthy, "prox_b02")
+    reach = cfg.zone_layout.reach["z0"]
+    start = next(i for i, r in enumerate(healthy.records) if r.obs.ts >= LOSS_S)
+    prev = healthy.records[start - 1].cmd.pwm
+    for k, (_with_sensor, without_sensor) in enumerate(pairs):
+        assert without_sensor.diagnostics["zones_in_fault"] == [], k
+        for ch in reach:
+            assert without_sensor.pwm[ch] >= prev[ch] - 1e-12, (k, ch)
+        prev = without_sensor.pwm
 
 
 def test_a_lost_redundant_proximal_sensor_changes_nothing(healthy_sigma_run):

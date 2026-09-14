@@ -210,8 +210,8 @@ mpc:
   # zones: trust_rule strict (a zone faults when a required sensor group has no
   # trusted member) or sigma (a zone faults when a bay's drive sigma or its air
   # sigma passes estimator.sigma_fault_c / sigma_air_fault_c: a lost sensor widens
-  # the margin first; not with two proximal sensors on a bay at different
-  # placements); fault_coupling declared (a zone fault also reaches the outputs of
+  # the margin first and its zone's fans never fall while it is lost; not with two
+  # proximal sensors on a bay at different placements); fault_coupling declared (a zone fault also reaches the outputs of
   # the zones in its coupled_to) or none (strictly per zone).
   zones: {trust_rule: strict, fault_coupling: declared}
   noise: {exponent: 5.0, weight_noise: 1.0, band_hysteresis: 0.02}
