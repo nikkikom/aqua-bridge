@@ -34,7 +34,8 @@ CI; ``--sim-plant`` picks it:
 HTTP (``http.enabled``) and MQTT (``mqtt.enabled``) run next to the loop via
 :mod:`aqua_bridge.publishers.runtime`; both attach to the supervisor's
 ``ControlSurface``. A publisher that fails to start (port in use, broker
-down) is logged and the daemon keeps controlling the fans without it. One
+down, or a bad scalar anywhere in its section -- item 57) is logged and the
+daemon keeps controlling the fans without it (:func:`start_publishers`). One
 :class:`~aqua_bridge.publishers.inputs.SmartInbox` is built here every run
 and threaded through both: ``build_io`` gives it to ``--source hwmon``'s
 ``CompositeSource``, ``start_publishers`` wires ``POST /api/in/smart`` and
@@ -70,7 +71,9 @@ from aqua_bridge.control.supervisor import Supervisor
 from aqua_bridge.model import MpcCommand, MpcConfig, MpcState, PlantObservation
 from aqua_bridge.modelstore import ModelPersister, initial_state, store_path
 from aqua_bridge.modelstore import load as load_model_store
+from aqua_bridge.publishers.httpauth import HttpSettings, HttpSetupError
 from aqua_bridge.publishers.inputs import SmartInbox, smart_topic_filter
+from aqua_bridge.publishers.mqtt_ha import MqttSetupError, validate_mqtt_section
 from aqua_bridge.recorder import DEFAULT_BACKUP_COUNT, DEFAULT_MAX_BYTES, Recorder, chain_on_tick
 from aqua_bridge.sdnotify import SdNotifier
 
@@ -528,9 +531,22 @@ def start_publishers(
     client gets ``add_topic_handler(smart_topic_filter(node_id), ...)`` on
     the same connection it already builds for commands (one broker
     connection for the whole daemon).
+
+    Item 57: ``enabled`` (and every other scalar in ``http:`` / ``mqtt:``) is parsed by
+    :class:`~aqua_bridge.publishers.httpauth.HttpSettings` /
+    :func:`~aqua_bridge.publishers.mqtt_ha.validate_mqtt_section` *before* deciding
+    whether to start -- a value such as ``enabled: "true"`` (a string, not a bool)
+    raises there and is logged by name instead of silently reading as ``False``
+    (``"true" is True`` is ``False``, which used to leave the section looking merely
+    disabled, with no log line at all).
     """
     http_service = mqtt_service = None
-    if app.section("http").get("enabled") is True:
+    try:
+        http_settings = HttpSettings.from_section(app.section("http"))
+    except HttpSetupError as exc:
+        _LOG.error("http: not started: %s", exc)
+        http_settings = None
+    if http_settings is not None and http_settings.enabled:
         try:
             from aqua_bridge.publishers.runtime import HttpService
 
@@ -539,7 +555,12 @@ def start_publishers(
                 http_service = service
         except Exception:
             _LOG.exception("http: not started")
-    if app.section("mqtt").get("enabled") is True:
+    try:
+        mqtt_settings = validate_mqtt_section(app.section("mqtt"))
+    except MqttSetupError as exc:
+        _LOG.error("mqtt: not started: %s", exc)
+        mqtt_settings = None
+    if mqtt_settings is not None and mqtt_settings["enabled"]:
         try:
             from aqua_bridge.publishers.runtime import MqttService
 
@@ -550,14 +571,13 @@ def start_publishers(
                 # implementation) must not take the whole MQTT service down
                 # with it -- commands/state still matter without SMART.
                 try:
-                    node_id = str(app.mqtt.get("node_id", "aqua-bridge"))
                     mqtt_service.client.add_topic_handler(
-                        smart_topic_filter(node_id), smart_inbox.on_message
+                        smart_topic_filter(mqtt_settings["node_id"]), smart_inbox.on_message
                     )
                 except Exception:
                     _LOG.exception("mqtt: smart inbox wiring failed")
             mqtt_service.start()
-            _LOG.info("mqtt: connecting to %s:%s", app.mqtt.get("host"), app.mqtt.get("port", 1883))
+            _LOG.info("mqtt: connecting to %s:%s", mqtt_settings["host"], mqtt_settings["port"])
         except Exception:
             _LOG.exception("mqtt: not started")
             mqtt_service = None

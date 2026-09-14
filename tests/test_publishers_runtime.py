@@ -11,6 +11,7 @@ from aqua_bridge.config import AppConfig
 from aqua_bridge.control.intents import ControlMode, SetMode
 from aqua_bridge.control.supervisor import Supervisor
 from aqua_bridge.model import MpcConfig
+from aqua_bridge.publishers.mqtt_ha import MqttSetupError
 from aqua_bridge.publishers.runtime import HttpService, MqttService
 
 
@@ -228,3 +229,12 @@ def test_from_config_wires_supervisor_and_connection_state(cfg: MpcConfig):
     assert sup.snapshot().mqtt_connected is False
     service.stop()
     assert client.calls[-2:] == ["disconnect", "loop_stop"]
+
+
+def test_from_config_rejects_a_bad_mqtt_section(cfg: MpcConfig):
+    """Item 57: a bad scalar anywhere in mqtt: (not only enabled:) is named, not
+    swallowed into some coerced value or a bare ValueError from int()/str()."""
+    sup = Supervisor(cfg)
+    app = _app(cfg, mqtt={"enabled": True, "port": "not-a-port"})
+    with pytest.raises(MqttSetupError, match="mqtt.port"):
+        MqttService.from_config(app, sup, client_factory=FakeMqttClient)

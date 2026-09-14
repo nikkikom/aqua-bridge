@@ -462,7 +462,9 @@ top-level sections are kept in `AppConfig.extra`, visible but not fatal.
 `record_max_bytes`, `record_backup_count` (the tick recorder, §3 Glue)
 and `sim.das` (`{topology?, preset?, seed?}`, the DAS simulator for
 `--sim-plant das`). `digole`, `onewire.enabled`, `onewire.buses` and
-`xt6.prefer` are parsed but no code reads them.
+`xt6.prefer` are parsed but no code acts on them (item 57: `onewire.enabled`
+and `digole.enabled` are still type-checked -- a non-boolean value is a
+config mistake worth naming even where it decides nothing).
 
 Channel names are logical (`xt1`, `qd2`, …; `radiator` in legacy mode).
 Mapping onto `hwmon pwmN` lives only in the hardware adapter.
@@ -2510,8 +2512,12 @@ Config `http:` (parsed and validated by `HttpSettings` in
   weaken the hashes if the credentials file leaked. Above 200000 (over
   2.5 s per login and per admitted flood check) lower `auth_verify_max`
   in proportion; that is not recommended on this core.
-- **Startup refusal:** with `http.enabled: true`, the service validates
-  `http:`, loads the certificate and key and the credentials file (at
+- **Startup refusal:** `start_publishers` parses the whole `http:` section
+  through `HttpSettings.from_section` before deciding whether to start
+  (item 57: this covers `enabled` itself too, so `enabled: "true"` — a
+  string, not a bool — is refused by name instead of comparing unequal to
+  `True` and reading as off with no log line). With `enabled: true`, the
+  service then loads the certificate and key and the credentials file (at
   least one user) **before** opening a socket. Any problem — an unknown
   key or invalid value, a missing or unreadable certificate or key, a key
   or credentials file readable by others or owned by another non-root
@@ -2756,7 +2762,11 @@ parsing as pure functions; `MqttClient` is a thin paho-mqtt 2.x wrapper;
 Config `mqtt:` — `enabled` (must be `true`; `false` in the example),
 `host`, `port` (1883), `username`, `password` (both optional),
 `discovery_prefix` (`homeassistant`), `node_id` (`aqua-bridge`). `host:` —
-`interval_s` (5): how often host metrics are refreshed.
+`interval_s` (5): how often host metrics are refreshed. `start_publishers`
+parses the section through `validate_mqtt_section` before deciding
+whether to connect (item 57): a wrong-typed scalar anywhere in it,
+`enabled` included, is a named, logged setup error, never a silent read
+as off or a bare `ValueError` from an ad hoc `int()`/`str()`.
 
 Topics:
 
@@ -2956,9 +2966,12 @@ Owner decisions (2026-09-14, later the same day):
     or uncached attempt runs PBKDF2, serialised by one lock; clients on
     many source addresses (easy with IPv6) could keep the core busy.
     Bound the global rate of uncached checks.
-57. `http.enabled: "true"` as a string silently leaves the API off with
-    no log line; validate booleans in the `http:` section (and other
-    sections read with `is True`).
+57. **Done:** `start_publishers` parses `http:` and `mqtt:` through
+    `HttpSettings.from_section` and `validate_mqtt_section` before deciding
+    whether to start, so `enabled: "true"` (a string) or any other mistyped
+    scalar is a named error in the journal instead of a silent "off".
+    `onewire.enabled` is type-checked at config load; `digole.enabled` has
+    no owner module yet and only logs a warning.
 58. Stuck detection gap after item 3: a proximal reading frozen while
     its zone's airflow stays within `stuck_airflow_net` (fans pinned at
     `pwm_max`, slow trims) is no longer flagged; on the `rich` sim 21 of

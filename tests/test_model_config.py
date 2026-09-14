@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import math
 
 import pytest
@@ -220,6 +221,23 @@ def test_app_config_from_mapping_and_errors(cfg):
         AppConfig.from_mapping({"mpc": cfg.to_dict(), "http": "not a mapping"})
     with pytest.raises(ConfigError):
         AppConfig.from_mapping([])  # type: ignore[arg-type]
+
+
+def test_digole_enabled_bad_type_logs_a_warning_and_does_not_raise(cfg, caplog):
+    """Item 57: digole: has no owner module yet, so a bad enabled: is logged, not
+    fatal -- a typo there must never stop the daemon from controlling the fans."""
+    with caplog.at_level(logging.WARNING):
+        app = AppConfig.from_mapping({"mpc": cfg.to_dict(), "digole": {"enabled": "true"}})
+    assert app.digole == {"enabled": "true"}  # unchanged: still nobody's job to fix it up
+    assert any(
+        "digole.enabled" in r.getMessage() and "'true'" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_digole_enabled_proper_bool_is_silent(cfg, caplog):
+    with caplog.at_level(logging.WARNING):
+        AppConfig.from_mapping({"mpc": cfg.to_dict(), "digole": {"enabled": True}})
+    assert not caplog.records
 
 
 def test_load_config_errors(tmp_path):

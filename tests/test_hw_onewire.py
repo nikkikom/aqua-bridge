@@ -462,6 +462,11 @@ def test_build_onewire_explicit_max_age_overrides_default(tmp_path: Path) -> Non
         ({"sensors": {"a": ""}}, "ROM id"),
         ({"sensors": {"a": "28-1"}, "resolution_bits": "x"}, "resolution_bits must be an int"),
         ({"sensors": {"a": "28-1"}, "max_age_s": "x"}, "max_age_s must be a number"),
+        ({"sensors": {"a": "28-1"}, "enabled": "true"}, "onewire.enabled must be true or false"),
+        # item 57: the check runs even when it would otherwise return None (no sensors) --
+        # a mistyped enabled: is a config mistake regardless of whether anything reads it.
+        ({"enabled": "yes"}, "onewire.enabled must be true or false"),
+        ({"enabled": 1}, "onewire.enabled must be true or false"),
     ],
 )
 def test_build_onewire_malformed_section_is_config_error(section: object, match: str) -> None:
