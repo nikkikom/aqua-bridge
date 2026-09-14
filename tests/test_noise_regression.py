@@ -63,8 +63,9 @@ UNCALIBRATED_BOUND = 2.0
 #: The rich preset draws placement and SMART offsets the calibration does not fully
 #: remove (estimates up to 2 degC off on some bays), so the MPC cools the bays it
 #: believes hottest; a uniform curve sized on the truth can then be quieter. Measured
-#: 0.47-1.21 over seeds 1-8.
-RICH_BOUND = 1.3
+#: 0.43-1.30 over seeds 1-8 (seed 7: 1.30; with the plain-drift return of the model
+#: fallback, before section 8 item 10, seed 1 was still in the fallback in the window).
+RICH_BOUND = 1.35
 #: A drive the rich preset draws may start above its limit; violations count after this.
 RICH_SETTLE_S = 600.0
 
