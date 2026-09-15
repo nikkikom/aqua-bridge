@@ -398,6 +398,39 @@ USB ports, the DKMS module removed (§8 item 82), run as a non-root user in
   stayed at 100 %; the Quadro's mode field is not identified. The adapter
   decodes the aquaero mode and warns about commanded outputs not in PWM
   mode, but does not change it (§8 item 81).
+- **Two more fans, PWM to rpm (2026-09-15).** Fans on aquaero outputs 1
+  and 4, both in PWM mode (output 4 switched from DC first), swept together
+  over hidraw, 10 s settle per step, up from 0 % and back down:
+
+  | PWM | output 1 up | output 1 down | output 4 up | output 4 down |
+  |---|---|---|---|---|
+  | 0 % | 0 | 0 | 0 | 0 |
+  | 5 % | 0 | 0 | 0 | 0 |
+  | 10 % | 0 | 0 | 0 | 0 |
+  | 15 % | 0 | 354 | 0 | 375 |
+  | 20 % | 0 | 354 | 0 | 375 |
+  | 25 % | 357 | 354 | 374 | 375 |
+  | 30 % | 416 | 430 | 447 | 452 |
+  | 40 % | 608 | 606 | 646 | 642 |
+  | 50 % | 780 | 785 | 823 | 834 |
+  | 60 % | 964 | 953 | 1024 | 1016 |
+  | 70 % | 1127 | 1129 | 1205 | 1196 |
+  | 80 % | 1305 | 1312 | 1388 | 1398 |
+  | 90 % | 1476 | 1496 | 1591 | 1590 |
+  | 100 % | 1733 | 1733 | 1857 | 1857 |
+
+  Both fans start at 25 %, stop at 13 %, and hold the same speed from 25 %
+  down to 14 % (about 355 and 371 rpm), so those duties differ in margin
+  only, not in speed or noise. They were left at 25 %, where a stopped fan
+  starts again. Unlike the first test fan on output 2 (120 rpm at 14 %),
+  these fans keep a minimum speed of their own. A 1 % search held both
+  steady at 14 % for a minute. Up and down agree within about 20 rpm except
+  at 90 % on output 1 (1476 / 1496).
+- **Output 4 in DC mode, for comparison.** Swept before the mode switch, it
+  did not follow the command below about 30 %: commanded 0–20 % gave 26–30 %
+  duty, 3.2–3.7 V and 320–970 rpm with large swings; commanded 100 % gave
+  63.7 % duty, 7.77 V and 1571 rpm. Duty verification flagged it on every
+  step of the minimum search, as intended.
 
 ---
 
