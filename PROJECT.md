@@ -1774,7 +1774,9 @@ converges only with them.
     raises `DeviceUnavailable`; the next call discovers it again (a
     re-plug may bring a new `hidrawN`). With `serial:` configured, a
     first status report carrying another serial closes the device and
-    raises, naming both. `ts` comes from the injected monotonic clock.
+    raises, naming both; `apply()` then raises too, without opening the
+    node, until a status report carries the configured serial (a device
+    that is merely silent is not affected). `ts` comes from the injected monotonic clock.
     `last_status` keeps the newest decoded report for tools and
     diagnostics; voltage, current and power are not in the observation
     (§8 item 79).
@@ -1809,9 +1811,21 @@ converges only with them.
     pending change, rises and pending falls alike. With both keys 0 every
     change is written. A deferred fall is not an error: `obs.pwm` keeps
     coming from the status report, so the controller sees the duty the
-    fans actually get. The stop write of `fallback_pwm` follows the same
-    rule (from a higher duty it is a fall and may be deferred, which only
-    leaves more cooling).
+    fans actually get.
+  - **No slower fan during a fault.** A deferred fall is recorded by the
+    loop as applied, so the fallback hold and ramp start from the lower
+    command while the device still holds the higher duty. With
+    `cmd.mode` FALLBACK or DEGRADED the adapter therefore never sends a
+    channel below the duty the device holds: `max(command, held)`, where
+    held is the duty in the cached control report (read first when the
+    cache is invalid; a failed read takes the failure path as usual) and,
+    for an aquaero channel on a firmware controller, the newest status
+    report's output duty since the open, or 100 % before any report. It
+    applies to every write in those modes, forced rewrites included, so a
+    pending fall can neither ride along with another channel's rise nor
+    mature after `write_min_interval_s` during a fault. The stop write of
+    `fallback_pwm` is a FALLBACK command, so it never lowers a fan either.
+    In AUTO and SATURATED mode falls are written as the rule above says.
   - **Keeping the cache honest.** Speed, output duty, voltage, current and
     power arrive in every status report, so drift of the fans themselves
     is visible without any control read. A one-time read misses a
@@ -1847,11 +1861,16 @@ converges only with them.
     Not called at exit (§2; §8 items 33, 76).
   - **Worst case per tick.** One `read()` plus one `apply()` of a device
     can block for `status_max_age_s` (the first read after an open) +
-    `ctrl_budget_s` + one control transfer that started just before the
-    budget ran out (5 s, or the gap if longer): 13 s per controller at
-    the defaults, 26 s for the aquaero and the Quadro. `build_io` reads the
-    systemd watchdog period from `$WATCHDOG_USEC` and refuses (exit 2) a
-    configuration whose sum over all devices is not below it (§9).
+    `ctrl_budget_s` + one 5 s control transfer that started just before the
+    budget ran out + `ctrl_gap_ms` (the retry after that failure sleeps the
+    gap before it finds the budget spent): 13.1 s for the aquaero and 13 s
+    for the Quadro at their defaults. `WATCHDOG=1` goes out at the end of a
+    tick and the loop then sleeps until the next one, so two pings can be
+    `mpc.dt` + `mpc.budget_alarm_ms` (the step time bound the config
+    states; a slower step is logged, not interrupted) + the sum over all
+    devices apart: 5 + 0.75 + 26.1 ≈ 32 s for `config.example-das.yaml`.
+    `build_io` reads the systemd watchdog period from `$WATCHDOG_USEC` and
+    refuses (exit 2) a configuration whose bound is not below it (§9).
 - **The device entry**, `xt6:` or one `aquacomputer:` list entry
   (`parse_device_section`; `build_adapter_from_config(xt6,
   channels=mpc.channels, temps=mpc.temps)` for `--source xt6`):
@@ -2590,14 +2609,18 @@ the board.
   newest report wins, a stale status report, a silent device (only the
   first read waits, `apply()` still writes), a full kernel queue treated
   as stale and read again, the configured serial against the status
-  report, a re-plug with a new node reads the control report again, an
+  report and a rejected serial blocking writes (a silent device still
+  takes them), a re-plug with a new node reads the control report again, an
   unchanged command sends nothing, a changed command sends one SET plus
   one secondary report with the driver's bytes, the per-kind gap timed
   from every operation (failed ones included), retries and
   `ctrl_budget_s` then `DeviceUnavailable`, a failed or unfinished write
   rewrites, write limiting (rises at once, falls after the interval and
   outside the deadband, one write carrying every pending change, zeros
-  writing everything), per-channel duty verification (a brief mismatch,
+  writing everything), no channel lowered in FALLBACK or DEGRADED mode (a
+  rise carrying a deferred fall, a matured fall, a forced rewrite, the
+  rewrite after a failed write, a channel on a firmware controller) while
+  AUTO still falls, per-channel duty verification (a brief mismatch,
   one within tolerance or one without a new report does not fire; another
   channel changing every tick does not hold it off; a change of the
   channel itself restarts it), the rewrite-then-stuck escalation, the
@@ -2612,8 +2635,9 @@ the board.
 - `tests/test_hw_aquacomputer_config.py` — the device entry: kinds,
   serial, input ranges per kind, `fans` / `temp_map` errors, keys equal
   to `mpc.channels` / `mpc.temps`, every timing key's validation, the
-  per-kind `ctrl_gap_ms` default, the worst case per tick against the
-  watchdog (and the unit's `WatchdogSec` against the default pair), the
+  per-kind `ctrl_gap_ms` default, the ping interval bound against the
+  watchdog (a timed-out retry within it, the unit's `WatchdogSec` against
+  the DAS example's `dt` and step bound with both controllers), the
   hints for `hwmon_name`, `root`, `name`, `map` and `fan_map`.
 - `tests/test_hw_sources.py` — `CompositeSource` over two fake
   controllers and a fake 1-Wire source: merged reads, each channel
@@ -4017,7 +4041,7 @@ SupplementaryGroups=dialout plugdev
 ExecStart=/opt/aqua-bridge/.venv/bin/python -m aqua_bridge --config /etc/aqua-bridge/config.yaml
 StateDirectory=aqua-bridge
 Restart=always
-WatchdogSec=30
+WatchdogSec=45
 TimeoutStartSec=120
 
 [Install]
@@ -4057,15 +4081,20 @@ controllers' `/dev/hidrawN` nodes (the kernel creates them `root:root
 0600`); without it the daemon cannot open them. `dialout` is for the
 Digole UART.
 
-**Watchdog against blocked ticks.** A tick that blocks longer than
-`WatchdogSec=` gets the daemon killed without its `fallback_pwm` stop
-write. The controller I/O per tick is bounded: `status_max_age_s` +
-`ctrl_budget_s` + one 5 s usbhid control transfer per controller (§3 Track
-B), 26 s for the aquaero and the Quadro at their defaults against
-`WatchdogSec=30`. `build_io` reads the period from `$WATCHDOG_USEC` (only
-set under systemd) and exits 2 when that sum is not below it; raise
-`WatchdogSec=` or lower those keys, and keep the margin for `step` and the
-recorder in mind.
+**Watchdog against blocked ticks.** Two `WATCHDOG=1` pings further apart
+than `WatchdogSec=` get the daemon killed without its `fallback_pwm` stop
+write. The loop pings at the end of a tick and sleeps until the next, so
+after a normal tick the next ping can come `mpc.dt` + `mpc.budget_alarm_ms`
++ the controllers' worst-case I/O later, each controller at most
+`status_max_age_s` + `ctrl_budget_s` + one 5 s usbhid control transfer +
+`ctrl_gap_ms` (§3 Track B). For `config.example-das.yaml` with the aquaero
+and the Quadro at their defaults that is 5 + 0.75 + 13.1 + 13 ≈ 32 s, hence
+`WatchdogSec=45` (it was 30). `build_io` reads the period from
+`$WATCHDOG_USEC` (only set under systemd) and exits 2 when that bound is not
+below it; raise `WatchdogSec=` or lower those keys, and keep a margin for
+the publishers and the recorder, which the bound does not count.
+`tests/test_hw_aquacomputer_config.py` checks the unit against the DAS
+example. `TimeoutStartSec=120` stays above `WatchdogSec`.
 
 `READY=1` waits for the first applied command, so a device that is
 absent at boot (USB not enumerated, hidraw permissions wrong) shows up as
