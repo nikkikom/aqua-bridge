@@ -2,7 +2,10 @@
 
 The fixtures in tests/fixtures/aquacomputer/ are real reports (serial bytes
 zeroed) and the Linux driver's hwmon readings taken about a second later
-(PROJECT.md section 2, "USB spike results"; section 4.7).
+(PROJECT.md section 2, "USB spike results", "hidraw check"; section 4.7). The
+``aquaero-*-aquabus-*`` and ``aquaero-status-no-aquabus`` captures are from
+firmware 2104 with the Quadro on the aquaero's aquabus and without it
+(PROJECT.md section 8 item 85).
 """
 
 from __future__ import annotations
@@ -17,8 +20,10 @@ from hypothesis import strategies as st
 from aqua_bridge.hw.aquacomputer import (
     AQUAERO,
     DUTY_MAX,
+    FAN_ABSENT_RPM,
     KINDS,
     QUADRO,
+    SOURCE_UNCONFIGURED,
     DeviceKind,
     ReportError,
     capture_channel,
@@ -37,6 +42,25 @@ from aqua_bridge.hw.aquacomputer import (
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "aquacomputer"
+
+#: The Linux driver's hwmon attribute names -> the names used here. The driver
+#: numbers the temperatures in one run and the flow sensors after the fans.
+DRIVER_NAMES = {
+    "aquaero": {
+        **{f"temp{n}": f"temp{n}" for n in range(1, 9)},
+        **{f"temp{8 + n}": f"soft{n}" for n in range(1, 9)},
+        **{f"temp{16 + n}": f"virt{n}" for n in range(1, 5)},
+        **{f"fan{n}": f"fan{n}" for n in range(1, 5)},
+        "fan5": "flow1",
+        "fan6": "flow2",
+    },
+    "quadro": {
+        **{f"temp{n}": f"temp{n}" for n in range(1, 5)},
+        **{f"temp{4 + n}": f"soft{n}" for n in range(1, 17)},
+        **{f"fan{n}": f"fan{n}" for n in range(1, 5)},
+        "fan5": "flow1",
+    },
+}
 
 
 def _bin(name: str) -> bytes:
@@ -61,23 +85,54 @@ def _readings(name: str) -> dict[str, int | None]:
 def test_status_decodes_like_the_driver(kind: DeviceKind, status: str, readings: str) -> None:
     report = decode_status(kind, _bin(status))
     driver = _readings(readings)
+    names = DRIVER_NAMES[kind.name]
     assert report.kind == kind.name
-    assert len(report.temps) == kind.temp_count == 20
-    for n in range(1, kind.temp_count + 1):
-        expected = driver[f"temp{n}_input"]
-        value = report.temp(n)
-        if expected is None:
-            assert value is None, f"temp{n}"
+    for attribute, name in names.items():
+        expected = driver[f"{attribute}_input"]
+        if name.startswith("fan"):
+            assert report.rpm(int(name[3:])) == expected, attribute
+        elif name.startswith("flow"):
+            assert report.flow(int(name[4:])) == expected, attribute
+        elif expected is None:
+            assert report.temp(name) is None, attribute
         else:
             # The driver had already taken the next report for one Quadro input.
-            assert value is not None and abs(value * 1000 - expected) <= 20, f"temp{n}"
-    for n in range(1, kind.fan_input_count + 1):
-        assert report.fan_input(n) == driver[f"fan{n}_input"], f"fan{n}"
-    for k, fan in enumerate(report.fans):
+            value = report.temp(name)
+            assert value is not None and abs(value * 1000 - expected) <= 20, attribute
+    # Every temperature the driver has is covered; the aquabus slots are new.
+    driver_temps = {name for name in names.values() if not name.startswith(("fan", "flow"))}
+    assert set(report.temps) - driver_temps == {f"bus{n}" for n in range(1, 9)} & set(
+        kind.temp_names
+    )
+    for k in range(4):
+        fan = report.fans[k]
         assert fan.voltage_cv * 10 == driver[f"in{k}_input"], f"in{k}"
         assert fan.current_ma == driver[f"curr{k + 1}_input"], f"curr{k + 1}"
         assert fan.power_cw * 10000 == driver[f"power{k + 1}_input"], f"power{k + 1}"
     assert report.serial == "00000-00000"  # zeroed in the fixture
+
+
+def test_temperature_group_names_in_report_order() -> None:
+    assert AQUAERO.temp_names == (
+        *(f"temp{n}" for n in range(1, 9)),
+        *(f"bus{n}" for n in range(1, 9)),
+        *(f"soft{n}" for n in range(1, 9)),
+        *(f"virt{n}" for n in range(1, 5)),
+    )
+    assert [(g.prefix, g.offset, g.count) for g in AQUAERO.temp_groups] == [
+        ("temp", 0x65, 8),
+        ("bus", 0x75, 8),
+        ("soft", 0x85, 8),
+        ("virt", 0x95, 4),
+    ]
+    assert QUADRO.temp_names == (
+        *(f"temp{n}" for n in range(1, 5)),
+        *(f"soft{n}" for n in range(1, 17)),
+    )
+    assert AQUAERO.describe_temps() == "temp1..temp8, bus1..bus8, soft1..soft8, virt1..virt4"
+    assert list(decode_status(AQUAERO, _bin("aquaero-status.bin")).temps) == list(
+        AQUAERO.temp_names
+    )
 
 
 def test_aquaero_status_output_duty_field() -> None:
@@ -86,6 +141,54 @@ def test_aquaero_status_output_duty_field() -> None:
     assert [report.duty(n) for n in range(1, 5)] == [10000, 1412, 10000, 10000]
     assert report.power_cycles is None
     assert report.firmware > 0
+
+
+def test_aquaero_without_a_device_on_aquabus() -> None:
+    """Firmware 2104, the Quadro not on aquabus: fans 5-8 read rpm 0xFFFF and 0 V, the
+    aquabus temperature slots and flow 3 no data. Software sensors 1 and 2 are enabled
+    and show their fallback values 40 and 50 degC."""
+    report = decode_status(AQUAERO, _bin("aquaero-status-no-aquabus.bin"))
+    assert report.firmware == 2104
+    assert report.temp("temp6") == pytest.approx(22.42)
+    assert [report.temp(f"bus{n}") for n in range(1, 9)] == [None] * 8
+    assert report.temp("soft1") == pytest.approx(40.0)
+    assert report.temp("soft2") == pytest.approx(50.0)
+    assert [report.temp(f"soft{n}") for n in range(3, 9)] == [None] * 6
+    assert [report.temp(f"virt{n}") for n in range(1, 5)] == [None] * 4
+    assert [fan.present for fan in report.fans] == [True] * 4 + [False] * 4
+    assert [report.rpm(n) for n in range(5, 9)] == [FAN_ABSENT_RPM] * 4
+    assert [report.fans[k].voltage_cv for k in range(4, 8)] == [0] * 4
+    assert [report.rpm(n) for n in range(1, 5)] == [353, 121, 0, 365]
+    assert [report.duty(n) for n in range(1, 5)] == [2500, 1412, 10000, 2500]
+    assert report.flows == (0, 0, 0x7FFF)
+
+
+@pytest.mark.parametrize(
+    ("name", "duty", "rpm", "bus2"),
+    [
+        ("aquaero-status-aquabus-fan7-100.bin", 10000, 1105, 24.14),
+        ("aquaero-status-aquabus-fan7-902.bin", 902, 128, 24.28),
+    ],
+    ids=["100", "9.02"],
+)
+def test_aquaero_with_the_quadro_on_aquabus(name: str, duty: int, rpm: int, bus2: float) -> None:
+    """The Quadro's outputs 1-4 in the aquaero's fan blocks 5-8 (a fan on its output 3,
+    so fan 7), its sensor 2 in aquabus slot 2, its flow in flow 3."""
+    report = decode_status(AQUAERO, _bin(name))
+    assert all(fan.present for fan in report.fans)
+    assert [report.rpm(n) for n in (5, 6, 8)] == [0, 0, 0]
+    assert (report.rpm(7), report.duty(7)) == (rpm, duty)
+    assert report.temp("bus2") == pytest.approx(bus2)
+    assert [report.temp(f"bus{n}") for n in (1, 3, 4, 5, 6, 7, 8)] == [None] * 7
+    assert (report.temp("soft1"), report.temp("soft2")) == (
+        pytest.approx(40.0),
+        pytest.approx(50.0),
+    )
+    assert report.flow(3) == 0
+    if duty == DUTY_MAX:
+        fan7 = report.fans[6]
+        assert (fan7.voltage_cv, fan7.current_ma, fan7.power_cw) == (1210, 27, 32)
+        assert fan7.voltage_v == pytest.approx(12.10) and fan7.power_w == pytest.approx(0.32)
 
 
 def test_quadro_status_output_duty_and_power_cycles() -> None:
@@ -97,12 +200,13 @@ def test_quadro_status_output_duty_and_power_cycles() -> None:
     for n in range(1, 5):
         assert round(report.duty(n) * 255 / DUTY_MAX) == driver[f"pwm{n}"]
     assert isinstance(report.power_cycles, int) and report.power_cycles > 0
+    assert all(fan.present for fan in report.fans)
 
 
 def test_negative_temperature_is_signed_not_655_degc() -> None:
     data = bytearray(_bin("aquaero-status.bin"))
     data[0x65:0x67] = (-250).to_bytes(2, "big", signed=True)
-    assert decode_status(AQUAERO, bytes(data)).temp(1) == pytest.approx(-2.5)
+    assert decode_status(AQUAERO, bytes(data)).temp("temp1") == pytest.approx(-2.5)
 
 
 @pytest.mark.parametrize("kind", [AQUAERO, QUADRO], ids=lambda k: k.name)
@@ -123,14 +227,21 @@ def test_status_of_the_other_kind_is_rejected() -> None:
         decode_status(QUADRO, _bin("aquaero-status.bin"))
 
 
-def test_channel_numbers_out_of_range_raise() -> None:
+def test_channel_numbers_and_names_out_of_range_raise() -> None:
     report = decode_status(QUADRO, _bin("quadro-status.bin"))
-    with pytest.raises(IndexError):
-        report.temp(21)
-    with pytest.raises(IndexError):
-        report.fan_input(6)
-    with pytest.raises(IndexError):
+    with pytest.raises(KeyError, match="temp5"):
+        report.temp("temp5")
+    with pytest.raises(KeyError, match="bus1"):
+        report.temp("bus1")  # the Quadro has no aquabus slots
+    with pytest.raises(IndexError, match="fan1..fan4"):
+        report.rpm(5)
+    with pytest.raises(IndexError, match="flow1..flow1"):
+        report.flow(2)
+    with pytest.raises(IndexError, match="pwm1..pwm4"):
         report.duty(0)
+    aquaero = decode_status(AQUAERO, _bin("aquaero-status.bin"))
+    with pytest.raises(IndexError, match="pwm1..pwm8"):
+        aquaero.duty(9)
 
 
 # --- control report ----------------------------------------------------------------------
@@ -181,11 +292,58 @@ def test_quadro_patch_reproduces_the_driver_write_byte_for_byte() -> None:
     assert bytes(buf) == _bin("quadro-ctrl-after-writes.bin")
 
 
+def test_aquaero_aquabus_output_7_patch_reproduces_the_hardware_write() -> None:
+    """Hardware 2026-09-15: duty 9.02 % on aquaero output 7 (the Quadro's output 3 on
+    aquabus) changed only min power, source and preset 7."""
+    before = _bin("aquaero-ctrl-aquabus-before-fan7-write.bin")
+    after = _bin("aquaero-ctrl-aquabus-after-fan7-write.bin")
+    assert [i for i in range(len(before)) if before[i] != after[i]] == [
+        0x288,
+        0x289,
+        0x295,
+        0x568,
+        0x569,
+    ]
+    buf = bytearray(before)
+    patch_duties(AQUAERO, buf, {6: 902})
+    finalize_control_report(AQUAERO, buf)
+    assert bytes(buf) == after
+    state = channel_state(AQUAERO, before, 6)
+    assert (state.source, state.min_power, state.duty, state.on_duty) == (0x59, 3996, 10000, False)
+    state = channel_state(AQUAERO, after, 6)
+    assert (state.duty, state.source, state.min_power, state.max_power) == (902, 0x62, 0, 10000)
+    assert state.on_duty and state.aquabus and channel_holds(AQUAERO, after, 6, 902)
+    snapshot = capture_channel(AQUAERO, before, 6)
+    restore_channel(buf, snapshot)
+    finalize_control_report(AQUAERO, buf)
+    assert bytes(buf) == before
+
+
+def test_aquaero_control_blocks_of_all_eight_outputs() -> None:
+    """Blocks at 0x20C + 20k, presets at 0x55C + 2k with id 0x5C + k; 5-8 on aquabus."""
+    for k, channel in enumerate(AQUAERO.ctrl_channels):
+        base = 0x20C + 20 * k
+        assert (channel.duty, channel.source, channel.preset_id) == (
+            0x55C + 2 * k,
+            base + 0x10,
+            0x5C + k,
+        )
+        assert (channel.min_power, channel.max_power, channel.mode) == (
+            base + 4,
+            base + 6,
+            base + 0x0E,
+        )
+        assert channel.aquabus == (k >= 4)
+    assert AQUAERO.fan_blocks == tuple(0x167 + 12 * k for k in range(8))
+    assert AQUAERO.fan_blocks[4:] == (0x197, 0x1A3, 0x1AF, 0x1BB)
+    assert AQUAERO.aquabus_outputs == (5, 6, 7, 8) and QUADRO.aquabus_outputs == ()
+
+
 def test_aquaero_channel_state_before_and_after_the_write() -> None:
     firmware = _bin("aquaero-ctrl-firmware.bin")
     after = _bin("aquaero-ctrl-after-writes.bin")
     before = channel_state(AQUAERO, firmware, 1)
-    assert before.source == 0x59 and not before.on_duty
+    assert before.source == 0x59 and not before.on_duty and not before.aquabus
     assert not channel_holds(AQUAERO, firmware, 1, control_duty(AQUAERO, firmware, 1))
     state = channel_state(AQUAERO, after, 1)
     assert (state.duty, state.source, state.min_power, state.max_power) == (1412, 0x5D, 0, 10000)
@@ -197,24 +355,47 @@ def test_aquaero_channel_state_before_and_after_the_write() -> None:
 
 
 def test_aquaero_output_mode_word() -> None:
-    """The firmware fixture: outputs 1-2 in PWM mode (0x0502), 3-4 in DC mode (0x0501);
-    a duty write does not touch the mode."""
-    for name in ("aquaero-ctrl-firmware.bin", "aquaero-ctrl-after-writes.bin"):
+    """The firmware fixtures: outputs 1-2 in PWM mode (0x0502), 3-4 in DC mode (0x0501;
+    output 4 was switched to PWM before the aquabus captures), aquabus blocks 5-7 0x0500
+    (low byte 0, not interpreted) and block 8 unconfigured (mode 0, source 0xFFFF); a
+    duty write does not touch the mode."""
+    output_4 = {"dc": 0x0501, "pwm": 0x0502}
+    for name, fourth in (
+        ("aquaero-ctrl-firmware.bin", "dc"),
+        ("aquaero-ctrl-after-writes.bin", "dc"),
+        ("aquaero-ctrl-aquabus-before-fan7-write.bin", "pwm"),
+        ("aquaero-ctrl-aquabus-after-fan7-write.bin", "pwm"),
+    ):
         data = _bin(name)
-        modes = [output_mode(AQUAERO, data, k) for k in range(4)]
-        assert [m.raw for m in modes] == [0x0502, 0x0502, 0x0501, 0x0501]
-        assert [m.name for m in modes] == ["pwm", "pwm", "dc", "dc"]
-        assert [channel_state(AQUAERO, data, k).mode for k in range(4)] == modes
+        modes = [output_mode(AQUAERO, data, k) for k in range(8)]
+        assert [m.raw for m in modes] == [0x0502, 0x0502, 0x0501, output_4[fourth]] + [
+            0x0500
+        ] * 3 + [0]
+        assert [m.name for m in modes] == ["pwm", "pwm", "dc", fourth] + ["unknown"] * 4
+        states = [channel_state(AQUAERO, data, k) for k in range(8)]
+        assert [s.mode for s in states] == modes
+        assert [s.unconfigured for s in states] == [False] * 7 + [True]
+        assert states[7].source == SOURCE_UNCONFIGURED
     patched = bytearray(_bin("aquaero-ctrl-firmware.bin"))
     patched[0x248 + 0x0E : 0x248 + 0x10] = (0x0503).to_bytes(2, "big")
     odd = output_mode(AQUAERO, patched, 3)
     assert odd is not None and odd.name == "unknown" and not odd.is_pwm
 
 
+def test_writing_the_unconfigured_block_sets_the_same_fields() -> None:
+    buf = bytearray(_bin("aquaero-ctrl-aquabus-before-fan7-write.bin"))
+    patch_duties(AQUAERO, buf, {7: 5000})
+    state = channel_state(AQUAERO, buf, 7)
+    assert (state.duty, state.source, state.min_power, state.max_power) == (5000, 0x63, 0, 10000)
+    assert state.on_duty and not state.unconfigured and state.mode is not None
+    assert state.mode.raw == 0  # the mode is never written
+
+
 def test_quadro_has_no_known_output_mode() -> None:
     data = _bin("quadro-ctrl-firmware.bin")
     assert output_mode(QUADRO, data, 0) is None
-    assert channel_state(QUADRO, data, 0).mode is None
+    state = channel_state(QUADRO, data, 0)
+    assert state.mode is None and not state.unconfigured and not state.aquabus
 
 
 def test_quadro_channel_state_has_no_aquaero_fields() -> None:
@@ -248,16 +429,22 @@ def test_patch_rejects_a_duty_outside_the_field(duty) -> None:
 
 def test_patch_rejects_an_unknown_channel() -> None:
     with pytest.raises(IndexError):
-        patch_duties(AQUAERO, bytearray(_bin("aquaero-ctrl-firmware.bin")), {4: 0})
+        patch_duties(AQUAERO, bytearray(_bin("aquaero-ctrl-firmware.bin")), {8: 0})
+    with pytest.raises(IndexError):
+        patch_duties(QUADRO, bytearray(_bin("quadro-ctrl-firmware.bin")), {4: 0})
 
 
-def test_secondary_reports_and_kind_table() -> None:
-    assert AQUAERO.secondary_report == bytes.fromhex("06 00 02 00 00 00 00")
-    assert QUADRO.secondary_report == bytes.fromhex("02 00 00 00 02 00 00 00 00 34 C6")
+def test_save_reports_and_kind_table() -> None:
+    """The save report: aquaero report 6 (verified to save, PROJECT.md section 8 item 84);
+    the Quadro's equals the Farbwerk 360's documented save report (not verified)."""
+    assert AQUAERO.save_report == bytes.fromhex("06 00 02 00 00 00 00")
+    assert QUADRO.save_report == bytes.fromhex("02 00 00 00 02 00 00 00 00 34 C6")
+    assert AQUAERO.save_verified and not QUADRO.save_verified
     assert (AQUAERO.product_id, AQUAERO.interface) == (0xF001, 2)
     assert (QUADRO.product_id, QUADRO.interface) == (0xF00D, 1)
-    assert (AQUAERO.fan_input_count, QUADRO.fan_input_count) == (6, 5)
-    assert AQUAERO.pwm_count == QUADRO.pwm_count == 4
+    assert (AQUAERO.pwm_count, AQUAERO.fan_count, AQUAERO.flow_count) == (8, 8, 3)
+    assert (QUADRO.pwm_count, QUADRO.fan_count, QUADRO.flow_count) == (4, 4, 1)
+    assert (AQUAERO.temp_count, QUADRO.temp_count) == (28, 20)
     assert kind_by_name("quadro") is QUADRO and set(KINDS) == {"aquaero", "quadro"}
     with pytest.raises(ValueError, match="supported"):
         kind_by_name("octo")
@@ -265,9 +452,12 @@ def test_secondary_reports_and_kind_table() -> None:
 
 @given(
     kind=st.sampled_from([AQUAERO, QUADRO]),
-    duties=st.dictionaries(st.integers(0, 3), st.integers(0, DUTY_MAX), min_size=1),
+    data=st.data(),
 )
-def test_patched_duties_read_back_and_hold(kind: DeviceKind, duties: dict[int, int]) -> None:
+def test_patched_duties_read_back_and_hold(kind: DeviceKind, data) -> None:
+    duties = data.draw(
+        st.dictionaries(st.integers(0, kind.pwm_count - 1), st.integers(0, DUTY_MAX), min_size=1)
+    )
     buf = bytearray(_bin(f"{kind.name}-ctrl-firmware.bin"))
     patch_duties(kind, buf, duties)
     finalize_control_report(kind, buf)
@@ -275,7 +465,7 @@ def test_patched_duties_read_back_and_hold(kind: DeviceKind, duties: dict[int, i
     for k, duty in duties.items():
         assert control_duty(kind, buf, k) == duty
         assert channel_holds(kind, buf, k, duty)
-    untouched = set(range(4)) - set(duties)
+    untouched = set(range(kind.pwm_count)) - set(duties)
     firmware = _bin(f"{kind.name}-ctrl-firmware.bin")
     for k in untouched:
         assert capture_channel(kind, buf, k) == capture_channel(kind, firmware, k)
