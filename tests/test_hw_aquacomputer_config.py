@@ -50,7 +50,7 @@ def test_matching_mpc_section_is_accepted() -> None:
     assert binding.kind is AQUAERO and binding.serial is None
     assert binding.pwm_map == {"radiator": 1, "intake": 2}
     assert binding.fan_map == {"radiator": 1}  # rpm is optional per fan
-    assert binding.temp_map == {"coolant": 1, "air": 2}
+    assert binding.temp_map == {"coolant": "temp1", "air": "temp2"}
     assert binding.timing == AquacomputerTiming.for_kind(AQUAERO)
     # without the mpc tuples the check is skipped (mapping-only callers)
     assert _parse(_SECTION).pwm_map == binding.pwm_map
@@ -63,9 +63,9 @@ device: quadro
 serial: 12345-54321
 prefer: hid
 fans:
-  radiator: {pwm: pwm4, rpm: fan5}
+  radiator: {pwm: pwm4, rpm: fan4}
   intake:   {pwm: pwm2, rpm: fan2}
-temp_map: {coolant: temp20, air: temp5}
+temp_map: {coolant: soft16, air: temp4}
 status_max_age_s: 2.5
 ctrl_gap_ms: 150
 ctrl_retries: 3
@@ -80,8 +80,8 @@ write_deadband: 0
     binding = _parse(section, channels=_CHANNELS, temps=_TEMPS)
     assert binding.kind is QUADRO and binding.serial == "12345-54321"
     assert binding.pwm_map == {"radiator": 4, "intake": 2}
-    assert binding.fan_map == {"radiator": 5, "intake": 2}
-    assert binding.temp_map == {"coolant": 20, "air": 5}
+    assert binding.fan_map == {"radiator": 4, "intake": 2}
+    assert binding.temp_map == {"coolant": "soft16", "air": "temp4"}
     assert binding.timing == AquacomputerTiming(
         status_max_age_s=2.5,
         ctrl_gap_ms=150,
@@ -169,23 +169,23 @@ def test_malformed_device_or_serial_is_config_error(section, match: str) -> None
         ),
         (
             {"radiator": {"pwm": "fan1"}, "intake": {"pwm": "pwm2"}},
-            "xt6.fans.radiator.pwm must be one of the aquaero's inputs pwm1..pwm4",
+            "xt6.fans.radiator.pwm must be one of the aquaero's outputs pwm1..pwm8",
         ),
         (
             {"radiator": {"pwm": "pwm1", "rpm": "pwm1"}, "intake": {"pwm": "pwm2"}},
-            "xt6.fans.radiator.rpm must be one of the aquaero's inputs fan1..fan6",
+            "xt6.fans.radiator.rpm must be one of the aquaero's tachometers fan1..fan8",
         ),
         (
             {"radiator": {"pwm": "pwm1", "rpm": 1}, "intake": {"pwm": "pwm2"}},
             "xt6.fans.radiator.rpm must be",
         ),
         (
-            {"radiator": {"pwm": "pwm5"}, "intake": {"pwm": "pwm2"}},
-            "pwm1..pwm4, got 'pwm5'",
+            {"radiator": {"pwm": "pwm9"}, "intake": {"pwm": "pwm2"}},
+            "pwm1..pwm8, got 'pwm9'",
         ),
         (
-            {"radiator": {"pwm": "pwm1", "rpm": "fan7"}, "intake": {"pwm": "pwm2"}},
-            "fan1..fan6, got 'fan7'",
+            {"radiator": {"pwm": "pwm1", "rpm": "fan9"}, "intake": {"pwm": "pwm2"}},
+            "fan1..fan8, got 'fan9'",
         ),
         (
             {"radiator": {"pwm": "pwm1"}, "intake": {"pwm": "pwm1"}},
@@ -221,11 +221,105 @@ def test_malformed_fans_entry_is_config_error(fans, match: str) -> None:
 
 def test_quadro_ranges_differ_from_the_aquaero() -> None:
     quadro = dict(_SECTION, device="quadro")
-    with pytest.raises(ConfigError, match="quadro's inputs fan1..fan5, got 'fan6'"):
+    with pytest.raises(ConfigError, match="quadro's tachometers fan1..fan4, got 'fan6'"):
         _parse(dict(quadro, fans={"radiator": {"pwm": "pwm1", "rpm": "fan6"}}))
-    with pytest.raises(ConfigError, match="temp1..temp20, got 'temp21'"):
-        _parse(dict(quadro, temp_map={"coolant": "temp21"}))
-    _parse(dict(_SECTION, fans={"radiator": {"pwm": "pwm1", "rpm": "fan6"}}))
+    with pytest.raises(ConfigError, match="quadro's outputs pwm1..pwm4, got 'pwm5'"):
+        _parse(dict(quadro, fans={"radiator": {"pwm": "pwm5"}}))
+    with pytest.raises(
+        ConfigError, match="quadro's temperature inputs temp1..temp4, soft1..soft16, got 'bus1'"
+    ):
+        _parse(dict(quadro, temp_map={"coolant": "bus1"}))
+    with pytest.raises(ConfigError, match="got 'virt1'"):
+        _parse(dict(quadro, temp_map={"coolant": "virt1"}))
+    _parse(dict(_SECTION, fans={"radiator": {"pwm": "pwm6", "rpm": "fan6"}}))
+
+
+def test_every_input_name_of_both_kinds_is_accepted() -> None:
+    """aquaero: outputs and tachometers 1-8 (5-8: a Quadro on its aquabus), physical
+    sensors temp1..8, aquabus slots bus1..8, software sensors soft1..8, virtual
+    sensors virt1..4; Quadro: 1-4, temp1..4, soft1..16 (PROJECT.md section 3, Track B)."""
+    for kind in (AQUAERO, QUADRO):
+        section = {
+            "device": kind.name,
+            "fans": {
+                f"ch{n}": {"pwm": f"pwm{n}", "rpm": f"fan{n}"} for n in range(1, kind.pwm_count + 1)
+            },
+            "temp_map": {f"t_{name}": name for name in kind.temp_names},
+        }
+        binding = _parse(section)
+        assert binding.pwm_map == {f"ch{n}": n for n in range(1, kind.pwm_count + 1)}
+        assert binding.fan_map == binding.pwm_map
+        assert set(binding.temp_map.values()) == set(kind.temp_names)
+    assert {"bus8", "soft8", "virt4"} <= set(AQUAERO.temp_names)
+    assert {"soft16"} <= set(QUADRO.temp_names)
+
+
+@pytest.mark.parametrize(
+    ("device", "field", "value", "match"),
+    [
+        (
+            "aquaero",
+            "temp",
+            "temp9",
+            r"numbering 'temp9' is 'soft1' \(the aquaero's software sensors\): use 'soft1'",
+        ),
+        ("aquaero", "temp", "temp16", r"use 'soft8'"),
+        (
+            "aquaero",
+            "temp",
+            "temp17",
+            r"'temp17' is 'virt1' \(the aquaero's virtual sensors\): use 'virt1'",
+        ),
+        ("aquaero", "temp", "temp20", r"use 'virt4'"),
+        (
+            "quadro",
+            "temp",
+            "temp5",
+            r"'temp5' is 'soft1' \(the quadro's software sensors\): use 'soft1'",
+        ),
+        ("quadro", "temp", "temp20", r"use 'soft16'"),
+        (
+            "quadro",
+            "rpm",
+            "fan5",
+            r"'fan5' was the hwmon driver's name of the quadro's flow sensor flow1",
+        ),
+        (
+            "aquaero",
+            "rpm",
+            "fan5",
+            r"'fan5' was the hwmon driver's name of the aquaero's flow sensor flow1",
+        ),
+        (
+            "aquaero",
+            "rpm",
+            "fan6",
+            r"flow sensor flow2, which is not a tachometer; fanN is the tachometer of output pwmN",
+        ),
+    ],
+)
+def test_hwmon_era_input_names_are_rejected_with_the_new_name(
+    device: str, field: str, value: str, match: str
+) -> None:
+    """The Linux driver numbered the temperatures in one run and the flow sensors after the
+    fans; those names mean other inputs now (aquabus slots, aquabus tachometers)."""
+    section = dict(_SECTION, device=device)
+    if field == "temp":
+        section["temp_map"] = {"coolant": value}
+    else:
+        section["fans"] = {"radiator": {"pwm": "pwm1", "rpm": value}}
+    with pytest.raises(ConfigError, match=match):
+        _parse(section)
+
+
+def test_aquaero_fan5_and_fan6_are_the_aquabus_tachometers_of_their_own_outputs() -> None:
+    binding = _parse(
+        dict(
+            _SECTION,
+            fans={"a": {"pwm": "pwm5", "rpm": "fan5"}, "b": {"pwm": "pwm6", "rpm": "fan6"}},
+        )
+    )
+    assert binding.fan_map == {"a": 5, "b": 6}
 
 
 @pytest.mark.parametrize(
@@ -321,6 +415,17 @@ def test_zero_is_allowed_where_documented() -> None:
     assert (writes.write_min_interval_s, writes.write_deadband) == (0, 0)
 
 
+def test_write_limiting_is_off_by_default_and_still_configurable() -> None:
+    """Item 86: writes are not saved, so every change is written by default; the keys
+    remain to limit USB traffic."""
+    assert (
+        _parse(_SECTION).timing.write_min_interval_s,
+        _parse(_SECTION).timing.write_deadband,
+    ) == (0, 0)
+    limited = _parse(dict(_SECTION, write_min_interval_s=30, write_deadband=50)).timing
+    assert (limited.write_min_interval_s, limited.write_deadband) == (30, 50)
+
+
 def test_ctrl_gap_default_depends_on_the_device_kind() -> None:
     """Owner decision 2026-09-15: 100 ms for the aquaero (EPIPE at 0 and 25 ms on the
     Pi), no gap for the Quadro; declared once, in KIND_TIMING_DEFAULTS."""
@@ -390,7 +495,8 @@ def test_a_retry_after_a_timeout_blocks_no_longer_than_the_bound() -> None:
 
 def test_the_unit_watchdog_fits_the_das_example_with_two_controllers_at_their_defaults() -> None:
     """deploy/aqua-bridge.service's WatchdogSec against config.example-das.yaml's dt and
-    step bound plus the aquaero and the Quadro at their defaults."""
+    step bound plus its controllers at their defaults, and plus the aquaero and a Quadro
+    on its own USB port."""
     from aqua_bridge.config import load_config
 
     root = Path(__file__).resolve().parent.parent
@@ -398,14 +504,17 @@ def test_the_unit_watchdog_fits_the_das_example_with_two_controllers_at_their_de
     match = re.search(r"^WatchdogSec=(\d+)$", unit, re.MULTILINE)
     assert match is not None
     app = load_config(root / "config.example-das.yaml")
-    pair = [
+    example = [
         (entry["device"], AquacomputerTiming.for_kind(entry["device"]))
         for entry in app.aquacomputer
     ]
-    assert [name for name, _ in pair] == ["aquaero", "quadro"]
-    check_watchdog(
-        pair,
-        float(match.group(1)),
-        dt=app.mpc.dt,
-        step_bound_s=app.mpc.budget_alarm_ms / 1000.0,
-    )
+    assert [name for name, _ in example] == ["aquaero"]  # the Quadro on its aquabus
+    # The alternative the example describes, the Quadro on its own USB port, fits too.
+    both = [(name, AquacomputerTiming.for_kind(name)) for name in ("aquaero", "quadro")]
+    for pair in (example, both):
+        check_watchdog(
+            pair,
+            float(match.group(1)),
+            dt=app.mpc.dt,
+            step_bound_s=app.mpc.budget_alarm_ms / 1000.0,
+        )

@@ -118,13 +118,14 @@ mpc:
 xt6:
   device: aquaero        # aquaero | quadro
   # serial: "12345-54321"  # only needed when several of one kind are attached
-  fans:                  # one entry per mpc.channels name: output pwm1..pwm4 and optional tachometer fanN
-    radiator: {pwm: pwm1, rpm: fan1}
+  fans:                  # one entry per mpc.channels name: output pwmN and optional tachometer fanN of that output
+    radiator: {pwm: pwm1, rpm: fan1}   # aquaero pwm1-4 its own outputs, pwm5-8 a Quadro on its aquabus; Quadro pwm1-4
     intake:   {pwm: pwm2, rpm: fan2}
-  temp_map:              # logical temperature -> tempN (aquaero: 1-8 inputs, 9-16 virtual, 17-20 calculated)
-    coolant: temp1
+  temp_map:              # logical temperature -> input: temp1-8 physical sensors, bus1-8 aquabus slots,
+    coolant: temp1       # soft1-8 software sensors, virt1-4 virtual sensors (Quadro: temp1-4, soft1-16)
     air: temp2
-  # Timing, defaults shown (PROJECT.md section 3, Track B):
+  # Timing, defaults shown (PROJECT.md section 3, Track B). Writes take effect at once and
+  # are not saved in the controller's memory; a power cycle brings back its saved configuration.
   status_max_age_s: 3.0         # an older status report is no observation: fallback (> 0)
   ctrl_gap_ms: 100              # wait after a control operation before the next read or write, ms (>= 0; default aquaero 100, quadro 0)
   ctrl_retries: 1               # retries of a failed control operation, each from a fresh read (int 0..5)
@@ -132,8 +133,8 @@ xt6:
   ctrl_refresh_s: 60.0          # read the control report again this often (>= 0, 0 disables)
   duty_mismatch_tolerance: 100  # output duty this far from the written duty is a mismatch, 1/100 % (0..10000)
   duty_mismatch_s: 5.0          # a mismatch lasting longer re-reads and rewrites every channel (> 0)
-  write_min_interval_s: 30.0    # a falling duty is written at most this often (>= 0; rises go out at once)
-  write_deadband: 50            # a falling duty is written only this far below the written one, 1/100 % (0..10000)
+  write_min_interval_s: 0.0     # a falling duty is written at most this often (>= 0; 0 writes every change; rises go out at once)
+  write_deadband: 0             # a falling duty is written only this far below the written one, 1/100 % (0..10000; 0 writes every change)
 
 http:
   # HTTPS with basic auth only; there is no plain-HTTP listener (PROJECT.md section 6).

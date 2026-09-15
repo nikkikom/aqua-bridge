@@ -1,8 +1,9 @@
 # Zoned DAS example (PROJECT.md): 4 zones, 15 hot-swap bays, 8 PWM outputs
-# (aquaero 6 XT xt1-xt4 + Quadro qd1-qd4, 1-2 fans per output, one tach per
-# output), 25 sensors (8 thermistors on the aquaero inputs, 17 DS18B20 on
-# 1-Wire; the Quadro's inputs are not bound: how many are usable is known only
-# once it is connected). Copy to /etc/aqua-bridge/config.yaml on the Pi and
+# (aquaero 6 XT xt1-xt4 + Quadro qd1-qd4 on the aquaero's aquabus, commanded
+# through the aquaero's outputs 5-8; 1-2 fans per output, one tach per output),
+# 25 sensors (8 thermistors on the aquaero inputs, 17 DS18B20 on 1-Wire; the
+# Quadro's inputs are not bound: how many are usable is known only once it is
+# connected). Copy to /etc/aqua-bridge/config.yaml on the Pi and
 # replace the names, controller inputs and ROM ids with your own.
 #
 # Run it with --source composite (aquacomputer: + onewire: below; the systemd unit needs
@@ -302,9 +303,12 @@ mpc:
 # Hardware bindings for --source composite: every mpc.temps name bound exactly once
 # across the controllers' temp_maps and onewire.sensors, every channel by one fans map.
 # Each controller is found under /sys/class/hidraw by USB id; tools/aquacomputer_probe.py
-# lists what is attached. Input numbers: aquaero temp1-8 thermistor inputs, temp9-16
-# virtual, temp17-20 calculated, fan1-4 outputs, fan5-6 flow; Quadro temp1-4 inputs,
-# temp5-20 virtual, fan1-4 outputs, fan5 flow; pwm1-4 on both.
+# lists what is attached. Input names: aquaero pwm1-8 / fan1-8 outputs and their
+# tachometers (1-4 its own, 5-8 the Quadro's outputs 1-4 on its aquabus), temp1-8 physical
+# sensors, bus1-8 aquabus temperature slots (the Quadro's sensors 1-4 in bus1-4), soft1-8
+# software sensors, virt1-4 virtual sensors; Quadro pwm1-4 / fan1-4, temp1-4, soft1-16.
+# A Quadro on aquabus ignores writes over its own USB, so a config that commands aquaero
+# pwm5-8 and Quadro outputs is refused.
 aquacomputer:
   - device: aquaero
     # serial: "12345-54321"  # only needed when several of one kind are attached
@@ -313,6 +317,10 @@ aquacomputer:
       xt2: {pwm: pwm2, rpm: fan2}
       xt3: {pwm: pwm3, rpm: fan3}
       xt4: {pwm: pwm4, rpm: fan4}
+      qd1: {pwm: pwm5, rpm: fan5}   # the Quadro's outputs 1-4 on the aquaero's aquabus
+      qd2: {pwm: pwm6, rpm: fan6}
+      qd3: {pwm: pwm7, rpm: fan7}
+      qd4: {pwm: pwm8, rpm: fan8}   # controller block 8 read unconfigured: writing it is unverified (logged)
     temp_map:            # the 8 thermistor inputs
       inlet_a: temp1
       air_z0: temp2
@@ -322,7 +330,8 @@ aquacomputer:
       prox_b03b: temp6
       exhaust_z0: temp7
       exhaust_z2: temp8
-    # Timing per controller, defaults shown (PROJECT.md section 3, Track B):
+    # Timing per controller, defaults shown (PROJECT.md section 3, Track B). Writes take
+    # effect at once and are not saved in the controller's memory:
     status_max_age_s: 3.0         # an older status report is no observation: fallback (> 0)
     ctrl_gap_ms: 100              # wait after a control operation before the next read or write, ms (>= 0; default aquaero 100, quadro 0)
     ctrl_retries: 1               # retries of a failed control operation, each from a fresh read (int 0..5)
@@ -330,16 +339,18 @@ aquacomputer:
     ctrl_refresh_s: 60.0          # read the control report again this often (>= 0, 0 disables)
     duty_mismatch_tolerance: 100  # output duty this far from the written duty is a mismatch, 1/100 % (0..10000)
     duty_mismatch_s: 5.0          # a mismatch lasting longer re-reads and rewrites every channel (> 0)
-    write_min_interval_s: 30.0    # a falling duty is written at most this often (>= 0; rises go out at once)
-    write_deadband: 50            # a falling duty is written only this far below the written one, 1/100 % (0..10000)
-  - device: quadro       # on its own USB port
-    fans:
-      qd1: {pwm: pwm1, rpm: fan1}
-      qd2: {pwm: pwm2, rpm: fan2}
-      qd3: {pwm: pwm3, rpm: fan3}
-      qd4: {pwm: pwm4, rpm: fan4}
-    temp_map: {}         # bind Quadro inputs only once they are connected
-    ctrl_gap_ms: 0                # the one timing default that differs: the Quadro needs no gap
+    write_min_interval_s: 0.0     # a falling duty is written at most this often (>= 0; 0 writes every change; rises go out at once)
+    write_deadband: 0             # a falling duty is written only this far below the written one, 1/100 % (0..10000; 0 writes every change)
+  # The alternative, the Quadro on its own USB port instead of aquabus: remove qd1-qd4
+  # from the aquaero entry above and add
+  # - device: quadro
+  #   fans:
+  #     qd1: {pwm: pwm1, rpm: fan1}
+  #     qd2: {pwm: pwm2, rpm: fan2}
+  #     qd3: {pwm: pwm3, rpm: fan3}
+  #     qd4: {pwm: pwm4, rpm: fan4}
+  #   temp_map: {}         # bind Quadro inputs only once they are connected
+  #   ctrl_gap_ms: 0       # the one timing default that differs: the Quadro needs no gap
 
 # 1-Wire: two w1-gpio buses (dtoverlay=w1-gpio,gpiopin=4 and gpiopin=17 in
 # config.txt); bus masters are discovered under root (default /sys/bus/w1/devices).
