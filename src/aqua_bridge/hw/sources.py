@@ -13,8 +13,8 @@ read-only)::
       - device: aquaero
         fans: {radiator: {pwm: pwm1, rpm: fan1}}
         temp_map: {air_z0: temp1}
-      - device: quadro             # on its own USB port
-        serial: "12345-54321"      # only needed with several of one kind
+      - device: quadro             # on its own USB port (on the aquaero's aquabus its
+        serial: "12345-54321"      # outputs are the aquaero's pwm5..pwm8 instead)
         fans: {exhaust: {pwm: pwm1}}
         temp_map: {air_z1: temp2}
     xt6:                           # still accepted as exactly one more device
@@ -34,6 +34,12 @@ name left unbound, is a :class:`~aqua_bridge.model.ConfigError` (startup, exit
 temperature" guarantee a single ``xt6:`` device gets, checked across the whole
 fleet. Two entries that could open the same controller (one kind without
 distinct serials) are a ``ConfigError`` too: they would fight over one device.
+So is a config that commands aquaero outputs 5-8 (a Quadro on the aquaero's
+aquabus) and also Quadro outputs over a Quadro's own USB: a Quadro on aquabus
+ignores writes over its USB, so one of the two would silently do nothing
+(PROJECT.md section 8 item 85). At runtime, a Quadro whose outputs do not follow
+while an aquaero next to it reports a device on its aquabus gets that
+explanation in its stuck-channel error.
 A ROM id missing from the 1-Wire bus at this point is only a warning (see
 :meth:`~aqua_bridge.hw.onewire.W1Source.start`) -- a sensor may be legitimately
 unplugged with its drive.
@@ -44,10 +50,12 @@ see the static AST check in ``tests/test_hw_imports.py``.
 
 from __future__ import annotations
 
+import functools
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
+from aqua_bridge.hw.aquacomputer import QUADRO
 from aqua_bridge.hw.aquacomputer_adapter import (
     AquacomputerAdapter,
     DeviceBinding,
@@ -97,6 +105,11 @@ class CompositeSource:
         self.onewire = onewire
         self.smart = smart
         self._clock = clock
+        aquaeros = tuple(device for device in self.devices if device.kind.aquabus_outputs)
+        if aquaeros:
+            for device in self.devices:
+                if device.kind is QUADRO:
+                    device.stuck_hint = functools.partial(_quadro_on_aquabus_hint, aquaeros)
 
     def _each_device(self, what: str, call: Callable[[AquacomputerAdapter], Any]) -> list[Any]:
         """Runs ``call`` on every device, even after one of them raised.
@@ -175,6 +188,24 @@ class CompositeSource:
         self._each_device("apply", lambda device: device.apply(cmd))
 
 
+def _quadro_on_aquabus_hint(aquaeros: Sequence[AquacomputerAdapter]) -> str | None:
+    """Why a Quadro's outputs may not follow: an aquaero in the same composite reports a
+    device on its aquabus (a fan block 5-8 whose rpm is not 0xFFFF)."""
+    for aquaero in aquaeros:
+        status = aquaero.last_status
+        if status is None:
+            continue
+        present = [n for n in aquaero.kind.aquabus_outputs if status.fans[n - 1].present]
+        if present:
+            outputs = ", ".join(f"pwm{n}" for n in present)
+            return (
+                f"{aquaero.binding.label} reports a device on its aquabus ({outputs}): the "
+                "Quadro is probably on the aquaero's aquabus, where it ignores writes over "
+                "its own USB; command its outputs through the aquaero (pwm5..pwm8) instead"
+            )
+    return None
+
+
 #: Alias: the sink half of a CompositeSource is the same object (its own
 #: apply()); kept as a name so callers can express "the composite sink" in
 #: type hints without importing CompositeSource for that alone.
@@ -213,6 +244,27 @@ def _check_distinct_devices(bindings: Sequence[tuple[str, DeviceBinding]]) -> No
                     f"{label_a} and {label_b} can both open the same {a.kind.name}: "
                     "give each a distinct 'serial:'"
                 )
+
+
+def _check_quadro_commanded_once(bindings: Sequence[tuple[str, DeviceBinding]]) -> None:
+    """Aquaero outputs 5-8 command a Quadro on the aquaero's aquabus, which ignores
+    writes over its own USB; a config doing both leaves one of them without effect."""
+    aquabus = [
+        (holder, sorted(n for n in binding.pwm_map.values() if n in binding.kind.aquabus_outputs))
+        for holder, binding in bindings
+    ]
+    aquabus = [(holder, outputs) for holder, outputs in aquabus if outputs]
+    quadros = [holder for holder, binding in bindings if binding.kind is QUADRO and binding.pwm_map]
+    if aquabus and quadros:
+        holder, outputs = aquabus[0]
+        names = ", ".join(f"pwm{n}" for n in outputs)
+        raise ConfigError(
+            f"{holder} commands aquabus outputs {names} (a Quadro on the aquaero's aquabus) "
+            f"and {quadros[0]} commands Quadro outputs over its own USB; a Quadro on aquabus "
+            "ignores writes over its USB. Command the Quadro either through the aquaero "
+            "(pwm5..pwm8, and 'fans: {}' in the quadro entry) or over its own USB (no aquaero "
+            "pwm5..pwm8)"
+        )
 
 
 def build_composite_from_config(
@@ -279,6 +331,7 @@ def build_composite_from_config(
         _claim(pwm_owner, binding.pwm_map, holder, "mpc.channels")
         bindings.append((holder, binding))
     _check_distinct_devices(bindings)
+    _check_quadro_commanded_once(bindings)
     check_watchdog(
         [(holder, binding.timing) for holder, binding in bindings],
         watchdog_s,

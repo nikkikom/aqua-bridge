@@ -5,7 +5,9 @@ firmware report) and emits status reports whose output duty follows it, the
 way the real devices do; tests override single fields to simulate a
 configuration changed behind the daemon's back. It implements
 :class:`~aqua_bridge.hw.hidraw.HidTransport` itself; :class:`FakeBus` is the
-adapter's ``opener``.
+adapter's ``opener``. The plain aquaero fixtures have nothing on aquabus (fan
+blocks 5-8 read rpm 0xFFFF); :func:`aquabus_aquaero` is an aquaero with the
+Quadro on its aquabus (the captured aquabus reports).
 """
 
 from __future__ import annotations
@@ -57,7 +59,7 @@ def _put_u16(buf: bytearray, offset: int, value: int) -> None:
 
 @dataclass
 class Op:
-    what: str  # "get" | "set" | "secondary"
+    what: str  # "get" | "set" | "save"
     t: float
     data: bytes
 
@@ -146,13 +148,14 @@ class FakeController:
     def last_set_duties(self) -> list[int]:
         from aqua_bridge.hw.aquacomputer import control_duty
 
-        return [control_duty(self.kind, self.sets()[-1].data, k) for k in range(4)]
+        data = self.sets()[-1].data
+        return [control_duty(self.kind, data, k) for k in range(self.kind.pwm_count)]
 
     def gets(self) -> list[Op]:
         return [op for op in self.ops if op.what == "get"]
 
-    def secondaries(self) -> list[Op]:
-        return [op for op in self.ops if op.what == "secondary"]
+    def saves(self) -> list[Op]:
+        return [op for op in self.ops if op.what == "save"]
 
     # -- HidTransport -----------------------------------------------------
 
@@ -188,7 +191,7 @@ class FakeController:
 
     def set_feature(self, data: bytes) -> None:
         self._check_usable()
-        what = "set" if data[0] == self.kind.ctrl_report_id else "secondary"
+        what = "set" if data[0] == self.kind.ctrl_report_id else "save"
         self.clock.advance(self.op_delay_s)
         self.ops.append(Op(what, self.clock(), bytes(data)))
         if self.failures:
@@ -197,10 +200,22 @@ class FakeController:
             check_control_report(self.kind, data)
             self.ctrl = bytearray(data)
         else:
-            assert data == self.kind.secondary_report
+            assert data == self.kind.save_report
 
     def close(self) -> None:
         self.closed = True
+
+
+def aquabus_aquaero(clock: FakeClock, **fields) -> FakeController:
+    """An aquaero with the Quadro on its aquabus: every fan block 5-8 has a device
+    (captured with a fan on the Quadro's output 3 = aquaero output 7)."""
+    from aqua_bridge.hw.aquacomputer import AQUAERO
+
+    fields.setdefault(
+        "ctrl", bytearray(fixture_bytes("aquaero-ctrl-aquabus-before-fan7-write.bin"))
+    )
+    fields.setdefault("status_template", fixture_bytes("aquaero-status-aquabus-fan7-100.bin"))
+    return FakeController(AQUAERO, clock, **fields)
 
 
 class FakeBus:

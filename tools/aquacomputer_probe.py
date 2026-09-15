@@ -8,18 +8,23 @@ Run on the Pi (the service user, or any user in ``plugdev``)::
 
 Lists every discovered status/control hidraw node (kind, serial, USB
 interface, device node), then for each device prints its newest status
-report -- temperatures, each output's rpm, output duty, voltage, current and
-power, flow, and the Quadro's power-cycle count -- and each output's duty in
-the control report, with the aquaero's control source and power limits (the
-daemon's duty is in effect only while the channel follows its own preset with
-limits 0 / 100 %), and the aquaero output mode (PWM or DC voltage). Use it to
-pick ``tempN`` / ``fanN`` / ``pwmN`` for the config and a ``serial:`` when
+report -- temperatures by group (physical sensors ``tempN``, the aquaero's
+aquabus temperature slots ``busN``, software sensors ``softN``, the aquaero's
+virtual sensors ``virtN``), each output's rpm, output duty, voltage, current
+and power (the aquaero's outputs 5-8 belong to a device on its aquabus, and
+read "no device" without one), flow ``flowN``, and the Quadro's power-cycle
+count -- and each output's duty in the control report, with the aquaero's
+control source and power limits (the daemon's duty is in effect only while the
+channel follows its own preset with limits 0 / 100 %) and output mode (PWM or
+DC voltage; not interpreted on the aquabus outputs; an unconfigured block
+says so). Use it to pick the input names for the config and a ``serial:`` when
 several of one kind are attached.
 
 It never writes: it reads input reports and fetches the control report
-(``HIDIOCGFEATURE``), nothing else. The fetch is a control operation like the
-daemon's own, so prefer running it with the daemon stopped (a fetch within
-``ctrl_gap_ms`` of the daemon's write may fail; that is reported, not retried).
+(``HIDIOCGFEATURE``), nothing else -- no control report SET and no save report.
+The fetch is a control operation like the daemon's own, so prefer running it
+with the daemon stopped (a fetch within ``ctrl_gap_ms`` of the daemon's write
+may fail; that is reported, not retried).
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ from typing import TextIO
 
 from aqua_bridge.hw.aquacomputer import (
     KINDS,
+    SENSOR_NOT_CONNECTED,
     DeviceKind,
     ReportError,
     StatusReport,
@@ -84,22 +90,31 @@ def _print_status(kind: DeviceKind, status: StatusReport, out: TextIO) -> None:
     print(f"  firmware {status.firmware}, serial in the status report {status.serial}", file=out)
     if status.power_cycles is not None:
         print(f"  power cycles: {status.power_cycles}", file=out)
-    connected = [(n, t) for n, t in enumerate(status.temps, start=1) if t is not None]
-    print("  temperatures (degC):", file=out)
-    for n, value in connected:
-        print(f"    temp{n:<3} {value:7.2f}", file=out)
-    missing = [f"temp{n}" for n, t in enumerate(status.temps, start=1) if t is None]
-    if missing:
-        print(f"    not connected: {' '.join(missing)}", file=out)
+    for group in kind.temp_groups:
+        names = group.names()
+        print(f"  {group.description} ({names[0]}..{names[-1]}, degC):", file=out)
+        for name in names:
+            value = status.temp(name)
+            if value is not None:
+                print(f"    {name:<7} {value:7.2f}", file=out)
+        missing = [name for name in names if status.temp(name) is None]
+        if missing:
+            print(f"    no data: {' '.join(missing)}", file=out)
     print("  outputs (status report):", file=out)
-    for k, fan in enumerate(status.fans):
+    aquabus = set(kind.aquabus_outputs)
+    for n, fan in enumerate(status.fans, start=1):
+        where = "  (aquabus)" if n in aquabus else ""
+        if not fan.present:
+            print(f"    pwm{n}/fan{n}  no device (rpm 0xFFFF){where}", file=out)
+            continue
         print(
-            f"    pwm{k + 1}/fan{k + 1}  {fan.rpm:5d} rpm  duty {_percent(fan.duty):>8}  "
-            f"{fan.voltage_v:5.2f} V  {fan.current_ma:5d} mA  {fan.power_w:6.2f} W",
+            f"    pwm{n}/fan{n}  {fan.rpm:5d} rpm  duty {_percent(fan.duty):>8}  "
+            f"{fan.voltage_v:5.2f} V  {fan.current_ma:5d} mA  {fan.power_w:6.2f} W{where}",
             file=out,
         )
-    for j, flow in enumerate(status.flows):
-        print(f"    fan{len(status.fans) + j + 1} (flow)  {flow}", file=out)
+    for j, flow in enumerate(status.flows, start=1):
+        value = "no data" if flow == SENSOR_NOT_CONNECTED else str(flow)
+        print(f"    flow{j}  {value}", file=out)
 
 
 def _print_control(kind: DeviceKind, data: bytes, out: TextIO) -> None:
@@ -114,7 +129,11 @@ def _print_control(kind: DeviceKind, data: bytes, out: TextIO) -> None:
                 f"  source 0x{state.source:02X}  min {_percent(state.min_power)}"
                 f"  max {_percent(state.max_power)}  ({follows})"
             )
-        if state.mode is not None:
+        if state.unconfigured:
+            line += "  (unconfigured)"
+        elif state.aquabus and state.mode is not None:
+            line += f"  mode 0x{state.mode.raw:04X} (aquabus, not interpreted)"
+        elif state.mode is not None:
             line += f"  mode {state.mode.name} (0x{state.mode.raw:04X})"
         print(line, file=out)
 

@@ -1,7 +1,8 @@
 """aquaero / Quadro source and sink over hidraw (PROJECT.md section 3, Track B).
 
 :class:`AquacomputerAdapter` is one controller: ``read() -> PlantObservation``,
-``apply(MpcCommand)`` and ``release()``, the contract ``control/loop.py`` and
+``apply(MpcCommand)``, ``release()`` and the commissioning-only ``save()``,
+the contract ``control/loop.py`` and
 :class:`~aqua_bridge.hw.sources.CompositeSource` use. The Linux hwmon driver
 is not involved: through hwmon every ``pwmN`` read cost 210 ms and every write
 420 ms, about 5 s per tick with 8 outputs (PROJECT.md section 2). Here a read
@@ -23,55 +24,72 @@ Reading
     ``read()`` waits up to ``status_max_age_s`` for a report; later reads never
     block. A vanished node closes the device; the next call finds it again,
     possibly as a new ``hidrawN``. With ``serial:`` configured, a first status
-    report carrying another serial closes the device and raises.
+    report carrying another serial closes the device and raises. A commanded
+    output or a bound tachometer whose fan block reads rpm ``0xFFFF`` has no
+    device behind it (an aquaero aquabus output 5-8 with nothing on the bus):
+    ``read()`` raises naming it, and ``apply()`` writes every channel but then
+    raises too, so neither reports success for it.
 
 Writing
     ``apply()`` opens the node without waiting for a status report, so the
     fallback ramp and the stop write reach a device whose status reports have
     stopped. The control report is read (GET) once after opening and kept as a
-    cache; a normal tick does no control read. A channel is written when its
-    duty rises (cooling never waits) or when it does not follow its duty at
-    all; a fall is written only when it is at least ``write_deadband`` below
-    the written duty and ``write_min_interval_s`` has passed since this
-    device's last write (flash wear, PROJECT.md section 8 item 77). Any write
-    carries every channel with a pending change, as one SET plus the secondary
-    report. A command in FALLBACK or DEGRADED mode never takes a channel below
-    the duty the device holds, in a forced rewrite too: a deferred fall that the
-    loop counted as applied must not mature, or ride along, during a fault (the
-    stop write is a FALLBACK command, so it never lowers a fan either). Before
-    every GET or SET the adapter waits ``ctrl_gap_ms`` after the previous
-    control operation, failed ones included (the secondary report
-    follows its SET at once). A failed operation invalidates the cache and is
-    retried from a fresh GET up to ``ctrl_retries`` times; no control operation
-    starts once ``ctrl_budget_s`` of this call is spent. Either way
+    cache; a normal tick does no control read. A write is **one** control report
+    SET carrying every channel with a pending change. It takes effect at once and
+    is not saved: the controller's memory keeps the configuration last saved
+    with the save report, which only :meth:`AquacomputerAdapter.save` sends
+    (PROJECT.md section 8 items 84, 86). A channel is written when its duty
+    rises (cooling never waits) or when it does not follow its duty at all; a
+    fall is written only when it is at least ``write_deadband`` below the
+    written duty and ``write_min_interval_s`` has passed since this device's
+    last write (both 0 by default: every change is written; the keys only limit
+    USB traffic). A command in FALLBACK or DEGRADED mode never takes a channel
+    below the duty the device holds, in a forced rewrite too: a deferred fall
+    that the loop counted as applied must not mature, or ride along, during a
+    fault (the stop write is a FALLBACK command, so it never lowers a fan
+    either). Before every GET or SET the adapter waits ``ctrl_gap_ms`` after
+    the previous control operation, failed ones included. A failed operation
+    invalidates the cache and is retried from a fresh GET up to
+    ``ctrl_retries`` times, and a failed SET makes the next write send every
+    configured channel (it may or may not have reached the device); no control
+    operation starts once ``ctrl_budget_s`` of this call is spent. Either way
     ``DeviceUnavailable`` is raised.
 
 Keeping the cache honest
     Speed, duty, voltage, current and power arrive in every status report, so
     drift of the fans themselves is visible without a control read. What a
     one-time read misses is a configuration changed behind the daemon's back
-    (front panel, aquasuite, liquidctl, a controller reset):
+    (front panel, aquasuite, liquidctl, a controller reset or power cycle, which
+    brings back the saved configuration):
 
     a) per channel, a status duty further than ``duty_mismatch_tolerance``
        from the duty written to the device, on reports received after that
        channel's last change, for longer than ``duty_mismatch_s`` invalidates
        the cache and makes the next ``apply()`` GET and rewrite every channel.
        A channel that mismatches again after that rewrite is logged once as an
-       error and listed in ``stuck_channels``; it is not rewritten for the
+       error (with :attr:`AquacomputerAdapter.stuck_hint`'s explanation when it
+       has one) and listed in ``stuck_channels``; it is not rewritten for the
        mismatch again until the device reports its duty (its normal writes on
        a changed command continue);
-       the aquaero's output mode is only reported: every commanded output
-       not in PWM mode gets one warning per open, and the mode is never
-       written;
+       the aquaero's output mode is only reported: every commanded output of
+       its own (1-4) not in PWM mode gets one warning per open, an aquabus
+       output (5-8, mode word not interpreted) none, an unconfigured block
+       (source ``0xFFFF``, mode 0) one warning per adapter that writing it is
+       unverified; the mode is never written;
     b) a change of the Quadro's power-cycle count invalidates the same way;
     c) every ``ctrl_refresh_s`` (0 disables) ``apply()`` GETs the report again
        and rewrites any channel that no longer holds its duty.
 
-Releasing
+Releasing and saving
     ``release()`` restores, for every channel this adapter has written, the
     fields captured by the first GET after the daemon started (aquaero:
-    preset, source, minimum and maximum power; Quadro: duty) with one SET.
-    It is not called at exit (PROJECT.md section 2).
+    preset, source, minimum and maximum power; Quadro: duty) with one live SET,
+    not saved. It is not called at exit (PROJECT.md section 2); a power cycle
+    of the controller restores the saved configuration anyway. ``save()`` sends
+    the save report once: the controller stores what it currently holds. The
+    daemon never calls it; it is the commissioning step for the saved safe
+    configuration (PROJECT.md section 8 item 84). On the aquaero it is verified
+    to persist; on the Quadro it is not.
 
 This module must not import :mod:`aqua_bridge.control`.
 """
@@ -102,7 +120,6 @@ from aqua_bridge.hw.aquacomputer import (
     decode_status,
     finalize_control_report,
     is_status_report,
-    output_mode,
     patch_duties,
     restore_channel,
 )
@@ -181,10 +198,12 @@ class AquacomputerTiming:
     duty_mismatch_tolerance: int = 100
     #: A mismatch lasting longer than this rewrites the channels, seconds (> 0).
     duty_mismatch_s: float = 5.0
-    #: A falling duty is written at most this often per device, seconds (>= 0).
-    write_min_interval_s: float = 30.0
-    #: A falling duty is written only this far below the written one, centi-percent.
-    write_deadband: int = 50
+    #: A falling duty is written at most this often per device, seconds (>= 0; 0 writes
+    #: every fall). Writes are not saved (item 86), so this only limits USB traffic.
+    write_min_interval_s: float = 0.0
+    #: A falling duty is written only this far below the written one, centi-percent
+    #: (0 writes every fall).
+    write_deadband: int = 0
 
     def __post_init__(self) -> None:
         _number("ctrl_gap_ms", self.ctrl_gap_ms, positive=False)
@@ -291,15 +310,16 @@ class DeviceBinding:
     """Which device, and where the logical names live on it.
 
     ``pwm_map`` is channel -> output number (``pwmN``), ``fan_map`` channel ->
-    ``fanN`` (keys must be ``pwm_map`` channels), ``temp_map`` logical
-    temperature -> ``tempN``. Numbers are 1-based as in the config. ``timing``
-    defaults to :meth:`AquacomputerTiming.for_kind`.
+    tachometer number (``fanN``; keys must be ``pwm_map`` channels), ``temp_map``
+    logical temperature -> the kind's temperature input name (``temp1``,
+    ``bus2``, ``soft1``, ``virt1``). Numbers are 1-based as in the config.
+    ``timing`` defaults to :meth:`AquacomputerTiming.for_kind`.
     """
 
     kind: DeviceKind
     pwm_map: Mapping[str, int]
     fan_map: Mapping[str, int] = field(default_factory=dict)
-    temp_map: Mapping[str, int] = field(default_factory=dict)
+    temp_map: Mapping[str, str] = field(default_factory=dict)
     serial: str | None = None
     timing: AquacomputerTiming = None  # type: ignore[assignment]  # set in __post_init__
 
@@ -309,8 +329,7 @@ class DeviceBinding:
         kind = self.kind
         for what, mapping, count in (
             ("pwm", self.pwm_map, kind.pwm_count),
-            ("fan", self.fan_map, kind.fan_input_count),
-            ("temp", self.temp_map, kind.temp_count),
+            ("fan", self.fan_map, kind.fan_count),
         ):
             for name, number in mapping.items():
                 if isinstance(number, bool) or not isinstance(number, int):
@@ -319,6 +338,17 @@ class DeviceBinding:
                     raise ValueError(
                         f"{name!r}: {kind.name} has {what}1..{what}{count}, not {what}{number}"
                     )
+        for name, value in self.temp_map.items():
+            if value not in kind.temp_names:
+                raise ValueError(
+                    f"{name!r}: {kind.name} has temperature inputs {kind.describe_temps()}, "
+                    f"not {value!r}"
+                )
+        for what, mapping in (
+            ("pwm", self.pwm_map),
+            ("fan", self.fan_map),
+            ("temp", self.temp_map),
+        ):
             if len(set(mapping.values())) != len(mapping):
                 raise ValueError(f"two names share one {kind.name} {what} input: {dict(mapping)}")
         stray = sorted(set(self.fan_map) - set(self.pwm_map))
@@ -371,6 +401,9 @@ class AquacomputerAdapter:
         self._opener: Opener = opener if opener is not None else _default_opener
         self._index = {ch: number - 1 for ch, number in binding.pwm_map.items()}
         self._names = {k: ch for ch, k in self._index.items()}
+        #: Called when a channel is found stuck; a non-empty string it returns is
+        #: added to the error (CompositeSource sets it on a Quadro next to an aquaero).
+        self.stuck_hint: Callable[[], str | None] | None = None
 
         self._transport: HidTransport | None = None
         self._opened_t: float | None = None
@@ -386,7 +419,7 @@ class AquacomputerAdapter:
         self._rewrite = False
         #: End of the last control operation, failed ones included (ctrl_gap_ms).
         self._last_op_t: float | None = None
-        #: End of the last complete write, SET and secondary report (write_min_interval_s).
+        #: End of the last successful SET (write_min_interval_s).
         self._last_write_t: float | None = None
         #: Channel index -> the duty the device holds for it, as written or read back.
         self._written: dict[int, int] = {}
@@ -402,6 +435,8 @@ class AquacomputerAdapter:
         self._ever_written: set[int] = set()
         #: The output modes were checked on this open's first control report.
         self._modes_checked = False
+        #: Unconfigured aquaero blocks already reported (once per adapter).
+        self._unconfigured_reported: set[int] = set()
         #: Why the last opened node was rejected for its serial; apply() refuses to
         #: write until a status report carries the configured serial.
         self._serial_rejected: str | None = None
@@ -519,6 +554,29 @@ class AquacomputerAdapter:
             self._invalidate(rewrite=True)
         self._power_cycles = count
 
+    def _absent(self, status: StatusReport, *, tachometers: bool) -> list[str]:
+        """Configured outputs (and, with ``tachometers``, bound ``fanN``) whose fan block
+        reports no device behind it (rpm ``0xFFFF``)."""
+        b = self.binding
+        out = [
+            f"pwm{n} ({ch})"
+            for ch, n in sorted(b.pwm_map.items(), key=lambda item: item[1])
+            if not status.fans[n - 1].present
+        ]
+        if tachometers:
+            out += [
+                f"fan{n} ({ch})"
+                for ch, n in sorted(b.fan_map.items(), key=lambda item: item[1])
+                if not status.fans[n - 1].present
+            ]
+        return out
+
+    def _absent_message(self, absent: Sequence[str]) -> str:
+        return (
+            f"{self.binding.label}: no device behind {', '.join(absent)}: the status report's "
+            "fan block reads rpm 0xFFFF (on the aquaero's outputs 5-8: nothing on its aquabus)"
+        )
+
     # -- read --------------------------------------------------------------
 
     def read(self) -> PlantObservation:
@@ -548,10 +606,13 @@ class AquacomputerAdapter:
             )
         if fresh:
             self._verify_duties(status, received)
+        absent = self._absent(status, tachometers=True)
+        if absent:
+            raise DeviceUnavailable(self._absent_message(absent))
         b = self.binding
         return PlantObservation(
-            temps={name: status.temp(n) for name, n in b.temp_map.items()},
-            rpm={ch: float(status.fan_input(n)) for ch, n in b.fan_map.items()},
+            temps={name: status.temp(input_name) for name, input_name in b.temp_map.items()},
+            rpm={ch: float(status.rpm(n)) for ch, n in b.fan_map.items()},
             pwm={ch: status.duty(n) / DUTY_MAX for ch, n in b.pwm_map.items()},
             ts=now,
         )
@@ -561,6 +622,12 @@ class AquacomputerAdapter:
         if rewrite:
             self._rewrite = True
 
+    def _stuck_hint(self) -> str:
+        if self.stuck_hint is None:
+            return ""
+        hint = self.stuck_hint()
+        return f"; {hint}" if hint else ""
+
     def _verify_duties(self, status: StatusReport, received: float) -> None:
         """Rule a of the module docstring, per channel, on one newly received report."""
         if self._ctrl is None:
@@ -568,7 +635,10 @@ class AquacomputerAdapter:
         tolerance = self.timing.duty_mismatch_tolerance
         label = self.binding.label
         for k, duty in sorted(self._written.items()):
-            reported = status.fans[k].duty
+            fan = status.fans[k]
+            if not fan.present:
+                continue  # no device behind it: read() and apply() raise instead
+            reported = fan.duty
             name = self._names.get(k, "?")
             if abs(reported - duty) <= tolerance:
                 self._mismatch_since.pop(k, None)
@@ -588,12 +658,13 @@ class AquacomputerAdapter:
                 _LOG.error(
                     "%s: pwm%d (%s) still reports %.2f %% after it was rewritten to %.2f %%; "
                     "not rewriting it again until the device follows (PROJECT.md section 8 "
-                    "item 81)",
+                    "item 81)%s",
                     label,
                     k + 1,
                     name,
                     reported / 100.0,
                     duty / 100.0,
+                    self._stuck_hint(),
                 )
                 continue
             self._rewritten.add(k)
@@ -618,12 +689,9 @@ class AquacomputerAdapter:
         if remaining > 0:
             self._sleep(remaining)
 
-    def _control(
-        self, deadline: float, operation: str, call: Callable[[], _T], *, gap: bool = True
-    ) -> _T:
+    def _control(self, deadline: float, operation: str, call: Callable[[], _T]) -> _T:
         """One control operation: gap, budget, and its end time recorded even on failure."""
-        if gap:
-            self._wait_gap()
+        self._wait_gap()
         if self._clock() >= deadline:
             raise _BudgetSpent(operation)
         try:
@@ -669,22 +737,24 @@ class AquacomputerAdapter:
         return drifted
 
     def _write(self, transport: HidTransport, report: bytes, deadline: float) -> float:
-        """SET plus the secondary report; returns when the write ended."""
-        self._rewrite = True  # until both went out, the next write sends every channel
+        """One control report SET, not saved; returns when it ended."""
+        # Until the SET went out, the next write sends every channel: a failed SET may
+        # or may not have reached the device.
+        self._rewrite = True
         self._control(deadline, "control report SET", lambda: transport.set_feature(report))
-        self._control(
-            deadline,
-            "secondary report",
-            lambda: transport.set_feature(self.kind.secondary_report),
-            gap=False,
-        )
         assert self._last_op_t is not None
         self._last_write_t = self._last_op_t
         self._ctrl = report
         self._rewrite = False
         return self._last_write_t
 
-    def _with_retries(self, what: str, operation: Callable[[HidTransport, float], _T]) -> _T:
+    def _with_retries(
+        self,
+        what: str,
+        operation: Callable[[HidTransport, float], _T],
+        *,
+        retry: bool = True,
+    ) -> _T:
         if self._serial_rejected is not None:
             raise DeviceUnavailable(
                 f"{self._serial_rejected}; nothing is written until a status report carries "
@@ -693,7 +763,7 @@ class AquacomputerAdapter:
         transport = self._open()
         budget = self.timing.ctrl_budget_s
         deadline = self._clock() + budget
-        attempts = self.timing.ctrl_retries + 1
+        attempts = self.timing.ctrl_retries + 1 if retry else 1
         failure: Exception | None = None
         for attempt in range(1, attempts + 1):
             try:
@@ -762,6 +832,10 @@ class AquacomputerAdapter:
         With ``cmd.mode`` FALLBACK or DEGRADED no channel is written below the
         duty the device holds (module docstring, Writing): the loop may have
         recorded a deferred fall as applied, and a fault must never slow a fan.
+
+        A configured output whose fan block in this open's newest status report
+        has no device behind it is written with the others, then
+        :class:`DeviceUnavailable` names it: the command did not reach a fan.
         """
         duties = self._duties(cmd)
         never_lower = getattr(cmd, "mode", None) in _NEVER_LOWER_MODES
@@ -769,15 +843,41 @@ class AquacomputerAdapter:
             "control report write",
             lambda transport, deadline: self._apply_once(transport, duties, deadline, never_lower),
         )
+        status = self._status if self._status_t is not None else None
+        if status is not None:
+            absent = self._absent(status, tachometers=False)
+            if absent:
+                raise DeviceUnavailable(
+                    self._absent_message(absent) + "; the command is not applied"
+                )
 
     def _warn_about_modes(self, ctrl: bytes) -> None:
-        """One warning per open for every commanded output not in PWM mode. The mode is
-        only reported, never changed (PROJECT.md section 8 item 81)."""
+        """One warning per open for every commanded output of the aquaero's own not in
+        PWM mode, and one per adapter for every commanded unconfigured block. The mode
+        is only reported, never changed (PROJECT.md section 8 items 81, 85)."""
         self._modes_checked = True
         for k in sorted(self._names):
-            mode = output_mode(self.kind, ctrl, k)
-            if mode is None or mode.is_pwm:
+            state = channel_state(self.kind, ctrl, k)
+            mode = state.mode
+            if mode is None:
                 continue
+            if state.unconfigured:
+                if k not in self._unconfigured_reported:
+                    self._unconfigured_reported.add(k)
+                    _LOG.warning(
+                        "%s: pwm%d (%s): controller block %d is unconfigured (source 0x%04X, "
+                        "mode word 0x%04X); it is written like the others, which is not "
+                        "verified on hardware (PROJECT.md section 8 item 85)",
+                        self.binding.label,
+                        k + 1,
+                        self._names[k],
+                        k + 1,
+                        state.source,
+                        mode.raw,
+                    )
+                continue
+            if state.aquabus or mode.is_pwm:
+                continue  # an aquabus output's mode word is not interpreted
             _LOG.warning(
                 "%s: pwm%d (%s) is in %s mode (mode word 0x%04X), not PWM; the daemon does not "
                 "change the mode, set it with the controller's own software",
@@ -864,11 +964,11 @@ class AquacomputerAdapter:
             self._written[k] = duty
         self._ever_written.update(send)
 
-    # -- release -----------------------------------------------------------
+    # -- release / save ------------------------------------------------------
 
     def release(self) -> None:
         """Restores the captured control fields of every channel this adapter
-        wrote, with one SET (module docstring). No-op when nothing was written."""
+        wrote, with one live SET (module docstring). No-op when nothing was written."""
         if not self._ever_written or not self._originals:
             return
         restore = {
@@ -895,9 +995,35 @@ class AquacomputerAdapter:
         self._stuck.clear()
         self._adopt(bytes(buf))
         _LOG.info(
-            "%s: restored the captured control settings of %s",
+            "%s: restored the captured control settings of %s (not saved)",
             self.binding.label,
             ", ".join(f"pwm{k + 1}" for k in restore),
+        )
+
+    def save(self) -> None:
+        """Sends the save report once: the controller stores the configuration it
+        holds now in its memory, and a power cycle brings that back.
+
+        Commissioning only (the saved safe configuration, PROJECT.md section 8 item
+        84): the daemon never calls it, since every live write the adapter makes
+        would otherwise become the configuration a controller restarts with. It
+        waits ``ctrl_gap_ms`` and honours ``ctrl_budget_s`` like any control
+        operation but is not retried; a failure raises :class:`DeviceUnavailable`.
+        Verified on the aquaero; on the Quadro the report is only known from the
+        Farbwerk 360.
+        """
+        self._with_retries(
+            "save report",
+            lambda transport, deadline: self._control(
+                deadline, "save report", lambda: transport.set_feature(self.kind.save_report)
+            ),
+            retry=False,
+        )
+        _LOG.warning(
+            "%s: sent the save report: the configuration the controller holds now is stored "
+            "in its memory%s",
+            self.binding.label,
+            "" if self.kind.save_verified else " (not verified on this kind)",
         )
 
 
@@ -923,25 +1049,78 @@ _REMOVED_KEYS = {
     "name": "was renamed to 'device' (aquaero or quadro)",
 }
 _LEGACY_MAP_KEYS = {"map": "fans.<channel>.pwm", "fan_map": "fans.<channel>.rpm"}
-_ROLE_PATTERN = {role: re.compile(rf"{role}([1-9][0-9]*)") for role in ("pwm", "fan", "temp")}
+_NUMBERED = {role: re.compile(rf"{role}([1-9][0-9]*)") for role in ("pwm", "fan")}
+#: Temperature names of the hwmon driver's numbering that mean another input now.
+_HWMON_ERA_TEMPS: Mapping[str, Mapping[str, str]] = MappingProxyType(
+    {
+        "aquaero": MappingProxyType(
+            {
+                **{f"temp{8 + n}": f"soft{n}" for n in range(1, 9)},
+                **{f"temp{16 + n}": f"virt{n}" for n in range(1, 5)},
+            }
+        ),
+        "quadro": MappingProxyType({f"temp{4 + n}": f"soft{n}" for n in range(1, 17)}),
+    }
+)
+#: ``fanN`` numbers the hwmon driver gave the flow sensors -> ``flowN``.
+_HWMON_ERA_FLOWS: Mapping[str, Mapping[int, int]] = MappingProxyType(
+    {"aquaero": MappingProxyType({5: 1, 6: 2}), "quadro": MappingProxyType({5: 1})}
+)
 
 
-def _input_number(where: str, role: str, value: Any, kind: DeviceKind) -> int:
-    count = {"pwm": kind.pwm_count, "fan": kind.fan_input_count, "temp": kind.temp_count}[role]
-    match = _ROLE_PATTERN[role].fullmatch(value) if isinstance(value, str) else None
-    if match is None or not 1 <= int(match.group(1)) <= count:
+def _numbered(role: str, value: Any) -> int | None:
+    match = _NUMBERED[role].fullmatch(value) if isinstance(value, str) else None
+    return None if match is None else int(match.group(1))
+
+
+def _output_number(where: str, value: Any, kind: DeviceKind) -> int:
+    number = _numbered("pwm", value)
+    if number is None or not 1 <= number <= kind.pwm_count:
         raise ConfigError(
-            f"{where} must be one of the {kind.name}'s inputs {role}1..{role}{count}, got {value!r}"
+            f"{where} must be one of the {kind.name}'s outputs pwm1..pwm{kind.pwm_count}, "
+            f"got {value!r}"
         )
-    return int(match.group(1))
+    return number
 
 
-def _claim_input(seen: dict[int, str], number: int, owner: str, where: str, role: str) -> None:
-    if number in seen:
+def _tachometer_number(where: str, value: Any, kind: DeviceKind, pwm_number: int) -> int:
+    number = _numbered("fan", value)
+    flow = None if number is None else _HWMON_ERA_FLOWS[kind.name].get(number)
+    if flow is not None and (number > kind.fan_count or number != pwm_number):
         raise ConfigError(
-            f"{where}: {seen[number]} and {owner} name the same input '{role}{number}'"
+            f"{where}: {value!r} was the hwmon driver's name of the {kind.name}'s flow sensor "
+            f"flow{flow}, which is not a tachometer; fanN is the tachometer of output pwmN"
+            f" ({kind.name}: fan1..fan{kind.fan_count})"
         )
-    seen[number] = owner
+    if number is None or not 1 <= number <= kind.fan_count:
+        raise ConfigError(
+            f"{where} must be one of the {kind.name}'s tachometers fan1..fan{kind.fan_count}, "
+            f"got {value!r}"
+        )
+    return number
+
+
+def _temperature_input(where: str, value: Any, kind: DeviceKind) -> str:
+    if isinstance(value, str) and value in kind.temp_names:
+        return value
+    hint = ""
+    renamed = _HWMON_ERA_TEMPS[kind.name].get(value) if isinstance(value, str) else None
+    if renamed is not None:
+        group = next(g for g in kind.temp_groups if renamed.startswith(g.prefix))
+        hint = (
+            f"; in the hwmon driver's numbering {value!r} is {renamed!r} (the {kind.name}'s "
+            f"{group.description}): use {renamed!r}"
+        )
+    raise ConfigError(
+        f"{where} must be one of the {kind.name}'s temperature inputs {kind.describe_temps()}, "
+        f"got {value!r}{hint}"
+    )
+
+
+def _claim_input(seen: dict[Any, str], name: Any, owner: str, where: str) -> None:
+    if name in seen:
+        raise ConfigError(f"{where}: {seen[name]} and {owner} name the same input '{name}'")
+    seen[name] = owner
 
 
 def _parse_fans(
@@ -956,8 +1135,8 @@ def _parse_fans(
         raise ConfigError(f"{label}.fans must be a mapping, got {type(fans).__name__}")
     pwm_map: dict[str, int] = {}
     fan_map: dict[str, int] = {}
-    pwm_seen: dict[int, str] = {}
-    fan_seen: dict[int, str] = {}
+    pwm_seen: dict[Any, str] = {}
+    fan_seen: dict[Any, str] = {}
     for channel, entry in fans.items():
         if not isinstance(channel, str) or not channel:
             raise ConfigError(f"{label}.fans keys must be non-empty channel names, got {channel!r}")
@@ -974,11 +1153,13 @@ def _parse_fans(
             )
         if "pwm" not in entry:
             raise ConfigError(f"{where}.pwm is required (the output, e.g. 'pwm1')")
-        pwm_map[channel] = _input_number(f"{where}.pwm", "pwm", entry["pwm"], kind)
-        _claim_input(pwm_seen, pwm_map[channel], channel, f"{label}.fans", "pwm")
+        pwm_map[channel] = _output_number(f"{where}.pwm", entry["pwm"], kind)
+        _claim_input(pwm_seen, f"pwm{pwm_map[channel]}", channel, f"{label}.fans")
         if entry.get("rpm") is not None:
-            fan_map[channel] = _input_number(f"{where}.rpm", "fan", entry["rpm"], kind)
-            _claim_input(fan_seen, fan_map[channel], channel, f"{label}.fans", "fan")
+            fan_map[channel] = _tachometer_number(
+                f"{where}.rpm", entry["rpm"], kind, pwm_map[channel]
+            )
+            _claim_input(fan_seen, f"fan{fan_map[channel]}", channel, f"{label}.fans")
     return pwm_map, fan_map
 
 
@@ -1008,14 +1189,23 @@ def parse_device_section(
         fans:                         # one entry per fan channel
           radiator: {pwm: pwm1, rpm: fan1}
           intake:   {pwm: pwm2}       # rpm optional
-        temp_map: {coolant: temp1}    # logical temperature -> tempN
+          quadro1:  {pwm: pwm5, rpm: fan5}  # aquaero 5-8: a Quadro on its aquabus
+        temp_map: {coolant: temp1, quadro_t2: bus2}
         ctrl_gap_ms: 100              # optional timing keys, see AquacomputerTiming
 
-    Channel numbers are checked against the device kind. ``hwmon_name``,
-    ``root`` and ``name`` (the hwmon era) and ``map`` / ``fan_map`` are
-    rejected with a hint; any other unknown key is rejected too, so a
-    misspelt timing key cannot silently fall back to its default.
-    ``ignored_keys`` are accepted and ignored (``xt6.prefer``).
+    Names are checked against the device kind: outputs ``pwmN`` and
+    tachometers ``fanN`` (aquaero 1-8, Quadro 1-4); temperatures ``tempN``
+    (physical sensors: aquaero 1-8, Quadro 1-4), ``busN`` (aquaero aquabus
+    slots 1-8), ``softN`` (software sensors: aquaero 1-8, Quadro 1-16) and
+    ``virtN`` (aquaero virtual sensors 1-4). A temperature or flow name of the
+    hwmon driver's numbering that means another input now (aquaero
+    ``temp9..20``, Quadro ``temp5..20``, the flow sensors ``fan5``/``fan6`` on
+    the aquaero unless paired with their own output, ``fan5`` on the Quadro) is
+    rejected with the new name. ``hwmon_name``, ``root`` and ``name`` (the
+    hwmon era) and ``map`` / ``fan_map`` are rejected with a hint; any other
+    unknown key is rejected too, so a misspelt timing key cannot silently fall
+    back to its default. ``ignored_keys`` are accepted and ignored
+    (``xt6.prefer``).
 
     ``channels`` / ``temps`` (the ``mpc`` tuples, as plain sequences) make
     the ``fans`` keys equal ``channels`` and the ``temp_map`` keys equal
@@ -1052,11 +1242,11 @@ def parse_device_section(
     temp_section = section.get("temp_map")
     if temp_section is not None and not isinstance(temp_section, Mapping):
         raise ConfigError(f"{label}.temp_map must be a mapping, got {type(temp_section).__name__}")
-    temp_map: dict[str, int] = {}
-    temp_seen: dict[int, str] = {}
+    temp_map: dict[str, str] = {}
+    temp_seen: dict[Any, str] = {}
     for name, value in dict(temp_section or {}).items():
-        temp_map[name] = _input_number(f"{label}.temp_map.{name}", "temp", value, kind)
-        _claim_input(temp_seen, temp_map[name], name, f"{label}.temp_map", "temp")
+        temp_map[name] = _temperature_input(f"{label}.temp_map.{name}", value, kind)
+        _claim_input(temp_seen, temp_map[name], name, f"{label}.temp_map")
     if channels is not None:
         _check_keys(f"{label}.fans", pwm_map, channels, "mpc.channels")
     if temps is not None:

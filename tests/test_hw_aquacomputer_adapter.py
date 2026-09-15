@@ -1,7 +1,8 @@
 """Tests for aqua_bridge.hw.aquacomputer_adapter against fake controllers, plus one live test.
 
 PROJECT.md section 3 (Track B) / section 4.7 / section 2 ("USB spike results",
-"hidraw check").
+"hidraw check") / section 8 items 85 (aquabus outputs) and 86 (no save report on
+a write).
 """
 
 from __future__ import annotations
@@ -33,12 +34,21 @@ from aqua_bridge.hw.aquacomputer_adapter import (
 )
 from aqua_bridge.hw.hidraw import HIDRAW_QUEUE_FULL, FeatureReportError
 from aqua_bridge.model import Mode, MpcCommand
-from aquacomputer_fakes import FakeBus, FakeClock, FakeController, FakeSleep, fixture_bytes
+from aquacomputer_fakes import (
+    FakeBus,
+    FakeClock,
+    FakeController,
+    FakeSleep,
+    aquabus_aquaero,
+    fixture_bytes,
+)
 
 LOGGER = "aqua_bridge.hw.aquacomputer"
 AQUAERO_T = AquacomputerTiming.for_kind(AQUAERO)
 QUADRO_T = AquacomputerTiming.for_kind(QUADRO)
 AQUAERO_GAP_S = AQUAERO_T.ctrl_gap_ms / 1000.0
+#: Write limiting for the tests that exercise it (the defaults write every change).
+LIMITS = {"write_min_interval_s": 30.0, "write_deadband": 50}
 
 
 def _cmd(**pwm: float) -> MpcCommand:
@@ -54,7 +64,7 @@ def _aquaero_binding(**timing) -> DeviceBinding:
         kind=AQUAERO,
         pwm_map={"xt1": 1, "xt2": 2},
         fan_map={"xt2": 2},
-        temp_map={"inlet": 6, "virtual": 9, "open": 1},
+        temp_map={"inlet": "temp6", "software": "soft1", "open": "temp1"},
         timing=_timing(AQUAERO, **timing),
     )
 
@@ -64,7 +74,7 @@ def _quadro_binding(**timing) -> DeviceBinding:
         kind=QUADRO,
         pwm_map={"qd1": 1, "qd3": 3},
         fan_map={"qd3": 3},
-        temp_map={"air": 2},
+        temp_map={"air": "temp2"},
         timing=_timing(QUADRO, **timing),
     )
 
@@ -90,7 +100,7 @@ def test_read_maps_the_aquaero_status_report() -> None:
     obs = adapter.read()
     assert obs.temps == {
         "inlet": pytest.approx(22.26),
-        "virtual": pytest.approx(40.0),
+        "software": pytest.approx(40.0),
         "open": None,
     }
     assert obs.rpm == {"xt2": 120.0}
@@ -172,7 +182,7 @@ def test_apply_opens_without_waiting_for_a_status_report() -> None:
     start = clock()
     adapter.apply(_cmd(qd1=0.8, qd3=0.8))
     assert clock() == start and bus.opened == [device.node]
-    assert [op.what for op in device.ops] == ["get", "set", "secondary"]
+    assert [op.what for op in device.ops] == ["get", "set"]
 
 
 def test_absent_device_raises_device_unavailable() -> None:
@@ -302,29 +312,31 @@ def test_full_queue_reports_are_no_duty_evidence() -> None:
 # --- apply --------------------------------------------------------------------------------
 
 
-def test_changed_command_is_one_set_plus_one_secondary_report_with_the_driver_bytes() -> None:
+def test_changed_command_is_one_set_with_the_driver_bytes_and_no_save_report() -> None:
+    """Item 86: a SET takes effect without the save report, which would store every
+    write in the controller's memory."""
     binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt2": 2})
     adapter, device, _bus, _clock, _ = _setup(binding)
     adapter.apply(_cmd(xt2=0.1412))
-    assert [op.what for op in device.ops] == ["get", "set", "secondary"]
+    assert [op.what for op in device.ops] == ["get", "set"]
     assert device.sets()[0].data == fixture_bytes("aquaero-ctrl-after-writes.bin")
-    assert device.secondaries()[0].data == AQUAERO.secondary_report
+    assert device.saves() == []
 
 
 def test_quadro_write_matches_the_driver_bytes_including_the_checksum() -> None:
     binding = DeviceBinding(kind=QUADRO, pwm_map={"qd3": 3})
     adapter, device, _bus, _clock, _ = _setup(binding)
     adapter.apply(_cmd(qd3=0.0902))
-    assert [op.what for op in device.ops] == ["get", "set", "secondary"]
+    assert [op.what for op in device.ops] == ["get", "set"]
     assert device.sets()[0].data == fixture_bytes("quadro-ctrl-after-writes.bin")
-    assert device.secondaries()[0].data == QUADRO.secondary_report
+    assert device.saves() == []
 
 
 def test_several_changed_channels_go_out_in_one_set() -> None:
     binding = DeviceBinding(kind=QUADRO, pwm_map={f"qd{n}": n for n in range(1, 5)})
     adapter, device, _bus, _clock, _ = _setup(binding)
     adapter.apply(_cmd(qd1=0.3, qd2=0.4, qd3=1.0, qd4=0.25))
-    assert len(device.sets()) == 1 and len(device.secondaries()) == 1
+    assert len(device.sets()) == 1 and device.saves() == []
     assert [control_duty(QUADRO, device.ctrl, k) for k in range(4)] == [3000, 4000, 10000, 2500]
 
 
@@ -416,16 +428,15 @@ def test_quadro_outputs_get_no_mode_warning(caplog) -> None:
 
 def test_aquaero_waits_the_gap_before_every_get_and_set() -> None:
     """Owner decision 2026-09-15: 100 ms on the aquaero, timed from every control
-    operation; the secondary report follows its SET at once."""
+    operation."""
     binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1})
     adapter, device, _bus, clock, sleep = _setup(binding)
     adapter.apply(_cmd(xt1=0.5))
-    get, set_, secondary = device.ops
+    get, set_ = device.ops
     assert get.t == 100.0  # nothing before it: no wait
     assert set_.t - get.t == pytest.approx(AQUAERO_GAP_S)
-    assert secondary.t == set_.t
     adapter.apply(_cmd(xt1=0.6))  # right away
-    assert device.sets()[1].t - secondary.t == pytest.approx(AQUAERO_GAP_S)
+    assert device.sets()[1].t - set_.t == pytest.approx(AQUAERO_GAP_S)
     assert sleep.calls == [pytest.approx(AQUAERO_GAP_S)] * 2
     clock.advance(AQUAERO_GAP_S * 2)
     adapter.apply(_cmd(xt1=0.7))
@@ -445,7 +456,7 @@ def test_a_failed_operation_counts_for_the_gap() -> None:
     adapter, device, _bus, _clock, _ = _setup(binding)
     device.failures = [FeatureReportError("EPIPE", errno.EPIPE)]
     adapter.apply(_cmd(xt1=0.5))
-    failed_get, retry_get, set_, _secondary = device.ops
+    failed_get, retry_get, set_ = device.ops
     assert (failed_get.what, retry_get.what) == ("get", "get")
     assert retry_get.t - failed_get.t == pytest.approx(AQUAERO_GAP_S)
     assert set_.t - retry_get.t == pytest.approx(AQUAERO_GAP_S)
@@ -459,7 +470,7 @@ def test_failed_get_is_retried_from_a_fresh_get() -> None:
     adapter, device, _bus, _clock, _ = _setup(binding)
     device.failures = [FeatureReportError("ENODATA", errno.ENODATA)]
     adapter.apply(_cmd(qd1=0.5))
-    assert [op.what for op in device.ops] == ["get", "get", "set", "secondary"]
+    assert [op.what for op in device.ops] == ["get", "get", "set"]
 
 
 def test_corrupt_control_report_is_retried() -> None:
@@ -518,37 +529,38 @@ def test_no_control_operation_starts_once_the_budget_is_spent() -> None:
     assert clock() - start == pytest.approx(budget * 1.2)
 
 
-def test_budget_spent_before_the_secondary_report_leaves_a_rewrite_pending() -> None:
+def test_budget_spent_before_the_set_leaves_a_rewrite_pending() -> None:
     budget = QUADRO_T.ctrl_budget_s
     binding = DeviceBinding(kind=QUADRO, pwm_map={"qd1": 1, "qd2": 2})
-    adapter, device, _bus, clock, _ = _setup(binding, op_delay_s=budget * 0.6)
-    with pytest.raises(DeviceUnavailable, match="before the secondary report"):
+    adapter, device, _bus, clock, _ = _setup(binding, op_delay_s=budget)
+    with pytest.raises(DeviceUnavailable, match="before the control report SET"):
         adapter.apply(_cmd(qd1=0.5, qd2=1.0))
-    assert len(device.sets()) == 1 and device.secondaries() == []
+    assert device.sets() == []
     device.op_delay_s = 0.0
     clock.advance(1.0)
     adapter.apply(_cmd(qd1=0.5, qd2=1.0))
-    assert len(device.sets()) == 2 and len(device.secondaries()) == 1
-    assert device.last_set_duties()[:2] == [5000, 10000]  # every channel again
+    assert len(device.sets()) == 1 and device.saves() == []
+    assert device.last_set_duties()[:2] == [5000, 10000]  # every channel, held or not
 
 
-def test_failed_secondary_report_rewrites_on_the_retry() -> None:
-    """The cache only counts as written once SET and secondary report both went out."""
+def test_failed_set_rewrites_every_channel_on_the_retry() -> None:
+    """A failed SET may or may not have reached the device: the retry sends every
+    configured channel."""
     binding = DeviceBinding(kind=QUADRO, pwm_map={"qd1": 1, "qd2": 2})
     adapter, device, _bus, _clock, _ = _setup(binding)
     original = device.set_feature
     state = {"failed": False}
 
-    def fail_secondary_once(data: bytes) -> None:
-        if data[0] != QUADRO.ctrl_report_id and not state["failed"]:
+    def fail_set_once(data: bytes) -> None:
+        if not state["failed"]:
             state["failed"] = True
-            device.ops.append(type(device.ops[0])("secondary", device.clock(), bytes(data)))
+            device.ops.append(type(device.ops[0])("set", device.clock(), bytes(data)))
             raise FeatureReportError("EPIPE", errno.EPIPE)
         original(data)
 
-    device.set_feature = fail_secondary_once  # type: ignore[method-assign]
+    device.set_feature = fail_set_once  # type: ignore[method-assign]
     adapter.apply(_cmd(qd1=0.5, qd2=1.0))
-    assert [op.what for op in device.ops] == ["get", "set", "secondary", "get", "set", "secondary"]
+    assert [op.what for op in device.ops] == ["get", "set", "get", "set"]
     # The retry rewrites every configured channel although the device already holds them.
     retry = device.sets()[1].data
     assert control_duty(QUADRO, retry, 0) == 5000 and control_duty(QUADRO, retry, 1) == DUTY_MAX
@@ -591,12 +603,12 @@ def test_invalid_command_raises_value_error_before_touching_the_device(pwm) -> N
     assert bus.opened == [] and device.ops == []
 
 
-# --- write limiting (flash wear, PROJECT.md section 8 item 77) -------------------------------
+# --- write limiting (USB traffic only since item 86; off by default) --------------------------
 
 
 def _limited_quadro(**timing):
     binding = DeviceBinding(
-        kind=QUADRO, pwm_map={"qd1": 1, "qd2": 2}, timing=_timing(QUADRO, **timing)
+        kind=QUADRO, pwm_map={"qd1": 1, "qd2": 2}, timing=_timing(QUADRO, **{**LIMITS, **timing})
     )
     adapter, device, _bus, clock, _ = _setup(binding)
     adapter.apply(_cmd(qd1=0.5, qd2=0.5))  # the first write: nothing written before it
@@ -613,7 +625,7 @@ def test_a_rise_is_written_at_once() -> None:
 
 def test_a_fall_waits_for_the_minimum_interval() -> None:
     adapter, device, clock = _limited_quadro()
-    interval = QUADRO_T.write_min_interval_s
+    interval = LIMITS["write_min_interval_s"]
     clock.advance(interval / 3)
     device.emit()
     obs = adapter.read()
@@ -630,11 +642,11 @@ def test_a_fall_waits_for_the_minimum_interval() -> None:
 
 def test_a_fall_inside_the_deadband_is_not_written_on_its_own() -> None:
     adapter, device, clock = _limited_quadro()
-    clock.advance(QUADRO_T.write_min_interval_s * 10)
-    just_inside = (5000 - (QUADRO_T.write_deadband - 1)) / DUTY_MAX
+    clock.advance(LIMITS["write_min_interval_s"] * 10)
+    just_inside = (5000 - (LIMITS["write_deadband"] - 1)) / DUTY_MAX
     adapter.apply(_cmd(qd1=just_inside, qd2=0.5))
     assert len(device.sets()) == 1
-    at_the_band = (5000 - QUADRO_T.write_deadband) / DUTY_MAX
+    at_the_band = (5000 - LIMITS["write_deadband"]) / DUTY_MAX
     adapter.apply(_cmd(qd1=at_the_band, qd2=0.5))
     assert len(device.sets()) == 2
 
@@ -648,11 +660,14 @@ def test_a_write_carries_every_pending_change() -> None:
     assert device.last_set_duties()[:2] == [3000, 6000]
 
 
-def test_zero_limits_write_every_change() -> None:
-    adapter, device, clock = _limited_quadro(write_min_interval_s=0, write_deadband=0)
-    for duty in (0.4999, 0.4998, 0.4997):
+def test_the_default_limits_write_every_change() -> None:
+    """Item 86: writes are not saved, so the defaults write every fall at once."""
+    binding = DeviceBinding(kind=QUADRO, pwm_map={"qd1": 1, "qd2": 2})
+    assert (binding.timing.write_min_interval_s, binding.timing.write_deadband) == (0, 0)
+    adapter, device, _bus, _clock, _ = _setup(binding)
+    for duty in (0.5, 0.4999, 0.4998, 0.4997):
         adapter.apply(_cmd(qd1=duty, qd2=0.5))
-    assert len(device.sets()) == 4
+    assert len(device.sets()) == 4 and device.saves() == []
 
 
 # --- never lower a fan during a fault (second review) ----------------------------------------
@@ -662,7 +677,8 @@ FAULT_MODES = [Mode.FALLBACK, Mode.DEGRADED]
 
 def _ab_quadro(**timing):
     """qd1 ("a") written at 60 %, qd2 ("b") at 30 %, then a fall of a to 40 % deferred."""
-    binding = DeviceBinding(kind=QUADRO, pwm_map={"a": 1, "b": 2}, timing=_timing(QUADRO, **timing))
+    timing = _timing(QUADRO, **{**LIMITS, **timing})
+    binding = DeviceBinding(kind=QUADRO, pwm_map={"a": 1, "b": 2}, timing=timing)
     adapter, device, _bus, clock, _ = _setup(binding)
     adapter.read()
     adapter.apply(_cmd(a=0.6, b=0.3))
@@ -688,7 +704,7 @@ def test_a_rise_during_a_fault_does_not_carry_a_deferred_fall(mode: Mode) -> Non
 @pytest.mark.parametrize("mode", FAULT_MODES, ids=lambda m: m.value)
 def test_a_deferred_fall_does_not_mature_during_a_fault(mode: Mode) -> None:
     adapter, device, clock = _ab_quadro()
-    clock.advance(QUADRO_T.write_min_interval_s)
+    clock.advance(LIMITS["write_min_interval_s"])
     adapter.apply(_fault(mode, a=0.4, b=0.3))
     assert len(device.sets()) == 1 and control_duty(QUADRO, device.ctrl, 0) == 6000
     adapter.apply(_cmd(a=0.4, b=0.3))  # back in AUTO the fall goes out as before
@@ -705,7 +721,7 @@ def test_a_forced_rewrite_during_a_fault_does_not_lower_a_fan(mode: Mode) -> Non
     adapter.read()  # invalidates the cache and forces a rewrite
     assert adapter.control_report is None
     adapter.apply(_fault(mode, a=0.4, b=0.3))
-    assert [op.what for op in device.ops[-3:]] == ["get", "set", "secondary"]
+    assert [op.what for op in device.ops[-2:]] == ["get", "set"]
     assert device.last_set_duties()[:2] == [6000, 3000]
 
 
@@ -941,7 +957,8 @@ def test_release_restores_the_captured_aquaero_fields() -> None:
     adapter.apply(_cmd(xt2=0.3))
     adapter.release()
     assert bytes(device.ctrl) == firmware
-    assert device.ops[-1].what == "secondary" and device.ops[-2].what == "set"
+    assert [op.what for op in device.ops[-2:]] == ["get", "set"]  # live, not saved
+    assert device.saves() == []
     ops = len(device.ops)
     adapter.release()  # nothing written since: no-op
     assert len(device.ops) == ops
@@ -986,15 +1003,204 @@ def test_release_restores_what_the_first_get_saw_even_after_a_replug() -> None:
     assert bytes(replugged.ctrl) == fixture_bytes("aquaero-ctrl-firmware.bin")
 
 
+# --- save (item 86: commissioning only) -----------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", [AQUAERO, QUADRO], ids=lambda k: k.name)
+def test_save_sends_exactly_one_save_report(kind: DeviceKind, caplog) -> None:
+    binding = DeviceBinding(kind=kind, pwm_map={"a": 1})
+    adapter, device, _bus, _clock, sleep = _setup(binding)
+    adapter.apply(_cmd(a=0.5))
+    assert device.saves() == []
+    with caplog.at_level("WARNING", logger=LOGGER):
+        adapter.save()
+    assert [op.what for op in device.ops] == ["get", "set", "save"]
+    assert device.saves()[0].data == kind.save_report
+    if kind is AQUAERO:
+        assert device.saves()[0].t - device.sets()[0].t == pytest.approx(AQUAERO_GAP_S)
+    message = next(m for m in _messages(caplog, "WARNING") if "save report" in m)
+    assert ("not verified" in message) is (kind is QUADRO)
+    adapter.apply(_cmd(a=0.6))  # later writes are live again
+    assert len(device.saves()) == 1 and len(device.sets()) == 2
+
+
+def test_save_is_not_retried() -> None:
+    binding = DeviceBinding(kind=QUADRO, pwm_map={"a": 1}, timing=_timing(QUADRO, ctrl_retries=3))
+    adapter, device, _bus, _clock, _ = _setup(binding)
+    device.failures = [FeatureReportError("EPIPE", errno.EPIPE)]
+    with pytest.raises(DeviceUnavailable, match="save report failed 1 time"):
+        adapter.save()
+    assert [op.what for op in device.ops] == ["save"]
+
+
+def test_nothing_the_daemon_does_sends_the_save_report() -> None:
+    """Writes, forced rewrites, the periodic refresh and release() all stay live."""
+    adapter, device, clock = _commanded_quadro()
+    device.duty_override = {0: 9000}
+    for _ in range(6):
+        _tick(adapter, device, clock, QUADRO_T.duty_mismatch_s, qd1=0.5, qd2=0.6)
+    _tick(adapter, device, clock, QUADRO_T.ctrl_refresh_s, qd1=0.7, qd2=0.6)
+    adapter.release()
+    assert len(device.sets()) >= 3 and device.saves() == []
+
+
+# --- aquabus outputs 5-8 (item 85) ----------------------------------------------------------
+
+
+def _aquabus(binding: DeviceBinding, **fields):
+    clock = FakeClock()
+    sleep = FakeSleep(clock)
+    device = aquabus_aquaero(clock, **fields)
+    adapter = AquacomputerAdapter(binding, clock=clock, sleep=sleep, opener=FakeBus(device))
+    return adapter, device, clock
+
+
+_QUADRO_ON_AQUABUS = DeviceBinding(
+    kind=AQUAERO,
+    pwm_map={"xt1": 1, "qd1": 5, "qd2": 6, "qd3": 7, "qd4": 8},
+    fan_map={"qd3": 7},
+    temp_map={"quadro_t2": "bus2", "software": "soft2"},
+)
+
+
+def test_aquabus_outputs_read_like_the_aquaeros_own() -> None:
+    adapter, _device, _clock = _aquabus(_QUADRO_ON_AQUABUS)
+    obs = adapter.read()
+    assert obs.temps == {"quadro_t2": pytest.approx(24.14), "software": pytest.approx(50.0)}
+    assert obs.rpm == {"qd3": 1105.0}
+    assert obs.pwm == {
+        "xt1": 0.25,
+        "qd1": pytest.approx(0.8861),
+        "qd2": 1.0,
+        "qd3": 1.0,
+        "qd4": 1.0,
+    }
+
+
+def test_aquabus_output_7_write_reproduces_the_hardware_bytes() -> None:
+    """Hardware 2026-09-15: 9.02 % on aquaero output 7 through the aquaero; one SET,
+    byte-identical to the control report read back afterwards, no save report."""
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={"qd3": 7})
+    adapter, device, _clock = _aquabus(binding)
+    adapter.read()
+    adapter.apply(_cmd(qd3=0.0902))
+    assert [op.what for op in device.ops] == ["get", "set"]
+    assert device.sets()[0].data == fixture_bytes("aquaero-ctrl-aquabus-after-fan7-write.bin")
+    device.emit()
+    assert adapter.read().pwm == {"qd3": pytest.approx(0.0902)}
+
+
+def test_all_eight_aquaero_outputs_go_out_in_one_set() -> None:
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={f"o{n}": n for n in range(1, 9)})
+    adapter, device, _clock = _aquabus(binding)
+    adapter.read()
+    duties = {f"o{n}": n / 10 for n in range(1, 9)}
+    adapter.apply(_cmd(**duties))
+    assert len(device.sets()) == 1
+    assert device.last_set_duties() == [n * 1000 for n in range(1, 9)]
+    assert all(channel_holds(AQUAERO, device.ctrl, k, (k + 1) * 1000) for k in range(8))
+
+
+def test_aquabus_modes_get_no_warning_and_the_unconfigured_block_is_reported_once(caplog) -> None:
+    """Blocks 5-7 read mode 0x0500 (not interpreted): no "not PWM" warning. Block 8 is
+    unconfigured (source 0xFFFF, mode 0): written the same way, one warning per adapter."""
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={f"qd{n}": n + 4 for n in range(1, 5)})
+    adapter, device, clock = _aquabus(binding)
+    with caplog.at_level("WARNING", logger=LOGGER):
+        adapter.apply(_cmd(qd1=0.5, qd2=0.5, qd3=0.5, qd4=0.5))
+        adapter.close()
+        clock.advance(1.0)
+        device.ctrl = bytearray(fixture_bytes("aquaero-ctrl-aquabus-before-fan7-write.bin"))
+        adapter.apply(_cmd(qd1=0.6, qd2=0.6, qd3=0.6, qd4=0.6))  # a new open, block 8 again
+    warnings = _messages(caplog, "WARNING")
+    assert not [m for m in warnings if "not PWM" in m]
+    unconfigured = [m for m in warnings if "unconfigured" in m]
+    assert len(unconfigured) == 1 and "pwm8 (qd4)" in unconfigured[0]
+    assert "not verified" in unconfigured[0]
+    state = channel_state(AQUAERO, device.ctrl, 7)
+    assert (state.duty, state.source, state.on_duty) == (6000, 0x63, True)
+    assert state.mode is not None and state.mode.raw == 0  # the mode is never written
+
+
+def test_an_output_without_a_device_on_aquabus_is_not_reported_as_working() -> None:
+    """Nothing on aquabus: fan blocks 5-8 read rpm 0xFFFF. read() raises naming the
+    channel; apply() still writes every channel (the aquaero's own outputs must get a
+    fallback) but raises too."""
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1, "qd1": 5}, fan_map={"qd1": 5})
+    adapter, device, _bus, clock, _ = _setup(binding)  # the plain aquaero fixture
+    with pytest.raises(DeviceUnavailable, match=r"pwm5 \(qd1\), fan5 \(qd1\).*0xFFFF"):
+        adapter.read()
+    with pytest.raises(DeviceUnavailable, match=r"pwm5 \(qd1\).*not applied"):
+        adapter.apply(_fault(Mode.FALLBACK, xt1=0.8, qd1=0.8))
+    assert len(device.sets()) == 1
+    assert channel_holds(AQUAERO, device.ctrl, 0, 10000)  # never below what it held
+    assert channel_holds(AQUAERO, device.ctrl, 4, 8861)  # the empty slot's reported duty
+    # No duty evidence from an empty slot: no mismatch rewrite, no stuck channel.
+    for _ in range(5):
+        clock.advance(AQUAERO_T.duty_mismatch_s)
+        device.emit()
+        with pytest.raises(DeviceUnavailable):
+            adapter.read()
+    assert adapter.control_report is not None and adapter.stuck_channels == ()
+    # The Quadro is plugged into aquabus: reads work again.
+    device.status_template = fixture_bytes("aquaero-status-aquabus-fan7-100.bin")
+    device.emit()
+    obs = adapter.read()
+    assert obs.rpm == {"qd1": 0.0} and obs.pwm["qd1"] == pytest.approx(0.8861)
+    adapter.apply(_cmd(xt1=0.8, qd1=0.8))
+
+
+def test_a_bound_tachometer_without_a_device_fails_the_read_only() -> None:
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1}, fan_map={"xt1": 7})
+    adapter, device, _bus, _clock, _ = _setup(binding)
+    with pytest.raises(DeviceUnavailable, match=r"fan7 \(xt1\)"):
+        adapter.read()
+    adapter.apply(_cmd(xt1=0.5))  # the output itself is the aquaero's own
+    assert len(device.sets()) == 1
+
+
+def test_apply_before_any_status_report_cannot_know_about_aquabus() -> None:
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={"qd1": 5})
+    adapter, device, _bus, _clock, _ = _setup(binding, report_delay_s=1e9)
+    adapter.apply(_cmd(qd1=0.5))
+    assert len(device.sets()) == 1
+
+
+def test_the_stuck_error_carries_the_hint(caplog) -> None:
+    dt = QUADRO_T.duty_mismatch_s / 2
+    adapter, device, clock = _commanded_quadro(ctrl_refresh_s=0)
+    calls = []
+
+    def hint() -> str:
+        calls.append(1)
+        return "the Quadro is probably on aquabus"
+
+    adapter.stuck_hint = hint
+    device.ignores = {0: DUTY_MAX}
+    with caplog.at_level("WARNING", logger=LOGGER):
+        for _ in range(12):
+            _tick(adapter, device, clock, dt, qd1=0.5, qd2=0.5)
+    (error,) = _messages(caplog, "ERROR")
+    assert error.endswith("; the Quadro is probably on aquabus") and len(calls) == 1
+    assert not any("probably" in m for m in _messages(caplog, "WARNING"))
+
+
 # --- DeviceBinding / timing model -----------------------------------------------------------
 
 
 def test_binding_rejects_numbers_outside_the_kind() -> None:
     with pytest.raises(ValueError, match="pwm1..pwm4"):
         DeviceBinding(kind=QUADRO, pwm_map={"a": 5})
-    with pytest.raises(ValueError, match="fan1..fan5"):
-        DeviceBinding(kind=QUADRO, pwm_map={"a": 1}, fan_map={"a": 6})
-    DeviceBinding(kind=AQUAERO, pwm_map={"a": 1}, fan_map={"a": 6})
+    with pytest.raises(ValueError, match="fan1..fan4"):
+        DeviceBinding(kind=QUADRO, pwm_map={"a": 1}, fan_map={"a": 5})
+    with pytest.raises(ValueError, match="pwm1..pwm8"):
+        DeviceBinding(kind=AQUAERO, pwm_map={"a": 9})
+    DeviceBinding(kind=AQUAERO, pwm_map={"a": 8}, fan_map={"a": 8})
+    with pytest.raises(ValueError, match="temperature inputs temp1..temp4, soft1..soft16"):
+        DeviceBinding(kind=QUADRO, pwm_map={}, temp_map={"t": "bus1"})
+    with pytest.raises(ValueError, match="share one"):
+        DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"t": "bus1", "u": "bus1"})
+    DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"t": "bus1", "u": "virt4", "v": "soft8"})
     with pytest.raises(ValueError, match="share one"):
         DeviceBinding(kind=AQUAERO, pwm_map={"a": 1, "b": 1})
     with pytest.raises(ValueError, match="not pwm_map channels"):
@@ -1012,7 +1218,7 @@ def test_timing_defaults_are_the_documented_ones() -> None:
         60.0,
     )
     assert (t.duty_mismatch_tolerance, t.duty_mismatch_s) == (100, 5.0)
-    assert (t.write_min_interval_s, t.write_deadband) == (30.0, 50)
+    assert (t.write_min_interval_s, t.write_deadband) == (0.0, 0)
 
 
 # --- live device ----------------------------------------------------------------------------
@@ -1046,11 +1252,12 @@ def test_live_read_and_reapply_what_the_device_holds(aquaero_hidraw) -> None:
     if _service_active():
         pytest.skip("the aqua-bridge service is active; stop it before the live test")
 
+    own = [n for n in range(1, AQUAERO.pwm_count + 1) if n not in AQUAERO.aquabus_outputs]
     reader = AquacomputerAdapter(
         DeviceBinding(
             kind=AQUAERO,
-            pwm_map={f"ch{k}": k for k in range(1, AQUAERO.pwm_count + 1)},
-            temp_map={f"t{n}": n for n in range(1, AQUAERO.temp_count + 1)},
+            pwm_map={f"ch{n}": n for n in own},  # 5-8 only with a device on aquabus
+            temp_map={f"t_{name}": name for name in AQUAERO.temp_names},
         )
     )
     try:
@@ -1060,7 +1267,8 @@ def test_live_read_and_reapply_what_the_device_holds(aquaero_hidraw) -> None:
     assert all(v is None or -40.0 < v < 125.0 for v in obs.temps.values())
     assert all(v is not None and 0.0 <= v <= 1.0 for v in obs.pwm.values())
     status = reader.last_status
-    assert status is not None and all(0 <= fan.rpm < 20000 for fan in status.fans)
+    assert status is not None
+    assert all(0 <= fan.rpm < 20000 for fan in status.fans[: len(own)])
 
     sent: list[bytes] = []
 
@@ -1082,7 +1290,7 @@ def test_live_read_and_reapply_what_the_device_holds(aquaero_hidraw) -> None:
         transport.close()
     held = {
         f"ch{k + 1}": control_duty(AQUAERO, ctrl, k)
-        for k in range(AQUAERO.pwm_count)
+        for k in range(len(own))
         if channel_state(AQUAERO, ctrl, k).on_duty
     }
     if not held:

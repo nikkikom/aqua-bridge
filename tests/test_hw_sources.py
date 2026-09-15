@@ -16,7 +16,7 @@ from aqua_bridge.hw.hidraw import DeviceUnavailable
 from aqua_bridge.hw.onewire import W1Source
 from aqua_bridge.hw.sources import CompositeSource, build_composite_from_config
 from aqua_bridge.model import ConfigError, Mode, MpcCommand
-from aquacomputer_fakes import FakeBus, FakeClock, FakeController, FakeSleep
+from aquacomputer_fakes import FakeBus, FakeClock, FakeController, FakeSleep, aquabus_aquaero
 
 
 def _fleet(clock: FakeClock | None = None):
@@ -27,14 +27,17 @@ def _fleet(clock: FakeClock | None = None):
     sleep = FakeSleep(clock)
     a = AquacomputerAdapter(
         DeviceBinding(
-            kind=AQUAERO, pwm_map={"radiator": 2}, fan_map={"radiator": 2}, temp_map={"air_z0": 6}
+            kind=AQUAERO,
+            pwm_map={"radiator": 2},
+            fan_map={"radiator": 2},
+            temp_map={"air_z0": "temp6"},
         ),
         clock=clock,
         sleep=sleep,
         opener=bus,
     )
     q = AquacomputerAdapter(
-        DeviceBinding(kind=QUADRO, pwm_map={"exhaust": 1}, temp_map={"air_z1": 2}),
+        DeviceBinding(kind=QUADRO, pwm_map={"exhaust": 1}, temp_map={"air_z1": "temp2"}),
         clock=clock,
         sleep=sleep,
         opener=bus,
@@ -396,3 +399,89 @@ def test_hwmon_style_entry_gets_the_rename_hint() -> None:
     entry = {"name": "quadro", "fans": {"exhaust": {"pwm": "pwm1"}}, "temp_map": {}}
     with pytest.raises(ConfigError, match="aquacomputer\\[0\\].name was renamed to 'device'"):
         _build(aquacomputer_section=(entry,), channels=("exhaust",), temps=())
+
+
+# --- a Quadro on the aquaero's aquabus (PROJECT.md section 8 item 85) --------------------------
+
+
+def test_aquabus_outputs_and_quadro_outputs_over_usb_are_refused_together() -> None:
+    """A Quadro on aquabus ignores writes over its own USB: commanding aquaero pwm5..8 and
+    Quadro outputs in one config leaves one of them without effect."""
+    aquabus = {
+        "device": "aquaero",
+        "fans": {
+            "radiator": {"pwm": "pwm1", "rpm": "fan1"},
+            "rear": {"pwm": "pwm7", "rpm": "fan7"},
+        },
+        "temp_map": {"air_z0": "temp1", "air_z1": "bus2"},
+    }
+    with pytest.raises(
+        ConfigError,
+        match=r"aquacomputer\[0\] \(aquaero\) commands aquabus outputs pwm7 .*"
+        r"aquacomputer\[1\] \(quadro\) commands Quadro outputs over its own USB",
+    ):
+        _build(
+            aquacomputer_section=(aquabus, dict(_QUADRO_ENTRY, temp_map={})),
+            channels=("radiator", "rear", "exhaust"),
+            temps=("air_z0", "air_z1"),
+        )
+    with pytest.raises(ConfigError, match="commands aquabus outputs pwm7"):
+        _build(
+            aquacomputer_section=(dict(_QUADRO_ENTRY, temp_map={}),),
+            xt6_section=aquabus,
+            channels=("radiator", "rear", "exhaust"),
+            temps=("air_z0", "air_z1"),
+        )
+    # The Quadro entry may still read its own sensors over USB, commanding nothing.
+    sensors_only = {"device": "quadro", "fans": {}, "temp_map": {"air_z2": "temp2"}}
+    composite, _ = _build(
+        aquacomputer_section=(aquabus, sensors_only),
+        channels=("radiator", "rear"),
+        temps=("air_z0", "air_z1", "air_z2"),
+    )
+    assert [d.kind for d in composite.devices] == [AQUAERO, QUADRO]
+    # And the aquaero's own outputs next to a commanding Quadro stay allowed.
+    _build(
+        aquacomputer_section=(dict(_XT6_SECTION), _QUADRO_ENTRY),
+        channels=("radiator", "exhaust"),
+        temps=("air_z0", "air_z1"),
+    )
+
+
+def _stuck_quadro_next_to(aquaero_device: FakeController, caplog) -> list[str]:
+    clock = aquaero_device.clock
+    quadro = FakeController(QUADRO, clock, node="/dev/hidraw5", serial="00000-11111")
+    quadro.ignores = {0: 10000}  # a Quadro on aquabus ignores its own fan settings
+    bus = FakeBus(aquaero_device, quadro)
+    sleep = FakeSleep(clock)
+    a = AquacomputerAdapter(
+        DeviceBinding(kind=AQUAERO, pwm_map={"radiator": 1}), clock=clock, sleep=sleep, opener=bus
+    )
+    q = AquacomputerAdapter(
+        DeviceBinding(kind=QUADRO, pwm_map={"exhaust": 1}), clock=clock, sleep=sleep, opener=bus
+    )
+    composite = CompositeSource([a, q], clock=clock)
+    step = q.timing.duty_mismatch_s / 2
+    with caplog.at_level("ERROR", logger="aqua_bridge.hw.aquacomputer"):
+        for _ in range(12):
+            clock.advance(step)
+            aquaero_device.emit()
+            quadro.emit()
+            composite.read()
+            composite.apply(MpcCommand(pwm={"radiator": 0.5, "exhaust": 0.5}, mode=Mode.AUTO))
+    assert q.stuck_channels == ("exhaust",)
+    return [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+
+
+def test_a_stuck_quadro_next_to_an_aquaero_with_an_aquabus_device_is_explained(caplog) -> None:
+    clock = FakeClock()
+    (error,) = _stuck_quadro_next_to(aquabus_aquaero(clock, node="/dev/hidraw2"), caplog)
+    assert "pwm1 (exhaust) still reports 100.00 %" in error
+    assert "reports a device on its aquabus (pwm5, pwm6, pwm7, pwm8)" in error
+    assert "probably on the aquaero's aquabus" in error and "(pwm5..pwm8)" in error
+
+
+def test_a_stuck_quadro_next_to_an_aquaero_without_an_aquabus_device_gets_no_hint(caplog) -> None:
+    clock = FakeClock()
+    (error,) = _stuck_quadro_next_to(FakeController(AQUAERO, clock, node="/dev/hidraw2"), caplog)
+    assert "still reports" in error and "aquabus" not in error
