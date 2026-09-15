@@ -133,7 +133,9 @@ def test_apply_with_the_first_device_gone_still_writes_the_others() -> None:
     controller even when an earlier one in the list has vanished."""
     a, q, aquaero, quadro, clock = _fleet()
     composite = CompositeSource([a, q], clock=clock)
+    composite.apply(MpcCommand(pwm={"radiator": 0.3, "exhaust": 0.3}, mode=Mode.AUTO))
     aquaero.gone = True
+    clock.advance(1.0)
 
     fallback = MpcCommand(pwm={"radiator": 0.8, "exhaust": 0.8}, mode=Mode.FALLBACK)
     with pytest.raises(
@@ -142,7 +144,7 @@ def test_apply_with_the_first_device_gone_still_writes_the_others() -> None:
         composite.apply(fallback)
 
     assert control_duty(QUADRO, quadro.ctrl, 0) == 8000  # the healthy device got it
-    assert len(quadro.sets()) == 1
+    assert len(quadro.sets()) == 2
     assert isinstance(exc.value.__cause__, DeviceUnavailable)
 
 
@@ -337,14 +339,18 @@ def test_build_composite_from_config_passes_smart_clock_sleep_and_opener_through
 def test_build_checks_the_summed_worst_case_against_the_watchdog() -> None:
     from aqua_bridge.hw.aquacomputer_adapter import AquacomputerTiming
 
+    dt, step = 5.0, 0.75  # _build's dt, a step bound
     total = (
-        AquacomputerTiming.for_kind(AQUAERO).worst_case_tick_s()
+        dt
+        + step
+        + AquacomputerTiming.for_kind(AQUAERO).worst_case_tick_s()
         + AquacomputerTiming.for_kind(QUADRO).worst_case_tick_s()
     )
     kwargs = dict(
         aquacomputer_section=(dict(_XT6_SECTION), _QUADRO_ENTRY),
         channels=("radiator", "exhaust"),
         temps=("air_z0", "air_z1"),
+        step_bound_s=step,
     )
     with pytest.raises(ConfigError, match="aquacomputer\\[0\\] .*aquacomputer\\[1\\]"):
         _build(watchdog_s=total, **kwargs)

@@ -196,6 +196,34 @@ def test_configured_serial_must_match_the_status_report() -> None:
     assert bus.opened == [device.node, device.node]
 
 
+def test_a_rejected_serial_blocks_writes_until_the_right_device_reports() -> None:
+    """Second review: read() closed the node, but the same tick's apply() reopened it
+    and wrote without any serial check."""
+    binding = DeviceBinding(kind=QUADRO, pwm_map={"qd1": 1}, serial="12345-54321")
+    adapter, device, bus, clock, _ = _setup(binding, status_serial="11111-22222")
+    for _ in range(3):
+        with pytest.raises(DeviceUnavailable, match="11111-22222"):
+            adapter.read()
+        with pytest.raises(DeviceUnavailable, match="nothing is written"):
+            adapter.apply(_cmd(qd1=0.8))
+        clock.advance(1.0)
+    assert device.ops == []
+    device.status_serial = None
+    device.pending.clear()
+    adapter.read()
+    adapter.apply(_cmd(qd1=0.8))
+    assert len(device.sets()) == 1
+
+
+def test_a_silent_device_with_a_configured_serial_still_takes_writes() -> None:
+    binding = DeviceBinding(kind=QUADRO, pwm_map={"qd1": 1}, serial="12345-54321")
+    adapter, device, _bus, _clock, _ = _setup(binding, report_delay_s=1e9)
+    with pytest.raises(DeviceUnavailable, match="no status report within"):
+        adapter.read()
+    adapter.apply(_cmd(qd1=0.8))
+    assert len(device.sets()) == 1
+
+
 def test_replug_with_a_new_node_reopens_and_gets_the_control_report_again() -> None:
     adapter, device, bus, clock, _ = _setup(_aquaero_binding())
     adapter.apply(_cmd(xt1=0.5, xt2=0.5))
@@ -625,6 +653,91 @@ def test_zero_limits_write_every_change() -> None:
     for duty in (0.4999, 0.4998, 0.4997):
         adapter.apply(_cmd(qd1=duty, qd2=0.5))
     assert len(device.sets()) == 4
+
+
+# --- never lower a fan during a fault (second review) ----------------------------------------
+
+FAULT_MODES = [Mode.FALLBACK, Mode.DEGRADED]
+
+
+def _ab_quadro(**timing):
+    """qd1 ("a") written at 60 %, qd2 ("b") at 30 %, then a fall of a to 40 % deferred."""
+    binding = DeviceBinding(kind=QUADRO, pwm_map={"a": 1, "b": 2}, timing=_timing(QUADRO, **timing))
+    adapter, device, _bus, clock, _ = _setup(binding)
+    adapter.read()
+    adapter.apply(_cmd(a=0.6, b=0.3))
+    clock.advance(1.0)
+    adapter.apply(_cmd(a=0.4, b=0.3))  # the loop now counts 40 % as applied
+    assert len(device.sets()) == 1 and control_duty(QUADRO, device.ctrl, 0) == 6000
+    return adapter, device, clock
+
+
+def _fault(mode: Mode, **pwm: float) -> MpcCommand:
+    return MpcCommand(pwm=pwm, mode=mode)
+
+
+@pytest.mark.parametrize("mode", FAULT_MODES, ids=lambda m: m.value)
+def test_a_rise_during_a_fault_does_not_carry_a_deferred_fall(mode: Mode) -> None:
+    adapter, device, clock = _ab_quadro()
+    clock.advance(1.0)
+    adapter.apply(_fault(mode, a=0.45, b=0.35))  # b rises: a write goes out
+    assert len(device.sets()) == 2
+    assert device.last_set_duties()[:2] == [6000, 3500]  # a is not lowered
+
+
+@pytest.mark.parametrize("mode", FAULT_MODES, ids=lambda m: m.value)
+def test_a_deferred_fall_does_not_mature_during_a_fault(mode: Mode) -> None:
+    adapter, device, clock = _ab_quadro()
+    clock.advance(QUADRO_T.write_min_interval_s)
+    adapter.apply(_fault(mode, a=0.4, b=0.3))
+    assert len(device.sets()) == 1 and control_duty(QUADRO, device.ctrl, 0) == 6000
+    adapter.apply(_cmd(a=0.4, b=0.3))  # back in AUTO the fall goes out as before
+    assert len(device.sets()) == 2 and control_duty(QUADRO, device.ctrl, 0) == 4000
+
+
+@pytest.mark.parametrize("mode", FAULT_MODES, ids=lambda m: m.value)
+def test_a_forced_rewrite_during_a_fault_does_not_lower_a_fan(mode: Mode) -> None:
+    adapter, device, clock = _ab_quadro()
+    assert device.power_cycles is not None
+    device.power_cycles += 1
+    clock.advance(1.0)
+    device.emit()
+    adapter.read()  # invalidates the cache and forces a rewrite
+    assert adapter.control_report is None
+    adapter.apply(_fault(mode, a=0.4, b=0.3))
+    assert [op.what for op in device.ops[-3:]] == ["get", "set", "secondary"]
+    assert device.last_set_duties()[:2] == [6000, 3000]
+
+
+@pytest.mark.parametrize("mode", FAULT_MODES, ids=lambda m: m.value)
+def test_the_rewrite_after_a_failed_write_during_a_fault_does_not_lower_a_fan(mode: Mode) -> None:
+    adapter, device, clock = _ab_quadro()
+    clock.advance(1.0)
+    device.failures = [FeatureReportError("EPIPE", errno.EPIPE)]  # the SET below fails
+    adapter.apply(_fault(mode, a=0.4, b=0.35))
+    assert device.last_set_duties()[:2] == [6000, 3500]
+    assert control_duty(QUADRO, device.ctrl, 0) == 6000
+
+
+def test_auto_still_falls_as_before() -> None:
+    adapter, device, clock = _ab_quadro()
+    clock.advance(1.0)
+    adapter.apply(_cmd(a=0.4, b=0.35))  # the rise carries the pending fall in AUTO
+    assert device.last_set_duties()[:2] == [4000, 3500]
+
+
+@pytest.mark.parametrize("with_status", [True, False], ids=["status", "no-status"])
+def test_a_channel_on_a_firmware_controller_is_not_lowered_during_a_fault(
+    with_status: bool,
+) -> None:
+    """Its preset says nothing about the output: the floor is the reported output duty,
+    or 100 % before any status report."""
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1})
+    adapter, device, _bus, _clock, _ = _setup(binding, report_delay_s=None if with_status else 1e9)
+    if with_status:
+        assert adapter.read().pwm["xt1"] == 1.0
+    adapter.apply(_fault(Mode.FALLBACK, xt1=0.8))
+    assert channel_holds(AQUAERO, device.ctrl, 0, DUTY_MAX)
 
 
 # --- keeping the cache honest ---------------------------------------------------------------

@@ -338,30 +338,74 @@ def test_ctrl_gap_default_depends_on_the_device_kind() -> None:
 
 
 def test_worst_case_tick_and_the_watchdog_check() -> None:
+    """Review finding: the per-device bound is budget + one transfer + the gap the
+    retry sleeps before it finds the budget spent, and pings are dt + step apart
+    besides."""
     aquaero = AquacomputerTiming.for_kind(AQUAERO)
     quadro = AquacomputerTiming.for_kind(QUADRO)
     worst = aquaero.status_max_age_s + aquaero.ctrl_budget_s + USB_CTRL_TIMEOUT_S
-    assert aquaero.worst_case_tick_s() == pytest.approx(worst)
-    slow_gap = AquacomputerTiming.for_kind(AQUAERO, ctrl_gap_ms=8000)
-    assert slow_gap.worst_case_tick_s() == pytest.approx(worst - USB_CTRL_TIMEOUT_S + 8.0)
+    assert aquaero.worst_case_tick_s() == pytest.approx(worst + aquaero.ctrl_gap_ms / 1000)
+    assert quadro.worst_case_tick_s() == pytest.approx(worst)  # no gap
+    slow_gap = AquacomputerTiming.for_kind(AQUAERO, ctrl_gap_ms=3000)
+    assert slow_gap.worst_case_tick_s() == pytest.approx(worst + 3.0)
     pair = [("aquacomputer[0]", aquaero), ("aquacomputer[1]", quadro)]
-    total = aquaero.worst_case_tick_s() + quadro.worst_case_tick_s()
+    dt, step = 5.0, 0.75
+    total = dt + step + aquaero.worst_case_tick_s() + quadro.worst_case_tick_s()
     check_watchdog(pair, None)
-    check_watchdog(pair, total + 0.001)
-    with pytest.raises(ConfigError, match=r"aquacomputer\[0\] .*not below the systemd watchdog"):
-        check_watchdog(pair, total)
+    check_watchdog(pair, total + 0.001, dt=dt, step_bound_s=step)
+    with pytest.raises(ConfigError, match=r"mpc.dt 5 s .*aquacomputer\[0\] .*not below"):
+        check_watchdog(pair, total, dt=dt, step_bound_s=step)
+    with pytest.raises(ValueError, match="needs dt and step_bound_s"):
+        check_watchdog(pair, total + 1)
+    single = dt + step + aquaero.worst_case_tick_s()
     with pytest.raises(ConfigError, match="WatchdogSec"):
-        build_adapter_from_config(_SECTION, watchdog_s=aquaero.worst_case_tick_s())
-    build_adapter_from_config(_SECTION, watchdog_s=aquaero.worst_case_tick_s() + 1)
+        build_adapter_from_config(_SECTION, watchdog_s=single, dt=dt, step_bound_s=step)
+    build_adapter_from_config(_SECTION, watchdog_s=single + 1, dt=dt, step_bound_s=step)
 
 
-def test_the_unit_watchdog_fits_two_controllers_at_their_defaults() -> None:
-    """deploy/aqua-bridge.service's WatchdogSec against the DAS pair at defaults."""
-    unit = (Path(__file__).resolve().parent.parent / "deploy" / "aqua-bridge.service").read_text()
+def test_a_retry_after_a_timeout_blocks_no_longer_than_the_bound() -> None:
+    """The reviewer's case: ctrl_gap_ms 3000, ctrl_retries 2, a control operation that
+    starts just before the budget runs out and times out after the usbhid timeout."""
+    from aqua_bridge.hw.aquacomputer_adapter import AquacomputerAdapter, DeviceBinding
+    from aqua_bridge.hw.hidraw import DeviceUnavailable, FeatureReportError
+    from aqua_bridge.model import Mode, MpcCommand
+    from aquacomputer_fakes import FakeBus, FakeClock, FakeController, FakeSleep
+
+    timing = AquacomputerTiming.for_kind(AQUAERO, ctrl_gap_ms=3000, ctrl_retries=2)
+    clock = FakeClock()
+    device = FakeController(AQUAERO, clock, op_delay_s=USB_CTRL_TIMEOUT_S)
+    device.failures = [FeatureReportError("ETIMEDOUT") for _ in range(3)]
+    adapter = AquacomputerAdapter(
+        DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1}, timing=timing),
+        clock=clock,
+        sleep=FakeSleep(clock),
+        opener=FakeBus(device),
+    )
+    start = clock()
+    with pytest.raises(DeviceUnavailable):
+        adapter.apply(MpcCommand(pwm={"xt1": 0.5}, mode=Mode.AUTO))
+    blocked = clock() - start
+    assert blocked <= timing.worst_case_tick_s() - timing.status_max_age_s + 1e-9
+
+
+def test_the_unit_watchdog_fits_the_das_example_with_two_controllers_at_their_defaults() -> None:
+    """deploy/aqua-bridge.service's WatchdogSec against config.example-das.yaml's dt and
+    step bound plus the aquaero and the Quadro at their defaults."""
+    from aqua_bridge.config import load_config
+
+    root = Path(__file__).resolve().parent.parent
+    unit = (root / "deploy" / "aqua-bridge.service").read_text()
     match = re.search(r"^WatchdogSec=(\d+)$", unit, re.MULTILINE)
     assert match is not None
+    app = load_config(root / "config.example-das.yaml")
     pair = [
-        ("aquaero", AquacomputerTiming.for_kind(AQUAERO)),
-        ("quadro", AquacomputerTiming.for_kind(QUADRO)),
+        (entry["device"], AquacomputerTiming.for_kind(entry["device"]))
+        for entry in app.aquacomputer
     ]
-    check_watchdog(pair, float(match.group(1)))
+    assert [name for name, _ in pair] == ["aquaero", "quadro"]
+    check_watchdog(
+        pair,
+        float(match.group(1)),
+        dt=app.mpc.dt,
+        step_bound_s=app.mpc.budget_alarm_ms / 1000.0,
+    )

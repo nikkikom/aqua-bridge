@@ -250,7 +250,9 @@ def build_io(
 
     ``watchdog_s`` is the systemd watchdog period (``watchdog_seconds()``;
     ``None`` without one): the hardware sources refuse a configuration whose
-    worst-case blocking per tick is not below it (``ConfigError``, exit 2).
+    longest interval between two pings (``mpc.dt`` + ``mpc.budget_alarm_ms`` +
+    the controllers' worst-case blocking) is not below it (``ConfigError``,
+    exit 2).
     """
     if source == "sim":
         if sim_plant == "basic":
@@ -277,6 +279,8 @@ def build_io(
             temps=app.mpc.temps,
             clock=clock,
             watchdog_s=watchdog_s,
+            dt=app.mpc.dt,
+            step_bound_s=app.mpc.budget_alarm_ms / 1000.0,
         )
         return adapter, adapter, None
     if source == "composite":
@@ -294,6 +298,7 @@ def build_io(
             smart=smart,
             clock=clock,
             watchdog_s=watchdog_s,
+            step_bound_s=app.mpc.budget_alarm_ms / 1000.0,
         )
         return composite, composite, release
     raise RuntimeError(f"unknown source {source!r}")
