@@ -138,9 +138,9 @@ measure it.
 - The daemon reads and writes both controllers through **hidraw**
   (`/dev/hidrawN`, `hw/hidraw.py`), not the Linux `aquacomputer_d5next`
   hwmon driver (owner decision 2026-09-15, §8.1). It reads the status
-  report each controller sends about once per second (about 1 ms) and
+  report each controller sends about once per second (2 ms on the Pi) and
   writes every channel of one controller with a single control feature
-  report; through hwmon a `pwmK` read took 210 ms and a write 420 ms,
+  report (9–13 ms, §2 "hidraw check"); through hwmon a `pwmK` read took 210 ms and a write 420 ms,
   about 5 s per tick with 8 outputs (§2 "USB spike results"). No kernel
   driver beyond `hid-generic` is needed. Raspberry Pi OS kernels do not
   include the hwmon driver anyway; `deploy/install-aquacomputer-dkms.sh`
@@ -336,6 +336,68 @@ open: they need the Quadro on aquabus.
   860 rpm, faster than at 10 %. Up and down differ by up to 100 rpm on the
   Quadro: 10 s may be too short, or the firmware ramps; not checked
   (§8 item 75).
+
+### hidraw check (2026-09-15)
+
+The branch with the hidraw adapter on the Pi, both controllers on their own
+USB ports, the DKMS module removed (§8 item 82), run as a non-root user in
+`plugdev`.
+
+- **Discovery and decoding.** `tools/aquacomputer_probe.py` listed both
+  controllers (aquaero on USB interface 2, Quadro on interface 1) and
+  decoded every status and control report field; `pytest -m hardware`
+  passed. `HID_UNIQ` equals the serial in the status report on both
+  devices (the adapter now checks that when `serial:` is configured).
+- **Timing** (medians):
+
+  | Operation | Time |
+  |---|---|
+  | status report read (`read()`) | 2 ms |
+  | first open, waiting for the first status report | 0.1–0.9 s |
+  | `apply()` with every duty already held (no SET) | about 1 ms |
+  | `apply()` with a changed duty | 9–13 ms |
+  | aquaero SET + secondary report | 6.5 ms + 0.8 ms |
+  | Quadro SET + secondary report | 2.9 ms + 0.8 ms |
+  | consecutive changed writes on one controller, old 200 ms gap | about 205 ms |
+  | one SET with all 4 outputs: aquaero / Quadro | 16 ms / 26 ms |
+
+  The status report showed a new duty in the next report (≤ 1 s); fan rpm
+  then took 3–6 s to settle. Two control report GETs 30 s apart with no
+  write in between were byte-identical on both devices, so writing from
+  the cached report does not revert fields the firmware changes by itself.
+- **Gap between writes.** Back-to-back writes (SET + secondary report) on
+  the aquaero failed with `EPIPE` at a gap of 0 ms (18 of 20) and 25 ms (15
+  of 30), and never at 50, 75, 100 or 150 ms (30 each). The Quadro wrote 20
+  of 20 at 0 ms. Owner decision: `ctrl_gap_ms` defaults to 100 ms on the
+  aquaero and 0 on the Quadro (§8.1).
+- **One SET, all outputs.** One SET wrote all four outputs of each
+  controller (read back from the control report), and `release()` restored
+  both control reports byte for byte. Not every output followed in the
+  status report: aquaero outputs 1 (no fan) and 2 (fan) went to 40 % and
+  30 %, outputs 3 and 4 (no fan) stayed at 100 %; Quadro output 3 (fan)
+  went to 30 %, outputs 1, 2 and 4 (no fan) stayed at 100 %. The four Quadro
+  channel regions (0x55 bytes from the duty offset − 2) are identical apart
+  from the duty.
+- **aquaero output mode.** The aquaero controller blocks differ: the word at
+  block +0x0E is `0x0502` on outputs 1 and 2 and `0x0501` on outputs 3 and 4
+  (the word at +0x02 is 1000 on 1–2 and 1600 on 3–4, not interpreted). The
+  +0x0E word is the output mode: output 4 (block `0x248`) at `0x0501`
+  followed the duty as a voltage (27 % → 3.3–3.6 V, 66 % → 8.06 V, current
+  and power reported). Changing only that word to `0x0502` (one GET, patch,
+  SET + secondary; the control report then differed from the saved copy
+  only at `0x257`) made the output PWM: 12.07 V at 30 % and 50 %, the status
+  duty equal to the command in the next report, rpm following. So the low
+  byte `0x01` is DC voltage mode and `0x02` PWM; the high byte (`0x05` on
+  every output) is not interpreted. In DC mode the output did not follow
+  low commands (0–20 % commanded, 27–30 % and 3.3–3.7 V reported) and lagged
+  a changed command by several seconds. The aquaero reports current and
+  power only in DC mode (0 in PWM mode). Outputs 3 and 4 that stayed at
+  100 % were in DC mode without a load; why a DC output without a load
+  reports 100 % is unknown, and the earlier guess of a firmware start boost
+  is withdrawn for the aquaero. The Quadro outputs without a fan also
+  stayed at 100 %; the Quadro's mode field is not identified. The adapter
+  decodes the aquaero mode and warns about commanded outputs not in PWM
+  mode, but does not change it (§8 item 81).
 
 ---
 
@@ -1638,7 +1700,10 @@ converges only with them.
   −1 °C would read 655 °C). The layouts are checked against captured
   reports and the driver's readings in `tests/fixtures/aquacomputer/` (§2
   "USB spike results"); a duty write patched into the captured firmware
-  reports reproduces the driver's write byte for byte. The official
+  reports reproduces the driver's write byte for byte. The aquaero output
+  mode word at block +0x0E (low byte `0x01` DC voltage, `0x02` PWM, §2
+  "hidraw check") is decoded (`output_mode`, `ChannelState.mode`) and
+  never written; the Quadro's mode field is not known. The official
   software and the driver also send the secondary report after every
   control report write; what it does is not known.
 - `hw/hidraw.py`: discovery and transport. Every `hidrawN` under
@@ -1662,56 +1727,98 @@ converges only with them.
     `obs.temps` in °C (`None` where nothing is connected), `obs.rpm` from
     `fanN`, `obs.pwm` in `[0, 1]` from the status report's **output
     duty** on both kinds (what the device drives, not the cached
-    command). No status report for longer than `status_max_age_s` raises
-    `DeviceUnavailable` (the loop's blank-observation fallback ramps the
-    fans up). A vanished node closes the device and raises
-    `DeviceUnavailable`; the next call discovers it again (a re-plug may
-    bring a new `hidrawN`) and waits up to `status_max_age_s` for its
-    first report. `ts` comes from the injected monotonic clock.
+    command). A report counts as received when the queue is drained, so
+    its age is known to one read (one tick). The kernel's hidraw queue
+    holds 63 reports (`HIDRAW_BUFFER_SIZE` 64) and drops new ones while
+    full: a drain that returns a full queue may be minutes old, so those
+    reports are discarded (no status time, no duty evidence) and the queue
+    is read once more. No status report for longer than
+    `status_max_age_s` raises `DeviceUnavailable` (the loop's
+    blank-observation fallback ramps the fans up). After an open, only
+    the first `read()` waits up to `status_max_age_s` for a report; a
+    device that stays silent then raises at once on every later read
+    instead of blocking each tick. A vanished node closes the device and
+    raises `DeviceUnavailable`; the next call discovers it again (a
+    re-plug may bring a new `hidrawN`). With `serial:` configured, a
+    first status report carrying another serial closes the device and
+    raises, naming both. `ts` comes from the injected monotonic clock.
     `last_status` keeps the newest decoded report for tools and
     diagnostics; voltage, current and power are not in the observation
     (§8 item 79).
-  - **Control report cache.** The control report is read (GET) once after
-    opening and again after every invalidation, never on a normal tick.
-    `apply()` needs a finite value in `[0, 1]` for every configured
-    channel (else `ValueError`, nothing sent; no silent clamping) and
-    commands `round(pwm × 10000)`. When every configured channel already
-    holds its duty (on the aquaero: follows its preset with power limits
-    0 / 100 %) nothing is sent. Otherwise every changed channel is
-    patched into the cached report, which goes out with **one** SET plus
-    the secondary report. Before any control operation the adapter waits
-    until `ctrl_gap_ms` has passed since the last SET (Linux commit
-    56b930dc added 200 ms after it saw `EPIPE`; a GET right before a SET
-    needs no gap, an isolated GET takes 4–8 ms). A failed operation
-    invalidates the cache and is retried from a fresh GET up to
-    `ctrl_retries` times (one control GET in about 60 failed with
-    `ENODATA` in the spike), then raises `DeviceUnavailable`. The cache
+  - **Control report cache.** `apply()` opens the node without waiting
+    for a status report, so the fallback ramp and the stop write reach a
+    device whose status reports stopped. The control report is read (GET)
+    once after opening and again after every invalidation, never on a
+    normal tick. `apply()` needs a finite value in `[0, 1]` for every
+    configured channel (else `ValueError`, nothing sent; no silent
+    clamping) and commands `round(pwm × 10000)`. A write patches every
+    channel with a pending change into the cached report and sends
+    **one** SET plus the secondary report. Before every GET and SET the
+    adapter waits `ctrl_gap_ms` after the end of the previous control
+    operation, failed ones included, as the Linux driver does (Linux
+    commit 56b930dc added its 200 ms after seeing `EPIPE`); the secondary
+    report follows its SET at once. A failed operation invalidates the
+    cache and is retried from a fresh GET up to `ctrl_retries` times (at
+    most 5), then raises `DeviceUnavailable`. No control operation starts
+    once `ctrl_budget_s` of this `apply()` is spent (`DeviceUnavailable`):
+    every usbhid control transfer can block for its 5 s timeout. The cache
     counts as written only when SET and secondary report both succeeded;
-    a retry after a failed SET rewrites every configured channel. A
-    Quadro control report whose checksum does not match is a failed read.
+    a retry after a failed or unfinished write rewrites every configured
+    channel. A Quadro control report whose checksum does not match is a
+    failed read.
+  - **Write limiting** (flash wear, §8 item 77; provisional defaults). A
+    channel's duty is written at once when it **rises** above the duty the
+    device holds, or when the channel does not follow a duty at all
+    (an aquaero channel on a firmware controller): cooling never waits. A
+    **fall** is written only when it is at least `write_deadband` below the
+    written duty **and** at least `write_min_interval_s` has passed since
+    this device's last write. Every write carries every channel with a
+    pending change, rises and pending falls alike. With both keys 0 every
+    change is written. A deferred fall is not an error: `obs.pwm` keeps
+    coming from the status report, so the controller sees the duty the
+    fans actually get. The stop write of `fallback_pwm` follows the same
+    rule (from a higher duty it is a fall and may be deferred, which only
+    leaves more cooling).
   - **Keeping the cache honest.** Speed, output duty, voltage, current and
     power arrive in every status report, so drift of the fans themselves
     is visible without any control read. A one-time read misses a
     configuration changed behind the daemon's back (front panel,
     aquasuite, liquidctl, a controller reset), hence three rules:
-    (a) *duty verification* — for every channel this adapter commands, a
-    status duty further than `duty_mismatch_tolerance` from the command,
-    continuously for longer than `duty_mismatch_s` (counted from the later
-    of the mismatch start and the last SET, and judged only on reports
-    received after that SET), invalidates the cache, logs a warning naming
-    device, channel, commanded and reported duty, and makes the next
-    `apply()` read the report again and rewrite every configured channel;
+    (a) *duty verification*, per channel — the reference is the duty
+    written to (or read back from) the device, not the raw command. A
+    channel's mismatch timer starts at the first status report received
+    after that channel's own last change that differs by more than
+    `duty_mismatch_tolerance`; it is cleared only by an agreeing report or
+    a write that changes that channel's duty (writes to other channels do
+    not restart it), and fires when it has lasted longer than
+    `duty_mismatch_s`: the cache is invalidated, a warning names device,
+    channel, written and reported duty, and the next `apply()` reads the
+    report again and rewrites every configured channel. A channel that
+    mismatches again after that rewrite is logged **once** as an error,
+    listed in `stuck_channels`, and not rewritten for the mismatch again
+    until the device reports its duty (writes on a changed command
+    continue) — no rewrite loop, no warning every few seconds (§8 item 81;
+    publishing it is item 83). The aquaero output mode (block +0x0E: PWM
+    or DC voltage) is only reported: one warning per open for every
+    commanded output not in PWM mode; the adapter never writes it;
     (b) *power cycles* — a change of the Quadro's power-cycle count from
-    the value seen at open does the same (logged);
+    the value seen at open invalidates the same way (logged);
     (c) *periodic refresh* — every `ctrl_refresh_s` (0 disables) `apply()`
-    reads the control report again first; a commanded channel that no
-    longer holds its duty is logged and rewritten, other changes in the
-    report are adopted.
+    reads the control report again first; a channel that no longer holds
+    its duty is logged and written again, other changes in the report are
+    adopted.
   - `release()` restores, for every channel this adapter has written, the
     fields captured by the first GET after the daemon started (aquaero:
     preset, control source, minimum and maximum power; Quadro: duty) with
     one SET plus the secondary report; a no-op when nothing was written.
     Not called at exit (§2; §8 items 33, 76).
+  - **Worst case per tick.** One `read()` plus one `apply()` of a device
+    can block for `status_max_age_s` (the first read after an open) +
+    `ctrl_budget_s` + one control transfer that started just before the
+    budget ran out (5 s, or the gap if longer): 13 s per controller at
+    the defaults, 26 s for the aquaero and the Quadro. `build_io` reads the
+    systemd watchdog period from `$WATCHDOG_USEC` and refuses (exit 2) a
+    configuration whose sum over all devices is not below it (§9).
 - **The device entry**, `xt6:` or one `aquacomputer:` list entry
   (`parse_device_section`; `build_adapter_from_config(xt6,
   channels=mpc.channels, temps=mpc.temps)` for `--source xt6`):
@@ -1719,32 +1826,40 @@ converges only with them.
   ```yaml
   xt6:
     device: aquaero               # required: aquaero | quadro
-    serial: "12345-67890"         # optional; required when several of one kind are attached
+    serial: "12345-54321"         # optional; required when several of one kind are attached
     fans:
       radiator: {pwm: pwm1, rpm: fan1}
       intake:   {pwm: pwm2}       # rpm optional
     temp_map:
       coolant: temp1
     status_max_age_s: 3.0         # optional timing keys, defaults shown
-    ctrl_gap_ms: 200
+    ctrl_gap_ms: 100              # per kind: aquaero 100, quadro 0
     ctrl_retries: 1
+    ctrl_budget_s: 5.0
     ctrl_refresh_s: 60.0
     duty_mismatch_tolerance: 100
     duty_mismatch_s: 5.0
+    write_min_interval_s: 30.0
+    write_deadband: 50
   ```
 
   | Key | Default | Valid | Meaning |
   |---|---|---|---|
   | `status_max_age_s` | 3.0 | finite, > 0 | a newest status report older than this is no observation (`DeviceUnavailable`); an open waits this long for the first report |
-  | `ctrl_gap_ms` | 200 | finite, ≥ 0 | wait after a control report SET before the next control operation |
-  | `ctrl_retries` | 1 | integer ≥ 0 | retries of a failed control operation, each from a fresh GET |
+  | `ctrl_gap_ms` | aquaero 100, Quadro 0 | finite, ≥ 0 | wait after any control operation (failed ones included) before the next GET or SET, ms |
+  | `ctrl_retries` | 1 | integer 0..5 | retries of a failed control operation, each from a fresh GET |
+  | `ctrl_budget_s` | 5.0 | finite, > 0 | no control operation starts once this much of one `apply()` is spent |
   | `ctrl_refresh_s` | 60.0 | finite, ≥ 0 | periodic control report read in `apply()`; 0 disables |
-  | `duty_mismatch_tolerance` | 100 | integer 0..10000 | 1/100 %: a status duty further from the command is a mismatch |
+  | `duty_mismatch_tolerance` | 100 | integer 0..10000 | 1/100 %: a status duty further from the written duty is a mismatch |
   | `duty_mismatch_s` | 5.0 | finite, > 0 | a mismatch lasting longer re-reads the report and rewrites every channel |
+  | `write_min_interval_s` | 30.0 | finite, ≥ 0 | a falling duty is written at most this long after the device's last write (rises at once); provisional, §8 item 77 |
+  | `write_deadband` | 50 | integer 0..10000 | 1/100 %: a falling duty is written only this far below the written one; provisional, §8 item 77 |
 
-  The defaults live once, in `AquacomputerTiming`; both example configs
-  show every key at its default (`tests/test_model_config.py` checks
-  that). Each fan is **one** `fans` entry that names the channel once and
+  The defaults live once, in `AquacomputerTiming`, and the one that
+  depends on the device kind (`ctrl_gap_ms`, owner decision 2026-09-15)
+  in `KIND_TIMING_DEFAULTS` next to it; both example configs show every
+  key at its default for their device (`tests/test_model_config.py`
+  checks that). Each fan is **one** `fans` entry that names the channel once and
   carries both inputs, so a PWM output and its tachometer cannot drift
   apart into two differently spelt channels. Only `pwm` and `rpm` are
   allowed inside an entry (a typo such as `rmp:` is rejected); `pwm` must
@@ -1768,7 +1883,11 @@ converges only with them.
   optional 1-Wire source into one `PlantObservation` and puts the SMART
   inbox's snapshot into `obs.inputs["smart"]`; `apply()` hands the whole
   command to every device, each adapter commanding its own channels with
-  at most one SET.
+  at most one SET. Both visit **every** device even after one raised, so
+  every hidraw queue is drained and the fallback ramp and stop write reach
+  every healthy controller; the failures are then raised as one
+  `DeviceUnavailable` naming each failed device, chained to the first
+  (the observation of that tick is still lost).
   `build_composite_from_config(aquacomputer_section=, xt6_section=, onewire_section=, channels=, temps=, dt=, smart=)`:
 
   ```yaml
@@ -1792,9 +1911,9 @@ converges only with them.
   and two entries of one kind need distinct serials (both would otherwise
   open and command the same controller), or the daemon exits 2 before the
   loop starts. A config that still has a `hwmon:` section exits 2 with a
-  message naming the rename to `aquacomputer:` and `device:`. A failing
-  device's exception propagates from `read()` / `apply()` (the loop's
-  existing partial-write and blank-observation policies apply). A ROM id
+  message naming the rename to `aquacomputer:` and `device:`, and so does
+  one whose summed worst case per tick is not below the systemd watchdog
+  (`watchdog_s=`, see above). A ROM id
   missing from every bus at start is a warning, not fatal: a sensor may
   be unplugged with its drive.
 - `hw/onewire.py`: `W1Source`, DS18B20 over the kernel's `w1_therm`
@@ -1837,8 +1956,9 @@ converges only with them.
   every discovered aquaero and Quadro (kind, serial, USB interface, node),
   then prints each one's status report (temperatures; rpm, duty, voltage,
   current and power per output; flow; the Quadro's power cycles) and each
-  output's control-report duty with the aquaero's control source and
-  power limits. Read-only: it never sends a SET. `--device`, `--serial`,
+  output's control-report duty with the aquaero's control source, power
+  limits and output mode (PWM or DC voltage). Read-only: it never sends a
+  SET. `--device`, `--serial`,
   `--timeout` (default: the `status_max_age_s` default).
 - Unit tests against captured HID reports, a **fake controller**
   (`tests/aquacomputer_fakes.py`), a fake hidraw sysfs tree and a **fake
@@ -2423,7 +2543,9 @@ the board.
   rejected; `crc16_usb` on both Quadro control reports; patching the
   firmware reports reproduces the driver's writes byte for byte (aquaero
   channel 2 to 14.12 %, Quadro channel 3 to 9.02 %) and capture /
-  restore undo them; Hypothesis round trips of patched duties.
+  restore undo them; the aquaero output mode word (outputs 1–2 PWM, 3–4
+  DC voltage in the firmware fixture; none on the Quadro); Hypothesis round
+  trips of patched duties.
 - `tests/test_hw_hidraw.py` — discovery on a fake sysfs tree (interface
   selection, serial selection, ambiguity naming the serials, not found,
   uevent lines without `=`), the ioctl request numbers, draining reports
@@ -2432,29 +2554,39 @@ the board.
 - `tests/test_hw_aquacomputer_adapter.py` — `AquacomputerAdapter` against
   a fake controller (`tests/aquacomputer_fakes.py`) with an injected
   clock and sleep: read mapping (the output duty as `obs.pwm`), the
-  newest report wins, a stale status report and an open without one →
-  `DeviceUnavailable`, a re-plug with a new node reads the control report
-  again, an unchanged command sends nothing, a changed command sends one
-  SET plus one secondary report with the driver's bytes, the gap, retries
-  then `DeviceUnavailable`, a failed secondary report rewrites, a duty
-  mismatch beyond tolerance for longer than `duty_mismatch_s` re-reads
-  and rewrites (a brief one, one within tolerance or one seen only on a
-  report from before the SET does not), a Quadro power cycle, the
-  periodic refresh and `ctrl_refresh_s: 0`, `release()` restoring the
-  captured bytes, rejected NaN / out-of-range / missing channel with
-  nothing sent. The live device test is `pytest.mark.hardware`
+  newest report wins, a stale status report, a silent device (only the
+  first read waits, `apply()` still writes), a full kernel queue treated
+  as stale and read again, the configured serial against the status
+  report, a re-plug with a new node reads the control report again, an
+  unchanged command sends nothing, a changed command sends one SET plus
+  one secondary report with the driver's bytes, the per-kind gap timed
+  from every operation (failed ones included), retries and
+  `ctrl_budget_s` then `DeviceUnavailable`, a failed or unfinished write
+  rewrites, write limiting (rises at once, falls after the interval and
+  outside the deadband, one write carrying every pending change, zeros
+  writing everything), per-channel duty verification (a brief mismatch,
+  one within tolerance or one without a new report does not fire; another
+  channel changing every tick does not hold it off; a change of the
+  channel itself restarts it), the rewrite-then-stuck escalation, the
+  aquaero output mode warning, a Quadro power cycle, the periodic refresh
+  and `ctrl_refresh_s: 0`, `release()` restoring the captured bytes,
+  rejected NaN / out-of-range / missing channel with nothing sent. The live device test is `pytest.mark.hardware`
   (`test_live_read_and_reapply_what_the_device_holds`: reads a status
-  report, re-applies the duty of every channel that already follows its
-  preset and asserts that no SET went out) and is skipped when no aquaero
-  hidraw node exists.
+  report, reads the control report right before re-applying the duty of
+  every channel that already follows its preset, and asserts that no SET
+  went out); it is skipped when no aquaero hidraw node exists or while the
+  `aqua-bridge` service is active.
 - `tests/test_hw_aquacomputer_config.py` — the device entry: kinds,
   serial, input ranges per kind, `fans` / `temp_map` errors, keys equal
   to `mpc.channels` / `mpc.temps`, every timing key's validation, the
+  per-kind `ctrl_gap_ms` default, the worst case per tick against the
+  watchdog (and the unit's `WatchdogSec` against the default pair), the
   hints for `hwmon_name`, `root`, `name`, `map` and `fan_map`.
 - `tests/test_hw_sources.py` — `CompositeSource` over two fake
   controllers and a fake 1-Wire source: merged reads, each channel
-  written to its own device with one SET each, a failing device
-  propagates, `xt6:` plus an `aquacomputer:` list, timing keys per
+  written to its own device with one SET each, a failing device (first or
+  last in the list) raises after every other device was still read or
+  written, naming all failed devices, `xt6:` plus an `aquacomputer:` list, timing keys per
   device, distinct serials for one kind, every name bound exactly once
   (exit 2 otherwise), a missing ROM at start does not block,
   `inputs["smart"]` only with an inbox.
@@ -2468,8 +2600,8 @@ the board.
 - `tests/test_w1_commission.py` — `--list`, `--identify` ranking by
   warming rate, `--check` building the daemon's composite.
 - `tests/test_aquacomputer_probe.py` — the probe on a fake sysfs tree and
-  fake controllers: listing, decoded output, filters, failures reported,
-  no SET or secondary report sent.
+  fake controllers: listing, decoded output including the aquaero output
+  mode, filters, failures reported, no SET or secondary report sent.
 
 These never replace §4.1–4.6.
 
@@ -2541,12 +2673,14 @@ runners allow it.
   (`--sim-plant basic|rich|das`), xt6 map mismatch → exit 2, `--source
   composite` wiring and a missing binding → exit 2, `--source hwmon`
   rejected, a config of the hwmon era → exit 2 naming the replacement
-  keys, `--record` and
+  keys, the hardware worst case per tick against `$WATCHDOG_USEC` → exit 2,
+  `--record` and
   `record_path`, `--model-store` and `STATE_DIRECTORY` (legacy: ignored /
   exit 2), publisher wiring and start failures, the
   SIGTERM stop path in-process, a SIGTERM delivered inside a stderr write,
   a second SIGTERM during shutdown, and a real subprocess (`slow`).
-- `tests/test_sdnotify.py` — address resolution, no-op without
+- `tests/test_sdnotify.py` — address resolution, the watchdog period
+  from `$WATCHDOG_USEC` / `$WATCHDOG_PID`, no-op without
   `$NOTIFY_SOCKET`, failures return `False`, a real `AF_UNIX` datagram
   socket (skipped where binding one is denied).
 - `tests/test_mqtt_ha.py` — topics, Discovery entities, PWM numbers only
@@ -3166,6 +3300,12 @@ Owner decision (2026-09-15):
   unsolicited status report (about 1 ms) and one feature report writes
   every channel of a controller (item 74, §3 Track B). The DKMS package
   stays in `deploy/` for later; `install-pi.sh` no longer runs it (§9).
+- `ctrl_gap_ms` (the wait between control operations on one controller)
+  stays a per-device config key; its default depends on the device kind:
+  **100 ms for the aquaero, 0 for the Quadro**. Measured on the Pi:
+  back-to-back aquaero writes failed with `EPIPE` at 0 ms (18 of 20) and
+  25 ms (15 of 30), none at 50, 75, 100 or 150 ms (30 each); the Quadro
+  wrote 20 of 20 at 0 ms (§2 "hidraw check").
 
 ### 8.2 Open — no DAS hardware needed (dev machine, CI, the Pi, the PC)
 
@@ -3319,6 +3459,10 @@ Owner decision (2026-09-15):
     against the fitted fan curve (`fan_models`, `tools/fit_fans.py`), a
     sagging rail voltage, output current or power out of line with the
     duty.
+83. Publish the adapter's device health: `AquacomputerAdapter.stuck_channels`
+    (outputs that keep reporting another duty after a rewrite, item 81) and
+    the aquaero outputs not in PWM mode are only logged today. Put them in
+    `/api/health`, the MQTT state and a Home Assistant problem sensor.
 
 ### 8.3 Open — needs the DAS hardware
 
@@ -3381,7 +3525,11 @@ Owner decision (2026-09-15):
     up to 860 rpm at 5–8 %). `mpc.pwm_min` is one global value. Per-output
     stall and start duties in the config, a start kick when a channel
     reads 0 rpm under a command above its stall duty, and
-    `tools/fit_fans.py` finding both duties and the unstable band.
+    `tools/fit_fans.py` finding both duties and the unstable band. Open
+    question for the Quadro: whether its jump to 860 rpm at 5–8 % is a
+    firmware start boost; if so, it may restart a stalled fan without daemon
+    code. (For the aquaero that guess is withdrawn: the outputs that stayed
+    at 100 % were in DC voltage mode, §2 "hidraw check".)
 76. What the aquaero channels hold after exit: each commanded channel
     keeps its manual preset (the stop write leaves `fallback_pwm`).
     `AquacomputerAdapter.release()` now restores the captured firmware
@@ -3394,38 +3542,43 @@ Owner decision (2026-09-15):
     needs the capture kept across restarts (for example in the state
     directory).
 77. Find out whether a control-report write is stored in the aquaero's or
-    the Quadro's non-volatile memory. If it is, a write every tick wears
-    it; item 74 (done) writes only on a tick whose duties changed, which
-    cuts the rate, but the answer decides how far (for example a minimum
-    duty step or write interval). Before item 42.
+    the Quadro's non-volatile memory: write a duty, power-cycle the
+    controller (owner), read the control report back. Upstream commit
+    56b930dc says the device needs its delay to "process the request and
+    save the data to memory"; a SET nearly every tick would be up to 17 280
+    writes a day per controller. Until this is answered the adapter limits
+    writes (§3 Track B): a rise goes out at once, a fall only when it is at
+    least `write_deadband` (50, i.e. 0.5 %) below the written duty and
+    `write_min_interval_s` (30 s) after the device's last write. **These
+    defaults are provisional** until the power-cycle test answers this item.
+    **Blocks item 42.**
 78. Send the driver fix in `deploy/dkms/aquacomputer_d5next/` upstream
     (linux-hwmon), then drop the patch once a Raspberry Pi OS kernel
     carries it. Only relevant if the DKMS driver path is revived: the
     daemon uses hidraw (§8.1, 2026-09-15).
-80. Time a full tick over hidraw on the Pi with both controllers: both
-    status report reads, a tick with a changed duty on each controller
-    (SET plus secondary report, no control read), the `ctrl_gap_ms` wait
-    after a SET, a periodic refresh tick and the reopen after a re-plug
-    (up to `status_max_age_s`). Confirm that `ctrl_gap_ms` 200 is needed
-    and enough (no `EPIPE` on an operation after a SET), and count how
-    often a control read fails (about one in 60 in the spike).
-81. Channel mode on the Quadro. The adapter writes only the Quadro's duty
-    field, as the driver does. If a channel has been switched to a curve
-    or another controller mode (aquasuite), the duty is ignored: duty
-    verification then re-reads and rewrites every `duty_mismatch_s`
-    without effect and logs a warning each time. Find the control-report
-    field that selects the channel mode, verify and set it the way the
-    aquaero's control source and power limits are, and escalate a
-    mismatch that a rewrite does not fix (one warning, then a health
-    flag) instead of rewriting forever. Check the aquaero for the same
-    (a fan in rpm mode, hold minimum power, start boost).
-82. The Pi that ran the USB spike still has the DKMS `aquacomputer_d5next`
-    module installed, which binds both controllers. The hidraw nodes
-    stay and the daemon works, but anything that reads a `pwmN` attribute
-    issues a control report read of its own, outside the daemon's
-    `ctrl_gap_ms`. Remove it (`sudo dkms remove aquacomputer_d5next
-    --all`, reboot) before item 42 and confirm the daemon runs with
-    `hid-generic`.
+80. Time a full tick over hidraw on the Pi with both controllers.
+    Measured 2026-09-15 (§2 "hidraw check"): status read 2 ms, first open
+    0.1–0.9 s, `apply()` 1 ms without a write and 9–13 ms with one, one SET
+    with all four outputs 16 ms (aquaero) / 26 ms (Quadro); the gap scan
+    that set `ctrl_gap_ms` to 100 ms (aquaero) and 0 (Quadro). Still open: a
+    full daemon tick with both controllers and the 1-Wire buses, a periodic
+    refresh tick, the reopen after a re-plug, and how often a control read
+    fails in long operation (about one in 60 in the hwmon spike).
+81. Outputs that do not follow the written duty. On the Pi (§2 "hidraw
+    check") one SET wrote all outputs, but aquaero outputs 3 and 4 and
+    Quadro outputs 1, 2 and 4, all without a fan, kept reporting 100 %. The
+    aquaero part is explained: the word at controller block +0x0E is the
+    output mode (low byte `0x01` DC voltage, `0x02` PWM); outputs 3 and 4
+    were in DC mode. `hw/aquacomputer.py` decodes it, the probe prints it,
+    and the adapter logs one warning per open for every commanded aquaero
+    output not in PWM mode; it does not set the mode. Duty verification is
+    escalated: a channel that still reports another duty after one rewrite
+    is logged once as an error, listed in `stuck_channels` and not
+    rewritten for the mismatch again until the device reports its duty
+    (writes on a changed command continue). Open: whether the config
+    declares a mode per output and the adapter sets it; the Quadro's mode
+    field (its four channel regions are identical apart from the duty); why
+    a DC output without a load reports 100 %.
 
 ### 8.4 Open — Zero 2 W upgrade
 
@@ -3495,9 +3648,21 @@ Owner decision (2026-09-15):
     Pi is item 80. hwmon PWM cost (§2 "USB spike results"): a `pwmK` read
     takes 210 ms and a write 420 ms, and `Xt6Adapter` reads every `pwmK`
     and writes every channel on every tick, about 5 s per tick with 8
-    outputs. Report the last commanded value instead of reading `pwmK`
-    back, write only channels whose raw value changed (and all of them
-    again after a re-plug), and time a full tick on the Pi.
+    outputs. Stop reading `pwmK` back on every tick (the original item
+    proposed reporting the last commanded value; the adapter reports the
+    status report's output duty instead), write only channels whose raw
+    value changed (and all of them again after a re-plug), and time a full
+    tick on the Pi.
+82. **Done:** the DKMS module was removed from the spike Pi on 2026-09-15
+    (`dkms remove --all`, source deleted, `dkms` package purged, module
+    unloaded); every Aqua Computer HID interface is on `hid-generic`. The
+    Pi that ran the USB spike still has the DKMS `aquacomputer_d5next`
+    module installed, which binds both controllers. The hidraw nodes stay
+    and the daemon works, but anything that reads a `pwmN` attribute
+    issues a control report read of its own, outside the daemon's
+    `ctrl_gap_ms`. Remove it (`sudo dkms remove aquacomputer_d5next
+    --all`, reboot) before item 42 and confirm the daemon runs with
+    `hid-generic`.
 
 #### Docs / repo
 
@@ -3858,6 +4023,16 @@ the service user.
 controllers' `/dev/hidrawN` nodes (the kernel creates them `root:root
 0600`); without it the daemon cannot open them. `dialout` is for the
 Digole UART.
+
+**Watchdog against blocked ticks.** A tick that blocks longer than
+`WatchdogSec=` gets the daemon killed without its `fallback_pwm` stop
+write. The controller I/O per tick is bounded: `status_max_age_s` +
+`ctrl_budget_s` + one 5 s usbhid control transfer per controller (§3 Track
+B), 26 s for the aquaero and the Quadro at their defaults against
+`WatchdogSec=30`. `build_io` reads the period from `$WATCHDOG_USEC` (only
+set under systemd) and exits 2 when that sum is not below it; raise
+`WatchdogSec=` or lower those keys, and keep the margin for `step` and the
+recorder in mind.
 
 `READY=1` waits for the first applied command, so a device that is
 absent at boot (USB not enumerated, hidraw permissions wrong) shows up as
