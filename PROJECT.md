@@ -3363,6 +3363,9 @@ Owner decision (2026-09-15):
   back-to-back aquaero writes failed with `EPIPE` at 0 ms (18 of 20) and
   25 ms (15 of 30), none at 50, 75, 100 or 150 ms (30 each); the Quadro
   wrote 20 of 20 at 0 ms (§2 "hidraw check").
+- Item 21 (live MQTT and Home Assistant check) is deferred: it does not
+  block production. Item 78 (sending the driver fix upstream) is deferred
+  too.
 
 ### 8.2 Open — no DAS hardware needed (dev machine, CI, the Pi, the PC)
 
@@ -3390,7 +3393,8 @@ Owner decision (2026-09-15):
 20. Experiments: settle timers are not persisted (after a restart a start
     waits `ident_settle_s` + `bay_settle_s`); a start that arrives between
     `plan_tick` and `record_tick` shifts the levels by one tick.
-21. Live MQTT and Home Assistant check against the owner's Home Assistant
+21. **Deferred** (owner, 2026-09-15: does not block production).
+    Live MQTT and Home Assistant check against the owner's Home Assistant
     broker (host in `private.md`): discovery entities appear, limit and
     setpoint numbers work, PWM numbers exist only in manual, `in/smart`
     arrives through the broker. Needs the Pi and Home Assistant, not the
