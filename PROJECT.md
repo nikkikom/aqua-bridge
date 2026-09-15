@@ -3967,6 +3967,23 @@ Owner decision (2026-09-15):
     fan's rpm in the aquaero's status report, several seconds behind the
     Quadro's own report, matters for stall detection (item 75).
 
+92. The aquaero lost the Quadro on aquabus without a restart (2026-09-15,
+    between 21:14 and 22:21; aquaero uptime counter 81 min, Quadro power
+    cycles unchanged, its USB still connected). The aquaero's fans 5–8 then
+    read rpm `0xFFFF` and 0 V and flow 3 `0x7FFF`, but its aquabus
+    temperature `bus2` stayed at 24.12 °C while the Quadro reported 23.66 °C
+    over its own USB: a lost aquabus device leaves its temperatures frozen,
+    not missing. In the same window byte `0x1A` of the aquaero's control
+    report changed from `0x01` to `0x00` (meaning unknown). The Quadro kept
+    its own saved duties. To do: find the cause (cable, bus speed,
+    `0x1A`, the owner's menu changes) and how to recover ("Find aquabus
+    devices" in aquasuite or the device menu); treat `busN` temperatures as
+    missing while the device behind them is absent (for the Quadro: its fan
+    slots 5–8 read `0xFFFF`), or refuse to bind them without such a check;
+    once the link is back, repeat the adapter's live write to outputs 5–8 on
+    the hardware (PR for items 85 and 86 was checked on the aquaero's own
+    outputs only: no save report, live writes, the fault floor).
+
 ### 8.4 Open — Zero 2 W upgrade
 
 50. Run on a Zero 2 W with the same config.
