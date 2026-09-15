@@ -251,13 +251,16 @@ def test_example_configs_show_every_timing_key_at_its_default(
     from aqua_bridge.hw.aquacomputer_adapter import TIMING_KEYS, AquacomputerTiming
 
     legacy = load_config(example_config_path).xt6
-    aquaero, quadro = load_config(example_das_config_path).aquacomputer
-    for entry in (legacy, aquaero, quadro):
+    (aquaero,) = load_config(example_das_config_path).aquacomputer  # the Quadro on aquabus
+    for entry in (legacy, aquaero):
         defaults = dataclasses.asdict(AquacomputerTiming.for_kind(entry["device"]))
         shown = {key: entry[key] for key in TIMING_KEYS if key in entry}
         assert shown == {key: defaults[key] for key in shown}
     assert set(TIMING_KEYS) <= set(legacy) and set(TIMING_KEYS) <= set(aquaero)
-    assert "ctrl_gap_ms" in quadro  # the kind-dependent default is shown for both kinds
+    # The Quadro-on-USB alternative is commented out; its gap default is shown there.
+    text = example_das_config_path.read_text()
+    quadro_gap = AquacomputerTiming.for_kind("quadro").ctrl_gap_ms
+    assert f"#   ctrl_gap_ms: {quadro_gap:g}" in text
 
 
 def test_digole_enabled_bad_type_logs_a_warning_and_does_not_raise(cfg, caplog):

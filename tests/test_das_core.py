@@ -102,10 +102,13 @@ def test_example_das_config_binds_every_name_once(tmp_path):
         dt=app.mpc.dt,
     )
     try:
-        assert [device.kind.name for device in composite.devices] == ["aquaero", "quadro"]
-        # The Quadro's temperature inputs are not assumed: only the aquaero binds thermistors.
-        quadro = app.aquacomputer[1]
-        assert quadro["temp_map"] == {}
+        # The Quadro is on the aquaero's aquabus: its outputs are the aquaero's 5-8.
+        (aquaero,) = composite.devices
+        assert aquaero.kind.name == "aquaero"
+        assert sorted(aquaero.binding.pwm_map.values()) == list(range(1, 9))
+        assert sorted(aquaero.binding.fan_map.values()) == list(range(1, 9))
+        # The Quadro's temperature inputs are not assumed: only the thermistors are bound.
+        assert all(name.startswith("temp") for name in aquaero.binding.temp_map.values())
     finally:
         if release is not None:
             release()
