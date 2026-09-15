@@ -214,13 +214,13 @@ def test_short_get_feature_returns_what_arrived() -> None:
 def test_set_feature_sends_the_buffer_and_checks_the_count() -> None:
     ioctl = _FakeIoctl()
     transport = HidrawTransport(_info(Path("/dev/hidraw2")), 7, ioctl=ioctl)
-    transport.set_feature(QUADRO.secondary_report)
+    transport.set_feature(QUADRO.save_report)
     ((_, request, sent),) = ioctl.calls
-    assert request == hidiocsfeature(len(QUADRO.secondary_report))
-    assert sent == QUADRO.secondary_report
+    assert request == hidiocsfeature(len(QUADRO.save_report))
+    assert sent == QUADRO.save_report
     short = HidrawTransport(_info(Path("/dev/hidraw2")), 7, ioctl=_FakeIoctl(result=3))
     with pytest.raises(FeatureReportError, match="sent 3 of 11"):
-        short.set_feature(QUADRO.secondary_report)
+        short.set_feature(QUADRO.save_report)
 
 
 @pytest.mark.parametrize(
@@ -242,7 +242,7 @@ def test_feature_report_errors_are_classified(err: int, expected: type[Exception
     if expected is FeatureReportError:
         assert exc.value.errno == err
     with pytest.raises(expected):
-        transport.set_feature(QUADRO.secondary_report)
+        transport.set_feature(QUADRO.save_report)
 
 
 def test_closed_transport_is_unavailable() -> None:

@@ -6,48 +6,66 @@ protocol constant (report ids, sizes, offsets, CRC parameters), not a tunable.
 
 Layouts were captured on the real devices and matched against the values the
 Linux ``aquacomputer_d5next`` driver reports (PROJECT.md section 2, "USB spike
-results"). All multi-byte fields are big-endian; offsets count from byte 0,
-the report id. Sizes include the id byte.
+results", "hidraw check"). All multi-byte fields are big-endian; offsets count
+from byte 0, the report id. Sizes include the id byte.
 
 Status report (input report ``0x01``, sent unsolicited about once per second):
 
 * aquaero, 903 bytes: serial ``u16`` pair at ``0x07``, firmware at ``0x0B``;
-  temperatures 8 sensors at ``0x65``, 8 virtual at ``0x85``, 4 calculated
-  virtual at ``0x95``; fan blocks at ``0x167 0x173 0x17F 0x18B`` with speed
-  ``+0``, output duty ``+2``, voltage ``+4``, current ``+6``, power ``+8``;
-  2 flow sensors at ``0xF9``.
+  temperatures: 8 physical sensors at ``0x65`` (``temp1..8``), 8 aquabus
+  temperature slots at ``0x75`` (``bus1..8``; a Quadro on aquabus puts its
+  sensors 1-4 in slots 1-4), 8 software sensors at ``0x85`` (``soft1..8``, set
+  by the host with output report ``0x07``; the Linux driver calls them virtual
+  sensors) and 4 virtual sensors at ``0x95`` (``virt1..4``; the driver's
+  calculated virtual sensors); fan blocks at ``0x167 + 12k`` for ``k`` 0..7
+  with speed ``+0``, output duty ``+2``, voltage ``+4``, current ``+6``, power
+  ``+8`` (blocks 1-4 the aquaero's own outputs, 5-8 the outputs of a device on
+  its aquabus, a Quadro's outputs 1-4); 3 flow sensors at ``0xF9``. A fan block
+  whose speed reads ``0xFFFF`` has no device behind it.
 * Quadro, 220 bytes: serial at ``0x03``, firmware at ``0x0D``, power-cycle
-  count ``u32`` at ``0x18``; temperatures 4 sensors at ``0x34``, 16 virtual at
-  ``0x3C``; fan blocks at ``0x70 0x7D 0x8A 0x97`` with output duty ``+0``,
+  count ``u32`` at ``0x18``; temperatures: 4 physical sensors at ``0x34``
+  (``temp1..4``) and 16 software sensors at ``0x3C`` (``soft1..16``; the
+  driver's virtual sensors, named after the aquaero's, not verified on the
+  Quadro); fan blocks at ``0x70 0x7D 0x8A 0x97`` with output duty ``+0``,
   voltage ``+2``, current ``+4``, power ``+6``, speed ``+8``; flow at ``0x6E``.
 
-Units: temperature centi-degC (``0x7FFF`` = nothing connected), duty
-centi-percent ``0..10000``, voltage centi-volt, current mA, power centi-watt,
-speed rpm, flow the raw value the driver reports as ``fanN_input``.
+Units: temperature centi-degC (``0x7FFF`` = no data), duty centi-percent
+``0..10000``, voltage centi-volt, current mA, power centi-watt, speed rpm, flow
+the raw value the driver reports as a ``fanN_input``.
 
-Channel numbers follow the driver's hwmon attributes, so the config keeps
-``pwmN`` / ``fanN`` / ``tempN``: aquaero ``temp1..8`` sensors, ``temp9..16``
-virtual, ``temp17..20`` calculated, ``fan1..4`` fans, ``fan5..6`` flow; Quadro
-``temp1..4`` sensors, ``temp5..20`` virtual, ``fan1..4`` fans, ``fan5`` flow;
-``pwm1..4`` on both. Unlike the driver, temperatures decode as signed ``s16``
-(``0x7FFF`` excepted), so a sub-zero reading is not 655 degC.
+Config names: ``pwmN`` for outputs, ``fanN`` for the tachometer of output N,
+``flowN`` for flow sensors and the temperature group prefixes above. The Linux
+driver numbered the temperatures in one run (aquaero ``temp9..16`` software,
+``temp17..20`` virtual; Quadro ``temp5..20`` software) and the flow sensors as
+``fanN`` after the fans; those names are not used here. Unlike the driver,
+temperatures decode as signed ``s16`` (``0x7FFF`` excepted), so a sub-zero
+reading is not 655 degC.
 
 Control report (a HID feature report holding the device's configuration):
 aquaero id ``0x0B``, 2707 bytes, no checksum; Quadro id ``0x03``, 961 bytes,
 CRC-16/USB over ``[1 : size - 2)`` stored at ``[size - 2 : size]``. A duty is
 commanded the way the driver does it: Quadro channel ``k`` has its duty at
-``0x37 0x8C 0xE1 0x136``; aquaero channel ``k`` gets its manual preset
+``0x37 0x8C 0xE1 0x136``; aquaero channel ``k`` (0..7) gets its manual preset
 (``0x55C + 2k``) set to the duty, its control source (controller block
-``0x20C 0x220 0x234 0x248`` ``+0x10``) set to the preset id ``0x5C + k``,
-minimum power (``+0x04``) to 0 and maximum power (``+0x06``) to 100 %. Every
-control report SET is followed by a secondary feature report (the official
-software sends it too).
+``0x20C + 20k``, ``+0x10``) set to the preset id ``0x5C + k``, minimum power
+(``+0x04``) to 0 and maximum power (``+0x06``) to 100 %. Verified on the
+aquaero's outputs 1-4 and on output 7, a Quadro's output 3 on aquabus.
+
+A SET of the control report takes effect in the next status report and is not
+kept over a power cycle (PROJECT.md section 8 item 84). The save report
+(:attr:`DeviceKind.save_report`, the "secondary report" the official software
+and the driver send after every SET) stores the configuration in the
+controller's memory; the adapter sends it only on an explicit request. It is
+verified to save on the aquaero; the Quadro's is byte-identical to the
+Farbwerk 360's documented save report, not verified on the Quadro.
 
 The aquaero controller block also holds the output mode, a ``u16`` at
 ``+0x0E``: low byte ``0x01`` drives the output as a DC voltage, ``0x02`` as PWM
 (verified on the Pi 2026-09-15 by switching one output; the high byte is not
-interpreted). It is decoded for diagnostics only; nothing here writes it. The
-Quadro's mode field is not known.
+interpreted). On the aquabus blocks 5-8 the low byte is 0 and not interpreted
+(the device on the bus drives the output). Block 8 read unconfigured (source
+``0xFFFF``, mode ``0x0000``) with a Quadro on aquabus. The mode is decoded for
+diagnostics only; nothing here writes it. The Quadro's mode field is not known.
 """
 
 from __future__ import annotations
@@ -59,19 +77,23 @@ from dataclasses import dataclass
 __all__ = [
     "AQUAERO",
     "DUTY_MAX",
+    "FAN_ABSENT_RPM",
     "KINDS",
     "QUADRO",
+    "SENSOR_NOT_CONNECTED",
+    "SOURCE_UNCONFIGURED",
     "STATUS_REPORT_ID",
     "VENDOR_ID",
     "ChannelSnapshot",
     "ChannelState",
     "ControlChannel",
     "DeviceKind",
-    "OutputMode",
     "FanLayout",
     "FanStatus",
+    "OutputMode",
     "ReportError",
     "StatusReport",
+    "TempGroup",
     "capture_channel",
     "channel_holds",
     "channel_state",
@@ -93,6 +115,11 @@ VENDOR_ID = 0x0C70
 STATUS_REPORT_ID = 0x01
 #: A temperature field holding this value has nothing connected.
 SENSOR_NOT_CONNECTED = 0x7FFF
+#: A fan block whose speed holds this value has no device behind it (an aquabus
+#: slot of the aquaero with nothing on the bus).
+FAN_ABSENT_RPM = 0xFFFF
+#: An aquaero controller block with this control source is not configured.
+SOURCE_UNCONFIGURED = 0xFFFF
 #: Duties are centi-percent: 10000 is 100 %.
 DUTY_MAX = 10000
 
@@ -113,6 +140,20 @@ class FanLayout:
 
 
 @dataclass(frozen=True)
+class TempGroup:
+    """One run of temperature fields in a status report, named ``{prefix}1..{prefix}{count}``."""
+
+    prefix: str
+    offset: int
+    count: int
+    #: What the group is, for tools and error messages.
+    description: str
+
+    def names(self) -> tuple[str, ...]:
+        return tuple(f"{self.prefix}{i}" for i in range(1, self.count + 1))
+
+
+@dataclass(frozen=True)
 class ControlChannel:
     """Where one PWM output lives in the control report.
 
@@ -129,6 +170,8 @@ class ControlChannel:
     max_power: int | None = None
     #: aquaero: the ``u16`` output mode word (read only, :func:`output_mode`).
     mode: int | None = None
+    #: The output belongs to a device on the aquaero's aquabus (aquaero outputs 5-8).
+    aquabus: bool = False
 
     def pinned(self) -> tuple[tuple[int, int], ...]:
         """``(offset, value)`` of every ``u16`` besides the duty that must hold
@@ -159,37 +202,78 @@ class DeviceKind:
     serial_offset: int
     firmware_offset: int
     power_cycles_offset: int | None
-    #: ``(offset, count)`` of each temperature block, in ``tempN`` order.
-    temp_blocks: tuple[tuple[int, int], ...]
+    #: The temperature groups in report order (config names ``{prefix}N``).
+    temp_groups: tuple[TempGroup, ...]
     #: Start of each fan block, in ``fanN`` / ``pwmN`` order.
     fan_blocks: tuple[int, ...]
     fan_layout: FanLayout
-    #: Flow sensors, numbered as ``fanN`` after the fans.
+    #: Flow sensors, ``flowN`` in this order.
     flow_offsets: tuple[int, ...]
     ctrl_report_id: int
     ctrl_size: int
     ctrl_checksum: bool
     ctrl_channels: tuple[ControlChannel, ...]
-    #: The feature report sent after every control report SET.
-    secondary_report: bytes
+    #: The feature report that stores the configuration in the controller's
+    #: memory; never part of a normal write (module docstring).
+    save_report: bytes
+    #: The save report was seen to persist the configuration over a power cycle.
+    save_verified: bool
+
+    @property
+    def temp_names(self) -> tuple[str, ...]:
+        """Every temperature input's config name, in report order."""
+        return tuple(name for group in self.temp_groups for name in group.names())
 
     @property
     def temp_count(self) -> int:
-        return sum(count for _, count in self.temp_blocks)
+        return sum(group.count for group in self.temp_groups)
 
     @property
-    def fan_input_count(self) -> int:
-        """Number of ``fanN`` inputs: fans, then flow sensors."""
-        return len(self.fan_blocks) + len(self.flow_offsets)
+    def fan_count(self) -> int:
+        """Number of tachometers ``fanN``, one per output."""
+        return len(self.fan_blocks)
+
+    @property
+    def flow_count(self) -> int:
+        return len(self.flow_offsets)
 
     @property
     def pwm_count(self) -> int:
         return len(self.ctrl_channels)
 
+    @property
+    def aquabus_outputs(self) -> tuple[int, ...]:
+        """Output numbers (1-based) that belong to a device on the aquaero's aquabus."""
+        return tuple(k + 1 for k, channel in enumerate(self.ctrl_channels) if channel.aquabus)
 
-_AQUAERO_CTRL_BLOCKS = (0x20C, 0x220, 0x234, 0x248)
+    def describe_temps(self) -> str:
+        """``temp1..temp8, bus1..bus8, ...``, for messages."""
+        return ", ".join(f"{g.prefix}1..{g.prefix}{g.count}" for g in self.temp_groups)
+
+
+#: aquaero outputs: 1-4 its own, 5-8 the outputs of a device on its aquabus.
+_AQUAERO_OUTPUTS = 8
+_AQUAERO_OWN_OUTPUTS = 4
+_AQUAERO_FAN_BLOCK_START = 0x167
+_AQUAERO_FAN_BLOCK_SIZE = 12
+_AQUAERO_CTRL_BLOCK_START = 0x20C
+_AQUAERO_CTRL_BLOCK_SIZE = 20
 _AQUAERO_PRESET_START = 0x55C
 _AQUAERO_PRESET_ID = 0x5C
+
+
+def _aquaero_channel(k: int) -> ControlChannel:
+    base = _AQUAERO_CTRL_BLOCK_START + _AQUAERO_CTRL_BLOCK_SIZE * k
+    return ControlChannel(
+        duty=_AQUAERO_PRESET_START + 2 * k,
+        source=base + 0x10,
+        preset_id=_AQUAERO_PRESET_ID + k,
+        min_power=base + 0x04,
+        max_power=base + 0x06,
+        mode=base + 0x0E,
+        aquabus=k >= _AQUAERO_OWN_OUTPUTS,
+    )
+
 
 AQUAERO = DeviceKind(
     name="aquaero",
@@ -199,25 +283,23 @@ AQUAERO = DeviceKind(
     serial_offset=0x07,
     firmware_offset=0x0B,
     power_cycles_offset=None,
-    temp_blocks=((0x65, 8), (0x85, 8), (0x95, 4)),
-    fan_blocks=(0x167, 0x173, 0x17F, 0x18B),
+    temp_groups=(
+        TempGroup("temp", 0x65, 8, "physical sensors"),
+        TempGroup("bus", 0x75, 8, "aquabus temperature slots"),
+        TempGroup("soft", 0x85, 8, "software sensors"),
+        TempGroup("virt", 0x95, 4, "virtual sensors"),
+    ),
+    fan_blocks=tuple(
+        _AQUAERO_FAN_BLOCK_START + _AQUAERO_FAN_BLOCK_SIZE * k for k in range(_AQUAERO_OUTPUTS)
+    ),
     fan_layout=FanLayout(speed=0x00, duty=0x02, voltage=0x04, current=0x06, power=0x08),
-    flow_offsets=(0xF9, 0xFB),
+    flow_offsets=(0xF9, 0xFB, 0xFD),
     ctrl_report_id=0x0B,
     ctrl_size=0xA93,
     ctrl_checksum=False,
-    ctrl_channels=tuple(
-        ControlChannel(
-            duty=_AQUAERO_PRESET_START + 2 * k,
-            source=base + 0x10,
-            preset_id=_AQUAERO_PRESET_ID + k,
-            min_power=base + 0x04,
-            max_power=base + 0x06,
-            mode=base + 0x0E,
-        )
-        for k, base in enumerate(_AQUAERO_CTRL_BLOCKS)
-    ),
-    secondary_report=bytes((0x06, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00)),
+    ctrl_channels=tuple(_aquaero_channel(k) for k in range(_AQUAERO_OUTPUTS)),
+    save_report=bytes((0x06, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00)),
+    save_verified=True,
 )
 
 QUADRO = DeviceKind(
@@ -228,7 +310,10 @@ QUADRO = DeviceKind(
     serial_offset=0x03,
     firmware_offset=0x0D,
     power_cycles_offset=0x18,
-    temp_blocks=((0x34, 4), (0x3C, 16)),
+    temp_groups=(
+        TempGroup("temp", 0x34, 4, "physical sensors"),
+        TempGroup("soft", 0x3C, 16, "software sensors"),
+    ),
     fan_blocks=(0x70, 0x7D, 0x8A, 0x97),
     fan_layout=FanLayout(speed=0x08, duty=0x00, voltage=0x02, current=0x04, power=0x06),
     flow_offsets=(0x6E,),
@@ -236,7 +321,8 @@ QUADRO = DeviceKind(
     ctrl_size=0x3C1,
     ctrl_checksum=True,
     ctrl_channels=tuple(ControlChannel(duty=offset) for offset in (0x37, 0x8C, 0xE1, 0x136)),
-    secondary_report=bytes((0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x34, 0xC6)),
+    save_report=bytes((0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x34, 0xC6)),
+    save_verified=False,
 )
 
 #: Supported kinds by config name (``device: aquaero`` / ``device: quadro``).
@@ -275,6 +361,11 @@ class FanStatus:
     power_cw: int
 
     @property
+    def present(self) -> bool:
+        """False when the block has no device behind it (speed ``0xFFFF``)."""
+        return self.rpm != FAN_ABSENT_RPM
+
+    @property
     def voltage_v(self) -> float:
         return self.voltage_cv / 100.0
 
@@ -290,35 +381,42 @@ class StatusReport:
     kind: str
     serial: str
     firmware: int
-    #: ``temps[i]`` is ``temp{i+1}`` in degC; ``None`` when nothing is connected.
-    temps: tuple[float | None, ...]
-    #: ``fans[k]`` is ``fan{k+1}`` and output ``pwm{k+1}``.
+    #: Every temperature input by config name (``temp1``, ``bus2``, ``soft1``, ...)
+    #: in report order, in degC; ``None`` where the field holds no data.
+    temps: Mapping[str, float | None]
+    #: ``fans[k]`` is tachometer ``fan{k+1}`` and output ``pwm{k+1}``.
     fans: tuple[FanStatus, ...]
-    #: ``flows[j]`` is ``fan{len(fans)+j+1}``.
+    #: ``flows[j]`` is ``flow{j+1}``.
     flows: tuple[int, ...]
     #: Quadro only: increments when the device is power-cycled.
     power_cycles: int | None
 
-    def temp(self, number: int) -> float | None:
-        """``tempN`` (1-based) in degC."""
-        if not 1 <= number <= len(self.temps):
-            raise IndexError(f"{self.kind} has temp1..temp{len(self.temps)}, not temp{number}")
-        return self.temps[number - 1]
+    def temp(self, name: str) -> float | None:
+        """The temperature input ``name`` (``temp1``, ``bus2``, ...) in degC."""
+        try:
+            return self.temps[name]
+        except KeyError:
+            raise KeyError(f"{self.kind} has no temperature input {name!r}") from None
 
-    def fan_input(self, number: int) -> int:
-        """``fanN`` (1-based) as the driver numbers it: fan rpm, then flow."""
-        count = len(self.fans) + len(self.flows)
-        if not 1 <= number <= count:
-            raise IndexError(f"{self.kind} has fan1..fan{count}, not fan{number}")
-        if number <= len(self.fans):
-            return self.fans[number - 1].rpm
-        return self.flows[number - 1 - len(self.fans)]
+    def rpm(self, number: int) -> int:
+        """Speed of tachometer ``fanN`` (1-based), rpm; ``0xFFFF`` without a device."""
+        return self._fan(number, "fan").rpm
+
+    def flow(self, number: int) -> int:
+        """Flow sensor ``flowN`` (1-based), raw."""
+        if not 1 <= number <= len(self.flows):
+            raise IndexError(f"{self.kind} has flow1..flow{len(self.flows)}, not flow{number}")
+        return self.flows[number - 1]
 
     def duty(self, number: int) -> int:
         """Output duty of ``pwmN`` (1-based), centi-percent."""
-        if not 1 <= number <= len(self.fans):
-            raise IndexError(f"{self.kind} has pwm1..pwm{len(self.fans)}, not pwm{number}")
-        return self.fans[number - 1].duty
+        return self._fan(number, "pwm").duty
+
+    def _fan(self, number: int, role: str) -> FanStatus:
+        count = len(self.fans)
+        if not 1 <= number <= count:
+            raise IndexError(f"{self.kind} has {role}1..{role}{count}, not {role}{number}")
+        return self.fans[number - 1]
 
 
 def _check_report(data: bytes | bytearray, report_id: int, size: int, what: str) -> None:
@@ -344,11 +442,11 @@ def _temperature(data: bytes | bytearray, offset: int) -> float | None:
 def decode_status(kind: DeviceKind, data: bytes | bytearray) -> StatusReport:
     """Decodes one status report; :class:`ReportError` for a wrong id or length."""
     _check_report(data, STATUS_REPORT_ID, kind.status_size, f"{kind.name} status report")
-    temps = tuple(
-        _temperature(data, offset + 2 * i)
-        for offset, count in kind.temp_blocks
-        for i in range(count)
-    )
+    temps = {
+        f"{group.prefix}{i + 1}": _temperature(data, group.offset + 2 * i)
+        for group in kind.temp_groups
+        for i in range(group.count)
+    }
     layout = kind.fan_layout
     fans = tuple(
         FanStatus(
@@ -459,6 +557,14 @@ class ChannelState:
     on_duty: bool
     #: aquaero: PWM or DC voltage (``None`` on the Quadro, whose mode field is unknown).
     mode: OutputMode | None = None
+    #: An aquaero aquabus output (5-8), whose mode word is not interpreted.
+    aquabus: bool = False
+
+    @property
+    def unconfigured(self) -> bool:
+        """An aquaero block with source ``0xFFFF`` and mode word 0 (seen on block 8 with
+        a Quadro on aquabus); writing it like the others is not verified."""
+        return self.source == SOURCE_UNCONFIGURED and self.mode is not None and self.mode.raw == 0
 
 
 def control_duty(kind: DeviceKind, data: bytes | bytearray, k: int) -> int:
@@ -479,6 +585,7 @@ def channel_state(kind: DeviceKind, data: bytes | bytearray, k: int) -> ChannelS
         max_power=field(channel.max_power),
         on_duty=all(_u16(data, offset) == value for offset, value in channel.pinned()),
         mode=output_mode(kind, data, k),
+        aquabus=channel.aquabus,
     )
 
 
