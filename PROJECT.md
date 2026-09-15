@@ -3975,9 +3975,12 @@ Owner decision (2026-09-15):
     over its own USB: a lost aquabus device leaves its temperatures frozen,
     not missing. In the same window byte `0x1A` of the aquaero's control
     report changed from `0x01` to `0x00` (meaning unknown). The Quadro kept
-    its own saved duties. To do: find the cause (cable, bus speed,
-    `0x1A`, the owner's menu changes) and how to recover ("Find aquabus
-    devices" in aquasuite or the device menu); treat `busN` temperatures as
+    its own saved duties. Cause: the owner unplugged the Quadro from aquabus
+    because the aquaero's menu misbehaved while it was connected. More than
+    an hour later `bus2` still read 24.12 °C. To do: find out why the menu
+    misbehaves with the Quadro on aquabus (firmware versions, bus speed,
+    address) and whether the Quadro stays on aquabus or on its own USB;
+    what `0x1A` means; treat `busN` temperatures as
     missing while the device behind them is absent (for the Quadro: its fan
     slots 5–8 read `0xFFFF`), or refuse to bind them without such a check;
     once the link is back, repeat the adapter's live write to outputs 5–8 on
