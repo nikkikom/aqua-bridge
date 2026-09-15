@@ -436,6 +436,26 @@ USB ports, the DKMS module removed (§8 item 82), run as a non-root user in
   reports were byte-identical before and after, the Quadro's power-cycle
   count went from 12 to 13 and the aquaero's u32 at status `0x11` restarted
   (39478 to 32). Control-report writes are stored in non-volatile memory.
+- **Quadro on aquabus (§8 items 32, 34).** With the Quadro on the aquaero's
+  aquabus high-speed port (its USB still connected), the Quadro ignored its
+  own fan settings: all four outputs ran at 100 % although its control
+  report held 9.02 % on output 3. The aquaero's status report gained the
+  Quadro's data, matching what the Quadro reports over its own USB:
+
+  | Quadro | aquaero status report | Value |
+  |---|---|---|
+  | sensor 2 | temperature slot 10 (`0x77`) | 24.04 °C (Quadro: 24.03 °C) |
+  | outputs 1–4 | fan blocks 5–8 (`0x197`, `0x1A3`, `0x1AF`, `0x1BB`), same layout as fans 1–4 | output 3: 1107 rpm, 100 %, 12.10 V, 20 mA |
+  | flow | third flow slot (`0xFD`) | 0 |
+
+  Before the aquabus connection these slots read `0x7FFF` (temperatures and
+  flow) and rpm `0xFFFF` (fans). The aquaero's control report has blocks
+  for fans 5–8 at `0x25C + 20k` and presets beyond 4. Writing aquaero fan 7
+  like outputs 1–4 (preset 7 at `0x568` = 902, block `0x284`: min 0, max
+  10000, source `0x62`; one SET plus the secondary report) changed only
+  those five bytes, and the Quadro's output 3 followed: status duty 9.02 %
+  on both devices at once, 1109 rpm down to 120–136 rpm, steady for a
+  minute. The Quadro's PWM is writable through the aquaero.
 
 ---
 
@@ -3542,6 +3562,22 @@ Owner decision (2026-09-15):
     `rich` sim with the write-limiting defaults, add a limit or quantisation
     for rises if needed without delaying cooling beyond a stated bound, and
     set the defaults from that. **Blocks item 42.**
+85. Adapter support for devices on the aquaero's aquabus (item 32). With the
+    Quadro on aquabus the aquaero's reports carry it, and the Quadro
+    ignores its own fan settings: a duty written over the Quadro's USB has
+    no effect. Extend `hw/aquacomputer.py` and the adapter: aquaero fans 5–8
+    (status blocks `0x197 + 12k`, control blocks `0x25C + 20k`, presets 5–8
+    at `0x55C + 2k` with preset id `0x5C + k`, same writes as outputs 1–4),
+    temperature slots 9–16 at `0x75`, the third flow slot at `0xFD`.
+    Renumber the aquaero's `fanN` inputs so aquabus fans do not collide with
+    the flow sensors (today `fan5`/`fan6` are flow). Decide how the config
+    names aquabus devices under the aquaero entry. Detect a Quadro that is on
+    aquabus (its status duty ignores its control report; the aquaero's fans
+    5–8 report an rpm other than `0xFFFF`) and refuse a config that commands
+    it over its own USB. The mode word at block `+0x0E` reads `0x0500` on
+    fans 5–7 (low byte 0, not interpreted) and block 8 is unconfigured
+    (source `0xFFFF`); check both before writing. Tests with captured
+    reports. **Blocks item 42** for a Quadro on aquabus.
 83. Publish the adapter's device health: `AquacomputerAdapter.stuck_channels`
     (outputs that keep reporting another duty after a rewrite, item 81) and
     the aquaero outputs not in PWM mode are only logged today. Put them in
@@ -3551,8 +3587,9 @@ Owner decision (2026-09-15):
 
 31. USB host: `dtoverlay=dwc2,dr_mode=host` (`deploy/host-usb.sh`), powered
     hub.
-32. Spike: is the Quadro's PWM writable through the XT6? If not, the Quadro
-    goes on its own USB port (`--source composite`).
+32. **Done** (2026-09-15): yes, the Quadro's PWM is writable through the
+    aquaero over aquabus (§2 "Quadro on aquabus"). The Quadro stays on
+    aquabus; the adapter does not support that yet (item 85).
 33. Spike: does the XT6 revert after the Pi stops writing? If not, software
     sensor plus firmware timeout (§2); then decide whether `release()` runs
     at exit. Written duties survive a power cycle of the controllers (item
@@ -3561,6 +3598,10 @@ Owner decision (2026-09-15):
     Item 84 looks at the software-sensor path.
 34. Spike: which Quadro temperature inputs carry a reading in its status
     report (`tools/aquacomputer_probe.py`); bind them in its `temp_map`.
+    Over aquabus the Quadro's sensors 1–4 appear in the aquaero's
+    temperature slots 9–12 (§2 "Quadro on aquabus"); with one thermistor on
+    sensor 2 only slot 10 read. Which inputs will be used is decided when
+    the sensors are wired; binding them needs item 85.
 35. Confirm the HID report layout of `hw/aquacomputer.py` on the real
     devices in their final wiring (the Quadro on aquabus or on its own
     USB port, every fan and sensor connected): the status report fields
