@@ -128,7 +128,9 @@ hardware.
    adapter (`hwmon:`, `xt6.hwmon_name`) exits 2 with a message naming
    the replacement keys, and so does an input name of the hwmon
    driver's numbering that now means another input (aquaero `temp9..20`,
-   Quadro `temp5..20`, flow as `fanN`), naming the new one.
+   Quadro `temp5..20` and its flow sensor `fan5`), naming the new one.
+   The aquaero's hwmon `fan5`/`fan6` were flow sensors and are now the
+   tachometers of a Quadro on its aquabus; flow sensors cannot be bound.
    Always pass `--config /etc/aqua-bridge/config.yaml` explicitly.
    Without `--das` at step 5, install the DAS example by hand instead:
    `sudo install -m 640 -o root -g <user> config.example-das.yaml

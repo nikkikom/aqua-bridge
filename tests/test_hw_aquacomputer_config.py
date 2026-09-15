@@ -282,20 +282,18 @@ def test_every_input_name_of_both_kinds_is_accepted() -> None:
             "quadro",
             "rpm",
             "fan5",
-            r"'fan5' was the hwmon driver's name of the quadro's flow sensor flow1",
+            r"'fan5' was the hwmon driver's name of the quadro's flow sensor flow1, which is "
+            r"not a tachometer \(quadro: fan1..fan4\); flow sensors cannot be bound in the "
+            r"config \(PROJECT.md section 8 item 91\)",
         ),
         (
             "aquaero",
             "rpm",
-            "fan5",
-            r"'fan5' was the hwmon driver's name of the aquaero's flow sensor flow1",
+            "flow1",
+            r"aquaero's tachometers fan1..fan8, got 'flow1'; 'flow1' is a flow sensor, and flow "
+            r"sensors cannot be bound in the config \(PROJECT.md section 8 item 91\)",
         ),
-        (
-            "aquaero",
-            "rpm",
-            "fan6",
-            r"flow sensor flow2, which is not a tachometer; fanN is the tachometer of output pwmN",
-        ),
+        ("quadro", "temp", "flow1", r"got 'flow1'; 'flow1' is a flow sensor"),
     ],
 )
 def test_hwmon_era_input_names_are_rejected_with_the_new_name(
@@ -312,14 +310,23 @@ def test_hwmon_era_input_names_are_rejected_with_the_new_name(
         _parse(section)
 
 
-def test_aquaero_fan5_and_fan6_are_the_aquabus_tachometers_of_their_own_outputs() -> None:
+def test_any_aquaero_tachometer_may_be_bound_to_any_output() -> None:
+    """Review finding: fan5/fan6 were the hwmon driver's flow sensors, but on the aquaero
+    they are aquabus tachometers now, so they are accepted with any output, like fan7."""
     binding = _parse(
         dict(
             _SECTION,
-            fans={"a": {"pwm": "pwm5", "rpm": "fan5"}, "b": {"pwm": "pwm6", "rpm": "fan6"}},
+            fans={
+                "a": {"pwm": "pwm5", "rpm": "fan5"},
+                "b": {"pwm": "pwm6", "rpm": "fan6"},
+                "c": {"pwm": "pwm1", "rpm": "fan7"},
+                "d": {"pwm": "pwm2", "rpm": "fan8"},
+            },
         )
     )
-    assert binding.fan_map == {"a": 5, "b": 6}
+    assert binding.fan_map == {"a": 5, "b": 6, "c": 7, "d": 8}
+    binding = _parse(dict(_SECTION, fans={"a": {"pwm": "pwm6", "rpm": "fan5"}}))
+    assert (binding.pwm_map, binding.fan_map) == ({"a": 6}, {"a": 5})
 
 
 @pytest.mark.parametrize(

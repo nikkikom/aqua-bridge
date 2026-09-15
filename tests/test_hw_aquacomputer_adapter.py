@@ -1122,41 +1122,63 @@ def test_aquabus_modes_get_no_warning_and_the_unconfigured_block_is_reported_onc
     assert state.mode is not None and state.mode.raw == 0  # the mode is never written
 
 
-def test_an_output_without_a_device_on_aquabus_is_not_reported_as_working() -> None:
+def test_an_output_without_a_device_on_aquabus_fails_the_read_not_the_write(caplog) -> None:
     """Nothing on aquabus: fan blocks 5-8 read rpm 0xFFFF. read() raises naming the
-    channel; apply() still writes every channel (the aquaero's own outputs must get a
-    fallback) but raises too."""
+    channel, lists it in absent_channels and logs one error; apply() writes every
+    channel and does not raise (an apply() that raised after its write would freeze the
+    loop's fallback ramp, PROJECT.md section 8 item 90)."""
     binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1, "qd1": 5}, fan_map={"qd1": 5})
     adapter, device, _bus, clock, _ = _setup(binding)  # the plain aquaero fixture
-    with pytest.raises(DeviceUnavailable, match=r"pwm5 \(qd1\), fan5 \(qd1\).*0xFFFF"):
-        adapter.read()
-    with pytest.raises(DeviceUnavailable, match=r"pwm5 \(qd1\).*not applied"):
-        adapter.apply(_fault(Mode.FALLBACK, xt1=0.8, qd1=0.8))
-    assert len(device.sets()) == 1
-    assert channel_holds(AQUAERO, device.ctrl, 0, 10000)  # never below what it held
-    assert channel_holds(AQUAERO, device.ctrl, 4, 8861)  # the empty slot's reported duty
-    # No duty evidence from an empty slot: no mismatch rewrite, no stuck channel.
-    for _ in range(5):
-        clock.advance(AQUAERO_T.duty_mismatch_s)
-        device.emit()
-        with pytest.raises(DeviceUnavailable):
+    assert adapter.absent_channels == ()
+    with caplog.at_level("INFO", logger=LOGGER):
+        with pytest.raises(DeviceUnavailable, match=r"pwm5 \(qd1\), fan5 \(qd1\).*0xFFFF"):
             adapter.read()
-    assert adapter.control_report is not None and adapter.stuck_channels == ()
-    # The Quadro is plugged into aquabus: reads work again.
-    device.status_template = fixture_bytes("aquaero-status-aquabus-fan7-100.bin")
-    device.emit()
-    obs = adapter.read()
-    assert obs.rpm == {"qd1": 0.0} and obs.pwm["qd1"] == pytest.approx(0.8861)
-    adapter.apply(_cmd(xt1=0.8, qd1=0.8))
+        assert adapter.absent_channels == ("qd1",)
+        adapter.apply(_fault(Mode.FALLBACK, xt1=0.8, qd1=0.8))
+        assert len(device.sets()) == 1
+        assert channel_holds(AQUAERO, device.ctrl, 0, 10000)  # never below what it held
+        assert channel_holds(AQUAERO, device.ctrl, 4, 8861)  # the empty slot's reported duty
+        adapter.apply(_cmd(xt1=0.8, qd1=0.3))  # AUTO: written as commanded
+        assert channel_holds(AQUAERO, device.ctrl, 4, 3000)
+        # No duty evidence from an empty slot: no mismatch rewrite, no stuck channel.
+        for _ in range(5):
+            clock.advance(AQUAERO_T.duty_mismatch_s)
+            device.emit()
+            with pytest.raises(DeviceUnavailable):
+                adapter.read()
+        assert adapter.control_report is not None and adapter.stuck_channels == ()
+        # The Quadro is plugged into aquabus: reads work again.
+        device.status_template = fixture_bytes("aquaero-status-aquabus-fan7-100.bin")
+        device.emit()
+        obs = adapter.read()
+    assert obs.rpm == {"qd1": 0.0} and obs.pwm["qd1"] == pytest.approx(0.3)
+    assert adapter.absent_channels == ()
+    (error,) = _messages(caplog, "ERROR")
+    assert error.startswith("aquaero: no device behind pwm5 (qd1), fan5 (qd1)")
+    assert [m for m in _messages(caplog, "INFO") if "again" in m] == [
+        "aquaero: a device is behind pwm5 (qd1), fan5 (qd1) again"
+    ]
 
 
-def test_a_bound_tachometer_without_a_device_fails_the_read_only() -> None:
+def test_a_bound_aquabus_tachometer_without_a_device_fails_the_read_only() -> None:
     binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1}, fan_map={"xt1": 7})
     adapter, device, _bus, _clock, _ = _setup(binding)
     with pytest.raises(DeviceUnavailable, match=r"fan7 \(xt1\)"):
         adapter.read()
+    assert adapter.absent_channels == ("xt1",)
     adapter.apply(_cmd(xt1=0.5))  # the output itself is the aquaero's own
     assert len(device.sets()) == 1
+
+
+def test_rpm_0xffff_on_the_aquaeros_own_outputs_is_no_absent_device() -> None:
+    """Only the aquabus slots 5-8 can be empty; the check never covers outputs 1-4."""
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1}, fan_map={"xt1": 1})
+    status = bytearray(fixture_bytes("aquaero-status-aquabus-fan7-100.bin"))
+    speed = AQUAERO.fan_blocks[0] + AQUAERO.fan_layout.speed
+    status[speed : speed + 2] = b"\xff\xff"
+    adapter, _device, _bus, _clock, _ = _setup(binding, status_template=bytes(status))
+    assert adapter.read().rpm == {"xt1": 65535.0}
+    assert adapter.absent_channels == ()
 
 
 def test_apply_before_any_status_report_cannot_know_about_aquabus() -> None:
