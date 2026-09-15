@@ -456,6 +456,15 @@ USB ports, the DKMS module removed (§8 item 82), run as a non-root user in
   those five bytes, and the Quadro's output 3 followed: status duty 9.02 %
   on both devices at once, 1109 rpm down to 120–136 rpm, steady for a
   minute. The Quadro's PWM is writable through the aquaero.
+- **Apply without saving (§8 item 84).** A SET of the aquaero's control
+  report with preset 1 changed from 25 % to 30 %, **without** report 6,
+  took effect in the next status report (duty 30 %, fan 1 speeding up) and
+  read back as 30 %. After a power cycle of the controllers (aquaero
+  uptime counter at 176 s) the control report was byte-identical to the
+  copy saved before the change, preset 1 at 25 % again. Software sensor 1
+  (report `0x07`) took 33.33 °C in the next status report (slot `0x85`),
+  held it for its 300 s timeout and fell back to 40.00 °C; the control
+  report did not change.
 
 ---
 
@@ -3547,21 +3556,50 @@ Owner decision (2026-09-15):
     against the fitted fan curve (`fan_models`, `tools/fit_fans.py`), a
     sagging rail voltage, output current or power out of line with the
     duty.
-84. Fan control without wearing the controllers' memory (item 77). Every
-    SET is stored in non-volatile memory, and rises are written at once, so
-    even with write limiting the write count follows how often the
-    controller raises a duty. Endurance of the memory is unknown. Look for a
-    path that does not write the configuration each tick: the aquaero's
-    software sensors or the Quadro's virtual sensors fed by the daemon,
-    with a firmware controller on each output that maps that sensor onto
-    the duty. Find the HID report that sets those sensors, whether a
-    sensor write is stored in non-volatile memory (repeat the item 77
-    power-cycle test), and whether the firmware has a sensor timeout that
-    falls back to a safe duty (that would also answer item 33 with a
-    hardware watchdog). If no such path exists: count SETs per day on the
-    `rich` sim with the write-limiting defaults, add a limit or quantisation
-    for rises if needed without delaying cooling beyond a stated bound, and
-    set the defaults from that. **Blocks item 42.**
+84. Fan control without wearing the controllers' memory (item 77).
+    Checked on the Pi (2026-09-15, §2 "Apply without saving"):
+    - A control report SET **without** the short report 6 that follows it
+      (`06 00 02 00 00 00 00`, the adapter's "secondary report") takes
+      effect at once and does **not** survive a power cycle: the controller
+      comes back with the configuration saved before. Report 6 saves. The
+      same pattern is documented for the Farbwerk 360, whose save report is
+      byte-identical to the Quadro's secondary report; for the Quadro this
+      is not verified. Whether a SET without the save still writes the
+      memory cannot be observed; nothing persisted.
+    - The aquaero's eight software temperature sensors are set by HID
+      output report `0x07` (16 bytes: eight u16 big-endian values in
+      1/100 °C, `0x7FFF` for no data; as in aerotools-ng). Their settings
+      sit in the control report from `0x177`, 5 bytes each: enabled (1
+      byte), fallback temperature (u16, 1/100 °C), timeout (u16, s). They
+      show in the status report at `0x85 + 2i`, the slots `hw/aquacomputer.py`
+      calls virtual sensors 1–8. A value written once to the enabled sensor
+      1 appeared in the next status report, held for exactly its 300 s
+      timeout and then fell back to 40.00 °C. The write did not change the
+      control report. A disabled sensor shows no value.
+    - The aquaero has only four curve controllers (manual §12.1), so mapping
+      software sensors onto duties covers at most four independent outputs,
+      not the eight of an aquaero plus a Quadro.
+    Plan to verify next: duties go live into the presets without the save
+    report (32 presets); one software sensor is a heartbeat written every
+    tick with a short timeout and a high fallback; an aquaero alarm on that
+    sensor switches to a saved safe profile (manual §18: alarm actions
+    include profile selection), which also answers item 33; the saved
+    configuration itself is the safe state after a power loss. Open: does a
+    profile switch override live presets, also for the Quadro's outputs on
+    aquabus; what happens when the alarm clears; does a live write through
+    the aquaero to an aquabus fan behave the same. The adapter change is
+    item 86. **Blocks item 42.**
+86. The adapter sends the save report (the "secondary report") after every
+    SET, so every write that changes a duty is saved to the controller's
+    memory (items 77, 84). Stop saving on normal writes; save only on an
+    explicit, rare operation (commissioning the safe configuration).
+    Revisit what write limiting (`write_min_interval_s`, `write_deadband`)
+    is still for, what `release()` restores (the saved configuration is
+    what a power cycle restores anyway), and the budget and retry logic
+    that treats SET plus secondary report as one write. Rename the status
+    slots at `0x85` to software sensors 1–8 (and the `0x95` slots to the
+    four virtual sensors) in `hw/aquacomputer.py`, the probe and the docs.
+    Tests with captured reports. **Blocks item 42.**
 85. Adapter support for devices on the aquaero's aquabus (item 32). With the
     Quadro on aquabus the aquaero's reports carry it, and the Quadro
     ignores its own fan settings: a duty written over the Quadro's USB has
@@ -3676,9 +3714,11 @@ Owner decision (2026-09-15):
     decoded). Both control reports read back byte-identical to the copies
     taken just before, and the fans came back at the written duties (aquaero
     outputs 1, 2, 4 at 25 %, 14.12 %, 25 % on their presets, output 4 still in
-    PWM mode; Quadro output 3 at 9.02 %). So every SET wears the controller's
-    memory, and the write limiting of §3 Track B is required, not
-    provisional; its defaults are revisited with item 84. A written duty also
+    PWM mode; Quadro output 3 at 9.02 %). Those writes were a SET followed by
+    the save report (report 6 on the aquaero); a SET without it does not
+    persist (item 84). With today's adapter, which always sends it, every
+    write is saved, so the write limiting of §3 Track B is required until
+    item 86 stops saving. A written duty also
     survives a power loss: after one, the fans run at the last written duty
     until the daemon writes again (item 33). Still **blocks item 42** through
     item 84.
