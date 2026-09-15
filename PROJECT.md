@@ -431,6 +431,11 @@ USB ports, the DKMS module removed (§8 item 82), run as a non-root user in
   duty, 3.2–3.7 V and 320–970 rpm with large swings; commanded 100 % gave
   63.7 % duty, 7.77 V and 1571 rpm. Duty verification flagged it on every
   step of the minimum search, as intended.
+- **Power cycle (§8 item 77).** With 12 V and USB removed from both
+  controllers for 30 s, every written setting survived: both control
+  reports were byte-identical before and after, the Quadro's power-cycle
+  count went from 12 to 13 and the aquaero's u32 at status `0x11` restarted
+  (39478 to 32). Control-report writes are stored in non-volatile memory.
 
 ---
 
@@ -1801,7 +1806,9 @@ converges only with them.
     a retry after a failed or unfinished write rewrites every configured
     channel. A Quadro control report whose checksum does not match is a
     failed read.
-  - **Write limiting** (flash wear, §8 item 77; provisional defaults). A
+  - **Write limiting** (memory wear: every SET is stored in the
+    controller's non-volatile memory, §8 item 77; defaults revisited with
+    §8 item 84). A
     channel's duty is written at once when it **rises** above the duty the
     device holds, or when the channel does not follow a duty at all
     (an aquaero channel on a firmware controller): cooling never waits. A
@@ -1904,8 +1911,8 @@ converges only with them.
   | `ctrl_refresh_s` | 60.0 | finite, ≥ 0 | periodic control report read in `apply()`; 0 disables |
   | `duty_mismatch_tolerance` | 100 | integer 0..10000 | 1/100 %: a status duty further from the written duty is a mismatch |
   | `duty_mismatch_s` | 5.0 | finite, > 0 | a mismatch lasting longer re-reads the report and rewrites every channel |
-  | `write_min_interval_s` | 30.0 | finite, ≥ 0 | a falling duty is written at most this long after the device's last write (rises at once); provisional, §8 item 77 |
-  | `write_deadband` | 50 | integer 0..10000 | 1/100 %: a falling duty is written only this far below the written one; provisional, §8 item 77 |
+  | `write_min_interval_s` | 30.0 | finite, ≥ 0 | a falling duty is written at most this long after the device's last write (rises at once); §8 items 77, 84 |
+  | `write_deadband` | 50 | integer 0..10000 | 1/100 %: a falling duty is written only this far below the written one; §8 items 77, 84 |
 
   The defaults live once, in `AquacomputerTiming`, and the one that
   depends on the device kind (`ctrl_gap_ms`, owner decision 2026-09-15)
@@ -3520,6 +3527,21 @@ Owner decision (2026-09-15):
     against the fitted fan curve (`fan_models`, `tools/fit_fans.py`), a
     sagging rail voltage, output current or power out of line with the
     duty.
+84. Fan control without wearing the controllers' memory (item 77). Every
+    SET is stored in non-volatile memory, and rises are written at once, so
+    even with write limiting the write count follows how often the
+    controller raises a duty. Endurance of the memory is unknown. Look for a
+    path that does not write the configuration each tick: the aquaero's
+    software sensors or the Quadro's virtual sensors fed by the daemon,
+    with a firmware controller on each output that maps that sensor onto
+    the duty. Find the HID report that sets those sensors, whether a
+    sensor write is stored in non-volatile memory (repeat the item 77
+    power-cycle test), and whether the firmware has a sensor timeout that
+    falls back to a safe duty (that would also answer item 33 with a
+    hardware watchdog). If no such path exists: count SETs per day on the
+    `rich` sim with the write-limiting defaults, add a limit or quantisation
+    for rises if needed without delaying cooling beyond a stated bound, and
+    set the defaults from that. **Blocks item 42.**
 83. Publish the adapter's device health: `AquacomputerAdapter.stuck_channels`
     (outputs that keep reporting another duty after a rewrite, item 81) and
     the aquaero outputs not in PWM mode are only logged today. Put them in
@@ -3533,7 +3555,10 @@ Owner decision (2026-09-15):
     goes on its own USB port (`--source composite`).
 33. Spike: does the XT6 revert after the Pi stops writing? If not, software
     sensor plus firmware timeout (§2); then decide whether `release()` runs
-    at exit.
+    at exit. Written duties survive a power cycle of the controllers (item
+    77), so without such a fallback a Pi that stops writing leaves the fans
+    at the last written duty, possibly low, until the daemon runs again.
+    Item 84 looks at the software-sensor path.
 34. Spike: which Quadro temperature inputs carry a reading in its status
     report (`tools/aquacomputer_probe.py`); bind them in its `temp_map`.
 35. Confirm the HID report layout of `hw/aquacomputer.py` on the real
@@ -3602,17 +3627,20 @@ Owner decision (2026-09-15):
     run's presets, not the firmware controllers, so a restore at exit also
     needs the capture kept across restarts (for example in the state
     directory).
-77. Find out whether a control-report write is stored in the aquaero's or
-    the Quadro's non-volatile memory: write a duty, power-cycle the
-    controller (owner), read the control report back. Upstream commit
-    56b930dc says the device needs its delay to "process the request and
-    save the data to memory"; a SET nearly every tick would be up to 17 280
-    writes a day per controller. Until this is answered the adapter limits
-    writes (§3 Track B): a rise goes out at once, a fall only when it is at
-    least `write_deadband` (50, i.e. 0.5 %) below the written duty and
-    `write_min_interval_s` (30 s) after the device's last write. **These
-    defaults are provisional** until the power-cycle test answers this item.
-    **Blocks item 42.**
+77. **Done** (2026-09-15): control-report writes are stored in
+    non-volatile memory on both controllers. The owner removed 12 V and USB
+    from both for 30 s. The Quadro's power-cycle count went from 12 to 13,
+    and the aquaero status report's u32 at `0x11` went from 39478 to 32 (it
+    restarts at power-on; likely seconds since power-on, not otherwise
+    decoded). Both control reports read back byte-identical to the copies
+    taken just before, and the fans came back at the written duties (aquaero
+    outputs 1, 2, 4 at 25 %, 14.12 %, 25 % on their presets, output 4 still in
+    PWM mode; Quadro output 3 at 9.02 %). So every SET wears the controller's
+    memory, and the write limiting of §3 Track B is required, not
+    provisional; its defaults are revisited with item 84. A written duty also
+    survives a power loss: after one, the fans run at the last written duty
+    until the daemon writes again (item 33). Still **blocks item 42** through
+    item 84.
 78. Send the driver fix in `deploy/dkms/aquacomputer_d5next/` upstream
     (linux-hwmon), then drop the patch once a Raspberry Pi OS kernel
     carries it. Only relevant if the DKMS driver path is revived: the
