@@ -135,8 +135,10 @@ measure it.
   tachometers `fan5..fan8`, its sensors 1–4 the aquaero's aquabus slots
   `bus1..bus4` (§3 Track B, §8 item 85). On its own USB port (`f00d`)
   instead, it is a second hidraw device and the config lists both under
-  `aquacomputer:`; a config that commands it both ways is refused, because
-  a Quadro on aquabus ignores writes over its USB. How many Quadro
+  `aquacomputer:`; a config that commands aquaero `pwm5..pwm8` and a quadro
+  entry without `serial:` is refused, because a Quadro on aquabus ignores
+  writes over its USB (a quadro entry with a serial is taken as a second
+  Quadro on its own USB port, with a warning). How many Quadro
   temperature inputs are usable is known only once it is connected;
   `config.example-das.yaml` binds none of them.
 - The daemon reads and writes both controllers through **hidraw**
@@ -1852,11 +1854,15 @@ converges only with them.
     first status report carrying another serial closes the device and
     raises, naming both; `apply()` then raises too, without opening the
     node, until a status report carries the configured serial (a device
-    that is merely silent is not affected). A configured output or bound
-    tachometer whose fan block reads rpm `0xFFFF` has no device behind it
-    (an aquaero output 5–8 with nothing on its aquabus): `read()` raises
-    `DeviceUnavailable` naming the channel (the loop's fallback runs), and
-    such a slot is no evidence for duty verification. `ts` comes from the
+    that is merely silent is not affected). A configured aquabus output or
+    bound aquabus tachometer (aquaero 5–8) whose fan block reads rpm
+    `0xFFFF` has no device behind it (nothing on the aquaero's aquabus):
+    `read()` raises `DeviceUnavailable` naming the channel (the loop's
+    fallback runs), `absent_channels` lists it, one error is logged when
+    that list changes (and an info line when it empties), and such a slot is
+    no evidence for duty verification. The check uses the newest status
+    report alone, with no confirmation over time (§8 item 90); the aquaero's
+    own outputs 1–4 are never checked. `ts` comes from the
     injected monotonic clock. `last_status` keeps the newest decoded
     report for tools and diagnostics; voltage, current and power are not in
     the observation (§8 item 79).
@@ -1882,10 +1888,14 @@ converges only with them.
     as written only when the SET succeeded; after a failed SET, or a budget
     spent before it, the next write sends every configured channel (a
     failed SET may or may not have reached the device). A Quadro control
-    report whose checksum does not match is a failed read. A configured
-    output with no device behind it in this open's newest status report is
-    written with the others (the aquaero's own outputs still get the
-    fallback), then `apply()` raises `DeviceUnavailable` naming it.
+    report whose checksum does not match is a failed read. An aquabus output
+    with no device behind it is written with the others and `apply()` does
+    not raise for it: `read()` already raises, which runs the fallback, and
+    the loop rate limits the fallback ramp against the last command whose
+    `apply()` succeeded, so an `apply()` that raised after its SET went out
+    would keep every fan of the composite below `fallback_pwm` while the
+    slot stays empty (and would hold back `READY=1` and report the stop
+    write as failed).
   - **Write limiting**, off by default. It was introduced against memory
     wear while every SET was followed by the save report and so stored in
     the controller's non-volatile memory (§8 item 77). A SET without the
@@ -2034,9 +2044,13 @@ converges only with them.
   `temp1..4`, `soft1..16`), and two names on one input are rejected. A
   name of the hwmon driver's numbering that means another input now is
   rejected with the new name: aquaero `temp9..16` (`soft1..8`) and
-  `temp17..20` (`virt1..4`), Quadro `temp5..20` (`soft1..16`), and the flow
-  sensors `fan5`/`fan6` (aquaero, unless paired with their own output
-  `pwm5`/`pwm6`) and `fan5` (Quadro), which are not tachometers.
+  `temp17..20` (`virt1..4`), Quadro `temp5..20` (`soft1..16`), and the
+  Quadro's flow sensor `fan5`, which is not a tachometer. Any tachometer
+  may be bound to any output; the aquaero's hwmon `fan5`/`fan6` were its
+  flow sensors and are its aquabus tachometers now, so an old config that
+  bound flow as `rpm` fails its reads with "no device behind fan5" unless a
+  Quadro is on aquabus. Flow sensors (`flowN`) cannot be bound anywhere in
+  the config; naming one gets that hint (§8 item 91).
   Unknown keys are rejected too, so a misspelt timing key cannot fall
   back to its default silently; `xt6.prefer` is accepted and ignored.
   Keys of the hwmon era are rejected with a hint: `hwmon_name` (use
@@ -2084,9 +2098,14 @@ converges only with them.
   and two entries of one kind need distinct serials (both would otherwise
   open and command the same controller), or the daemon exits 2 before the
   loop starts. So does a config that commands aquaero outputs `pwm5..pwm8`
-  and Quadro outputs over a Quadro's own USB: a Quadro on aquabus ignores
-  writes over its USB, so one of the two would do nothing (a Quadro entry
-  with `fans: {}` that only reads sensors is allowed). At runtime a Quadro
+  together with a quadro entry that commands outputs and has no `serial:`:
+  that entry opens whichever Quadro is attached, possibly the one on
+  aquabus, which ignores writes over its USB (a quadro entry with
+  `fans: {}` that only reads sensors is allowed). Which Quadro sits on
+  aquabus cannot be read before the devices are opened, so a commanding
+  quadro entry with a serial is accepted as a second Quadro on its own USB
+  port and logged as a warning; if it is the one on aquabus after all, its
+  channels are found stuck with the explanation below. At runtime a Quadro
   channel found stuck, next to an aquaero whose status report shows a device
   on its aquabus, is logged with that explanation: the Quadro is probably
   on aquabus and must be commanded through the aquaero. A config that
@@ -2763,8 +2782,9 @@ the board.
   hint, the aquaero output mode warning (none for aquabus outputs, one per
   adapter for an unconfigured block), aquabus outputs 5–8 (read, the output
   7 write with the hardware's bytes, all eight in one SET, an output or
-  tachometer with no device behind it failing `read()` and `apply()` after
-  the write, no duty evidence from an empty slot), a Quadro power cycle,
+  tachometer with no device behind it failing `read()` but not `apply()`,
+  `absent_channels` and its one error, rpm `0xFFFF` on an own output not
+  treated as absent, no duty evidence from an empty slot), a Quadro power cycle,
   the periodic refresh
   and `ctrl_refresh_s: 0`, `release()` restoring the captured bytes,
   rejected NaN / out-of-range / missing channel with nothing sent. The live device test is `pytest.mark.hardware`
@@ -2781,7 +2801,8 @@ the board.
   the DAS example's `dt` and step bound, and with the aquaero and a Quadro
   on its own USB port), every input name of both kinds, the hints for
   `hwmon_name`, `root`, `name`, `map` and `fan_map` and for the hwmon
-  driver's input numbering, write limiting off by default.
+  driver's input numbering, the flow sensor hint, any aquaero tachometer on
+  any output, write limiting off by default.
 - `tests/test_hw_sources.py` — `CompositeSource` over two fake
   controllers and a fake 1-Wire source: merged reads, each channel
   written to its own device with one SET each, a failing device (first or
@@ -2789,8 +2810,11 @@ the board.
   written, naming all failed devices, `xt6:` plus an `aquacomputer:` list, timing keys per
   device, distinct serials for one kind, every name bound exactly once
   (exit 2 otherwise), aquaero `pwm5..pwm8` together with a commanding Quadro
-  entry refused (a sensors-only Quadro entry allowed), the stuck Quadro
-  hint only next to an aquaero reporting an aquabus device, a missing ROM
+  entry without a serial refused (a sensors-only Quadro entry allowed, one
+  with a serial accepted with a warning), the stuck Quadro hint only next to
+  an aquaero reporting an aquabus device, the loop over an aquaero whose
+  aquabus slot empties (the fallback ramp reaches `fallback_pwm`, the stop
+  write succeeds) and a start with an empty slot sending `READY=1`, a missing ROM
   at start does not block, `inputs["smart"]` only with an inbox.
 - `tests/test_hw_imports.py` — `hw/` never imports `control`, and
   `hw/aquacomputer.py` imports no I/O module.
@@ -3732,39 +3756,60 @@ Owner decision (2026-09-15):
     temperature slots `bus1..bus8` (`0x75`) and `flow1..flow3`. Config names
     are by group (aquaero `tempN`, `busN`, `softN`, `virtN`; Quadro
     `temp1..4`, `soft1..16`; `fanN`, `flowN`, `pwmN`), and a name of the hwmon
-    driver's numbering that means another input now (aquaero `temp9..20`
-    and the flow sensors `fan5`/`fan6`, Quadro `temp5..20` and `fan5`) is
-    rejected with the new name (§3 Track B). A configured output or tachometer whose
-    fan block reads rpm `0xFFFF` (nothing on aquabus) fails `read()` and,
-    after the write, `apply()`, naming the channel. A config that commands
-    `pwm5..pwm8` and Quadro outputs over a Quadro's own USB is refused at
-    startup; a stuck Quadro channel next to an aquaero that reports an
-    aquabus device is logged as probably on aquabus, to be commanded through
-    the aquaero. Aquabus blocks (mode word `0x0500`) get no "not PWM"
-    warning; the unconfigured block 8 (source `0xFFFF`, mode 0) is written
-    the same way with one warning that this is unverified (item 89).
-    `config.example-das.yaml` commands the Quadro through the aquaero. Tests
-    with captures with and without the Quadro on aquabus (§4.7). Follow-ups:
-    items 89, 90.
+    driver's numbering that means another input now (aquaero `temp9..20`,
+    Quadro `temp5..20` and its flow sensor `fan5`) is rejected with the new
+    name (§3 Track B); flow sensors cannot be bound (item 91). A configured
+    aquabus output or tachometer whose fan block reads rpm `0xFFFF` (nothing
+    on aquabus) fails `read()` naming the channel and is listed in
+    `absent_channels`; `apply()` writes it and does not raise, so the
+    fallback ramp is not held back (item 90). A config that commands
+    `pwm5..pwm8` and the outputs of a quadro entry without `serial:` is
+    refused at startup (one with a serial is accepted with a warning, as a
+    second Quadro on its own USB port); a stuck Quadro channel next to an
+    aquaero that reports an aquabus device is logged as probably on aquabus,
+    to be commanded through the aquaero. Aquabus blocks (mode word `0x0500`)
+    get no "not PWM" warning; the unconfigured block 8 (source `0xFFFF`,
+    mode 0) is written the same way with one warning that this is unverified
+    (item 89). `config.example-das.yaml` commands the Quadro through the
+    aquaero. Tests with captures with and without the Quadro on aquabus
+    (§4.7). Follow-ups: items 89, 90, 91.
 88. A commissioning command for the saved configuration (item 84): a tool
     that opens one controller, shows what its control report holds and,
     after a confirmation, calls `AquacomputerAdapter.save()` once, refusing
     while the `aqua-bridge` service is active. On the hardware: confirm that
     the Quadro's save report (identical to the Farbwerk 360's) persists a
     configuration over a power cycle, as report 6 does on the aquaero.
-90. An aquaero output or tachometer bound in the config with nothing on
-    aquabus (or a Quadro that drops off aquabus) makes every `read()` and
-    `apply()` of that controller raise, so the whole composite runs in the
-    fallback and the journal gets a read and an apply failure every tick.
-    That is the safe direction, but it also blinds the aquaero's own
-    thermistors. Decide whether a missing aquabus device should fault only
-    its channels (for example `None` rpm and duty for them, if the contract
-    and the gate allow it), and publish it with item 83.
+90. An aquaero aquabus output or tachometer bound in the config with
+    nothing on aquabus (or a Quadro that drops off aquabus) makes every
+    `read()` of that controller raise, so the whole composite runs in the
+    fallback (fans ramp to `fallback_pwm`) and the journal gets a read
+    failure every tick plus one adapter error when the slot empties. It also
+    blinds the aquaero's own thermistors and every other sensor of the
+    composite for as long as the slot stays empty. `apply()` does not raise
+    for it: an `apply()` that raised after its SET would keep the loop's
+    rate-limited fallback ramp at the last good command, so with every
+    sensor blind the fans would stay low indefinitely, `READY=1` would never
+    go out and the stop write would be logged as failed. Absence is judged from
+    the newest status report alone; a single report with rpm `0xFFFF` while
+    the Quadro re-enumerates on aquabus costs one fallback tick. Decide
+    whether a missing aquabus device should fault only its channels (for
+    example `None` rpm and duty for them, if the contract and the gate allow
+    it), whether absence needs confirmation over time (a config key, if the
+    hardware shows transient `0xFFFF` reports), and publish
+    `absent_channels` with item 83.
 83. Publish the adapter's device health: `AquacomputerAdapter.stuck_channels`
     (outputs that keep reporting another duty after a rewrite, item 81), the
     aquaero outputs not in PWM mode and outputs with no device behind them on
-    aquabus (item 85) are only logged today. Put them in
+    aquabus (`absent_channels`, items 85, 90) are only logged today. Put them in
     `/api/health`, the MQTT state and a Home Assistant problem sensor.
+91. Flow sensors in the config. `hw/aquacomputer.py` decodes the aquaero's
+    `flow1..flow3` and the Quadro's `flow1`, but no config key binds them:
+    `rpm` takes only tachometers and `temp_map` only temperatures, and
+    `PlantObservation` has no flow field. An old hwmon-era config that bound
+    a flow sensor as `rpm` (aquaero `fan5`/`fan6`) now binds an aquabus
+    tachometer instead. Decide whether flow belongs in the observation at
+    all (the DAS has no coolant loop; the legacy coolant layout might use
+    it, for example in `inputs`) and how it is named in a device entry.
 
 ### 8.3 Open — needs the DAS hardware
 

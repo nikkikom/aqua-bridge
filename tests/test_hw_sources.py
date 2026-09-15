@@ -10,13 +10,22 @@ from pathlib import Path
 
 import pytest
 
+from aqua_bridge.control.loop import Loop, TickResult
+from aqua_bridge.control.supervisor import Supervisor
 from aqua_bridge.hw.aquacomputer import AQUAERO, QUADRO, control_duty
 from aqua_bridge.hw.aquacomputer_adapter import AquacomputerAdapter, DeviceBinding
 from aqua_bridge.hw.hidraw import DeviceUnavailable
 from aqua_bridge.hw.onewire import W1Source
 from aqua_bridge.hw.sources import CompositeSource, build_composite_from_config
 from aqua_bridge.model import ConfigError, Mode, MpcCommand
-from aquacomputer_fakes import FakeBus, FakeClock, FakeController, FakeSleep, aquabus_aquaero
+from aquacomputer_fakes import (
+    FakeBus,
+    FakeClock,
+    FakeController,
+    FakeSleep,
+    aquabus_aquaero,
+    fixture_bytes,
+)
 
 
 def _fleet(clock: FakeClock | None = None):
@@ -418,7 +427,8 @@ def test_aquabus_outputs_and_quadro_outputs_over_usb_are_refused_together() -> N
     with pytest.raises(
         ConfigError,
         match=r"aquacomputer\[0\] \(aquaero\) commands aquabus outputs pwm7 .*"
-        r"aquacomputer\[1\] \(quadro\) commands Quadro outputs over its own USB",
+        r"aquacomputer\[1\] \(quadro\) commands the outputs of whichever Quadro is attached"
+        r".*needs 'serial:' in its entry",
     ):
         _build(
             aquacomputer_section=(aquabus, dict(_QUADRO_ENTRY, temp_map={})),
@@ -446,6 +456,31 @@ def test_aquabus_outputs_and_quadro_outputs_over_usb_are_refused_together() -> N
         channels=("radiator", "exhaust"),
         temps=("air_z0", "air_z1"),
     )
+
+
+def test_a_second_quadro_named_by_serial_next_to_aquabus_outputs_is_accepted_with_a_warning(
+    caplog,
+) -> None:
+    """Review finding: Quadro A on the aquaero's aquabus (pwm5..8) and Quadro B on its own
+    USB port is a valid topology. Which Quadro is on aquabus is unknown before opening, so
+    an entry with a serial is taken as the second one, with a warning."""
+    aquabus = {
+        "device": "aquaero",
+        "fans": {"rear": {"pwm": "pwm5", "rpm": "fan5"}},
+        "temp_map": {"air_z0": "temp1"},
+    }
+    quadro_b = dict(_QUADRO_ENTRY, serial="00000-22222", temp_map={})
+    with caplog.at_level("WARNING", logger="aqua_bridge.hw.sources"):
+        composite, _ = _build(
+            aquacomputer_section=(aquabus, quadro_b),
+            channels=("rear", "exhaust"),
+            temps=("air_z0",),
+        )
+    assert [d.binding.serial for d in composite.devices] == [None, "00000-22222"]
+    (warning,) = [r.getMessage() for r in caplog.records if r.name == "aqua_bridge.hw.sources"]
+    assert "aquacomputer[0] (aquaero) commands aquabus outputs pwm5" in warning
+    assert "aquacomputer[1] (quadro 00000-22222) commands Quadro outputs over USB" in warning
+    assert "not the one on the aquaero's aquabus" in warning
 
 
 def _stuck_quadro_next_to(aquaero_device: FakeController, caplog) -> list[str]:
@@ -485,3 +520,98 @@ def test_a_stuck_quadro_next_to_an_aquaero_without_an_aquabus_device_gets_no_hin
     clock = FakeClock()
     (error,) = _stuck_quadro_next_to(FakeController(AQUAERO, clock, node="/dev/hidraw2"), caplog)
     assert "still reports" in error and "aquabus" not in error
+
+
+# --- the loop over an aquaero whose aquabus slot is empty (PROJECT.md section 8 item 90) -------
+
+
+class _Notifier:
+    def __init__(self) -> None:
+        self.ready_n = 0
+
+    def ready(self) -> bool:
+        self.ready_n += 1
+        return True
+
+    def watchdog(self) -> bool:
+        return True
+
+    def stopping(self) -> bool:
+        return True
+
+
+def _aquabus_loop(cfg, device: FakeController):
+    """The example config's channels on the aquaero: radiator on its own output 1,
+    intake on aquabus output 5 (with its tachometer)."""
+    clock = device.clock
+    adapter = AquacomputerAdapter(
+        DeviceBinding(
+            kind=AQUAERO,
+            pwm_map={"radiator": 1, "intake": 5},
+            fan_map={"intake": 5},
+            temp_map={"coolant": "temp6", "air": "temp7"},
+        ),
+        clock=clock,
+        sleep=FakeSleep(clock),
+        opener=FakeBus(device),
+    )
+    composite = CompositeSource([adapter], clock=clock)
+    notifier = _Notifier()
+    loop = Loop(
+        composite,
+        composite,
+        cfg,
+        Supervisor(cfg, clock=lambda: 0.0),
+        clock=clock,
+        notifier=notifier,
+    )
+
+    physical = next(g for g in AQUAERO.temp_groups if g.prefix == "temp").offset
+
+    def run(ticks: int) -> list[TickResult]:
+        results = []
+        for _ in range(ticks):
+            clock.advance(cfg.dt)
+            # A frozen temperature while the fans move would be the gate's stuck case.
+            status = bytearray(device.status_template)
+            for offset in (physical + 2 * 5, physical + 2 * 6):  # temp6, temp7
+                value = 3000 + 5 * (loop.tick_count % 2)
+                status[offset : offset + 2] = value.to_bytes(2, "big")
+            device.status_template = bytes(status)
+            device.emit()
+            results.append(loop.tick())
+        return results
+
+    return adapter, loop, notifier, run
+
+
+def test_the_fallback_ramp_reaches_fallback_pwm_while_an_aquabus_slot_is_empty(fast_cfg) -> None:
+    """Review finding: an apply() that raised after its write for an empty aquabus slot
+    left the loop's applied command at the last good one, so the rate-limited fallback
+    ramp stayed one d_pwm_max step above it on every output. Only read() fails now: the
+    ramp reaches fallback_pwm, and the stop write reports success."""
+    cfg = fast_cfg
+    device = aquabus_aquaero(FakeClock(), node="/dev/hidraw2")
+    adapter, loop, notifier, run = _aquabus_loop(cfg, device)
+    good = run(20)
+    assert all(r.ok for r in good[-3:]) and notifier.ready_n == 1
+    assert max(good[-1].cmd.pwm.values()) <= cfg.fallback_pwm["radiator"] - 2 * cfg.d_pwm_max
+
+    device.status_template = fixture_bytes("aquaero-status.bin")  # the Quadro left aquabus
+    faults = run(60)
+    assert all(r.read_error and "pwm5 (intake)" in r.read_error for r in faults)
+    assert faults[-1].cmd.mode is Mode.FALLBACK
+    assert control_duty(AQUAERO, device.ctrl, 0) == round(cfg.fallback_pwm["radiator"] * 10000)
+    assert control_duty(AQUAERO, device.ctrl, 4) == round(cfg.fallback_pwm["intake"] * 10000)
+    assert faults[-1].cmd.pwm == pytest.approx(cfg.fallback_pwm)
+    assert all(r.applied and r.apply_error is None for r in faults)
+    assert adapter.absent_channels == ("intake",)
+    assert loop.shutdown() is True
+
+
+def test_a_daemon_started_with_an_empty_aquabus_slot_becomes_ready(fast_cfg) -> None:
+    device = FakeController(AQUAERO, FakeClock(), node="/dev/hidraw2")  # nothing on aquabus
+    _adapter, _loop, notifier, run = _aquabus_loop(fast_cfg, device)
+    (first,) = run(1)
+    assert first.read_error is not None and first.applied
+    assert notifier.ready_n == 1

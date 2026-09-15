@@ -25,10 +25,16 @@ Reading
     block. A vanished node closes the device; the next call finds it again,
     possibly as a new ``hidrawN``. With ``serial:`` configured, a first status
     report carrying another serial closes the device and raises. A commanded
-    output or a bound tachometer whose fan block reads rpm ``0xFFFF`` has no
-    device behind it (an aquaero aquabus output 5-8 with nothing on the bus):
-    ``read()`` raises naming it, and ``apply()`` writes every channel but then
-    raises too, so neither reports success for it.
+    aquabus output (aquaero 5-8) or a bound aquabus tachometer whose fan block
+    reads rpm ``0xFFFF`` has no device behind it (nothing on the aquaero's
+    aquabus): ``read()`` raises naming it (the loop runs its fallback), lists
+    it in ``absent_channels`` and logs one error when that list changes. The
+    check uses the newest status report alone; the aquaero's own outputs 1-4
+    are not checked. ``apply()`` writes such an output with the others and
+    does not raise for it: the loop rate limits its fallback ramp against the
+    last command whose ``apply()`` succeeded, so a write that went out and
+    then raised would hold every fan below ``fallback_pwm`` for as long as the
+    slot stays empty (PROJECT.md section 8 item 90).
 
 Writing
     ``apply()`` opens the node without waiting for a status report, so the
@@ -437,6 +443,11 @@ class AquacomputerAdapter:
         self._modes_checked = False
         #: Unconfigured aquaero blocks already reported (once per adapter).
         self._unconfigured_reported: set[int] = set()
+        #: Output numbers that belong to a device on the aquaero's aquabus.
+        self._aquabus = frozenset(binding.kind.aquabus_outputs)
+        #: The absent inputs read() found last ("pwm5 (qd1)", ...), logged when it changes.
+        self._absent_inputs: tuple[str, ...] = ()
+        self._absent_channels: tuple[str, ...] = ()
         #: Why the last opened node was rejected for its serial; apply() refuses to
         #: write until a status report carries the configured serial.
         self._serial_rejected: str | None = None
@@ -462,6 +473,12 @@ class AquacomputerAdapter:
         """Channels whose output kept disagreeing with the written duty after a
         rewrite (module docstring, rule a); empty once the device follows."""
         return tuple(sorted(self._names[k] for k in self._stuck))
+
+    @property
+    def absent_channels(self) -> tuple[str, ...]:
+        """Channels whose aquabus output or bound aquabus tachometer had no device
+        behind it (rpm ``0xFFFF``) in the status report the last ``read()`` used."""
+        return self._absent_channels
 
     def close(self) -> None:
         """Closes the device node (the next call opens it again)."""
@@ -554,28 +571,43 @@ class AquacomputerAdapter:
             self._invalidate(rewrite=True)
         self._power_cycles = count
 
-    def _absent(self, status: StatusReport, *, tachometers: bool) -> list[str]:
-        """Configured outputs (and, with ``tachometers``, bound ``fanN``) whose fan block
-        reports no device behind it (rpm ``0xFFFF``)."""
-        b = self.binding
-        out = [
-            f"pwm{n} ({ch})"
-            for ch, n in sorted(b.pwm_map.items(), key=lambda item: item[1])
-            if not status.fans[n - 1].present
-        ]
-        if tachometers:
-            out += [
-                f"fan{n} ({ch})"
-                for ch, n in sorted(b.fan_map.items(), key=lambda item: item[1])
-                if not status.fans[n - 1].present
-            ]
-        return out
+    def _empty_slot(self, status: StatusReport, number: int) -> bool:
+        """Output / tachometer ``number`` (1-based) is an aquabus slot with no device
+        behind it (rpm ``0xFFFF``). The aquaero's own outputs are never empty slots."""
+        return number in self._aquabus and not status.fans[number - 1].present
 
-    def _absent_message(self, absent: Sequence[str]) -> str:
-        return (
-            f"{self.binding.label}: no device behind {', '.join(absent)}: the status report's "
-            "fan block reads rpm 0xFFFF (on the aquaero's outputs 5-8: nothing on its aquabus)"
+    def _check_absent(self, status: StatusReport) -> None:
+        """Updates ``absent_channels`` from ``status`` (one log line when it changes) and
+        raises :class:`DeviceUnavailable` while it is not empty."""
+        b = self.binding
+        found = [
+            (f"{role}{n} ({ch})", ch)
+            for role, mapping in (("pwm", b.pwm_map), ("fan", b.fan_map))
+            for ch, n in sorted(mapping.items(), key=lambda item: item[1])
+            if self._empty_slot(status, n)
+        ]
+        inputs = tuple(name for name, _ in found)
+        message = (
+            f"{b.label}: no device behind {', '.join(inputs)}: the status report's fan block "
+            "reads rpm 0xFFFF (nothing on the aquaero's aquabus)"
         )
+        if inputs != self._absent_inputs:
+            if inputs:
+                _LOG.error(
+                    "%s; reads fail until a device is behind it, writes still go out "
+                    "(PROJECT.md section 8 item 90)",
+                    message,
+                )
+            else:
+                _LOG.info(
+                    "%s: a device is behind %s again",
+                    b.label,
+                    ", ".join(self._absent_inputs),
+                )
+            self._absent_inputs = inputs
+            self._absent_channels = tuple(sorted({ch for _, ch in found}))
+        if inputs:
+            raise DeviceUnavailable(message)
 
     # -- read --------------------------------------------------------------
 
@@ -606,9 +638,7 @@ class AquacomputerAdapter:
             )
         if fresh:
             self._verify_duties(status, received)
-        absent = self._absent(status, tachometers=True)
-        if absent:
-            raise DeviceUnavailable(self._absent_message(absent))
+        self._check_absent(status)
         b = self.binding
         return PlantObservation(
             temps={name: status.temp(input_name) for name, input_name in b.temp_map.items()},
@@ -635,10 +665,9 @@ class AquacomputerAdapter:
         tolerance = self.timing.duty_mismatch_tolerance
         label = self.binding.label
         for k, duty in sorted(self._written.items()):
-            fan = status.fans[k]
-            if not fan.present:
-                continue  # no device behind it: read() and apply() raise instead
-            reported = fan.duty
+            if self._empty_slot(status, k + 1):
+                continue  # no device behind it: no duty evidence, read() raises instead
+            reported = status.fans[k].duty
             name = self._names.get(k, "?")
             if abs(reported - duty) <= tolerance:
                 self._mismatch_since.pop(k, None)
@@ -833,9 +862,9 @@ class AquacomputerAdapter:
         duty the device holds (module docstring, Writing): the loop may have
         recorded a deferred fall as applied, and a fault must never slow a fan.
 
-        A configured output whose fan block in this open's newest status report
-        has no device behind it is written with the others, then
-        :class:`DeviceUnavailable` names it: the command did not reach a fan.
+        An aquabus output with no device behind it is written with the others and
+        is no error here: ``read()`` raises for it, which runs the loop's
+        fallback, and ``absent_channels`` lists it (module docstring, Reading).
         """
         duties = self._duties(cmd)
         never_lower = getattr(cmd, "mode", None) in _NEVER_LOWER_MODES
@@ -843,13 +872,6 @@ class AquacomputerAdapter:
             "control report write",
             lambda transport, deadline: self._apply_once(transport, duties, deadline, never_lower),
         )
-        status = self._status if self._status_t is not None else None
-        if status is not None:
-            absent = self._absent(status, tachometers=False)
-            if absent:
-                raise DeviceUnavailable(
-                    self._absent_message(absent) + "; the command is not applied"
-                )
 
     def _warn_about_modes(self, ctrl: bytes) -> None:
         """One warning per open for every commanded output of the aquaero's own not in
@@ -1062,9 +1084,11 @@ _HWMON_ERA_TEMPS: Mapping[str, Mapping[str, str]] = MappingProxyType(
         "quadro": MappingProxyType({f"temp{4 + n}": f"soft{n}" for n in range(1, 17)}),
     }
 )
-#: ``fanN`` numbers the hwmon driver gave the flow sensors -> ``flowN``.
+#: ``fanN`` numbers the hwmon driver gave the flow sensors that are out of a kind's
+#: tachometer range now -> ``flowN``. The aquaero's hwmon ``fan5``/``fan6`` (flow 1-2)
+#: are its aquabus tachometers now, accepted like any other ``fanN``.
 _HWMON_ERA_FLOWS: Mapping[str, Mapping[int, int]] = MappingProxyType(
-    {"aquaero": MappingProxyType({5: 1, 6: 2}), "quadro": MappingProxyType({5: 1})}
+    {"aquaero": MappingProxyType({}), "quadro": MappingProxyType({5: 1})}
 )
 
 
@@ -1083,27 +1107,37 @@ def _output_number(where: str, value: Any, kind: DeviceKind) -> int:
     return number
 
 
-def _tachometer_number(where: str, value: Any, kind: DeviceKind, pwm_number: int) -> int:
+def _flow_hint(value: Any) -> str:
+    """The hint for a flow sensor name where a tachometer or temperature is expected."""
+    if isinstance(value, str) and re.fullmatch(r"flow[1-9][0-9]*", value):
+        return (
+            f"; {value!r} is a flow sensor, and flow sensors cannot be bound in the config "
+            "(PROJECT.md section 8 item 91)"
+        )
+    return ""
+
+
+def _tachometer_number(where: str, value: Any, kind: DeviceKind) -> int:
     number = _numbered("fan", value)
+    if number is not None and 1 <= number <= kind.fan_count:
+        return number
     flow = None if number is None else _HWMON_ERA_FLOWS[kind.name].get(number)
-    if flow is not None and (number > kind.fan_count or number != pwm_number):
+    if flow is not None:
         raise ConfigError(
             f"{where}: {value!r} was the hwmon driver's name of the {kind.name}'s flow sensor "
-            f"flow{flow}, which is not a tachometer; fanN is the tachometer of output pwmN"
-            f" ({kind.name}: fan1..fan{kind.fan_count})"
+            f"flow{flow}, which is not a tachometer ({kind.name}: fan1..fan{kind.fan_count}); "
+            "flow sensors cannot be bound in the config (PROJECT.md section 8 item 91)"
         )
-    if number is None or not 1 <= number <= kind.fan_count:
-        raise ConfigError(
-            f"{where} must be one of the {kind.name}'s tachometers fan1..fan{kind.fan_count}, "
-            f"got {value!r}"
-        )
-    return number
+    raise ConfigError(
+        f"{where} must be one of the {kind.name}'s tachometers fan1..fan{kind.fan_count}, "
+        f"got {value!r}{_flow_hint(value)}"
+    )
 
 
 def _temperature_input(where: str, value: Any, kind: DeviceKind) -> str:
     if isinstance(value, str) and value in kind.temp_names:
         return value
-    hint = ""
+    hint = _flow_hint(value)
     renamed = _HWMON_ERA_TEMPS[kind.name].get(value) if isinstance(value, str) else None
     if renamed is not None:
         group = next(g for g in kind.temp_groups if renamed.startswith(g.prefix))
@@ -1156,9 +1190,7 @@ def _parse_fans(
         pwm_map[channel] = _output_number(f"{where}.pwm", entry["pwm"], kind)
         _claim_input(pwm_seen, f"pwm{pwm_map[channel]}", channel, f"{label}.fans")
         if entry.get("rpm") is not None:
-            fan_map[channel] = _tachometer_number(
-                f"{where}.rpm", entry["rpm"], kind, pwm_map[channel]
-            )
+            fan_map[channel] = _tachometer_number(f"{where}.rpm", entry["rpm"], kind)
             _claim_input(fan_seen, f"fan{fan_map[channel]}", channel, f"{label}.fans")
     return pwm_map, fan_map
 
@@ -1197,11 +1229,12 @@ def parse_device_section(
     tachometers ``fanN`` (aquaero 1-8, Quadro 1-4); temperatures ``tempN``
     (physical sensors: aquaero 1-8, Quadro 1-4), ``busN`` (aquaero aquabus
     slots 1-8), ``softN`` (software sensors: aquaero 1-8, Quadro 1-16) and
-    ``virtN`` (aquaero virtual sensors 1-4). A temperature or flow name of the
-    hwmon driver's numbering that means another input now (aquaero
-    ``temp9..20``, Quadro ``temp5..20``, the flow sensors ``fan5``/``fan6`` on
-    the aquaero unless paired with their own output, ``fan5`` on the Quadro) is
-    rejected with the new name. ``hwmon_name``, ``root`` and ``name`` (the
+    ``virtN`` (aquaero virtual sensors 1-4). Any tachometer may be bound to any
+    output. A temperature or flow name of the hwmon driver's numbering that
+    means another input now (aquaero ``temp9..20``, Quadro ``temp5..20``, the
+    Quadro's flow sensor ``fan5``) is rejected with the new name; the aquaero's
+    hwmon ``fan5``/``fan6`` (flow) are its aquabus tachometers now. Flow
+    sensors (``flowN``) cannot be bound. ``hwmon_name``, ``root`` and ``name`` (the
     hwmon era) and ``map`` / ``fan_map`` are rejected with a hint; any other
     unknown key is rejected too, so a misspelt timing key cannot silently fall
     back to its default. ``ignored_keys`` are accepted and ignored

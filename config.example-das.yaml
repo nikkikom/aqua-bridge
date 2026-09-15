@@ -308,7 +308,8 @@ mpc:
 # sensors, bus1-8 aquabus temperature slots (the Quadro's sensors 1-4 in bus1-4), soft1-8
 # software sensors, virt1-4 virtual sensors; Quadro pwm1-4 / fan1-4, temp1-4, soft1-16.
 # A Quadro on aquabus ignores writes over its own USB, so a config that commands aquaero
-# pwm5-8 and Quadro outputs is refused.
+# pwm5-8 and the outputs of a quadro entry without serial is refused; a quadro entry with
+# a serial is taken as a second Quadro on its own USB port (logged as a warning).
 aquacomputer:
   - device: aquaero
     # serial: "12345-54321"  # only needed when several of one kind are attached

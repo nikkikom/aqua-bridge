@@ -35,11 +35,14 @@ temperature" guarantee a single ``xt6:`` device gets, checked across the whole
 fleet. Two entries that could open the same controller (one kind without
 distinct serials) are a ``ConfigError`` too: they would fight over one device.
 So is a config that commands aquaero outputs 5-8 (a Quadro on the aquaero's
-aquabus) and also Quadro outputs over a Quadro's own USB: a Quadro on aquabus
-ignores writes over its USB, so one of the two would silently do nothing
-(PROJECT.md section 8 item 85). At runtime, a Quadro whose outputs do not follow
-while an aquaero next to it reports a device on its aquabus gets that
-explanation in its stuck-channel error.
+aquabus) and also, through a quadro entry without ``serial:``, the outputs of
+whichever Quadro is attached over USB: a Quadro on aquabus ignores writes over
+its USB, so that entry may command the Quadro on aquabus and do nothing
+(PROJECT.md section 8 item 85). Which Quadro sits on aquabus cannot be read
+before the devices are opened, so a commanding quadro entry with a serial is
+accepted with a warning, as a second Quadro on its own USB port. At runtime, a
+Quadro whose outputs do not follow while an aquaero next to it reports a device
+on its aquabus gets that explanation in its stuck-channel error.
 A ROM id missing from the 1-Wire bus at this point is only a warning (see
 :meth:`~aqua_bridge.hw.onewire.W1Source.start`) -- a sensor may be legitimately
 unplugged with its drive.
@@ -51,6 +54,7 @@ see the static AST check in ``tests/test_hw_imports.py``.
 from __future__ import annotations
 
 import functools
+import logging
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
@@ -71,6 +75,8 @@ __all__ = ["CompositeSink", "CompositeSource", "SmartSource", "build_composite_f
 
 #: default onewire.max_age_s = this * mpc.dt (plan section 1).
 _DEFAULT_MAX_AGE_DT_FACTOR = 1.5
+
+_LOG = logging.getLogger("aqua_bridge.hw.sources")
 
 
 @runtime_checkable
@@ -248,23 +254,42 @@ def _check_distinct_devices(bindings: Sequence[tuple[str, DeviceBinding]]) -> No
 
 def _check_quadro_commanded_once(bindings: Sequence[tuple[str, DeviceBinding]]) -> None:
     """Aquaero outputs 5-8 command a Quadro on the aquaero's aquabus, which ignores
-    writes over its own USB; a config doing both leaves one of them without effect."""
+    writes over its own USB. Which Quadro is on aquabus cannot be known before the
+    devices are opened: a commanding Quadro entry without ``serial:`` opens whichever
+    Quadro is attached, possibly that one, and is refused; one with a serial is taken
+    as a second Quadro on its own USB port, with a warning."""
     aquabus = [
         (holder, sorted(n for n in binding.pwm_map.values() if n in binding.kind.aquabus_outputs))
         for holder, binding in bindings
     ]
     aquabus = [(holder, outputs) for holder, outputs in aquabus if outputs]
-    quadros = [holder for holder, binding in bindings if binding.kind is QUADRO and binding.pwm_map]
-    if aquabus and quadros:
-        holder, outputs = aquabus[0]
-        names = ", ".join(f"pwm{n}" for n in outputs)
+    quadros = [
+        (holder, binding)
+        for holder, binding in bindings
+        if binding.kind is QUADRO and binding.pwm_map
+    ]
+    if not aquabus or not quadros:
+        return
+    holder, outputs = aquabus[0]
+    names = ", ".join(f"pwm{n}" for n in outputs)
+    unidentified = [quadro for quadro, binding in quadros if binding.serial is None]
+    if unidentified:
         raise ConfigError(
             f"{holder} commands aquabus outputs {names} (a Quadro on the aquaero's aquabus) "
-            f"and {quadros[0]} commands Quadro outputs over its own USB; a Quadro on aquabus "
-            "ignores writes over its USB. Command the Quadro either through the aquaero "
-            "(pwm5..pwm8, and 'fans: {}' in the quadro entry) or over its own USB (no aquaero "
-            "pwm5..pwm8)"
+            f"and {unidentified[0]} commands the outputs of whichever Quadro is attached over "
+            "USB, which can be that one; a Quadro on aquabus ignores writes over its USB. "
+            "Command the Quadro either through the aquaero (pwm5..pwm8, and 'fans: {}' in the "
+            "quadro entry) or over its own USB (no aquaero pwm5..pwm8); a second Quadro on its "
+            "own USB port needs 'serial:' in its entry"
         )
+    _LOG.warning(
+        "%s commands aquabus outputs %s and %s commands Quadro outputs over USB: this "
+        "works only if that Quadro is not the one on the aquaero's aquabus, which ignores "
+        "writes over its USB (its outputs would then be logged as stuck)",
+        holder,
+        names,
+        ", ".join(quadro for quadro, _ in quadros),
+    )
 
 
 def build_composite_from_config(
