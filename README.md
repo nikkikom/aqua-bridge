@@ -114,16 +114,21 @@ hardware.
    `mpc.temps` / `mpc.sensors` / `mpc.topology` for the enclosure, the
    `aquacomputer:` list (one entry per controller: `device: aquaero` or
    `quadro`, `serial:` when several of one kind are attached, `fans`
-   with `{pwm: pwmN, rpm: fanN}` per output, `temp_map` per thermistor
-   input actually present; the optional timing keys are shown at their
-   defaults, PROJECT.md §3 Track B), `onewire.sensors`
+   with `{pwm: pwmN, rpm: fanN}` per output (with the Quadro on the
+   aquaero's aquabus, its outputs are the aquaero's `pwm5..pwm8` and
+   `fan5..fan8`), `temp_map` per input actually present (`tempN`
+   physical sensors, `busN` the aquaero's aquabus slots, `softN` software
+   and `virtN` virtual sensors); the optional timing keys are shown at
+   their defaults, PROJECT.md §3 Track B), `onewire.sensors`
    (bound in step 8), the MQTT host and credentials, `http.enabled` /
    `mqtt.enabled`. Every declared name must be bound exactly once — the
    daemon exits 2 otherwise. Legacy (no DAS sections): `xt6.device`,
    `xt6.fans` and `xt6.temp_map` with exactly the keys of
    `mpc.channels` / `mpc.temps`. A config from before the hidraw
    adapter (`hwmon:`, `xt6.hwmon_name`) exits 2 with a message naming
-   the replacement keys.
+   the replacement keys, and so does an input name of the hwmon
+   driver's numbering that now means another input (aquaero `temp9..20`,
+   Quadro `temp5..20`, flow as `fanN`), naming the new one.
    Always pass `--config /etc/aqua-bridge/config.yaml` explicitly.
    Without `--das` at step 5, install the DAS example by hand instead:
    `sudo install -m 640 -o root -g <user> config.example-das.yaml
@@ -143,13 +148,16 @@ hardware.
    controlled.
 
 7. **USB hardware.** dwc2 host + powered hub, XT6 on USB; the Quadro on
-   aquabus, or its own USB port if its PWM is not writable through the
-   XT6 (§2). `lsusb`, then, as the service user,
+   aquabus (its PWM is writable through the XT6, §2), or on its own USB
+   port. `lsusb`, then, as the service user,
    `.venv/bin/python tools/aquacomputer_probe.py` — read-only: lists
    each aquaero / Quadro (serial, USB interface, `/dev/hidrawN`) with
-   its temperatures, outputs (rpm, duty, voltage, current, power) and
-   control settings; pick `tempN` / `fanN` / `pwmN` and `serial:` from
-   it. A permission error means the udev rule has not applied
+   its temperatures by group, outputs (rpm, duty, voltage, current,
+   power; the aquaero's 5–8 are the Quadro's on aquabus) and control
+   settings; pick the input names and `serial:` from it. The daemon's
+   writes take effect at once and are not saved in the controllers'
+   memory: after a power cycle they run their saved configuration. A
+   permission error means the udev rule has not applied
    (`ls -l /dev/hidraw*` must show group `plugdev` with read/write).
    Firmware revert behaviour is still an open spike question. As the
    service user:
