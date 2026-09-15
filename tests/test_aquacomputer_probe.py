@@ -14,7 +14,7 @@ import pytest
 
 from aqua_bridge.hw.aquacomputer import AQUAERO, QUADRO
 from aqua_bridge.hw.hidraw import DeviceUnavailable, FeatureReportError
-from aquacomputer_fakes import FakeClock, FakeController
+from aquacomputer_fakes import FakeClock, FakeController, aquabus_aquaero
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
 if str(TOOLS_DIR) not in sys.path:
@@ -71,17 +71,24 @@ def test_lists_and_decodes_both_devices_without_writing(rig) -> None:
     assert "aquaero  serial 12345-54321    interface 2" in text
     assert "quadro   serial 00000-11111    interface 1" in text
     assert "hidraw0" not in text
-    # aquaero status: a connected input, a virtual sensor, the commanded output, flow
-    assert "temp6     22.26" in text and "temp9     40.00" in text
+    # aquaero status: temperature groups, the commanded output, flow, empty aquabus slots
+    assert "  physical sensors (temp1..temp8, degC):\n    temp6     22.26\n" in text
+    assert "  aquabus temperature slots (bus1..bus8, degC):\n    no data: bus1" in text
+    assert "  software sensors (soft1..soft8, degC):\n    soft1     40.00\n" in text
+    assert "  virtual sensors (virt1..virt4, degC):" in text
     assert "pwm2/fan2    120 rpm  duty  14.12 %  12.09 V" in text
-    assert "fan5 (flow)  0" in text
-    # aquaero control report: source and limits
+    assert "pwm5/fan5  no device (rpm 0xFFFF)  (aquabus)" in text
+    assert "flow1  0" in text and "flow3  no data" in text and "(flow)" not in text
+    # aquaero control report: source and limits, modes, aquabus blocks
     assert "pwm2  duty   0.00 %  source 0x59  min 50.00 %  max 100.00 %  (does not follow" in text
     assert "preset)  mode pwm (0x0502)" in text and "mode dc (0x0501)" in text
-    # Quadro: power cycles, duty from the control report
+    assert "(does not follow its preset)  mode 0x0500 (aquabus, not interpreted)" in text
+    assert "pwm8  duty 100.00 %  source 0xFFFF" in text and "(unconfigured)" in text
+    # Quadro: power cycles, duty from the control report, software sensors
     assert "power cycles:" in text and "pwm3  duty 100.00 %" in text
+    assert "software sensors (soft1..soft16, degC):" in text
     for controller in rig[3].values():
-        assert controller.sets() == [] and controller.secondaries() == []
+        assert controller.sets() == [] and controller.saves() == []
         assert len(controller.gets()) == 1 and controller.closed
 
 
@@ -133,3 +140,28 @@ def test_main_parses_arguments(rig, capsys) -> None:
     assert aquacomputer_probe.main(["--timeout", "0"]) == 2
     with pytest.raises(SystemExit):
         aquacomputer_probe.main(["--device", "octo"])
+
+
+def test_decodes_the_quadro_on_the_aquaeros_aquabus(tmp_path: Path) -> None:
+    sysfs = tmp_path / "hidraw"
+    dev = tmp_path / "dev"
+    _hidraw(sysfs, "hidraw2", 0xF001, 2, "12345-54321")
+    clock = FakeClock()
+    controller = aquabus_aquaero(clock, node=str(dev / "hidraw2"))
+
+    def opener(info):
+        controller.emit()
+        return controller
+
+    out = io.StringIO()
+    assert (
+        aquacomputer_probe.probe(sysfs_root=sysfs, dev_dir=dev, clock=clock, out=out, opener=opener)
+        == 0
+    )
+    text = out.getvalue()
+    assert "  aquabus temperature slots (bus1..bus8, degC):\n    bus2      24.14\n" in text
+    assert "pwm7/fan7   1105 rpm  duty 100.00 %  12.10 V     27 mA    0.32 W  (aquabus)" in text
+    assert "pwm5/fan5      0 rpm" in text and "no device" not in text
+    assert "flow3  0" in text
+    assert "pwm7  duty 100.00 %  source 0x59  min 39.96 %" in text
+    assert controller.sets() == [] and controller.saves() == []
