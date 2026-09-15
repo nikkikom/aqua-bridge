@@ -35,8 +35,12 @@ Writing
     the written duty and ``write_min_interval_s`` has passed since this
     device's last write (flash wear, PROJECT.md section 8 item 77). Any write
     carries every channel with a pending change, as one SET plus the secondary
-    report. Before every GET or SET the adapter waits ``ctrl_gap_ms`` after the
-    previous control operation, failed ones included (the secondary report
+    report. A command in FALLBACK or DEGRADED mode never takes a channel below
+    the duty the device holds, in a forced rewrite too: a deferred fall that the
+    loop counted as applied must not mature, or ride along, during a fault (the
+    stop write is a FALLBACK command, so it never lowers a fan either). Before
+    every GET or SET the adapter waits ``ctrl_gap_ms`` after the previous
+    control operation, failed ones included (the secondary report
     follows its SET at once). A failed operation invalidates the cache and is
     retried from a fresh GET up to ``ctrl_retries`` times; no control operation
     starts once ``ctrl_budget_s`` of this call is spent. Either way
@@ -110,7 +114,7 @@ from aqua_bridge.hw.hidraw import (
     HidTransport,
     open_device,
 )
-from aqua_bridge.model import ConfigError, MpcCommand, PlantObservation
+from aqua_bridge.model import ConfigError, Mode, MpcCommand, PlantObservation
 
 __all__ = [
     "CTRL_RETRIES_MAX",
@@ -128,6 +132,9 @@ __all__ = [
 ]
 
 _LOG = logging.getLogger("aqua_bridge.hw.aquacomputer")
+
+#: Command modes in which no channel is written below the duty the device holds.
+_NEVER_LOWER_MODES = frozenset({Mode.FALLBACK, Mode.DEGRADED})
 
 #: ``(kind, serial) -> open transport``; the default discovers and opens hidraw.
 Opener = Callable[[DeviceKind, str | None], HidTransport]
@@ -210,14 +217,16 @@ class AquacomputerTiming:
         """The longest one ``read()`` plus one ``apply()`` of this device can block.
 
         ``read()`` waits up to ``status_max_age_s`` for the first report after an
-        open; ``apply()`` starts no control operation after ``ctrl_budget_s``,
+        open. ``apply()`` starts no control operation after ``ctrl_budget_s``,
         but one started just before can still block for a usbhid control
-        transfer timeout (or a gap wait, whichever is longer).
+        transfer timeout, and the retry after it sleeps ``ctrl_gap_ms`` before it
+        finds the budget spent.
         """
         return (
             self.status_max_age_s
             + self.ctrl_budget_s
-            + max(USB_CTRL_TIMEOUT_S, self.ctrl_gap_ms / 1000.0)
+            + USB_CTRL_TIMEOUT_S
+            + self.ctrl_gap_ms / 1000.0
         )
 
 
@@ -241,22 +250,39 @@ def _integer(name: str, value: Any, minimum: int, maximum: int | None) -> None:
 
 
 def check_watchdog(
-    timings: Sequence[tuple[str, AquacomputerTiming]], watchdog_s: float | None
+    timings: Sequence[tuple[str, AquacomputerTiming]],
+    watchdog_s: float | None,
+    *,
+    dt: float | None = None,
+    step_bound_s: float | None = None,
 ) -> None:
-    """Raises :class:`ConfigError` when the devices' worst-case blocking per tick
-    (:meth:`AquacomputerTiming.worst_case_tick_s`, summed) is not below the
-    systemd watchdog: a tick that long would get the daemon killed without its
-    ``fallback_pwm`` stop write. ``watchdog_s`` ``None`` (no watchdog) skips it."""
+    """Raises :class:`ConfigError` when the longest interval between two watchdog
+    pings can reach the systemd watchdog: a daemon that silent is killed without
+    its ``fallback_pwm`` stop write. ``watchdog_s`` ``None`` (no watchdog) skips it.
+
+    ``WATCHDOG=1`` goes out at the end of a tick and the loop then sleeps until the
+    next tick, so after a normal tick the next ping can come ``dt`` plus one
+    worst-case tick later. That tick is the controller I/O
+    (:meth:`AquacomputerTiming.worst_case_tick_s`, summed over the devices) plus
+    ``step()``. ``step_bound_s`` is the step time the config states,
+    ``mpc.budget_alarm_ms`` (both modes have it): a step past it is logged as an
+    error, not interrupted, so this is the configured bound, not a guarantee.
+    Publishers and the recorder are not counted; keep a margin for them.
+    """
     if watchdog_s is None:
         return
+    if dt is None or step_bound_s is None:
+        raise ValueError("check_watchdog needs dt and step_bound_s with a watchdog")
     parts = [(label, timing.worst_case_tick_s()) for label, timing in timings]
-    total = sum(worst for _, worst in parts)
+    total = dt + step_bound_s + sum(worst for _, worst in parts)
     if total >= watchdog_s:
         detail = ", ".join(f"{label} {worst:g} s" for label, worst in parts)
         raise ConfigError(
-            f"the controllers can block one tick for {total:g} s ({detail}: status_max_age_s "
-            f"+ ctrl_budget_s + one {USB_CTRL_TIMEOUT_S:g} s control transfer each), not below "
-            f"the systemd watchdog of {watchdog_s:g} s; lower those keys or raise WatchdogSec"
+            f"two watchdog pings can be {total:g} s apart (mpc.dt {dt:g} s + step bound "
+            f"mpc.budget_alarm_ms {step_bound_s:g} s + controllers {detail}: status_max_age_s "
+            f"+ ctrl_budget_s + one {USB_CTRL_TIMEOUT_S:g} s control transfer + ctrl_gap_ms "
+            f"each), not below the systemd watchdog of {watchdog_s:g} s; lower those keys or "
+            f"raise WatchdogSec"
         )
 
 
@@ -376,6 +402,9 @@ class AquacomputerAdapter:
         self._ever_written: set[int] = set()
         #: The output modes were checked on this open's first control report.
         self._modes_checked = False
+        #: Why the last opened node was rejected for its serial; apply() refuses to
+        #: write until a status report carries the configured serial.
+        self._serial_rejected: str | None = None
 
     # -- diagnostics -------------------------------------------------------
 
@@ -466,12 +495,14 @@ class AquacomputerAdapter:
     def _check_serial(self, transport: HidTransport, status: StatusReport) -> None:
         configured = self.binding.serial
         if configured is None or status.serial == configured:
+            self._serial_rejected = None
             return
-        self.close()
-        raise DeviceUnavailable(
+        self._serial_rejected = (
             f"{self.binding.label}: {transport.info.node} reports serial {status.serial} in "
             f"its status report, not the configured serial {configured}"
         )
+        self.close()
+        raise DeviceUnavailable(self._serial_rejected)
 
     def _check_power_cycles(self, status: StatusReport, *, first: bool) -> None:
         count = status.power_cycles
@@ -654,6 +685,11 @@ class AquacomputerAdapter:
         return self._last_write_t
 
     def _with_retries(self, what: str, operation: Callable[[HidTransport, float], _T]) -> _T:
+        if self._serial_rejected is not None:
+            raise DeviceUnavailable(
+                f"{self._serial_rejected}; nothing is written until a status report carries "
+                "the configured serial"
+            )
         transport = self._open()
         budget = self.timing.ctrl_budget_s
         deadline = self._clock() + budget
@@ -722,11 +758,16 @@ class AquacomputerAdapter:
         clamping). Channels of other devices in ``cmd.pwm`` are ignored. A
         deferred fall (write limiting) is not an error: ``obs.pwm`` keeps
         reporting what the output actually drives.
+
+        With ``cmd.mode`` FALLBACK or DEGRADED no channel is written below the
+        duty the device holds (module docstring, Writing): the loop may have
+        recorded a deferred fall as applied, and a fault must never slow a fan.
         """
         duties = self._duties(cmd)
+        never_lower = getattr(cmd, "mode", None) in _NEVER_LOWER_MODES
         self._with_retries(
             "control report write",
-            lambda transport, deadline: self._apply_once(transport, duties, deadline),
+            lambda transport, deadline: self._apply_once(transport, duties, deadline, never_lower),
         )
 
     def _warn_about_modes(self, ctrl: bytes) -> None:
@@ -766,8 +807,30 @@ class AquacomputerAdapter:
                 return pending
         return {}
 
+    def _not_below_held(self, ctrl: bytes, duties: Mapping[int, int]) -> dict[int, int]:
+        """``max(command, held)`` per channel. Held is the duty the control report
+        holds; for a channel that does not follow its duty (an aquaero channel on a
+        firmware controller) it is the newest status report's output duty since this
+        open, or 100 % when there is none."""
+        status = self._status if self._status_t is not None else None
+        out: dict[int, int] = {}
+        for k, duty in duties.items():
+            state = channel_state(self.kind, ctrl, k)
+            if state.on_duty:
+                held = state.duty
+            elif status is not None:
+                held = status.fans[k].duty
+            else:
+                held = DUTY_MAX
+            out[k] = max(duty, held)
+        return out
+
     def _apply_once(
-        self, transport: HidTransport, duties: Mapping[int, int], deadline: float
+        self,
+        transport: HidTransport,
+        duties: Mapping[int, int],
+        deadline: float,
+        never_lower: bool = False,
     ) -> None:
         if self._refresh_due():
             drifted = self._adopt(self._fetch(transport, deadline))
@@ -784,6 +847,8 @@ class AquacomputerAdapter:
         if not self._modes_checked and ctrl is not None:
             self._warn_about_modes(ctrl)
         assert ctrl is not None
+        if never_lower:
+            duties = self._not_below_held(ctrl, duties)
         send = self._plan(ctrl, duties)
         if not send:
             return
@@ -1017,12 +1082,15 @@ def build_adapter_from_config(
     sleep: Callable[[float], None] = time.sleep,
     opener: Opener | None = None,
     watchdog_s: float | None = None,
+    dt: float | None = None,
+    step_bound_s: float | None = None,
 ) -> AquacomputerAdapter:
     """``--source xt6``: the single-device ``xt6:`` section (``prefer`` ignored).
     Opens nothing; the first ``read()`` / ``apply()`` does. ``watchdog_s`` (the
-    systemd watchdog, ``None`` without one) is checked by :func:`check_watchdog`."""
+    systemd watchdog, ``None`` without one) is checked by :func:`check_watchdog`
+    with ``dt`` and ``step_bound_s``."""
     binding = parse_device_section(
         section, label=label, channels=channels, temps=temps, ignored_keys=("prefer",)
     )
-    check_watchdog([(label, binding.timing)], watchdog_s)
+    check_watchdog([(label, binding.timing)], watchdog_s, dt=dt, step_bound_s=step_bound_s)
     return AquacomputerAdapter(binding, clock=clock, sleep=sleep, opener=opener)

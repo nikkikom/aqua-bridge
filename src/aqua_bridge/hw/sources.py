@@ -228,6 +228,7 @@ def build_composite_from_config(
     sleep: Callable[[float], None] = time.sleep,
     opener: Opener | None = None,
     watchdog_s: float | None = None,
+    step_bound_s: float | None = None,
 ) -> tuple[CompositeSource, Callable[[], None] | None]:
     """Builds the composite source/sink from raw config sections.
 
@@ -238,9 +239,10 @@ def build_composite_from_config(
     either) is required. Nothing is opened here: each adapter opens its device
     on its first ``read()`` / ``apply()``. ``sleep`` and ``opener`` reach every
     adapter (tests inject fakes). ``watchdog_s`` is the systemd watchdog period
-    (``None`` without one): the devices' summed worst-case blocking per tick
-    must stay below it (:func:`~aqua_bridge.hw.aquacomputer_adapter.check_watchdog`),
-    or the build fails with a ``ConfigError``.
+    (``None`` without one): ``dt`` + ``step_bound_s`` (``mpc.budget_alarm_ms``) +
+    the devices' summed worst-case blocking per tick must stay below it
+    (:func:`~aqua_bridge.hw.aquacomputer_adapter.check_watchdog`), or the build
+    fails with a ``ConfigError``.
 
     ``smart`` is an already-built :class:`SmartSource` (typically a
     :class:`~aqua_bridge.publishers.inputs.SmartInbox` shared with the MQTT/
@@ -277,7 +279,12 @@ def build_composite_from_config(
         _claim(pwm_owner, binding.pwm_map, holder, "mpc.channels")
         bindings.append((holder, binding))
     _check_distinct_devices(bindings)
-    check_watchdog([(holder, binding.timing) for holder, binding in bindings], watchdog_s)
+    check_watchdog(
+        [(holder, binding.timing) for holder, binding in bindings],
+        watchdog_s,
+        dt=dt,
+        step_bound_s=step_bound_s,
+    )
 
     onewire_source = build_onewire_from_config(
         onewire_section or {}, default_max_age_s=_DEFAULT_MAX_AGE_DT_FACTOR * dt, clock=clock

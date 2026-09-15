@@ -317,7 +317,11 @@ def test_build_io_checks_the_hardware_worst_case_against_the_watchdog(example_co
     from aqua_bridge.hw.aquacomputer_adapter import AquacomputerTiming
 
     app = load_config(example_config_path)
-    worst = AquacomputerTiming.for_kind(app.xt6["device"]).worst_case_tick_s()
+    worst = (
+        app.mpc.dt
+        + app.mpc.budget_alarm_ms / 1000.0
+        + AquacomputerTiming.for_kind(app.xt6["device"]).worst_case_tick_s()
+    )
     for source in ("xt6", "composite"):
         with pytest.raises(ConfigError, match="systemd watchdog"):
             main_mod.build_io(app, source, watchdog_s=worst)

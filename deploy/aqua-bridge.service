@@ -24,7 +24,7 @@ ExecStart=/opt/aqua-bridge/.venv/bin/python -m aqua_bridge --config /etc/aqua-br
 # it. Delete model.json for a clean prior (the calibrations go with it).
 StateDirectory=aqua-bridge
 Restart=always
-WatchdogSec=30
+WatchdogSec=45
 # READY=1 is sent after the first tick whose command reached the device, so
 # a device that is absent at boot (USB not yet enumerated, hidraw permissions
 # wrong) shows up as a start timeout followed by Restart=always -- the
