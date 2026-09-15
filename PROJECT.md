@@ -3749,6 +3749,24 @@ Owner decision (2026-09-15):
     (§4.7). Follow-ups: items 87, 88. The adapter sent the save report (the
     "secondary report") after every SET, so every write that changed a duty
     was saved to the controller's memory.
+    Hardware watchdog verified (2026-09-15, owner's profiles): software
+    sensor 1 enabled with a 30 s timeout and a 90 °C fallback; a temperature
+    alarm on it selects profile 2, alarm level 0 selects profile 1. In both
+    profiles every output 1–8 (the Quadro on aquabus included) follows preset
+    1 with minimum 35 % and maximum 100 %; profile 1 holds preset 1 at 25 %
+    (every output at 51.25 %: the aquaero scales a controller value into
+    [min, max]), profile 2 at 100 %. With a heartbeat of 20.00 °C written
+    every 2 s nothing changed; 30 s after the last write the sensor fell
+    back to 90 °C and within 2 s every output went to 100 %. A resumed
+    heartbeat brought profile 1 back within 2 s, with the control report
+    byte-identical to before. Byte `0x06` of the control report reads the
+    active profile (0 = profile 1, 1 = profile 2; 0 in every earlier
+    capture). A live, unsaved preset (30 %, output 54.5 %) was overridden by
+    the alarm and did not come back with profile 1: the switch reloads the
+    saved profile, so the daemon must rewrite its duties after a profile
+    change (watch `0x06`). With no daemon writing the heartbeat, the aquaero
+    now goes to profile 2 on its own 30 s after any silence, including after
+    a power cycle.
 85. **Done** (2026-09-15): the aquaero entry commands outputs `pwm1..pwm8` and
     reads tachometers `fan1..fan8`, 5–8 being a Quadro on its aquabus (fan
     blocks `0x167 + 12k`, control blocks `0x20C + 20k`, presets `0x55C + 2k`
