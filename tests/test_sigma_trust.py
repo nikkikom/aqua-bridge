@@ -1,29 +1,32 @@
-"""``zones.trust_rule: sigma`` (PROJECT.md section 3 per-zone trust, section 8 item 8).
+"""``zones.trust_rule: sigma`` (PROJECT.md section 3 per-zone trust, section 8 items 8,
+67, 69 and 70).
 
 A zone is trusted under ``sigma`` iff the time status is ``first`` / ``ok``, no
 unknown key arrived, its setpoint groups hold (zoned setpoint configs), every
 bay declared ``occupied: true`` / ``auto`` that the estimator does not report
-``empty`` has a drive sigma of at most ``estimator.sigma_fault_c``, and the
-zone's air sigma is at most ``estimator.sigma_air_fault_c``. ``step`` runs the
+``empty`` has a drive sigma of at most ``estimator.sigma_fault_c`` (unless the
+estimator reports it ``settling`` and ``observed``), the
+zone's air sigma is at most ``estimator.sigma_air_fault_c``, and its air node has
+had a trusted reading within ``estimator.air_blind_fault_s``. ``step`` runs the
 estimator before zone trust, so the verdict reads this tick's sigma.
 
 The rule on scripted estimator updates first; then ``step`` (the tick ordering,
 an estimator fault, a zone returning without its lost sensor, switching rules by
-config); then the DAS truth simulator: sensor dropouts fault far fewer zones than
-under ``strict`` with every drive within its limit, a lost proximal sensor does not
-lower the PI-like DAS solver's cooling (a replay of the same observations without
-it), and losing a bay's or a zone's sensors for good still faults the zone once
-sigma passes its threshold, with its channels held and then raised. The sigma floor
+config); then the DAS truth simulator: sensor dropouts fault no zone at all where
+``strict`` faults dozens, with every drive within its limit; a lost proximal sensor does
+not lower the PI-like DAS solver's cooling (a replay of the same observations without
+it); a hot swap no longer faults its zone while the bay is still watched, but a swapped
+bay that goes blind faults at once; and losing a bay's or a zone's sensors for good still
+faults the zone, on the drive sigma or on the blind air clock, with its channels held and
+then raised. The sigma floor
 (``mpc.step`` 4b) keeps the reach of a zone with a lost group at or above ``prev``:
 without it the DAS MPC, which had followed a measured warming that the blind estimate
 does not show, lowered the fans on the tick of the loss.
 
 The simulator runs use the ``basic`` preset with each sensor type's noise (the
-DAS golden physics). The ``rich`` sweep (nightly) masks the example's two
-redundant proximal sensors: on ``rich`` a bay's two sensors sit at different
-drawn placements, the estimator fuses both into one sensor node, and its
-fast-swap rule inflates that bay's sigma on every tick (up to 7 degC measured),
-which faults the zone under ``sigma`` on a healthy plant (reported separately).
+DAS golden physics); the ``rich`` sweeps (nightly) draw the placements, so the example's
+two redundant proximal pairs sit several degC apart there -- the case item 67 was about,
+now carried as a placement offset per member rather than as one fused node.
 """
 
 from __future__ import annotations
@@ -92,12 +95,14 @@ def fixture_update(
     *,
     sigma: Mapping[str, Any] | None = None,
     air: Mapping[str, Any] | None = None,
+    blind: Mapping[str, Any] | None = None,
     occupancy: Mapping[str, str] | None = None,
+    bay_flags: Mapping[str, Mapping[str, Any]] | None = None,
     drop_estimates: tuple[str, ...] = (),
     uninitialised: tuple[str, ...] = (),
 ) -> estimator.EstimatorUpdate:
-    """A real first-tick estimator update of the fixture, with sigmas, occupancy and
-    zone state overridden (the rule reads nothing else)."""
+    """A real first-tick estimator update of the fixture, with sigmas, occupancy, the blind
+    air clock, the per-bay flags and zone state overridden (the rule reads nothing else)."""
     temps = {k: v for k, v in default_temps(cfg).items() if v is not None}
     up = estimator.update(None, cfg, temps=temps, u=dict.fromkeys(cfg.channels, 0.5), ts=0.0)
     est = {b: dict(e) for b, e in up.estimates.items() if b not in drop_estimates}
@@ -106,11 +111,15 @@ def fixture_update(
     zones_out = {z: dict(info) for z, info in up.zones.items()}
     for zone, value in (air or {}).items():
         zones_out[zone]["sigma_air_c"] = value
+    for zone, value in (blind or {}).items():
+        zones_out[zone]["air_blind_s"] = value
     for zone in uninitialised:
         zones_out[zone] = {"initialised": False}
     bays = {b: dict(info) for b, info in up.bays.items()}
     for bay, occ in (occupancy or {}).items():
         bays[bay]["occupancy"] = occ
+    for bay, flags in (bay_flags or {}).items():
+        bays[bay].update(flags)
     return dataclasses.replace(up, estimates=est, zones=zones_out, bays=bays)
 
 
@@ -179,7 +188,65 @@ def test_a_zone_without_an_air_estimate_is_not_trusted():
     gate = gate_for(cfg, das_obs(cfg, 0.0))
     v = zones.evaluate(gate, "ok", cfg, fixture_update(cfg, uninitialised=("zc",)))
     assert trusted(v) == {"za", "zb"}
-    assert v["zc"].reasons == ("sigma:zone_air=none>2",)
+    assert v["zc"].reasons == ("sigma:zone_air=none>2", "sigma:zone_air_blind=none>900")
+
+
+def test_a_zone_blind_on_air_for_too_long_is_not_trusted():
+    """Item 70: the air sigma barely grows, so the blind time decides."""
+    cfg = lcfg()
+    window = cfg.estimator.air_blind_fault_s
+    gate = gate_for(cfg, das_obs(cfg, 0.0))
+    at = fixture_update(cfg, blind={"za": window})
+    assert trusted(zones.evaluate(gate, "ok", cfg, at)) == {"za", "zb", "zc"}
+    past = fixture_update(cfg, blind={"za": math.nextafter(window, math.inf)})
+    v = zones.evaluate(gate, "ok", cfg, past)
+    assert trusted(v) == {"zb", "zc"}
+    assert v["za"].reasons == ("sigma:zone_air_blind=900.000>900",)
+
+
+@pytest.mark.parametrize("bad", [None, math.nan, "600", True], ids=repr)
+def test_a_blind_time_that_is_not_a_number_is_not_trusted(bad):
+    cfg = lcfg()
+    gate = gate_for(cfg, das_obs(cfg, 0.0))
+    v = zones.evaluate(gate, "ok", cfg, fixture_update(cfg, blind={"za": bad}))
+    assert trusted(v) == {"zb", "zc"}
+
+
+def test_air_blind_fault_s_is_a_config_key():
+    gate_cfg = lcfg()
+    tight = with_rule(gate_cfg, "sigma", air_blind_fault_s=10.0)
+    gate = gate_for(tight, das_obs(tight, 0.0))
+    up = fixture_update(tight, blind={"za": 11.0})
+    assert trusted(zones.evaluate(gate, "ok", tight, up)) == {"zb", "zc"}
+    wide = with_rule(gate_cfg, "sigma", air_blind_fault_s=10_000.0)
+    assert trusted(zones.evaluate(gate, "ok", wide, up)) == {"za", "zb", "zc"}
+
+
+def test_a_settling_observed_bay_carries_no_sigma_check():
+    """Item 69: the estimator widened that bay on purpose while it was still watching it."""
+    cfg = lcfg()
+    gate = gate_for(cfg, das_obs(cfg, 0.0))
+    wide = {"a2": 9.0}
+    faulted = fixture_update(cfg, sigma=wide)
+    assert trusted(zones.evaluate(gate, "ok", cfg, faulted)) == {"zb", "zc"}
+    settling = fixture_update(
+        cfg, sigma=wide, bay_flags={"a2": {"settling": True, "observed": True}}
+    )
+    assert trusted(zones.evaluate(gate, "ok", cfg, settling)) == {"za", "zb", "zc"}
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [{"settling": True, "observed": False}, {"settling": False, "observed": True}],
+    ids=["blind", "settled"],
+)
+def test_a_bay_that_is_not_both_settling_and_observed_still_faults(flags):
+    cfg = lcfg()
+    gate = gate_for(cfg, das_obs(cfg, 0.0))
+    up = fixture_update(cfg, sigma={"a2": 9.0}, bay_flags={"a2": flags})
+    v = zones.evaluate(gate, "ok", cfg, up)
+    assert trusted(v) == {"zb", "zc"}
+    assert v["za"].reasons == ("sigma:bay:a2=9.000>4",)
 
 
 @pytest.mark.parametrize("bad", [None, math.nan, math.inf, "1.0", True], ids=repr)
@@ -607,7 +674,7 @@ HEAT = {
 }
 #: Per-tick dropout probability of every DS18B20 (1-Wire CRC failures and the like).
 DROPOUT = 0.02
-#: The example's redundant proximal sensors (masked on ``rich``, module docstring).
+#: The example's redundant proximal sensors: a second sensor on b03 and on b10.
 REDUNDANT = ("prox_b03b", "prox_b10b")
 
 ObsHook = Callable[[int, PlantObservation], PlantObservation]
@@ -666,22 +733,16 @@ def zone_faults(run: DasRun) -> tuple[int, int]:
 
 
 def assert_dropouts_fault_fewer_zones(ticks: int, preset: str, seed: int, solver: str) -> None:
-    hook = without(REDUNDANT) if preset == "rich" else None
     strict = sim_run(
-        example_cfg("strict", solver), ticks, preset=preset, seed=seed, dropout=DROPOUT, hook=hook
+        example_cfg("strict", solver), ticks, preset=preset, seed=seed, dropout=DROPOUT
     )
-    sigma = sim_run(
-        example_cfg("sigma", solver), ticks, preset=preset, seed=seed, dropout=DROPOUT, hook=hook
-    )
+    sigma = sim_run(example_cfg("sigma", solver), ticks, preset=preset, seed=seed, dropout=DROPOUT)
     strict_faults, sigma_faults = zone_faults(strict), zone_faults(sigma)
     assert strict_faults[0] > 50, strict_faults  # the dropouts do fault zones under strict
-    # Under sigma none, except a sensor that drops out on the very first tick: the
-    # estimator starts that bay's sensor node at the air, the reading that returns trips
-    # the fast-swap rule for one tick (rich seed 5, strict faulted that tick as well).
-    assert sigma_faults[0] <= 1, sigma_faults
-    assert sigma_faults[1] <= sigma_faults[0] * (1 + example_cfg("sigma").confirm_ticks)
-    early = [r.obs.ts for r in sigma.records if r.cmd.diagnostics["zones_in_fault"]]
-    assert all(ts <= 60.0 for ts in early), early
+    # Under sigma none at all, the example's two redundant proximal pairs included (items
+    # 67 and 69: their placements are an offset the filter carries, and a sensor missing on
+    # the estimator's first tick seeds its bay instead of tripping the fast-swap rule).
+    assert sigma_faults == (0, 0), sigma_faults
     assert strict.violations() == 0 and sigma.violations() == 0
     assert all(r.cmd.diagnostics["trust_rule"] == "sigma" for r in sigma.records), (
         "every tick had an estimator update"
@@ -700,6 +761,38 @@ def test_dropouts_fault_far_fewer_zones_under_sigma_than_strict(solver):
 )
 def test_dropouts_fault_far_fewer_zones_under_sigma_sweep(preset, seed, solver):
     assert_dropouts_fault_fewer_zones(LONG_TICKS, preset, seed, solver)
+
+
+def assert_redundant_pairs_do_not_fault_a_healthy_zone(ticks: int, seed: int, solver: str) -> None:
+    """Item 67: on ``rich`` the two proximal sensors of b03 and of b10 sit at different
+    drawn placements and read degrees apart. Their disagreement is a placement offset the
+    filter carries, not a swap, so the bays' sigmas stay at the uncalibrated floor and no
+    zone faults on a healthy plant."""
+    run = sim_run(example_cfg("sigma", solver), ticks, preset="rich", seed=seed)
+    assert zone_faults(run) == (0, 0)
+    for bay in ("b03", "b10"):
+        sigma = [
+            r.cmd.diagnostics["estimates"][bay]["sigma_c"]
+            for r in run.records
+            if bay in r.cmd.diagnostics["estimates"]
+        ]
+        assert max(sigma) < SIGMA_UNCALIBRATED_C + 0.1, (bay, max(sigma))
+    offsets = run.records[-1].cmd.diagnostics["bays"]
+    assert set(offsets["b03"]["offsets_c"]) == {"prox_b03b"}
+    assert set(offsets["b10"]["offsets_c"]) == {"prox_b10b"}
+    assert run.violations() == 0
+
+
+@pytest.mark.parametrize("solver", ["pi", "mpc"])
+def test_the_redundant_pairs_do_not_fault_a_healthy_zone_on_rich(solver):
+    assert_redundant_pairs_do_not_fault_a_healthy_zone(PR_TICKS, 1, solver)
+
+
+@pytest.mark.nightly
+@pytest.mark.parametrize("solver", ["pi", "mpc"])
+@pytest.mark.parametrize("seed", range(6))
+def test_the_redundant_pairs_do_not_fault_a_healthy_zone_sweep(seed, solver):
+    assert_redundant_pairs_do_not_fault_a_healthy_zone(LONG_TICKS, seed, solver)
 
 
 #: When the replayed sensor is lost (the fans have taken up the busy bays by then).
@@ -829,14 +922,8 @@ def floor_case(
     floor (the PR test only compares the first minutes after the loss) and then runs the
     soft floor without the per-tick invariant checks, which the nightly sweep makes."""
     cfg = example_cfg("sigma", solver)
-    masked = REDUNDANT if preset == "rich" else ()
-
-    def healthy_hook(i: int, obs: PlantObservation) -> PlantObservation:
-        return without(masked)(i, obs)
-
-    def lost_hook(i: int, obs: PlantObservation) -> PlantObservation:
-        return without((sensor,), since_s=LOSS_S)(i, without(masked)(i, obs))
-
+    healthy_hook = None
+    lost_hook = without((sensor,), since_s=LOSS_S)
     kw: dict[str, Any] = {"preset": preset, "seed": seed}
     short = ticks if reference_ticks is None else reference_ticks
     healthy = sim_run(cfg, short, hook=healthy_hook, **kw)
@@ -988,17 +1075,22 @@ def test_the_soft_sigma_floor_until_it_has_released(preset, seed, sensor):
     assert max(case.margin_loss(case.soft)) <= max(bare, SOFT_FLOOR_LOSS_C) + UNCOVERED_LOSS_C
 
 
-def test_a_lost_redundant_proximal_sensor_changes_nothing(healthy_sigma_run):
-    """b03 keeps its other proximal sensor: sigma and the commands stay as they were."""
+@pytest.mark.parametrize(("name", "sigma_cost"), [("prox_b03b", 0.001), ("prox_b03", 0.05)])
+def test_a_lost_proximal_member_of_a_redundant_pair_changes_almost_nothing(
+    healthy_sigma_run, name, sigma_cost
+):
+    """b03 keeps its other proximal sensor: sigma and the commands stay as they were.
+    Losing the member that carries a placement offset (``prox_b03b``) costs nothing;
+    losing the anchor leaves the bay observed through an offset whose own uncertainty the
+    sigma now carries, which is a hundredth of a degree, far below ``sigma_fault_c``."""
     cfg, healthy = healthy_sigma_run
-    for name in ("prox_b03",):
-        for with_sensor, without_sensor in replay_without(cfg, healthy, name):
-            s0 = with_sensor.diagnostics["estimates"]["b03"]["sigma_c"]
-            s1 = without_sensor.diagnostics["estimates"]["b03"]["sigma_c"]
-            assert abs(s1 - s0) < 0.01
-            assert without_sensor.diagnostics["zones_in_fault"] == []
-            for ch in cfg.channels:
-                assert abs(without_sensor.pwm[ch] - with_sensor.pwm[ch]) < 0.005
+    for with_sensor, without_sensor in replay_without(cfg, healthy, name):
+        s0 = with_sensor.diagnostics["estimates"]["b03"]["sigma_c"]
+        s1 = without_sensor.diagnostics["estimates"]["b03"]["sigma_c"]
+        assert abs(s1 - s0) < sigma_cost
+        assert without_sensor.diagnostics["zones_in_fault"] == []
+        for ch in cfg.channels:
+            assert abs(without_sensor.pwm[ch] - with_sensor.pwm[ch]) < 0.005
 
 
 #: When the sensors of the observability-loss runs go missing for good.
@@ -1006,10 +1098,16 @@ LOST_S = 300.0
 
 
 def assert_observability_loss_faults(
-    cfg: MpcConfig, names: tuple[str, ...], zone: str, ticks: int
+    cfg: MpcConfig,
+    names: tuple[str, ...],
+    zone: str,
+    ticks: int,
+    *,
+    why: str = "sigma:bay:",
 ) -> tuple[DasRun, int]:
     """``names`` missing from ``LOST_S`` on: the zone runs on the solver with rising fans
-    until a sigma passes its threshold, then faults for good; its reach holds and then
+    until a sigma passes its threshold (or its air node has been blind for
+    ``estimator.air_blind_fault_s``), then faults for good; its reach holds and then
     rises to ``fallback_pwm``. Returns the run and the first fault tick."""
     run = sim_run(cfg, ticks, hook=without(names, since_s=LOST_S), controller=checked_step)
     at = next(
@@ -1019,7 +1117,7 @@ def assert_observability_loss_faults(
     lost = next(i for i, r in enumerate(run.records) if r.obs.ts >= LOST_S)
     assert at > lost + int(300.0 / cfg.dt), "no graceful period: the zone faulted at once"
     reasons = run.records[at].cmd.diagnostics["zones"][zone]["reasons"]
-    assert reasons and all(why.startswith("sigma:bay:") for why in reasons), reasons
+    assert reasons and all(reason.startswith(why) for reason in reasons), reasons
     if cfg.solver.value == "pi":  # the margin deficit rose with sigma (the MPC re-plans)
         before, faulted = run.records[lost].cmd.pwm, run.records[at].cmd.pwm
         assert zone_airflow(cfg, zone, faulted) > zone_airflow(cfg, zone, before)
@@ -1049,13 +1147,49 @@ def test_losing_a_bays_only_sensor_for_good_faults_its_zone_once_sigma_passes(so
 
 
 @pytest.mark.parametrize("solver", ["pi", "mpc"])
-def test_losing_every_sensor_of_a_zone_faults_it_once_sigma_passes(solver):
-    # at the default thresholds: about 17 minutes after the loss; the air sigma stays far
-    # below sigma_air_fault_c (the model binds the air node), the drives' sigmas pass
+def test_losing_every_sensor_of_a_zone_faults_it_on_the_blind_air_clock(solver):
+    """Item 70. The air sigma stays far below ``sigma_air_fault_c`` (every proximal sensor
+    reads the air beside its drive, and the inlet and the fan command pin the rest), so
+    what decides is ``air_blind_fault_s``: 15 minutes after the loss, just before the
+    drives' sigmas reach ``sigma_fault_c`` at about 17 minutes."""
     cfg = example_cfg("sigma", solver)
     names = tuple(n for n in cfg.temps if cfg.sensors[n].zone == "z0")
     assert set(names) >= {"air_z0", "prox_b01", "prox_b02", "prox_b03", "prox_b03b", "prox_b04"}
-    assert_observability_loss_faults(cfg, names, "z0", 300)
+    run, at = assert_observability_loss_faults(cfg, names, "z0", 300, why="sigma:zone_air_blind=")
+    info = run.records[at].cmd.diagnostics["estimator"]["zones"]["z0"]
+    assert info["sigma_air_c"] < cfg.estimator.sigma_air_fault_c / 4
+    assert info["air_blind_s"] == pytest.approx(cfg.estimator.air_blind_fault_s + cfg.dt)
+
+
+@pytest.mark.parametrize("solver", ["pi", "mpc"])
+def test_losing_every_sensor_of_a_zone_faults_on_sigma_with_the_blind_clock_wide(solver):
+    """The same loss with ``air_blind_fault_s`` far away: the drives' sigmas decide, about
+    17 minutes after the loss, which is what this rule did before item 70."""
+    cfg = example_cfg("sigma", solver, air_blind_fault_s=10_000.0)
+    names = tuple(n for n in cfg.temps if cfg.sensors[n].zone == "z0")
+    run, at = assert_observability_loss_faults(cfg, names, "z0", 300)
+    assert run.records[at].obs.ts - LOST_S > 900.0
+
+
+def test_a_zone_that_loses_only_its_air_sensor_faults_on_the_blind_clock():
+    """The case no sigma ever caught: the bays keep their proximal sensors, so every drive
+    sigma stays at the uncalibrated floor and the air sigma below 0.1 degC for ever."""
+    cfg = example_cfg("sigma")
+    run, at = assert_observability_loss_faults(
+        cfg, ("air_z0",), "z0", 300, why="sigma:zone_air_blind="
+    )
+    every = [
+        e["sigma_c"]
+        for r in run.records
+        for b, e in r.cmd.diagnostics["estimates"].items()
+        if r.cmd.diagnostics["bays"][b]["zone"] == "z0"
+    ]
+    assert max(every) < cfg.estimator.sigma_fault_c / 2, max(every)
+    air = [r.cmd.diagnostics["estimator"]["zones"]["z0"]["sigma_air_c"] for r in run.records]
+    assert max(air[1:]) < 0.1, max(air[1:])  # air[0] is the prior sqrt(P0_T_AIR)
+    wide = example_cfg("sigma", air_blind_fault_s=10_000.0)
+    never = sim_run(wide, 300, hook=without(("air_z0",), since_s=LOST_S))
+    assert not any(r.cmd.diagnostics["zones_in_fault"] for r in never.records)
 
 
 @pytest.mark.nightly
@@ -1066,42 +1200,49 @@ def test_a_bays_only_sensor_lost_for_good_keeps_every_drive_within_its_limit(
     preset, seed, solver, sensor
 ):
     """75 minutes with the sensor lost from 10 minutes on, default thresholds."""
-    masked = REDUNDANT if preset == "rich" else ()
-
-    def hook(i: int, obs: PlantObservation) -> PlantObservation:
-        return without((sensor,), since_s=600.0)(i, without(masked)(i, obs))
+    hook = without((sensor,), since_s=600.0)
 
     run = sim_run(example_cfg("sigma", solver), LONG_TICKS, preset=preset, seed=seed, hook=hook)
     assert run.violations() == 0
 
 
-def test_a_hot_swap_holds_its_zone_for_a_few_ticks_under_sigma():
-    """The estimator widens a swapped bay's sigma on purpose (the fast-swap rule on the
-    removal, a 25 degC^2 drive variance on the insert), above sigma_fault_c for a tick:
-    under ``sigma`` the zone faults for that tick plus its confirmation, shorter than
-    ``fallback_hold_s``, so its channels only hold; the insert still raises the fans.
-    ``tests/test_hotswap.py`` runs the same swap under ``strict`` without a zone fault."""
-    remove_s, insert_s = 300.0, 1200.0
-    cfg = example_cfg("sigma")
-    run = sim_run(
+def hot_swap_run(cfg: MpcConfig, insert_s: float = 1200.0, **kw: Any) -> DasRun:
+    """b06's drive pulled at 300 s and a warm one inserted at ``insert_s``."""
+    return sim_run(
         cfg,
         int((insert_s + cfg.estimator.bay_settle_s) / cfg.dt),
         seed=31,
         controller=checked_step,
         heat_schedule={"b06": [(0.0, 1.0)], "b07": [(0.0, 0.5)]},
         bay_schedule=[
-            {"t_s": remove_s, "bay": "b06", "action": "remove"},
+            {"t_s": 300.0, "bay": "b06", "action": "remove"},
             {"t_s": insert_s, "bay": "b06", "action": "insert", "temp_c": 45.0},
         ],
+        **kw,
     )
-    episodes, ticks = zone_faults(run)
-    assert 1 <= episodes <= 2 and ticks <= episodes * (cfg.confirm_ticks + 1)
+
+
+def test_a_hot_swap_no_longer_faults_its_zone_under_sigma():
+    """Item 69. The estimator widens a swapped bay's sigma on purpose (the fast-swap rule
+    on the removal, a 25 degC^2 drive variance on the insert), above ``sigma_fault_c`` for
+    a tick. That is the filter following the swap while it is still watching the bay, not
+    an observability loss, so the sigma check is suspended while the bay is ``settling``
+    and ``observed``: no zone fault, while the margin the widened sigma carries still
+    raises the fans. ``tests/test_hotswap.py`` runs the same swap under ``strict``."""
+    cfg = example_cfg("sigma")
+    insert_s = 1200.0
+    run = hot_swap_run(cfg, insert_s)
+    assert zone_faults(run) == (0, 0)
     for rec in run.records:
         d = rec.cmd.diagnostics
-        assert set(d["zones_in_fault"]) <= {"z1"}
-        assert all(p in ("solver", "hold") for p in d["policy_by_channel"].values())
-        for reason in d["zones"]["z1"]["reasons"]:
-            assert reason.startswith("sigma:bay:b06="), reason
+        assert d["zones_in_fault"] == []
+        assert all(p == "solver" for p in d["policy_by_channel"].values())
+    peak = max(
+        r.cmd.diagnostics["estimates"]["b06"]["sigma_c"]
+        for r in run.records
+        if "b06" in r.cmd.diagnostics["estimates"]
+    )
+    assert peak > cfg.estimator.sigma_fault_c  # the widening is still there
     assert run.violations() == 0
     at = next(i for i, t in enumerate(run.series["ts"]) if t >= insert_s)
     rise = max(
@@ -1109,3 +1250,20 @@ def test_a_hot_swap_holds_its_zone_for_a_few_ticks_under_sigma():
         for ch in cfg.topology.zones["z1"].channels
     )
     assert rise > 0.05
+
+
+def test_a_swapped_bay_that_goes_blind_faults_at_once():
+    """The exemption needs the bay observed: lose its sensor right after the insert and the
+    widened sigma faults the zone on that tick, sooner than it would have before item 69."""
+    cfg = example_cfg("sigma")
+    insert_s = 1200.0
+    blind_from = insert_s + 2 * cfg.dt
+    run = hot_swap_run(cfg, insert_s, hook=without(("prox_b06",), since_s=blind_from))
+    at = next(
+        (i for i, r in enumerate(run.records) if "z1" in r.cmd.diagnostics["zones_in_fault"]), None
+    )
+    assert at is not None, "a blind bay with a wide sigma did not fault its zone"
+    assert run.records[at].obs.ts <= blind_from + cfg.dt
+    reasons = run.records[at].cmd.diagnostics["zones"]["z1"]["reasons"]
+    assert all(reason.startswith("sigma:bay:b06=") for reason in reasons), reasons
+    assert run.violations() == 0
