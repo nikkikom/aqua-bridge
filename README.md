@@ -288,7 +288,13 @@ hardware.
     in Home Assistant it is the `Board problem` binary sensor. The board is
     a health signal only — it is never a solver input, a zone air sensor or
     a model node — and the divergence rule is a hint about the air sensors
-    or the board's placement, not a verdict about either.
+    or the board's placement, not a verdict about either: it shows on the
+    board's own verdict and its `Board problem` sensor, and deliberately
+    does *not* make `/api/health` not-ok or turn on `Controller problem`,
+    which a hot or throttling board (a fact, not a hint) does. Its default
+    `divergence_c` is a coarse backstop — an idle Zero 2 W already sits
+    20–25 °C above the air around it — so narrow it only from a measured
+    board-vs-air delta on the board in its finished place.
 
 12. **Optional SMART agent**, on the PC with the drives attached (not
     the Pi): `python tools/smart_agent.py --mqtt <broker-host>

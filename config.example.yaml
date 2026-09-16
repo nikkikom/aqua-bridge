@@ -216,10 +216,13 @@ host_health:
   temp_fault_s: 120.0        # held this long it is reported, seconds (> 0): a build or an
                              # update heats the SoC for tens of seconds; two minutes is
                              # placement or airflow
-  divergence_c: 25.0         # the board further than this from the enclosure air is a
-                             # deviation while the CPU is idle, degC (> 0): at idle a
-                             # Zero 2 W sits 10-20 degC above the air around it. Judged on
-                             # the absolute difference, either way round
+  divergence_c: 40.0         # the board further than this from the enclosure air is a
+                             # deviation while the CPU is idle, degC (> 0). A coarse
+                             # backstop: an un-heatsinked Zero 2 W idles 20-25 degC above
+                             # the air around it (the owner's reads 47.2 degC at idle), so
+                             # a healthy board is already that far from a room-temperature
+                             # reference. Narrow it only from a measured board-vs-air
+                             # delta. Judged on the absolute difference, either way round
   divergence_fault_s: 900.0  # a divergence held this long, idle throughout, is reported,
                              # seconds (> 0); the enclosure's air moves in minutes
   idle_load1_max: 0.5        # the CPU counts as idle at or below this load1 (>= 0): above
@@ -229,6 +232,10 @@ host_health:
                              # empty means every zone_air sensor, else every inlet sensor,
                              # else every configured temperature
   log_interval_s: 300.0      # one log line for the board at most this often, seconds (> 0)
+  vcgencmd_timeout_s: 2.0    # how long a `vcgencmd get_throttled` fallback may take,
+                             # seconds (> 0); only the HTTP and MQTT readers ever start
+                             # that process, and only where the sysfs attribute is
+                             # missing -- the control tick's reader never does
 
 http:
   # HTTPS with basic auth only; there is no plain-HTTP listener (PROJECT.md section 6).
