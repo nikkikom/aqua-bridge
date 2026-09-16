@@ -287,6 +287,8 @@ mpc:
     associate_window_s: 3600      # serial -> bay association by correlation (no SES)
     associate_min_corr: 0.8
     associate_margin: 0.15
+    associate_drop_corr: 0.3      # a correlated pair is re-scored against its bay every
+    associate_drop_checks: 3      # evaluation; this many scores below it in a row drop it
     sigma_uncalibrated_c: 1.5     # sigma floor of a bay without an accepted SMART calibration
     p0_t_air: 0.25       # initial variance per state kind: air, air disturbance, drive,
     p0_d_air: 2.5e-3     # sensor node, heat (the same order as the q_* above)

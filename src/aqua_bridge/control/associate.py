@@ -37,7 +37,20 @@ Rules
 4. Dropping (the estimator applies it): an association ends when the bay's
    occupancy changes into or out of ``empty`` (a hot swap), when the bay's
    proximal sensor shows a jump (the conservative fast-swap rule of the
-   estimator), or when the serial stays silent for ``smart_max_age_s``.
+   estimator), when the serial stays silent for ``smart_max_age_s``, or when it
+   stops correlating (rule 5).
+5. Re-checking: an association is a claim about correlation, so it has to keep
+   holding. The bay series and the serial's SMART history go on being recorded
+   after the pair is accepted, and every evaluation re-scores the pair against
+   its own bay. ``associate_drop_checks`` consecutive scores below
+   ``associate_drop_corr`` end it; a pair too short of history to score is left
+   alone. Keeping a pair asks less than choosing one, because a correct pair
+   dips through a quiet window while a wrong one sits near zero. A dropped
+   pair's history starts over, so it must win rule 3 again over a full window
+   before it may calibrate that bay. A wrong pair from a coincidence over one
+   window does not survive the next ones; the absolute SMART band
+   (``smart_reject_c``) cannot tell the two apart, because an uncalibrated bay's
+   estimate carries the prior map's own offset.
 
 Series layout (plain JSON, kept by the estimator)::
 

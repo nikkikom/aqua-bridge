@@ -1276,6 +1276,8 @@ ESTIMATOR_DEFAULTS: dict[str, float] = {
     "jump_min_c": 0.5,
     "jump_sigmas": 6.0,
     "occupancy_hold_s": 30.0,
+    "associate_drop_corr": 0.3,
+    "associate_drop_checks": 3.0,
 }
 
 #: ``estimator`` keys that are a variance of a filter state (all ``> 0``).
@@ -1328,6 +1330,12 @@ class EstimatorSpec:
     * ``smart_max_age_s``          -- a SMART sample older than this is ignored and an
       association whose serial stays silent this long is dropped (``>= dt``)
     * ``smart_reject_c``           -- a SMART value this far from the estimate is dropped
+    * ``associate_drop_corr`` / ``associate_drop_checks`` -- a correlation pair is
+      re-scored against its own bay at every evaluation; this many consecutive scores
+      below that correlation drop it (``0 < associate_drop_corr < associate_min_corr``,
+      ``associate_drop_checks >= 1``), and it must then be earned again. Keeping a pair
+      asks less than choosing one: a correct pair scores near ``associate_min_corr`` but
+      dips through a quiet window, a wrong one sits near zero
     * ``occupied_dT_c`` / ``empty_dT_c`` -- occupancy evidence thresholds on
       ``T_s - T_a`` (``occupied_dT_c > empty_dT_c > 0``)
     * ``empty_confirm_s``          -- low evidence must last this long before a bay is
@@ -1344,6 +1352,10 @@ class EstimatorSpec:
       this long is no longer trusted (> 0)
     * ``associate_window_s`` / ``associate_min_corr`` / ``associate_margin`` -- serial
       -> bay association by correlation (``>= 600``, ``(0, 1)``, ``(0, 1)``)
+    * ``associate_drop_corr`` / ``associate_drop_checks`` -- a correlated pair is
+      re-scored against its own bay on every association evaluation; this many
+      consecutive scores (``>= 1``) below this correlation (``0 < associate_drop_corr
+      < associate_min_corr``) end the pair
     """
 
     k_sigma: float = ESTIMATOR_DEFAULTS["k_sigma"]
@@ -1379,6 +1391,8 @@ class EstimatorSpec:
     jump_min_c: float = ESTIMATOR_DEFAULTS["jump_min_c"]
     jump_sigmas: float = ESTIMATOR_DEFAULTS["jump_sigmas"]
     occupancy_hold_s: float = ESTIMATOR_DEFAULTS["occupancy_hold_s"]
+    associate_drop_corr: float = ESTIMATOR_DEFAULTS["associate_drop_corr"]
+    associate_drop_checks: float = ESTIMATOR_DEFAULTS["associate_drop_checks"]
 
     @classmethod
     def coerce(cls, data: object) -> EstimatorSpec:
@@ -1421,6 +1435,15 @@ class EstimatorSpec:
         ):
             if getattr(self, key) < 0:
                 raise ConfigError(f"{where}.{key} must be >= 0, got {getattr(self, key)}")
+        if not 0.0 < self.associate_drop_corr < self.associate_min_corr:
+            raise ConfigError(
+                f"{where}: 0 < associate_drop_corr < associate_min_corr is required, got "
+                f"{self.associate_drop_corr} and {self.associate_min_corr}"
+            )
+        if self.associate_drop_checks < 1:
+            raise ConfigError(
+                f"{where}.associate_drop_checks must be >= 1, got {self.associate_drop_checks}"
+            )
         if self.smart_max_age_s < dt:
             raise ConfigError(
                 f"{where}.smart_max_age_s must be >= dt ({dt}), got {self.smart_max_age_s}"
