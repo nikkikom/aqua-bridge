@@ -23,6 +23,12 @@ testable without files:
   ``fan_models`` entry, so a fitted curve survives a restart through the store. Without
   the switch the section is still loaded and saved, but nothing reads it: the configured
   curves are used.
+* ``ident_settle`` -- how long each zone had been trusted and fault-free, in seconds,
+  when the file was written (:func:`aqua_bridge.control.ident.settle_snapshot`). The
+  daemon's outage is subtracted here and the whole section is dropped when the file is
+  stale, its age unknown, or the outage longer than ``ident_settle_resume_max_gap_s``;
+  what is left goes to ``diagnostics["store"]["ident_settle"]``, where the supervisor
+  picks it up as the experiments' settle credit (section 8 item 20).
 * ``bays`` -- the last occupancy, class, serial and association per bay, reported only.
   Conservative choice: occupancy restarts ``unknown`` (a drive may have been inserted
   while the daemon was down) and associations by correlation are formed again (drives
@@ -33,8 +39,9 @@ The result, ``solver_memory[STORE_KEY]`` and ``diagnostics["store"]``::
 
     {"source": "fresh" | "stale" | "prior", "path": str | None, "age_s": float | None,
      "loaded_ts": ts, "sections": {"thermal": "loaded" | "dropped" | "ignored" | "absent",
-     "calibration": int entries, "fan_curves": int, "bays": int},
-     "warnings": [str, ...], "bays": {bay: {...}}}
+     "calibration": int entries, "fan_curves": int, "bays": int, "ident_settle": int},
+     "warnings": [str, ...], "bays": {bay: {...}},
+     ["ident_settle": {"ts": ts, "credit_s": {zone: seconds}}]}
 
 ``source`` is what the file was; a ``fresh`` file whose thermal section was dropped
 still reports ``fresh`` with that section ``dropped``. A missing or unusable file comes as
@@ -115,11 +122,53 @@ def _bays(raw: object, cfg: MpcConfig, warnings: list[str]) -> dict[str, dict[st
     return out
 
 
+def _ident_settle(
+    raw: object, cfg: MpcConfig, age_s: float | None, stale: bool, warnings: list[str]
+) -> dict[str, float]:
+    """The experiments' settle credit per zone: what each zone had accumulated when the
+    file was written, minus the daemon's outage (module docstring).
+
+    Nothing is credited from a ``stale`` file, from one whose age is unknown (a wall
+    clock behind it) or after an outage longer than ``ident_settle_resume_max_gap_s``:
+    the enclosure may have been moved, reloaded or run on another curve meanwhile."""
+    if not isinstance(raw, Mapping):
+        warnings.append("ident_settle: not a mapping, section dropped")
+        return {}
+    gap = cfg.ident_settle_resume_max_gap_s
+    if stale or age_s is None or age_s < 0.0 or age_s > gap:
+        if raw:
+            warnings.append(
+                f"ident_settle: the outage ({'unknown' if age_s is None else f'{age_s:.0f} s'}) "
+                f"is past ident_settle_resume_max_gap_s ({gap:g} s), the experiments' "
+                "settle timers start over"
+            )
+        return {}
+    zones = set(cfg.zone_layout.zones)
+    out: dict[str, float] = {}
+    for zone, value in raw.items():
+        if zone not in zones:
+            warnings.append(f"ident_settle: {zone!r} is not a zone of this config, dropped")
+            continue
+        if not _finite(value) or float(value) < 0.0:
+            warnings.append(f"ident_settle: {zone!r} has no usable value, dropped")
+            continue
+        credit = float(value) - age_s
+        if credit > 0.0:
+            out[str(zone)] = credit
+    return out
+
+
 def apply_seed(mem: dict[str, Any], cfg: MpcConfig, seed: object, ts: float) -> dict[str, Any]:
     """Install a store seed into ``mem`` (``solver_memory``, modified in place) and return
     the store summary, also kept as ``mem[STORE_KEY]`` (module docstring). Never raises."""
     warnings: list[str] = []
-    sections: dict[str, Any] = {"thermal": "absent", "calibration": 0, "fan_curves": 0, "bays": 0}
+    sections: dict[str, Any] = {
+        "thermal": "absent",
+        "calibration": 0,
+        "fan_curves": 0,
+        "bays": 0,
+        "ident_settle": 0,
+    }
     summary: dict[str, Any] = {
         "source": "prior",
         "path": None,
@@ -180,11 +229,19 @@ def apply_seed(mem: dict[str, Any], cfg: MpcConfig, seed: object, ts: float) -> 
         if bays is not None:
             summary["bays"] = _bays(bays, cfg, warnings)
             sections["bays"] = len(summary["bays"])
+
+        settle = seed.get("ident_settle")
+        if settle is not None:
+            credit = _ident_settle(settle, cfg, summary["age_s"], stale, warnings)
+            if credit:
+                summary["ident_settle"] = {"ts": float(ts), "credit_s": credit}
+                sections["ident_settle"] = len(credit)
         mem.update(staged)
     except Exception as exc:  # a malformed seed never raises out of step (nothing installed)
         summary["source"] = "prior"
         summary["bays"] = {}
-        sections.update(thermal="absent", calibration=0, fan_curves=0, bays=0)
+        summary.pop("ident_settle", None)
+        sections.update(thermal="absent", calibration=0, fan_curves=0, bays=0, ident_settle=0)
         warnings.append(f"store: not applied ({type(exc).__name__}: {exc})"[:300])
     if len(warnings) > MAX_WARNINGS:
         extra = len(warnings) - MAX_WARNINGS

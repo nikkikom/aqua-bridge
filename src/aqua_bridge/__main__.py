@@ -473,6 +473,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     notifier = SdNotifier()
     supervisor = Supervisor(cfg, version=VERSION)
+    if persister is not None:
+        # The experiments' settle timers live in the supervisor and ride along in
+        # model.json, so a restart does not start them over (section 8 item 20).
+        persister.ident_settle = supervisor.ident_settle_snapshot
     sleep = _make_sleep(args.sim_speed) if args.source == "sim" else None
     loop = Loop(
         source,

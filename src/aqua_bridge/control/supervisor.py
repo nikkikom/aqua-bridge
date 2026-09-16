@@ -118,8 +118,20 @@ Identification experiments (DAS plan section 5, :mod:`aqua_bridge.control.ident`
   ``fallback`` and restarts the settle count. An unexpected error
   in this bookkeeping aborts the experiment (reason ``error``) and never raises.
   Every start and end is logged.
+* **The tick a start lands on.** ``plan_tick`` marks the plan pending and
+  ``record_tick`` clears it, so a start that arrives between the two -- the loop
+  already holds the plan for the next tick and that tick cannot carry the overrides --
+  arms offset 0 one tick further out (``ident.start``'s ``skip_ticks``). Without it
+  the machine credited the levels to a tick that ran without them (section 8 item 20).
+* **Settle timers across a restart.** They are the only part of the experiments that
+  survives one: :meth:`Supervisor.ident_settle_snapshot` hands
+  ``aqua_bridge.modelstore.ModelPersister`` ``{zone: seconds settled}`` for
+  ``model.json``, and on the first zoned tick that carries a store section
+  (``diagnostics["store"]``) the tracker takes back what
+  :func:`aqua_bridge.control.persist.apply_seed` left of it after subtracting the
+  outage. A running experiment still never resumes.
 * ``snapshot().extra["experiment"]`` is :func:`~aqua_bridge.control.ident.status`
-  (DAS mode only). Nothing of an experiment survives a restart.
+  (DAS mode only). No running experiment survives a restart.
 
 The offset applies on top of the user's setpoint; ``snapshot().setpoints``
 reports the user's values and ``extra["effective_setpoints"]`` the
@@ -377,11 +389,15 @@ class Supervisor:
         self._effective = apply_preset(cfg, self._setpoints, self._preset, self._limits, self._bays)
         self._released: set[str] = set()
 
-        # Identification experiments (module docstring); in memory only.
+        # Identification experiments (module docstring). The running experiment is in
+        # memory only; the settle timers come back through the model store.
         self._ident_tracker: dict[str, Any] = ident.new_tracker()
         self._ident_facts: ident.TickFacts | None = None
         self._experiment: dict[str, Any] | None = None
         self._ident_last: dict[str, Any] = {}
+        self._ident_resume_pending = True
+        #: A plan has been handed to the loop and its tick is not recorded yet.
+        self._plan_pending = False
 
         # Loop-reported facts.
         self._obs: PlantObservation | None = None
@@ -686,7 +702,12 @@ class Supervisor:
         if reasons:
             raise IntentConflict(f"cannot start the experiment: {', '.join(reasons)}")
         assert facts is not None
-        self._experiment = ident.start(cfg, facts, kind, name)
+        # A start between plan_tick and record_tick arrives after the loop has taken the
+        # plan for the tick that follows ``facts``: that tick cannot carry the overrides,
+        # so offset 0 is the tick after it (section 8 item 20).
+        self._experiment = ident.start(
+            cfg, facts, kind, name, skip_ticks=1 if self._plan_pending else 0
+        )
         _LOG.info(
             "experiment started on %s %r: channels %s, base %s",
             kind,
@@ -743,6 +764,7 @@ class Supervisor:
     def plan_tick(self) -> TickPlan:
         """Atomic view for one tick; consumes the pending ``released`` set."""
         with self._lock:
+            self._plan_pending = True
             released = frozenset(self._released)
             self._released.clear()
             overrides = dict(self._overrides)
@@ -828,6 +850,7 @@ class Supervisor:
         failure); ``None`` falls back to ``obs.ts``. In DAS mode it also advances the
         experiment bookkeeping (module docstring)."""
         with self._lock:
+            self._plan_pending = False
             if obs is not None:
                 self._obs = obs
             if mpc_cmd is not None:
@@ -855,10 +878,21 @@ class Supervisor:
                 tick_ts = obs.ts if ts is None and obs is not None else ts
                 self._ident_tick(solver_cmd, tick_ts, applied)
 
+    def ident_settle_snapshot(self) -> dict[str, float]:
+        """The experiments' settle timers for the model store: ``{zone: seconds settled}``.
+
+        ``aqua_bridge.modelstore.ModelPersister`` is constructed with this; empty in
+        legacy mode and before the first zoned tick."""
+        with self._lock:
+            return ident.settle_snapshot(self._ident_tracker)
+
     def _ident_tick(self, mpc_cmd: MpcCommand | None, ts: float | None, applied: bool) -> None:
         try:
             facts = ident.facts_from_tick(mpc_cmd, ts=ts, applied=applied)
             self._ident_facts = facts
+            if self._ident_resume_pending and facts.store:
+                self._ident_resume_pending = False
+                self._ident_tracker = ident.resume_tracker(self._ident_tracker, facts)
             self._ident_tracker = ident.track(self._ident_tracker, self._effective, facts)
             if self._experiment is None:
                 return

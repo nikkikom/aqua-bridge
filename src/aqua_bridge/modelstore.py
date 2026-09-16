@@ -37,7 +37,8 @@ File schema (:data:`SCHEMA`, version :data:`SCHEMA_VERSION`; plain JSON, finite 
                                      ["inflate", "confirm",]
                                      "last_sample_wall": unix time | null,
                                      "expires_wall": unix time | null}}},
-     "bays": {bay: {"occupancy", "class", "serial", "association"}}}
+     "bays": {bay: {"occupancy", "class", "serial", "association"}},
+     "ident_settle": {zone: seconds trusted and fault-free at the snapshot}}
 
 ``thermal`` is the thermal model's memory as the controller keeps it (coefficients,
 covariances, zone statuses, a pending stale hold); its windows and samples are dropped
@@ -49,6 +50,12 @@ hardware) to wall time at the snapshot, so they survive a reboot:
 ``fan_curves`` is ``solver_memory["fan_curves"]``: the PWM -> RPM curve per fan model
 that ``mpc.fan_curve_online`` fits online (:mod:`aqua_bridge.control.fancurve`), empty
 without the switch.
+``ident_settle`` is the experiments' settle timers
+(:func:`aqua_bridge.control.ident.settle_snapshot`, through the ``ident_settle``
+callable this class is constructed with) as **seconds already settled**, not times,
+so they need no clock conversion;
+:func:`aqua_bridge.control.persist.apply_seed` subtracts the outage from them and
+drops them altogether when it was too long.
 
 The fingerprint covers ``dt``, ``channels``, ``temps``, the zones (channels, coupling,
 inlet), the bay-to-zone map, the sensors' placement (role, zone, bay, redundant) and the
@@ -332,7 +339,7 @@ def load(path: str | os.PathLike[str], cfg: MpcConfig, *, now_wall: float) -> Lo
         seed["thermal"] = thermal
         if doc.get("calibration") is not None:
             seed["calibration"] = _calibration_seed(doc["calibration"], now_wall, result.warnings)
-        for name in ("fan_curves", "bays"):
+        for name in ("fan_curves", "bays", "ident_settle"):
             value = doc.get(name)
             if value is None:
                 continue
@@ -367,6 +374,7 @@ def build_document(
     ts: float | None,
     wall: float,
     bays: Mapping[str, Any] | None = None,
+    ident_settle: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The file content for a snapshot of ``solver_memory`` taken at controller time
     ``ts`` and wall time ``wall`` (module docstring, *File schema*)."""
@@ -399,6 +407,11 @@ def build_document(
             bays_out[str(bay)] = {
                 k: info.get(k) for k in ("occupancy", "class", "serial", "association")
             }
+    settle_out = {
+        str(zone): float(value)
+        for zone, value in (ident_settle or {}).items()
+        if _finite(value) and float(value) >= 0.0
+    }
     curves = memory.get("fan_curves")
     return {
         "schema": SCHEMA,
@@ -409,6 +422,7 @@ def build_document(
         "fan_curves": dict(curves) if isinstance(curves, Mapping) else {},
         "calibration": calibration,
         "bays": bays_out,
+        "ident_settle": settle_out,
     }
 
 
@@ -511,6 +525,7 @@ class ModelPersister:
         clock: Callable[[], float] = time.monotonic,
         wall: Callable[[], float] = time.time,
         interval_s: float | None = None,
+        ident_settle: Callable[[], Mapping[str, Any] | None] | None = None,
     ) -> None:
         if not cfg.is_das:
             raise ValueError("a model store needs a zoned config (mpc.topology)")
@@ -519,12 +534,16 @@ class ModelPersister:
         self.clock = clock
         self.wall = wall
         self.interval_s = float(cfg.model_store_interval_s if interval_s is None else interval_s)
+        #: Called on every captured tick for the experiments' settle timers (module
+        #: docstring); ``None`` leaves that section empty.
+        self.ident_settle = ident_settle
         self.writes = 0
         self.errors = 0
         self.last_error: str | None = None
         self._last_write = clock()
         self._snapshot: tuple[Mapping[str, Any], float | None, float] | None = None
         self._bays: Mapping[str, Any] | None = None
+        self._settle: Mapping[str, Any] | None = None
         self._dirty = False
         self._reported = False
 
@@ -547,6 +566,9 @@ class ModelPersister:
         diagnostics = getattr(cmd, "diagnostics", None)
         if isinstance(diagnostics, Mapping) and isinstance(diagnostics.get("bays"), Mapping):
             self._bays = diagnostics["bays"]
+        if self.ident_settle is not None:
+            settle = self.ident_settle()
+            self._settle = settle if isinstance(settle, Mapping) else None
         ts = memory.get("last_ts")
         self._snapshot = (memory, float(ts) if _finite(ts) else None, float(self.wall()))
         self._dirty = True
@@ -571,7 +593,9 @@ class ModelPersister:
         memory, ts, wall = self._snapshot
         self._last_write = self.clock()
         try:
-            doc = build_document(self.cfg, memory, ts=ts, wall=wall, bays=self._bays)
+            doc = build_document(
+                self.cfg, memory, ts=ts, wall=wall, bays=self._bays, ident_settle=self._settle
+            )
             data = json.dumps(doc, allow_nan=False, separators=(",", ":")).encode()
             write_atomic(self.path, data)
         except Exception as exc:  # a disk error must not touch the loop
