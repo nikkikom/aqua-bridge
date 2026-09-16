@@ -95,11 +95,19 @@ with CPU load. It never becomes a solver input, a zone air sensor or a model
 node; its verdict rides the same published health payload as the fans' and is
 read by nothing that computes a duty. Its thresholds are ``host_health:`` keys,
 declared once in :class:`HostHealthConfig` under the same rules.
+
+The two rules that report a fact -- the board is hot, the board is throttling --
+join the payload's daemon-wide ``problems``; the divergence rule, which is a hint
+about where to look, does not, and shows only on the board's own published
+verdict and its Home Assistant ``host_problem`` sensor. The reader the control
+loop uses never starts a process (:func:`host_metrics_reader`): a ``vcgencmd``
+fallback belongs to the publishers' readers, off the loop thread.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import math
 from collections import deque
@@ -108,7 +116,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from aqua_bridge.control.thermal import phi
-from aqua_bridge.hostinfo import THROTTLED_BITS
+from aqua_bridge.hostinfo import THROTTLED_BITS, collect_hostinfo, run_vcgencmd
 from aqua_bridge.model import ConfigError, MpcConfig
 
 __all__ = [
@@ -122,6 +130,8 @@ __all__ = [
     "HostHealthConfig",
     "default_air_temps",
     "expected_rpm",
+    "host_metrics_reader",
+    "validate_host_health",
 ]
 
 _LOG = logging.getLogger("aqua_bridge.health")
@@ -273,12 +283,17 @@ class HostHealthConfig:
     #: minutes is placement or airflow, not a burst of work.
     temp_fault_s: float = 120.0
     #: The board's temperature further than this from the enclosure air is a
-    #: deviation while the CPU is idle, degC (> 0). At idle a Zero 2 W sits roughly
-    #: 10-20 degC above the air around it, so this leaves room for that spread and
-    #: still catches a board sitting in hot exhaust, or an air sensor that stopped
-    #: tracking. Judged on the absolute difference: air reading *above* the board is
-    #: just as much evidence.
-    divergence_c: float = 25.0
+    #: deviation while the CPU is idle, degC (> 0). A coarse backstop, deliberately:
+    #: the owner's Zero 2 W reads 47.2 degC at idle, and an un-heatsinked Zero 2 W
+    #: idles roughly 20-25 degC above the air around it, so a *healthy* board is
+    #: already 20-25 degC from a room-temperature reference and anything near that
+    #: figure would stand permanently tripped. 40 degC clears the self-heating floor
+    #: with room to spare and still catches a board in hot exhaust or an air sensor
+    #: that stopped tracking. Narrow it only from a measured board-vs-air delta on
+    #: the board in its finished place (PROJECT.md section 3, "The board itself").
+    #: Judged on the absolute difference: air reading *above* the board is just as
+    #: much evidence.
+    divergence_c: float = 40.0
     #: A divergence held this long -- idle throughout -- is reported, seconds (> 0).
     #: The enclosure's air moves in minutes, so a quarter of an hour of continuous
     #: idle divergence is not a transient.
@@ -295,6 +310,13 @@ class HostHealthConfig:
     air_temps: tuple[str, ...] = ()
     #: One log line for the board at most this often, seconds (> 0).
     log_interval_s: float = 300.0
+    #: How long a ``vcgencmd get_throttled`` fallback may take, seconds (> 0). Only
+    #: the publishers' host-metrics readers ever start that process, and only on a
+    #: board whose firmware exposes no sysfs attribute; the control tick's reader has
+    #: the fallback switched off outright (:func:`host_metrics_reader`), so nothing
+    #: here can block the loop. Two seconds is a mailbox round trip with room for a
+    #: busy VideoCore, and a timeout is simply ``None``.
+    vcgencmd_timeout_s: float = 2.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
@@ -302,7 +324,7 @@ class HostHealthConfig:
         _number("host_health.temp_limit_c", self.temp_limit_c, minimum=0.0, maximum=None)
         _number("host_health.divergence_c", self.divergence_c, minimum=1e-9, maximum=None)
         _number("host_health.idle_load1_max", self.idle_load1_max, minimum=0.0, maximum=None)
-        for name in ("temp_fault_s", "divergence_fault_s", "log_interval_s"):
+        for name in ("temp_fault_s", "divergence_fault_s", "log_interval_s", "vcgencmd_timeout_s"):
             _number(f"host_health.{name}", getattr(self, name), minimum=1e-9, maximum=None)
         if isinstance(self.air_temps, str) or not isinstance(self.air_temps, list | tuple):
             raise ConfigError(
@@ -331,21 +353,64 @@ class HostHealthConfig:
 HOSTHEALTH_KEYS: tuple[str, ...] = tuple(f.name for f in dataclasses.fields(HostHealthConfig))
 
 
-def default_air_temps(cfg: Any) -> tuple[str, ...]:
+def default_air_temps(cfg: MpcConfig) -> tuple[str, ...]:
     """The enclosure-air reference when ``host_health.air_temps`` is empty.
 
     Every ``zone_air`` sensor (the air the drives and the board actually sit in),
     else every ``inlet`` sensor, else -- a legacy config, which declares no roles --
     every configured temperature. The divergence rule is a hint either way, so a
     rough reference is better than none.
+
+    ``cfg.temps`` and ``cfg.sensors`` are read straight off the config: a renamed
+    field is an :class:`AttributeError` at startup, not a silently empty reference
+    that switches the divergence rule off with nothing said.
     """
-    temps = tuple(getattr(cfg, "temps", ()) or ())
-    sensors = getattr(cfg, "sensors", None) or {}
+    temps = tuple(cfg.temps)
+    sensors = cfg.sensors
     for role in ("zone_air", "inlet"):
         named = tuple(t for t in temps if getattr(sensors.get(t), "role", None) == role)
         if named:
             return named
     return temps
+
+
+def validate_host_health(cfg: MpcConfig, settings: HostHealthConfig) -> tuple[str, ...]:
+    """The air reference ``settings`` resolves to, or :class:`ConfigError` for a name
+    that is not in ``mpc.temps``.
+
+    The one ``host_health:`` check that needs the controller config, so it cannot
+    live in :class:`HostHealthConfig`. Called from ``__main__.main`` before anything
+    is opened -- a typo'd sensor name is a startup ``ConfigError`` (exit 2), not a
+    traceback out of a half-built daemon holding hidraw handles -- and again from
+    :meth:`HealthMonitor.__init__`, which is the only way to build the rules.
+    """
+    unknown = sorted(set(settings.air_temps) - set(cfg.temps))
+    if unknown:
+        raise ConfigError(
+            f"host_health.air_temps names temperature(s) {unknown} that are not in mpc.temps"
+        )
+    return tuple(settings.air_temps) or default_air_temps(cfg)
+
+
+def host_metrics_reader(
+    settings: HostHealthConfig | None = None, *, subprocess_fallback: bool = True
+) -> Callable[[], dict[str, Any]]:
+    """:func:`~aqua_bridge.hostinfo.collect_hostinfo` bound to this config's fallback.
+
+    ``subprocess_fallback=False`` switches the ``vcgencmd get_throttled`` fallback
+    off entirely: the reader then does file reads only, which is what the control
+    loop's own reader wants -- ``HealthMonitor.on_tick`` runs on the loop thread, and
+    a fork/exec there would stretch the tick (and the watchdog ping behind it) by
+    however long the VideoCore mailbox takes, invisibly to the step budget, which is
+    measured before the tick's observers run. The publishers' readers keep the
+    fallback, bounded by ``host_health.vcgencmd_timeout_s``.
+    """
+    if not subprocess_fallback:
+        return functools.partial(collect_hostinfo, vcgencmd=None)
+    timeout_s = (settings or HostHealthConfig()).vcgencmd_timeout_s
+    return functools.partial(
+        collect_hostinfo, vcgencmd=functools.partial(run_vcgencmd, timeout_s=timeout_s)
+    )
 
 
 class HostHealth:
@@ -372,6 +437,13 @@ class HostHealth:
         starts the window again. This rule is a **hint, not a verdict**: it says
         that either the air sensors or the board's placement deserve a look, never
         which.
+
+    :meth:`check` reports the first two as ``faults`` and the hint as ``hints``,
+    with ``problems`` their concatenation and ``ok`` false for either. Only the
+    ``faults`` join the daemon-wide problem list (:meth:`HealthMonitor.update`): a
+    hint must not make ``/api/health`` not-ok or turn on the controller-fault sensor
+    in Home Assistant, which would read exactly like an aquabus device that has gone
+    missing. The board's own ``host_problem`` sensor carries all of it.
 
     None of this steers anything: the verdict is published (``/api/state``,
     ``/api/health``, the MQTT state blob, the page) and logged, and never enters
@@ -431,39 +503,44 @@ class HostHealth:
             "load1": load1,
             "idle": idle,
             "throttled": throttled,
+            "faults": [],
+            "hints": [],
             "problems": [],
             "ok": True,
         }
         if not s.enabled:
             return out
 
-        problems: list[str] = []
+        faults: list[str] = []
         held = self._sustained("temp", board_c is not None and board_c > s.temp_limit_c, now)
         if held is not None and board_c is not None:
-            problems.append(
+            faults.append(
                 f"host: the board reads {board_c:.1f} degC, above the "
                 f"{s.temp_limit_c:g} degC limit, for {held:.0f} s"
             )
 
         if throttled is not None and throttled.get("now"):
             flags = [name for _, name in THROTTLED_BITS if throttled.get(f"{name}_now")]
-            problems.append(
+            faults.append(
                 f"host: the board is throttling now ({', '.join(flags) or 'unknown bit'}, "
                 f"get_throttled {throttled.get('hex')})"
             )
 
+        hints: list[str] = []
         diverging = idle is True and divergence is not None and abs(divergence) > s.divergence_c
         held = self._sustained("divergence", diverging, now)
         if held is not None and divergence is not None and air is not None:
-            problems.append(
+            hints.append(
                 f"host: the board is {divergence:+.1f} degC from the enclosure air "
                 f"({air:.1f} degC) at idle, beyond {s.divergence_c:g} degC, for {held:.0f} s "
                 f"-- a hint about the air sensors or the board's placement, not a verdict"
             )
 
-        out["problems"] = problems
-        out["ok"] = not problems
-        self._log(problems, now)
+        out["faults"] = faults
+        out["hints"] = hints
+        out["problems"] = [*faults, *hints]
+        out["ok"] = not out["problems"]
+        self._log(out["problems"], now)
         return out
 
     def _log(self, problems: list[str], now: float) -> None:
@@ -545,12 +622,10 @@ class HealthMonitor:
         self._channels: dict[str, _ChannelState] = {}
         self._tick = 0
         self.host_settings = host_settings or HostHealthConfig()
-        unknown = sorted(set(self.host_settings.air_temps) - set(getattr(cfg, "temps", ()) or ()))
-        if unknown:
-            raise ConfigError(
-                f"host_health.air_temps names temperature(s) {unknown} that are not in mpc.temps"
-            )
-        self.host = HostHealth(self.host_settings, air_temps=default_air_temps(cfg))
+        # The same check ``__main__.main`` runs before anything is opened, so a bad
+        # air_temps name never gets this far in the daemon (:func:`validate_host_health`).
+        air_temps = validate_host_health(cfg, self.host_settings)
+        self.host = HostHealth(self.host_settings, air_temps=air_temps)
         self._hostinfo = hostinfo
         self.last: dict[str, Any] = {
             "devices": [],
@@ -756,7 +831,11 @@ class HealthMonitor:
             "devices": devices["devices"],
             "fans": fans,
             "host": board,
-            "problems": [*devices["problems"], *problems, *board["problems"]],
+            # Only the board's *faults* (hot, throttling now) are daemon problems.
+            # The divergence rule is a hint about where to look, not a verdict, and
+            # must not flip /api/health or the controller-fault sensor; it is in
+            # host["problems"] and on the board's own host_problem sensor instead.
+            "problems": [*devices["problems"], *problems, *board["faults"]],
         }
         payload["ok"] = not payload["problems"]
         self.last = payload
