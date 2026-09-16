@@ -1429,6 +1429,21 @@ class AquacomputerAdapter:
             ", ".join(f"pwm{k + 1}" for k in restore),
         )
 
+    def control_snapshot(self) -> bytes:
+        """Fetches the control report fresh and caches it (``control_report``),
+        writing nothing: the same GET ``apply()`` runs when its cache is stale,
+        called on its own for commissioning (PROJECT.md section 8 item 88, the
+        tool that shows what :meth:`save` is about to store before asking to run
+        it). Raises :class:`~aqua_bridge.hw.hidraw.DeviceUnavailable` on failure,
+        not retried, like :meth:`save`."""
+
+        def once(transport: HidTransport, deadline: float) -> bytes:
+            self._adopt(self._fetch(transport, deadline))
+            assert self._ctrl is not None
+            return self._ctrl
+
+        return self._with_retries("control report GET", once, retry=False)
+
     def save(self) -> None:
         """Sends the save report once: the controller stores the configuration it
         holds now in its memory, and a power cycle brings that back.
