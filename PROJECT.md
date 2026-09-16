@@ -703,7 +703,7 @@ long `dt`):
 | `model_return_dwell_s` | 300 | ≥ 0, s: how long the scaled checks must pass continuously (and since the fallback began) |
 | `model_drift_rate_tau_s` | 120 | > 0, s: low-pass time constant both the drives' observed rate and the model's own rate go through |
 | `model_drift_dwell_s` | 120 | ≥ 0, s: how long the drift or the air-disturbance check must keep failing before the entry faults the model (a leaky dwell: a passing tick does not restart it, a passing spell this long does) |
-| `model_max_air_dist_c_per_min` | 8.0 | > 0, °C/min: the zone-air disturbance's move away from its slow level (§8 items 66, 96) |
+| `model_max_air_dist_c_per_min` | 8.0 | > 0, °C/min: the zone-air disturbance's move away from its slow level (§8 items 66, 98) |
 | `model_air_dist_tau_s` | 900 | > 0, s: time constant of that slow level, and how long it must have run before the check has a reference to report a move against |
 | `model_accept_prior` | `false` | the DAS MPC may act on a model that has not converged (needs `topology`) |
 | `model_store_interval_s` | 600 | > 0 |
@@ -4424,7 +4424,7 @@ Owner decision (2026-09-16):
     stage 3), which is what the enclosure runs on until identification has
     happened, so the check faults on a prior model too.
     On the real enclosure the model is fitted, so the healthy floor is far
-    below the `rich` preset's and the limit can come down — item 96.
+    below the `rich` preset's and the limit can come down — item 98.
 67. Sigma trust with two proximal sensors on one bay at different
     placements: the estimator fuses both into one sensor node, their
     disagreement trips the fast-swap rule every tick and the bay's σ
@@ -4803,7 +4803,7 @@ Owner decision (2026-09-16):
     revisions agree, not that the controller is unchanged, so the golden
     diff has to be read). If no, close this item and leave both phases as
     they are.
-96. Tune `model_max_air_dist_c_per_min` on the real enclosure (item 66).
+98. Tune `model_max_air_dist_c_per_min` on the real enclosure (item 66).
     The shipped 8.0 °C/min is set above what the `rich` truth simulator's
     *drawn* physics produce on a healthy enclosure, where the prior's air
     node is already as wrong as a 2× airflow error; with a fitted model
@@ -6008,7 +6008,7 @@ blob in the log.
    | 1 offline fit + fan curves | – | `tools/fit_model.py`: `E` per group and per-bay `k` pinned (relative SE under `model_converged_rel_se`); `tools/fit_fans.py` RMS < 5 % rpm, copied into `fan_models`; spare thermistors moved to the bays the fit ranks tightest | fit and replay reports |
    | 2 SMART calibration (if used) | agent on the PC | most bays `calibrated`, `σ_cal` ≤ 0.7 °C, calibrated estimates within 2 °C of SMART, associations match the physical bays | HA `drive_sigma_*`, `/api/model` calibration, `/api/bays` |
    | 3 shadow + experiments | `model_shadow: true`, `ident_enabled: true`, store on; experiments one group at a time under PI-DAS | every zone `converged`, prediction error < 0.5 °C, no experiment abort on the envelope | HA `model_status`, `model_pred_err_c`, `ident_running`, `/api/model` |
-   | 4 MPC | `solver: mpc` | the validity gate keeps `active: mpc` (no model fallbacks), no `degraded`, `noise_db` lower than stage 0 at equal or better `drive_margin_*`, step p99 under budget | `/api/health`, `solver_diag.model` (its `checks`, `air_dist_c_per_min` for §8 item 96), `noise_db`, `drive_margin_*` |
+   | 4 MPC | `solver: mpc` | the validity gate keeps `active: mpc` (no model fallbacks), no `degraded`, `noise_db` lower than stage 0 at equal or better `drive_margin_*`, step p99 under budget | `/api/health`, `solver_diag.model` (its `checks`, `air_dist_c_per_min` for §8 item 98), `noise_db`, `drive_margin_*` |
    | 5 restart check | restart the daemon | `model.json` loads `fresh` and the zones `frozen`; after > `model_store_max_age_days` offline it loads `stale` and re-confirms in shadow before the MPC acts | `/api/model` `store`, journal |
    | 6 `trust_rule: sigma` | `zones.trust_rule: sigma` (§3 per-zone trust; not with two proximal sensors on a bay at different placements) | fewer zone faults than `strict`, no violation, the time from a lost sensor to its zone fault acceptable | zone graphs, `diagnostics.zones` reasons, `drive_sigma_*` |
 
