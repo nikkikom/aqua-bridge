@@ -23,9 +23,10 @@ the group's gain between them; ``start`` on a channel runs that channel alone.
 ``ident_max_duration_s`` is split evenly over the phases. While one channel of a
 group runs alone the group's other channels are held at the group's base (a
 solver-driven sibling would move against the experiment and make the two
-regressors collinear again; that base follows the solver's demand upward like
-every other level below, so holding a sibling never gives less cooling than the
-solver asks for).
+regressors collinear again; that base follows the solver's demand like every
+other level below, and a held sibling is floored by the solver's own command on
+every tick like every other experiment channel, so holding one never gives less
+cooling than the solver asks for).
 
 Each channel's base ``u_base`` starts as the solver's command for it on the last
 tick before the start. The two levels are ``ident_levels``:
@@ -55,7 +56,7 @@ aborts the experiment; re-planning follows it instead, which is what the Zero
 2 W's compute allows on every tick (owner, 2026-09-14; the measured cost is in
 PROJECT.md section 8.4).
 
-Two pieces, both on only with ``ident_replan``:
+Three pieces, all three on only with ``ident_replan``:
 
 * **The anchor follows the demand up, de-biased.** :func:`advance` reads the
   solver's want for the tick that just ran (``diagnostics["target_pwm"]``: before
