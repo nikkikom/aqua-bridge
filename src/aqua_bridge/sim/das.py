@@ -1016,6 +1016,11 @@ class DasPlant:
     def occupied(self) -> dict[str, bool]:
         return {b: self.drives[i] is not None for b, i in self._bi.items()}
 
+    def drive_of(self, bay: str) -> DriveSpec | None:
+        """The drive in ``bay`` (``None`` when it is empty); ``KeyError`` for an
+        unknown bay. Its ``smart_offset_c`` and ``limit_c`` are truth a test may read."""
+        return self.drives[self._bi[bay]]
+
     def activity(self, bay: str, t: float | None = None) -> float:
         t = self.ts if t is None else t
         p = self.params

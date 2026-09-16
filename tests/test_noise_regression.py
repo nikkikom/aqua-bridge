@@ -61,12 +61,19 @@ ZONES = ("z0", "z1", "z2", "z3")
 #: Plan section 9: calibrated MPC noise <= 0.8x the quietest uniform curve.
 CALIBRATED_BOUND = 0.8
 UNCALIBRATED_BOUND = 2.0
-#: The rich preset draws placement and SMART offsets the calibration does not fully
-#: remove (estimates up to 2 degC off on some bays), so the MPC cools the bays it
-#: believes hottest; a uniform curve sized on the truth can then be quieter. Measured
-#: 0.43-1.30 over seeds 1-8 (seed 7: 1.30; with the plain-drift return of the model
-#: fallback, before section 8 item 10, seed 1 was still in the fallback in the window).
-RICH_BOUND = 1.35
+#: The rich preset draws a per-drive SMART offset (+-2 degC) that no controller can
+#: observe: the estimate tracks the drive-*reported* temperature, the truth margin here
+#: is on the physical node, so the MPC cools the bays it believes hottest and a uniform
+#: curve sized on the truth can be quieter. Measured 0.29-1.18 over seeds 1-8 (seed 7:
+#: 1.18). Before section 8 item 17 (a bay with two proximal sensors never calibrated)
+#: it was 0.43-1.30; before section 8 item 10 seed 1 was still in the model fallback in
+#: the window.
+RICH_BOUND = 1.25
+#: Section 8 item 17: with every bay calibrated the estimate follows the drive-reported
+#: temperature (true drive temperature + the drawn SMART offset) to this, degC, over the
+#: window. Measured 0.12-1.97 rms over seeds 1-8; the outlier is a bay with a redundant
+#: proximal pair, which one sensor node per bay cannot represent (section 8 item 96).
+RICH_ESTIMATE_RMS_C = 2.5
 #: A drive the rich preset draws may start above its limit; violations count after this.
 RICH_SETTLE_S = 600.0
 
@@ -129,6 +136,7 @@ def uniform_margin(plant: DasPlant, u: float) -> float:
 @dataclass(frozen=True)
 class NoiseResult:
     run: DasRun
+    plant: DasPlant
     hot: str
     worst_margin_c: float
     power: float
@@ -168,7 +176,26 @@ def run_scenario(*, seed: int, calibrated: bool, solver=SolverKind.MPC, preset="
             mid = 0.5 * (lo + hi)
             lo, hi = (lo, mid) if uniform_margin(plant, mid) >= worst else (mid, hi)
         u_star = hi
-    return NoiseResult(run, hot, worst, power, u_star, uniform_power(plant, u_star), window)
+    return NoiseResult(run, plant, hot, worst, power, u_star, uniform_power(plant, u_star), window)
+
+
+def estimate_errors(r: NoiseResult) -> dict[str, float]:
+    """Mean estimate error per bay over the window against the drive-*reported*
+    temperature the estimator is calibrated to (true drive temperature + the preset's
+    drawn SMART offset, which nothing in the daemon can observe)."""
+    out: dict[str, float] = {}
+    for bay, truth in r.run.series["t_drive"].items():
+        drive = r.plant.drive_of(bay)
+        if drive is None:
+            continue
+        errors = [
+            float(rec.cmd.diagnostics["estimates"][bay]["t_c"]) - float(t) - drive.smart_offset_c
+            for rec, t, inside in zip(r.run.records, truth, r.window, strict=True)
+            if inside and t is not None and bay in rec.cmd.diagnostics.get("estimates", {})
+        ]
+        if errors:
+            out[bay] = sum(errors) / len(errors)
+    return out
 
 
 def describe(r: NoiseResult) -> str:
@@ -235,3 +262,22 @@ def test_noise_sweep_rich_preset(seed):
     if r.u_star >= 1.0 - 1e-9:
         pytest.skip(f"the hot zone needs full speed on this seed ({describe(r)})")
     assert r.ratio <= RICH_BOUND, describe(r)
+
+
+@pytest.mark.nightly
+@pytest.mark.parametrize("seed", range(1, 9))
+def test_rich_preset_estimates_follow_the_drive_reported_temperature(seed):
+    """Section 8 item 17: every bay calibrates and the estimate tracks what the drive
+    reports, the only quantity the daemon can see."""
+    r = run_scenario(seed=seed, calibrated=True, preset="rich")
+    errors = estimate_errors(r)
+    rms = math.sqrt(sum(v * v for v in errors.values()) / len(errors))
+    worst = max(errors.items(), key=lambda kv: abs(kv[1]))
+    print(
+        f"seed {seed} rich estimate error: rms {rms:.2f} degC, "
+        f"worst {worst[0]} {worst[1]:+.2f} degC"
+    )
+    bays = r.run.records[-1].cmd.diagnostics["bays"]
+    uncalibrated = sorted(b for b, info in bays.items() if not info["calibrated"])
+    assert not uncalibrated, f"bays that never calibrated: {uncalibrated}"
+    assert rms <= RICH_ESTIMATE_RMS_C, f"rms {rms:.2f} degC, per bay {errors}"
