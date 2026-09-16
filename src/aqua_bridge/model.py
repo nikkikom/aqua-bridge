@@ -103,12 +103,15 @@ choice for cooling:
   ``ident_enabled: true`` needs ``topology``. The numeric keys are validated
   always (``ident_amplitude`` in ``(0, 0.3]``, ``ident_max_duration_s`` in
   ``(0, 7200]``, ``ident_settle_s >= 0``, ``ident_start_band_c > 0``,
-  ``ident_max_over_c > 0``, ``ident_seed >= 0``, ``ident_hold_s`` a non-empty
-  list of positive numbers, ``ident_levels`` ``above`` | ``symmetric``); the
+  ``ident_max_over_c > 0``, ``ident_abort_below_limit_c > 0``,
+  ``ident_settle_resume_max_gap_s >= 0``, ``ident_seed >= 0``, ``ident_hold_s``
+  a non-empty list of positive numbers, ``ident_levels`` ``above`` |
+  ``symmetric``); the
   rules that depend on ``dt`` and ``confirm_s`` (every hold ``>= 5 * dt``,
   ``ident_settle_s >= confirm_s``) are checked only with ``ident_enabled`` so a
   default never invalidates a legacy config with a long ``dt``. There is no
-  ``ident_abort_temp_c``: the absolute abort is per drive (its limit - 1 degC).
+  ``ident_abort_temp_c``: the absolute abort is per drive, at
+  ``ident_abort_below_limit_c`` below the limit in force on its bay.
 """
 
 from __future__ import annotations
@@ -1707,11 +1710,15 @@ class MpcConfig:
       error in bounds before it may act again. Inert in legacy mode.
     * ``ident_enabled`` / ``ident_amplitude`` / ``ident_levels`` / ``ident_hold_s`` /
       ``ident_max_duration_s`` / ``ident_settle_s`` / ``ident_start_band_c`` /
-      ``ident_max_over_c`` / ``ident_seed`` -- active identification experiments
+      ``ident_max_over_c`` / ``ident_abort_below_limit_c`` /
+      ``ident_settle_resume_max_gap_s`` / ``ident_seed`` -- active identification
+      experiments
       (``control/ident.py``): whether ``POST /api/ident`` may start one, the PWM step,
       the two levels, the hold times the seeded sequence draws from, the total
       duration, how long every zone the experiment serves must have been trusted,
-      the start band and the envelope above each drive's soft target, and the seed.
+      the start band and the envelope above each drive's soft target, how far below
+      each drive's limit the absolute abort sits, the longest daemon outage after
+      which the stored settle credit is still honoured, and the seed.
     * ``topology`` / ``sensors`` / ``drive_classes`` / ``fans`` / ``fan_models`` /
       ``zones`` / ``noise`` / ``estimator`` -- the zoned DAS layout (module
       docstring, *DAS layout*); all absent is legacy mode. With ``topology`` the
@@ -1806,6 +1813,8 @@ class MpcConfig:
     ident_settle_s: float = 600.0
     ident_start_band_c: float = 1.0
     ident_max_over_c: float = 3.0
+    ident_abort_below_limit_c: float = 1.0
+    ident_settle_resume_max_gap_s: float = 300.0
     ident_seed: int = 1
 
     # -- construction -------------------------------------------------------
@@ -1937,6 +1946,8 @@ class MpcConfig:
             "ident_settle_s",
             "ident_start_band_c",
             "ident_max_over_c",
+            "ident_abort_below_limit_c",
+            "ident_settle_resume_max_gap_s",
         ):
             s(self, name, _cfg_num(name, getattr(self, name)))
         s(self, "ident_seed", _cfg_int("ident_seed", self.ident_seed))
@@ -2270,6 +2281,15 @@ class MpcConfig:
             raise ConfigError(f"mpc.ident_start_band_c must be > 0, got {self.ident_start_band_c}")
         if self.ident_max_over_c <= 0:
             raise ConfigError(f"mpc.ident_max_over_c must be > 0, got {self.ident_max_over_c}")
+        if self.ident_abort_below_limit_c <= 0:
+            raise ConfigError(
+                f"mpc.ident_abort_below_limit_c must be > 0, got {self.ident_abort_below_limit_c}"
+            )
+        if self.ident_settle_resume_max_gap_s < 0:
+            raise ConfigError(
+                "mpc.ident_settle_resume_max_gap_s must be >= 0, got "
+                f"{self.ident_settle_resume_max_gap_s}"
+            )
         if self.ident_seed < 0:
             raise ConfigError(f"mpc.ident_seed must be >= 0, got {self.ident_seed}")
         if not self.ident_enabled:
