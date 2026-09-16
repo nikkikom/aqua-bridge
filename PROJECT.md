@@ -2075,8 +2075,17 @@ ident_max_over_c` (3 °C, owner-accepted), `T̂_d ≤ hard` always, and
 drive; there is no `ident_abort_temp_c`). **`k·σ` is counted once:** `soft`
 and `hard` already subtract it, so only the absolute rule, measured against
 the raw limit, adds it back. `T̂_d ≤ hard` therefore *is* `T̂_d + k·σ ≤
-limit`, and the absolute abort is stricter than it by
-`ident_abort_below_limit_c`, so it is the rule that binds. **Abort list:**
+limit`. **Which rule binds:** on `T̂_d + k·σ` the envelope fires above
+`limit − comfort_c + ident_max_over_c`, the absolute abort at `limit −
+ident_abort_below_limit_c` and `hard` above `limit`, so the absolute abort
+is always stricter than `hard`, and the *soft envelope* binds first whenever
+`ident_max_over_c < comfort_c − ident_abort_below_limit_c` — the case for
+every class of `config.example-das.yaml`: the envelope fires at `T̂_d + k·σ`
+of 48 / 58 / 63 °C for hdd / ssd_sata / nvme against 49 / 64 / 69 °C for the
+absolute abort. (The absolute abort binds instead where the comfort band is
+narrow, e.g. the `quiet` preset on hdd.) So item 53 *did* move the binding
+abort, up by `k·σ`, on the envelope — that `k·σ` was the double count — while
+the absolute backstop is bit-identical to before it. **Abort list:**
 any fallback tick or tick without a solver command, any `degraded` tick,
 two failed applies, a clock running backwards or jumping past the duration,
 the envelope, an untrusted served zone, a lost sensor group in a served
@@ -2100,8 +2109,15 @@ the experiment against 10.72–10.73 °C without it, zero limit violations, the
 excitation visible on the fans (max PWM 0.527 against 0.501); `rich` seeds
 3–5 keep 9.81 / 10.06 / 8.32 °C from the start on, the same with and without,
 zero violations, and `rich` seeds 1–2 are drawn saturated and the start is
-refused. Experiments are needed where PI-DAS acts: a model converges only
-with them.
+refused. A settled enclosure never comes near the envelope, so the same file
+also drives it there: with the room warming 20 °C/h, `basic` seeds 1–5 abort
+on `envelope:<bay>` 12–13 minutes into the experiment at `T̂_d` 0.00–0.04 °C
+past `soft + ident_max_over_c`, with `T̂_d + k·σ` 48.0 °C against the absolute
+abort at 49.0 °C (so the soft envelope is what stopped the run, as above),
+zero limit violations and 4.69 °C of worst true margin, on `ident_levels:
+above` and `symmetric` alike — `symmetric` commands the low level throughout
+and aborts a minute earlier for it. Experiments are needed where PI-DAS acts:
+a model converges only with them.
 
 ### Track A — core (dev machine / CI, no Pi)
 
@@ -3649,12 +3665,12 @@ tests carry the `nightly` marker.
 | `tests/test_thermal_ident.py` | identifiability with group experiments on the truth sim: in-zone `E` within 15 % (PR seed), per-bay `k` within 25 %, `leak` / `κ` at prior, convergence; regulation only never converges; the seed sweep (bound 25 %), sensor offsets, the rich preset | PR: 4 cases; nightly: sweeps |
 | `tests/test_solver_das.py` | active-piece SQP vs a projected-gradient reference, monotone objective, iteration cap, forbidden-band snap and hysteresis, zero-order hold, prediction vs thermal Jacobians, noise index and surrogate, bumpless offset, fixed channels, validity gate and model fallback with dwell (the entry dwell, the model rate through the drives' filter, the air-disturbance check, the prediction guard on eligible rows only), a clock stepped back, horizon and block extremes | PR |
 | `tests/test_model_fallback_sim.py` | the validity gate against the truth plant: the observed drive rate (ramp, restarts, memory), a sound model returns within `model_return_dwell_s + 2 · mpc_every_ticks · dt` and does not re-enter (§8 items 10, 64), a model with wrong bay gains is caught and held, a healthy enclosure never reaches the fallback (§8 item 65), a fouling jump to 0.15× airflow does (§8 item 66) and the same run without it does not, every drive within its limit and bumpless switches; the plain drift holds the same step | PR: 1 return, 1 broken model, 3 healthy seeds and the fouling pair per preset; nightly: zones × seeds on `basic` and `rich`, more broken gains, 8 healthy seeds and 4 fouling seeds per preset |
-| `tests/test_noise_regression.py` | calibrated DAS MPC noise ≤ 0.8× the quietest uniform curve at equal or better worst true margin (measured 0.31–0.48×); uncalibrated bound 2.0 (0.30–0.69×); rich preset bound 1.25 (up to 1.18×); on `rich` every bay calibrates and the estimate follows the drive-*reported* temperature to 2.5 °C rms (§8 item 17); MPC vs PI-DAS reported, not asserted (PI-DAS has not settled within the window on several seeds) | PR: 2 seeds; nightly: 8-seed sweeps |
+| `tests/test_noise_regression.py` | calibrated DAS MPC noise ≤ 0.8× the quietest uniform curve at equal or better worst true margin (measured 0.31–0.48×); uncalibrated bound 2.0 (0.30–0.69×); rich preset bound 1.25 (up to 1.18×); on `rich` every bay calibrates and the estimate follows the drive-*reported* temperature to 2.5 °C rms and never reads more than 1.0 °C *below* it (§8 item 17); MPC vs PI-DAS reported, not asserted (PI-DAS has not settled within the window on several seeds) | PR: 2 seeds; nightly: 8-seed sweeps |
 | `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× (named constant) the legacy MPC p99, the 75th percentile of several interleaved, warm-up-discarded repeats (§8 item 6); `bench_step.py` runs both DAS solvers; absolute p99 ≤ `mpc.budget_ms` only on `armv6l`; the Zero W fallback of §8 item 73 (`budget_ms` 1000 with `budget_alarm_ms` 1250 loads, `budget_ms` 1000 alone is rejected, `mpc_every_ticks: 3` solves a third of the ticks and a solve tick is the expensive one) | PR / Pi |
 | `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise; a `tools/fit_model.py` report in the store's place loads as a model, ages like a store file, drops a model of another structure and is refused outright when its `store_fingerprint` is another config's or missing (item 15); the settle timers round-trip through the file as seconds already settled minus the daemon's outage, drop on a long outage, a stale file or an unknown age, a malformed section is dropped with a warning, and the persister asks the supervisor for them before a save (item 20) | PR |
 | `tests/test_fancurve.py` | the online PWM → RPM fit (item 14): a swept fan is identified per fan model, one duty or a ramping command is never enough, a noisy tachometer is refused by the residual, the bins stay bounded and follow a fan that changes, a malformed memory or a changed channel → fan-model map starts over, `curve_pair` falls back to the config for anything unusable, `step` publishes the fit into the store's `fan_curves` and reports it, the curve round-trips through `model.json`, and `model_use_rpm` keeps the configured `rpm_max` as its reference so a worn fan still reads as less air | PR |
 | `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes a run but the settle timers come back from the store and a start between `plan_tick` and `record_tick` keeps its tick (§8 item 20); `k·σ` counted once and the absolute abort from `ident_abort_below_limit_c` (items 53, 54); a lost sensor group blocks a start and aborts a run (item 72); legacy refuses | PR |
-| `tests/test_ident_sim.py` | an experiment on the truth plant never takes a drive over a limit and never leaves the enclosure hotter than the same seed without one, with the excitation visible on the fans; a drawn enclosure that is already saturated refuses the start | PR: `basic` seed 1; nightly: `basic` and `rich` seeds 1–5 |
+| `tests/test_ident_sim.py` | an experiment on the truth plant never takes a drive over a limit and never leaves the enclosure hotter than the same seed without one, with the excitation visible on the fans; a drawn enclosure that is already saturated refuses the start; and, with the room warming 20 °C/h so the envelope actually binds, the run aborts on `envelope:<bay>` with `T̂_d + k·σ` still below the absolute abort and no drive over its limit from the abort on, on `ident_levels: above` and `symmetric` (§8 item 53) | PR: `basic` seed 1, both `ident_levels`; nightly: `basic` and `rich` seeds 1–5, envelope sweep `basic` seeds 1–5 × both `ident_levels` |
 | `tests/test_sim_das.py` | the truth plant: energy balance through transients and hot swap, steady state, more airflow never warms anything, dead band and exponent, quantisation per sensor type, lags, SMART cadence, determinism per seed | PR |
 
 Test cost: the PR selection is about 1,900 tests in under five minutes
@@ -4446,7 +4462,15 @@ Owner decision (2026-09-16):
     0.12–1.97 °C over the seeds. The one outlier inside that (bay `b10`,
     up to 3 °C on two seeds, over-estimating, i.e. the conservative
     direction) is the single sensor node per bay: two proximal sensors at
-    different placements cannot both be represented → item 101.
+    different placements cannot both be represented → item 101. The nightly
+    accuracy test bounds both directions, not one rms: 2.5 °C rms over the
+    bays (which `b10`'s +7.62 °C on seed 2 fits inside) plus a signed
+    per-bay floor of −1.0 °C, because an *under*-estimate is the direction
+    that regulates a drive hotter than the daemon believes (measured worst:
+    −0.27 °C). `RICH_BOUND` is asserted on six of the eight seeds: seeds 2
+    and 5 skip it because `b10`'s over-estimate drives their hot zone to
+    `u* = 1.0`, where the uniform-curve ratio is 1.0 by construction; their
+    margins are still asserted, and their estimates by the accuracy test.
 18. **Done** (2026-09-16): a correlation pair now has to keep proving itself.
     An association is a claim about correlation, so the claim is re-tested with
     the statistic that made it: the bay series and the serial's SMART history go
@@ -4514,9 +4538,14 @@ Owner decision (2026-09-16):
     seconds already settled (`ident_settle`), `persist.apply_seed` subtracts
     the daemon's outage from them and drops them when the file is stale, its
     age unknown or the outage longer than the new
-    `ident_settle_resume_max_gap_s`, and a zone spends what is left only when
+    `ident_settle_resume_max_gap_s` (the warning names which of the three it
+    was), and a zone spends what is left only when
     it is trusted and fault-free again, minus the time that took — so no
-    second the daemon did not observe is counted as settled (§5). `plan_tick`
+    second the daemon did not observe is counted as settled (§5).
+    `build_model_store` takes the supervisor-backed `ident_settle` callable
+    as a parameter and hands it to `ModelPersister`, so a caller other than
+    `main` cannot end up with a persister that writes the section empty.
+    `plan_tick`
     marks the plan pending and `record_tick` clears it, so a start between
     the two arms offset 0 one tick further out. A restart still never resumes
     a running experiment, and `bay_settle_s` deliberately still runs again
@@ -4667,10 +4696,16 @@ Owner decision (2026-09-16):
     `--help` output (README.md).
 53. **Done** (2026-09-16): the soft and hard rules read `T̂` and only the
     absolute abort, measured against the raw limit, adds `k·σ` back (§5).
-    The absolute rule is the one that binds and it did not move, so nothing
-    got looser where it matters; on the truth simulator an experiment keeps
-    the same worst true margin as the same seed without one and never takes a
-    drive over a limit (`tests/test_ident_sim.py`, numbers in §5). The module
+    What moved and what did not: the *soft envelope* is the rule that binds
+    first under the shipped defaults, and it moved up by `k·σ` — that `k·σ`
+    was the double count the item is about; the absolute abort
+    (`limit − ident_abort_below_limit_c`) is bit-identical to before and
+    still stops an experiment before `hard`. On the truth simulator an
+    experiment keeps the same worst true margin as the same seed without one
+    and never takes a drive over a limit; a run driven onto the envelope by a
+    rising inlet aborts with `envelope:` and takes no drive over its limit
+    after the abort either, on `ident_levels: above` and `symmetric` alike
+    (`tests/test_ident_sim.py`, numbers in §5). The module
     docstring no longer defends the old formulas. Experiments count `k·σ`
     twice: `control/ident.py` checks `T̂ + k·σ` against `soft` and `hard`,
     which already subtract `k·σ`. Now that PI-like DAS settles at `soft`, a
