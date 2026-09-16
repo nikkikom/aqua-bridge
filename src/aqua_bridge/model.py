@@ -1391,7 +1391,11 @@ class StuckParams:
       airflow move (warmer air after more airflow, cooler after less) by more
       than ``stuck_air_oppose_c`` and at most ``stuck_air_oppose_max_c`` voids
       it as evidence, and whose plausible net move above ``stuck_zone_air_dT_c``
-      is evidence on its own while the airflow stays inside ``stuck_airflow_net``
+      is evidence once a ``zone_peer`` moved with it
+    * ``zone_peers`` -- the other ``drive_proximal`` readings of the same zone,
+      whatever their bay: one of them moving plausibly by more than
+      ``stuck_sibling_dT_c`` over the same window is what corroborates a
+      zone-air move as evidence, since a lying zone-air sensor moves alone
 
     Legacy mode: the global ``stuck_s`` / ``stuck_eps_c``, every channel (each on
     its own), every other temperature, no ``airflow`` and no ``air``. With
@@ -1402,7 +1406,8 @@ class StuckParams:
     role as siblings, for a ``drive_proximal`` sensor only those of its own bay
     (another bay's reading follows that bay's drive heat, which does not reach
     this sensor); and for a ``drive_proximal`` sensor the zone-air sensors of its
-    zone as ``air`` (empty for every other role).
+    zone as ``air`` and the zone's other proximal readings as ``zone_peers``
+    (both empty for every other role).
     """
 
     ticks: int
@@ -1412,6 +1417,7 @@ class StuckParams:
     channels: tuple[str, ...]
     siblings: tuple[str, ...]
     air: tuple[str, ...] = ()
+    zone_peers: tuple[str, ...] = ()
     airflow: tuple[tuple[str, float, float, float], ...] = ()
 
 
@@ -2479,6 +2485,17 @@ class MpcConfig:
                         o
                         for o in self.temps
                         if sensors[o].role == "zone_air" and sensors[o].zone == sp.zone
+                    )
+                    if proximal
+                    else ()
+                ),
+                zone_peers=(
+                    tuple(
+                        o
+                        for o in self.temps
+                        if o != t
+                        and sensors[o].role == "drive_proximal"
+                        and sensors[o].zone == sp.zone
                     )
                     if proximal
                     else ()

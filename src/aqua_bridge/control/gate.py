@@ -443,14 +443,26 @@ def _stuck(
                     cached.append(air_move)
         return cached
 
+    def peer_moved() -> bool:
+        """Whether another proximal reading of the zone moved plausibly over the window."""
+        return any(
+            _plausible_net_move(cfg, [*series_of(peer), filtered_now.get(peer)], step_limit)
+            for peer in params.zone_peers
+        )
+
     if params.airflow:  # zoned: the net move of the zone's relative airflow
         move = _airflow_move(params.airflow, commands)
-        if move is not None and abs(move) > cfg.stuck_airflow_net:
-            if not _air_opposes(cfg, air_moves() if params.air else None, move):
+        if move is not None:
+            if abs(move) > cfg.stuck_airflow_net and not _air_opposes(
+                cfg, air_moves() if params.air else None, move
+            ):
                 return first
-        elif move is not None and params.air and _zone_air_moved(cfg, air_moves()):
-            # Steady airflow: a zone-air move the reading had to follow (item 58).
-            return first
+            # No airflow move to measure, or one the zone air excused: a zone-air move
+            # another bay's reading followed had to reach this one too (item 58). The
+            # excused case falls through on purpose -- more fan activity must not hide
+            # what less would have caught.
+            if params.air and _zone_air_moved(cfg, air_moves(), peer_moved):
+                return first
     else:  # legacy / no zone: the net PWM move of each channel on its own
         # the PWM move must be old enough for the plant to have answered it
         oldest_pwm = commands[0]
@@ -542,6 +554,13 @@ def _air_opposes(cfg: MpcConfig, air_moves: Sequence[float] | None, pwm_move: fl
     swing larger than ``stuck_air_oppose_max_c`` cannot excuse a reading that did
     not move at all -- without the bound an arbitrarily large air move kept a dead
     sensor trusted for as long as it lasted.
+
+    An excuse here is not the end of the check: ``_stuck`` still asks
+    :func:`_zone_air_moved`, so an opposing move above ``stuck_zone_air_dT_c``
+    that another bay's reading followed flags the sensor anyway. The excuse is
+    therefore effective between ``stuck_air_oppose_c`` and whichever of
+    ``stuck_air_oppose_max_c`` / ``stuck_zone_air_dT_c`` is met first, and a zone
+    whose fans happen to move cannot hide a dead sensor that a still zone catches.
     """
     if not air_moves:
         return False
@@ -551,18 +570,29 @@ def _air_opposes(cfg: MpcConfig, air_moves: Sequence[float] | None, pwm_move: fl
     )
 
 
-def _zone_air_moved(cfg: MpcConfig, air_moves: Sequence[float]) -> bool:
-    """Zone-air evidence at steady airflow for a frozen proximal reading (item 58).
+def _zone_air_moved(
+    cfg: MpcConfig, air_moves: Sequence[float], peer_moved: Callable[[], bool]
+) -> bool:
+    """Zone-air evidence for a frozen proximal reading (item 58).
 
     A proximal reading is its zone's air plus the drive-to-air difference, and at
     constant airflow that difference moves only with the bay's own drive power.
     A zone-air move above ``stuck_zone_air_dT_c`` -- much larger than the band the
     reading sits in -- therefore has to show in a healthy reading unless the bay's
-    own heat happened to cancel it over the whole window, so it is evidence in its
-    own right: a reading frozen while the fans are pinned at ``pwm_max`` or trimmed
-    slowly (no airflow move to measure) is caught by the zone air instead.
+    own heat happened to cancel it over the whole window: a reading frozen while
+    the fans are pinned at ``pwm_max`` or trimmed slowly (no airflow move to
+    measure) is caught by the zone air instead.
+
+    The move counts only when ``peer_moved`` -- another ``drive_proximal`` reading
+    of the same zone, of any bay, moved plausibly by more than
+    ``stuck_sibling_dT_c`` over the same window. Without that corroboration the
+    rule cannot tell "the air moved and this one reading did not follow" from "this
+    zone-air sensor is drifting and every reading of the zone is correctly still",
+    and a single lying air sensor would brand every healthy proximal reading of its
+    zone Stuck and fault the zone. The peer is asked last: it needs a second window
+    sanitised, and the air move is the cheaper half of the test.
     """
-    return any(abs(move) > cfg.stuck_zone_air_dT_c for move in air_moves)
+    return any(abs(move) > cfg.stuck_zone_air_dT_c for move in air_moves) and peer_moved()
 
 
 def _plausible_move(
