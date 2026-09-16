@@ -109,13 +109,16 @@ Identification experiments (DAS plan section 5, :mod:`aqua_bridge.control.ident`
 * **A rise in the solver's demand wins over the experiment's plan** (``ident_replan``,
   :mod:`~aqua_bridge.control.ident`): an experiment's own override (not a human one)
   is floored in ``compose`` with the solver's command for that tick,
-  ``max(override, mpc_cmd.pwm[ch] - ident.dip_below_solver(cfg))`` -- nothing under
-  ``above``, the owner-accepted ``ident_amplitude`` dip under ``symmetric`` -- before
-  the usual rate limit and clamp. The experiment's levels follow the demand from the
-  next tick on; this floor closes the one tick in between, so no tick of an
-  experiment puts less on a fan than the controller would have. With
-  ``ident_replan: false`` (the Zero W behaviour) neither happens and the levels stay
-  frozen at the base of the start.
+  ``max(override, mpc_cmd.pwm[ch] - ident.planned_dip(experiment, ch, cfg))`` --
+  nothing under ``above``, the owner-accepted ``ident_amplitude`` dip under
+  ``symmetric``, read off the running experiment's own levels -- before the usual
+  rate limit and clamp. The experiment's levels follow the demand from the next tick
+  on; this floor closes the one tick in between, so no tick of an experiment puts
+  less on a fan than the controller would have. Both the floor and the re-planning
+  follow the flag the **running** experiment was started with, so a config rebuilt
+  under it cannot take the floor away mid-experiment. With ``ident_replan: false``
+  (the Zero W behaviour) neither happens and the levels stay frozen at the base of
+  the start.
 * Any other intent submitted while an experiment runs aborts it first
   (``human_intent:<kind>``), whether or not that intent is then accepted
   (conservative: the fans go back to the solver).
@@ -357,18 +360,21 @@ def _clamp(value: float, lo: float, hi: float) -> float:
 def _experiment_floor(mpc_cmd: MpcCommand, plan: TickPlan, cfg: MpcConfig) -> dict[str, float]:
     """Lowest PWM an experiment channel may be composed to this tick (module docstring).
 
-    Empty without a running experiment or with ``ident_replan: false``. Only channels
+    Empty without a running experiment and for an experiment that was planned with
+    ``ident_replan: false`` -- the running experiment's own flag, not the live config,
+    so a config rebuilt under it can neither take the floor away nor add one to a
+    frozen plan. The dip comes from that experiment's own levels
+    (:func:`~aqua_bridge.control.ident.planned_dip`) for the same reason. Only channels
     the experiment itself drives are floored: a human override of the same channel
     (which aborts the experiment anyway) keeps its value."""
     experiment = plan.experiment
-    if not cfg.ident_replan or experiment is None:
+    if experiment is None or not experiment.get("replan"):
         return {}
     levels = experiment.get("overrides")
     if not isinstance(levels, Mapping):
         return {}
-    dip = ident.dip_below_solver(cfg)
     return {
-        ch: float(mpc_cmd.pwm[ch]) - dip
+        ch: float(mpc_cmd.pwm[ch]) - ident.planned_dip(experiment, ch, cfg)
         for ch, value in levels.items()
         if ch in cfg.channels and plan.overrides.get(ch) == value and ch in mpc_cmd.pwm
     }
@@ -922,7 +928,11 @@ class Supervisor:
 
     def _ident_tick(self, mpc_cmd: MpcCommand | None, ts: float | None, applied: bool) -> None:
         try:
-            facts = ident.facts_from_tick(mpc_cmd, ts=ts, applied=applied)
+            # only an experiment that re-plans reads the demand: no other tick, and no
+            # tick of a frozen plan, pays for the two copies (item 52)
+            exp = self._experiment
+            wants = bool(exp is not None and exp.get("replan"))
+            facts = ident.facts_from_tick(mpc_cmd, ts=ts, applied=applied, with_demand=wants)
             self._ident_facts = facts
             if self._ident_resume_pending and facts.store:
                 self._ident_resume_pending = False
