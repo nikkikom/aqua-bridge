@@ -80,6 +80,12 @@ line itself is rate limited to at most one per ``cfg.budget_log_interval_s``
 per severity and names how many exceedances of that severity happened since
 the previous line. A tick whose ``step`` raised is not measured (the
 controller-error path already logs).
+
+Both lines name the config keys that decide the budget -- ``mpc.budget_ms``
+or ``mpc.budget_alarm_ms``, whichever was exceeded -- and the keys an operator
+can change: raising the two of them, and, where the DAS MPC is the solver,
+``mpc.mpc_every_ticks`` to solve less often (PROJECT.md section 8 item 73).
+Nothing in the loop changes a budget by itself; the alarm only reports.
 """
 
 from __future__ import annotations
@@ -95,7 +101,15 @@ from typing import Any, Protocol, runtime_checkable
 
 from aqua_bridge.control.mpc import resolve_prev, step
 from aqua_bridge.control.supervisor import Supervisor, TickPlan
-from aqua_bridge.model import Mode, MpcCommand, MpcConfig, MpcState, PlantObservation, WindowSample
+from aqua_bridge.model import (
+    Mode,
+    MpcCommand,
+    MpcConfig,
+    MpcState,
+    PlantObservation,
+    SolverKind,
+    WindowSample,
+)
 from aqua_bridge.sdnotify import NullNotifier
 
 __all__ = ["Loop", "Notifier", "Sink", "Source", "TickResult", "emergency_command"]
@@ -337,6 +351,21 @@ class Loop:
                 _LOG.exception("tick %d: on_tick hook failed", index)
         return result
 
+    @staticmethod
+    def _budget_remedy(cfg: MpcConfig) -> str:
+        """The config keys an operator changes when the step budget is missed (item 73).
+
+        ``mpc_every_ticks`` is only worth naming where it does something: it replays
+        the stored plan between the DAS MPC's solves and is inert for every other
+        solver, so a legacy or PI-like configuration is told about the budget keys only.
+        """
+        if cfg.regulates_drive_limits and cfg.solver is SolverKind.MPC:
+            return (
+                "raise mpc.budget_ms and mpc.budget_alarm_ms above it, or solve less "
+                "often with mpc.mpc_every_ticks"
+            )
+        return "raise mpc.budget_ms and mpc.budget_alarm_ms above it"
+
     def _record_step_budget(self, step_ms: float, cfg: MpcConfig, *, now: float) -> None:
         """Update the step-time counters and log per the module docstring."""
         self.step_ms_last = step_ms
@@ -357,11 +386,12 @@ class Loop:
             )
             if due:
                 _LOG.error(
-                    "step %.1f ms exceeded the alarm budget %.1f ms (%d exceedance(s) "
-                    "since the last line)",
+                    "step %.1f ms exceeded mpc.budget_alarm_ms %.1f ms (%d exceedance(s) "
+                    "since the last line); %s",
                     step_ms,
                     cfg.budget_alarm_ms,
                     self._budget_alarm_since_log,
+                    self._budget_remedy(cfg),
                 )
                 self._budget_alarm_logged_at = now
                 self._budget_alarm_since_log = 0
@@ -372,11 +402,12 @@ class Loop:
             )
             if due:
                 _LOG.warning(
-                    "step %.1f ms exceeded the budget %.1f ms (%d exceedance(s) "
-                    "since the last line)",
+                    "step %.1f ms exceeded mpc.budget_ms %.1f ms (%d exceedance(s) "
+                    "since the last line); %s",
                     step_ms,
                     cfg.budget_ms,
                     self._budget_warn_since_log,
+                    self._budget_remedy(cfg),
                 )
                 self._budget_warn_logged_at = now
                 self._budget_warn_since_log = 0

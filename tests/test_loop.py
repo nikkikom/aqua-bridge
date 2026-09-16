@@ -13,7 +13,7 @@ from aqua_bridge.__main__ import PlantIO, make_sim_plant
 from aqua_bridge.control.intents import ClearOverride, ControlMode, SetMode, SetPwm
 from aqua_bridge.control.loop import Loop, Notifier, Sink, Source, TickResult, emergency_command
 from aqua_bridge.control.supervisor import Supervisor
-from aqua_bridge.model import Mode, MpcCommand, MpcState, PlantObservation
+from aqua_bridge.model import Mode, MpcCommand, MpcState, PlantObservation, SolverKind
 from invariants import assert_command_safe, assert_state_finite, make_obs
 
 # --- fakes -------------------------------------------------------------------------
@@ -676,6 +676,68 @@ def test_step_budget_warns_past_budget_ms_and_errors_past_budget_alarm_ms(fast_c
     assert "1 exceedance" in warnings[0].getMessage()
     assert "2 exceedance" in warnings[1].getMessage()
     assert "1 exceedance" in errors[0].getMessage()
+
+
+def test_step_budget_lines_name_the_config_keys_that_decide_them(fast_cfg, caplog):
+    """Both lines name the key that was exceeded and the keys to change (item 73)."""
+    cfg = dataclasses.replace(
+        fast_cfg, budget_ms=50.0, budget_alarm_ms=100.0, budget_log_interval_s=0.0001
+    )
+    clock = ScriptedClock([0.0, 0.060, 1.0, 1.150])  # tick 1: 60 ms (warn); tick 2: 150 ms (alarm)
+    loop, *_ = make_loop(cfg, good_source(cfg), clock=clock)
+    with caplog.at_level(logging.WARNING, logger="aqua_bridge.loop"):
+        loop.tick()
+        loop.tick()
+    warning = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    error = next(r.getMessage() for r in caplog.records if r.levelno == logging.ERROR)
+    assert "mpc.budget_ms 50.0 ms" in warning
+    assert "mpc.budget_alarm_ms 100.0 ms" in error
+    for message in (warning, error):
+        assert "raise mpc.budget_ms and mpc.budget_alarm_ms above it" in message
+        # a legacy config: mpc_every_ticks is inert there, so the line does not name it
+        assert "mpc_every_ticks" not in message
+
+
+def test_the_das_mpc_step_budget_line_names_mpc_every_ticks(das_example_cfg, caplog):
+    """With the DAS MPC, solving less often is the other lever (item 73)."""
+    cfg = dataclasses.replace(
+        das_example_cfg, solver=SolverKind.MPC, budget_ms=50.0, budget_alarm_ms=100.0
+    )
+    loop, *_ = make_loop(cfg, FakeSource(), clock=ScriptedClock([0.0, 0.060]))
+    with caplog.at_level(logging.WARNING, logger="aqua_bridge.loop"):
+        loop._record_step_budget(60.0, cfg, now=0.060)
+    message = next(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert "solve less often with mpc.mpc_every_ticks" in message
+    # the PI-like DAS form does not replay a plan, so it is not offered that lever
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="aqua_bridge.loop"):
+        loop._record_step_budget(60.0, dataclasses.replace(cfg, solver=SolverKind.PI), now=99.0)
+    assert "mpc_every_ticks" not in next(
+        r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+    )
+
+
+def test_a_raised_budget_ms_moves_both_thresholds_with_it(fast_cfg, caplog):
+    """The documented Zero W fallback (item 73): the alarm reads the config, nothing else.
+
+    ``mpc.budget_ms`` must stay below ``mpc.budget_alarm_ms``, so raising it to
+    1000 ms means raising the alarm above that as well -- 1250 ms keeps the
+    stock 1.25 ratio (``tests/test_bench_budget.py`` checks the config itself).
+    """
+    cfg = dataclasses.replace(
+        fast_cfg, budget_ms=1000.0, budget_alarm_ms=1250.0, budget_log_interval_s=0.0001
+    )
+    # 900 ms (inside the raised budget), 1100 ms (warns), 1300 ms (alarms)
+    clock = ScriptedClock([0.0, 0.900, 10.0, 11.1, 20.0, 21.3])
+    loop, *_ = make_loop(cfg, good_source(cfg), clock=clock)
+    with caplog.at_level(logging.WARNING, logger="aqua_bridge.loop"):
+        loop.tick()
+        assert loop.budget_warn_count == 0 and not caplog.records
+        loop.tick()
+        assert (loop.budget_warn_count, loop.budget_alarm_count) == (1, 0)
+        loop.tick()
+        assert (loop.budget_warn_count, loop.budget_alarm_count) == (2, 1)
+    assert [r.levelno for r in caplog.records] == [logging.WARNING, logging.ERROR]
 
 
 def test_step_budget_counters_and_last_reach_the_mqtt_state_blob(fast_cfg):

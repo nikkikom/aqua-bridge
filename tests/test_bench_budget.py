@@ -39,13 +39,14 @@ import gc
 import importlib.util
 import json
 import platform
+import statistics
 import time
 
 import pytest
 
 from aqua_bridge.config import load_config
 from aqua_bridge.control.mpc import step
-from aqua_bridge.model import MpcConfig, MpcState, SolverKind
+from aqua_bridge.model import ConfigError, MpcConfig, MpcState, SolverKind
 from aqua_bridge.sim.das import SENSOR_TYPES, build_das_plant, topology_from_config
 from aqua_bridge.sim.plant import Plant, PlantParams
 from conftest import EXAMPLE_CONFIG, EXAMPLE_DAS_CONFIG, REPO_ROOT
@@ -61,6 +62,13 @@ WARMUP_REPEATS = 1
 RELATIVE_PERCENTILE = 75.0
 TICKS = 240
 WARMUP = 20
+#: Ticks per closed loop in the Zero W fallback tests (shorter: they run several loops).
+FALLBACK_TICKS = 140
+#: PROJECT.md section 8 item 73, the owner's fallback of 2026-09-14 for the Zero W: what
+#: goes into ``mpc:`` when the DAS MPC misses the budget there. Not a default -- the
+#: shipped configs keep 600 / 750 ms and ``mpc_every_ticks: 2``; these tests only check
+#: that the values are a config the model accepts and that they do what the item says.
+ZERO_W_FALLBACK = {"budget_ms": 1000.0, "budget_alarm_ms": 1250.0, "mpc_every_ticks": 3}
 
 
 def p99(samples: list[float]) -> float:
@@ -86,7 +94,9 @@ def das_mpc_config() -> MpcConfig:
     )
 
 
-def das_mpc_times(cfg: MpcConfig, ticks: int = TICKS) -> list[float]:
+def das_mpc_times(
+    cfg: MpcConfig, ticks: int = TICKS, *, solved: list[bool] | None = None
+) -> list[float]:
     topology = topology_from_config(cfg)
     for entry in topology["sensors"].values():
         entry["noise_sigma_c"] = SENSOR_TYPES[entry["type"]].noise_sigma_c
@@ -98,10 +108,12 @@ def das_mpc_times(cfg: MpcConfig, ticks: int = TICKS) -> list[float]:
         seed=7,
         heat_schedule={"b02": [(0.0, 1.0)], "b10": [(300.0, 1.0)], "b13": [(0.0, 0.5)]},
     )
-    return _timed(cfg, plant, ticks)
+    return _timed(cfg, plant, ticks, solved=solved)
 
 
-def _timed(cfg: MpcConfig, plant, ticks: int) -> list[float]:
+def _timed(cfg: MpcConfig, plant, ticks: int, *, solved: list[bool] | None = None) -> list[float]:
+    """Step times of ``ticks`` closed-loop ticks; ``solved`` collects, per measured tick,
+    whether the solver ran its solve rather than replaying a stored plan."""
     state = MpcState.cold()
     times: list[float] = []
     enabled = gc.isenabled()
@@ -114,6 +126,8 @@ def _timed(cfg: MpcConfig, plant, ticks: int) -> list[float]:
             elapsed = (time.perf_counter() - t0) * 1e3
             if i >= WARMUP:
                 times.append(elapsed)
+                if solved is not None:
+                    solved.append(bool(cmd.diagnostics.get("solver_diag", {}).get("solved")))
             plant.apply(cmd.pwm)
             plant.advance()
     finally:
@@ -157,6 +171,60 @@ def test_das_mpc_step_p99_within_budget_ms_on_the_pi():
     cfg = das_mpc_config()
     times = das_mpc_times(cfg, ticks=200)
     assert p99(times) <= cfg.budget_ms, f"DAS MPC step p99 {p99(times):.0f} ms > {cfg.budget_ms} ms"
+
+
+# --- the documented Zero W fallback (PROJECT.md section 8 item 73) -------------------
+
+
+def test_the_zero_w_fallback_is_a_config_the_model_accepts():
+    """``budget_ms: 1000`` alone is rejected: it must stay below ``budget_alarm_ms``."""
+    cfg = das_mpc_config()
+    raised = dataclasses.replace(cfg, **ZERO_W_FALLBACK)
+    assert raised.budget_ms == 1000.0 and raised.budget_alarm_ms == 1250.0
+    assert raised.mpc_every_ticks == 3
+    with pytest.raises(ConfigError) as exc:  # the stock alarm is 750 ms
+        dataclasses.replace(cfg, budget_ms=1000.0)
+    assert "mpc.budget_ms" in str(exc.value) and "mpc.budget_alarm_ms" in str(exc.value)
+
+
+def test_mpc_every_ticks_replays_the_plan_between_solves_on_the_das_plant():
+    """Item 73's second lever: the DAS MPC solves every n-th tick, replays in between.
+
+    Checked on the truth plant rather than on a synthetic request, because the solver
+    also re-solves at once when the fixed channels, trusted zones, constrained bays or
+    active model change -- the share of solve ticks is what an operator gets, not the
+    nominal ``1 / n``.
+    """
+    base = das_mpc_config()
+    shares: dict[int, float] = {}
+    for every in (1, 3):
+        solved: list[bool] = []
+        das_mpc_times(
+            dataclasses.replace(base, mpc_every_ticks=every), FALLBACK_TICKS, solved=solved
+        )
+        shares[every] = sum(solved) / len(solved)
+    assert shares[1] == 1.0
+    assert shares[3] == pytest.approx(1 / 3, abs=0.05)
+
+
+def test_solving_less_often_lowers_the_mean_and_leaves_the_p99_a_solve_tick():
+    """The note in item 73: a solve tick is the expensive one, and with
+    ``mpc_every_ticks: 3`` solve ticks are still a third of all ticks -- far above the
+    1 % where the p99 over all ticks would stop being one. So the lever buys mean time
+    (and CPU), not p99, and the Pi gate on ``mpc.budget_ms`` still has to be met by the
+    solve tick itself."""
+    base = das_mpc_config()
+    solved: list[bool] = []
+    every3 = das_mpc_times(
+        dataclasses.replace(base, mpc_every_ticks=3), FALLBACK_TICKS, solved=solved
+    )
+    every1 = das_mpc_times(dataclasses.replace(base, mpc_every_ticks=1), FALLBACK_TICKS)
+    solve_ms = [t for t, s in zip(every3, solved, strict=True) if s]
+    replay_ms = [t for t, s in zip(every3, solved, strict=True) if not s]
+    assert statistics.median(solve_ms) > statistics.median(replay_ms)
+    assert statistics.median(every3) < statistics.median(every1)
+    assert len(solve_ms) / len(every3) > 0.01  # the p99 over all ticks is a solve tick
+    assert p99(every3) >= statistics.median(solve_ms)
 
 
 def test_bench_tool_runs_both_das_solvers_on_the_das_plant(capsys):
