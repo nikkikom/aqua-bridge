@@ -12,6 +12,7 @@ Usage::
                                [--solver pi --solver mpc] [--noise 0.2]
     python tools/bench_step.py --sim-plant das [--config config.example-das.yaml]
                                [--ticks 600] [--solver pi --solver mpc]
+                               [--sim-preset basic|rich]
 
 The loop includes the sensor gate, the fault bookkeeping and the solver,
 i.e. exactly what runs on the Pi once per ``dt``; the plant simulation is
@@ -19,17 +20,21 @@ timed separately and excluded from the ``step()`` numbers.
 
 ``--sim-plant basic`` (default) is the legacy RC plant with a legacy config.
 ``--sim-plant das`` runs a zoned config (default ``config.example-das.yaml``)
-against the DAS truth plant (``aqua_bridge.sim.das``, basic preset with each
-sensor type's white noise, activity bursts in three bays and an inlet step): the
-``pi`` solver is the PI-like DAS form and ``mpc`` the DAS MPC
-(``control/solver_das.py``), benchmarked with ``model_accept_prior: true`` so its
-MPC path is timed rather than its PI-like fallback (``model_active_fraction``
-reports the share of ticks the MPC drove the fans). The step then includes the
-estimator; ``solve_p99_ms`` is the p99 over the ticks on which the MPC solved
-(``mpc_every_ticks``), ``budget_ms`` / ``budget_alarm_ms`` the config's per-tick
-gate (``mpc.budget_ms`` / ``mpc.budget_alarm_ms``, at ``dt = 5 s`` in the DAS
-example) -- read from the loaded config, same as the runtime alarm in
-``control/loop.py``, and not enforced in ``step`` itself.
+against the DAS truth plant (``aqua_bridge.sim.das``, ``--sim-preset`` (default
+``basic``) with each sensor type's white noise, activity bursts in three bays
+and an inlet step; ``rich`` additionally draws the unknown physical
+parameters -- placement offsets, drive/fan spread, fouling, inlet drift and
+more -- from the run's seed instead of using nominal values, PROJECT.md
+section 8 item 17): the ``pi`` solver is the PI-like DAS form and ``mpc``
+the DAS MPC (``control/solver_das.py``), benchmarked with
+``model_accept_prior: true`` so its MPC path is timed rather than its PI-like
+fallback (``model_active_fraction`` reports the share of ticks the MPC drove
+the fans). The step then includes the estimator; ``solve_p99_ms`` is the p99
+over the ticks on which the MPC solved (``mpc_every_ticks``), ``budget_ms`` /
+``budget_alarm_ms`` the config's per-tick gate (``mpc.budget_ms`` /
+``mpc.budget_alarm_ms``, at ``dt = 5 s`` in the DAS example) -- read from the
+loaded config, same as the runtime alarm in ``control/loop.py``, and not
+enforced in ``step`` itself.
 """
 
 from __future__ import annotations
@@ -106,7 +111,9 @@ def bench_solver(
     }
 
 
-def das_plant(cfg: MpcConfig, ticks: int, seed: int):  # -> DasPlant (lazy import)
+def das_plant(
+    cfg: MpcConfig, ticks: int, seed: int, *, preset: str = "basic"
+):  # -> DasPlant (lazy import)
     """The DAS truth plant of the benchmark (module docstring)."""
     from aqua_bridge.sim.das import SENSOR_TYPES, build_das_plant, topology_from_config
 
@@ -122,13 +129,15 @@ def das_plant(cfg: MpcConfig, ticks: int, seed: int):  # -> DasPlant (lazy impor
         bays[-1]: [(0.0, 0.5), (0.7 * span, 1.0)],
     }
     return build_das_plant(
-        topology, preset="basic", dt=cfg.dt, initial_pwm=0.5, seed=seed, heat_schedule=heat
+        topology, preset=preset, dt=cfg.dt, initial_pwm=0.5, seed=seed, heat_schedule=heat
     )
 
 
-def bench_das_solver(cfg: MpcConfig, ticks: int, *, seed: int) -> dict[str, object]:
+def bench_das_solver(
+    cfg: MpcConfig, ticks: int, *, seed: int, preset: str = "basic"
+) -> dict[str, object]:
     """Closed loop of ``ticks`` steps on the DAS truth plant (module docstring)."""
-    plant = das_plant(cfg, ticks, seed)
+    plant = das_plant(cfg, ticks, seed, preset=preset)
     state = MpcState.cold()
     times_ms: list[float] = []
     solve_ms: list[float] = []
@@ -199,6 +208,11 @@ def main(argv: list[str] | None = None) -> int:
         default="basic",
         help="basic: legacy RC plant and config; das: DAS truth plant and a zoned config",
     )
+    parser.add_argument(
+        "--sim-preset",
+        default="basic",
+        help="--sim-plant das only: aqua_bridge.sim.das preset, 'basic' or 'rich' (default: basic)",
+    )
     parser.add_argument("--noise", type=float, default=0.2, help="sensor noise sigma, degrees C")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--heat-w", type=float, default=100.0, help="plant heat load, W")
@@ -210,6 +224,11 @@ def main(argv: list[str] | None = None) -> int:
     base = load_config(config_path).mpc
     if das and not base.regulates_drive_limits:
         parser.error("--sim-plant das needs a zoned config without setpoints (mpc.topology)")
+    if das:
+        from aqua_bridge.sim.das import PRESETS
+
+        if args.sim_preset not in PRESETS:
+            parser.error(f"--sim-preset must be one of {PRESETS}, got {args.sim_preset!r}")
     kinds = [SolverKind(k) for k in args.solver] if args.solver else list(SolverKind)
     results: dict[str, object] = {}
     for kind in kinds:
@@ -217,7 +236,9 @@ def main(argv: list[str] | None = None) -> int:
         if das:
             if kind is SolverKind.MPC:
                 cfg = dataclasses.replace(cfg, model_accept_prior=True)
-            results[kind.value] = bench_das_solver(cfg, args.ticks, seed=args.seed)
+            results[kind.value] = bench_das_solver(
+                cfg, args.ticks, seed=args.seed, preset=args.sim_preset
+            )
         else:
             results[kind.value] = bench_solver(
                 cfg, args.ticks, noise=args.noise, seed=args.seed, heat_w=args.heat_w
@@ -230,7 +251,7 @@ def main(argv: list[str] | None = None) -> int:
         "config": base.to_dict(),
         "sim_plant": args.sim_plant,
         "plant": (
-            {"preset": "basic", "sensor_noise": "per type", "seed": args.seed}
+            {"preset": args.sim_preset, "sensor_noise": "per type", "seed": args.seed}
             if das
             else {"noise_sigma_c": args.noise, "heat_w": args.heat_w, "delay_ticks": 1}
         ),
