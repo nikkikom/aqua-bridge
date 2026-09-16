@@ -732,6 +732,8 @@ long `dt`):
 | `ident_max_duration_s` | 1800 | `(0, 7200]` |
 | `ident_settle_s` | 600 | ≥ 0; ≥ `confirm_s` when enabled |
 | `ident_start_band_c` / `ident_max_over_c` | 1.0 / 3.0 | > 0 |
+| `ident_abort_below_limit_c` | 1.0 | > 0, °C: the absolute abort below the limit in force on a bay |
+| `ident_settle_resume_max_gap_s` | 300 | ≥ 0, s: the longest daemon outage after which `model.json`'s settle timers still count; 0 always starts them over |
 | `ident_seed` | 1 | int ≥ 0 |
 | `stuck_airflow_net` | 0.15 | `(0, 1]`: net move of a zone's relative airflow (block means over the Stuck window, below) that is Stuck evidence for the zone's sensors |
 | `stuck_air_oppose_c` | 0.3 | > 0, °C: a zone-air move against that airflow move by more than this voids it for the zone's `drive_proximal` sensors |
@@ -1564,6 +1566,14 @@ untrusted sensors are skipped. SMART enters as a measurement of `T_d`
 fault ticks included. A **fast-swap rule** inflates a bay's drive and
 sensor variance on a proximal innovation above `jump_min_c` (0.5 °C) and
 `jump_sigmas` (6) σ, so a pulled-and-replaced drive widens its margin at once.
+The innovations of a bay's proximal members are taken against the sensor node
+before any of them updates it, and the members have to agree: the rule fires
+only when at least one passes the test and no other member's innovation is
+past `jump_min_c` the other way. One bay holds one drive, so a swap moves
+every sensor of the bay the same way; two redundant sensors at different
+placements disagree in opposite directions for as long as they sit there, and
+that standing disagreement used to re-arm the rule every tick and lock the
+bay's SMART out of the calibration for good (§8 item 17).
 
 **Placement offsets** (item 67). A bay's sensor node is anchored on its first
 proximal member that is not `redundant`; every further member reads that node
@@ -2006,8 +2016,11 @@ left out, so tightening a limit keeps the model), `saved_wall`,
 `thermal` (the thermal memory, which `tools/fit_model.py --store-out` can
 write straight from an offline fit, item 15), `fan_curves`, `calibration` (per bay and
 serial, with wall-clock `last_sample_wall` and `expires_wall` so expiry
-survives a reboot) and `bays` (last occupancy, class, serial,
-association; report only). `ModelPersister` (a loop `on_tick` observer)
+survives a reboot), `bays` (last occupancy, class, serial,
+association; report only) and `ident_settle` (the experiments' settle
+timers as **seconds already settled** per zone, so they need no clock
+conversion: the outage is subtracted from them on load). `ModelPersister`
+(a loop `on_tick` observer)
 writes atomically (temp file, `fsync`, `os.replace`, directory `fsync`)
 at most every `model_store_interval_s` and once at a clean stop; a
 failure keeps the previous file. A missing, corrupt, oversized,
@@ -2049,30 +2062,46 @@ named reason: control mode `auto` without human overrides
 or stall on the target (`saturated:`, `band:`, `no_command:`,
 `fan_stall:`), every served zone (listing a target channel, plus
 `coupled_to`) trusted and fault-free for `ident_settle_s` (`settle:`),
-no bay there `unknown` or mid-transition (`bay_unknown:`,
-`bay_transition:`), no calibration in its first 20 samples
+no served zone with a sensor group that has no trusted, confirmed
+member (`sensor_lost:`, from `diagnostics["sigma_floor"]`: under
+`trust_rule: sigma` such a zone is still trusted, so nothing else in the
+list sees the loss), no bay there `unknown` or mid-transition
+(`bay_unknown:`, `bay_transition:`), no calibration in its first 20 samples
 (`calibrating:`), and every drive within `ident_start_band_c` of its soft
 target (`start_band:`). **Envelope** on the estimates, every tick, for
-every constrained bay of the served zones, with `upper = T̂_d + k·σ`:
-`upper ≤ soft + ident_max_over_c` (3 °C, owner-accepted), `upper ≤ hard`
-always, and `upper < limit − 1 °C` (the absolute abort per drive; there
-is no `ident_abort_temp_c`). **Abort list:** any fallback tick or tick
-without a solver command, any `degraded` tick, two failed applies, a
-clock running backwards or jumping past the duration, the envelope, an
-untrusted served zone, an `unknown` bay, a stalled experiment fan, `stop`,
-and any human intent. An abort releases the channels; the solver
-re-initialises bumplessly on them and moves at most `d_pwm_max` per tick.
-The control mode stays `auto` during an experiment; its status is in
-`snapshot().extra["experiment"]`. A restart never resumes an experiment.
-The envelope still adds `k·σ` to `T̂_d` on top of `soft` and `hard`, which
-already subtract it. PI-DAS counts `k·σ` once and rides `T̂_d = soft`, so a
-settled enclosure under PI-DAS (or the MPC's PI-DAS fallback) has
-`upper = soft + k·σ`: with the uncalibrated σ (`k·σ` about 3 °C) that is
-outside `ident_start_band_c` and on the edge of `ident_max_over_c`, and an
-experiment starts only while the drives sit at least `k·σ −
-ident_start_band_c` below their soft targets (open, not changed by the
-PI-DAS change). Experiments are needed where PI-DAS acts: a model
-converges only with them.
+every constrained bay of the served zones: `T̂_d ≤ soft +
+ident_max_over_c` (3 °C, owner-accepted), `T̂_d ≤ hard` always, and
+`T̂_d + k·σ < limit − ident_abort_below_limit_c` (the absolute abort per
+drive; there is no `ident_abort_temp_c`). **`k·σ` is counted once:** `soft`
+and `hard` already subtract it, so only the absolute rule, measured against
+the raw limit, adds it back. `T̂_d ≤ hard` therefore *is* `T̂_d + k·σ ≤
+limit`, and the absolute abort is stricter than it by
+`ident_abort_below_limit_c`, so it is the rule that binds. **Abort list:**
+any fallback tick or tick without a solver command, any `degraded` tick,
+two failed applies, a clock running backwards or jumping past the duration,
+the envelope, an untrusted served zone, a lost sensor group in a served
+zone, an `unknown` bay, a stalled experiment fan, `stop`, and any human
+intent. An abort releases the channels; the solver re-initialises bumplessly
+on them and moves at most `d_pwm_max` per tick. The control mode stays
+`auto` during an experiment; its status is in
+`snapshot().extra["experiment"]`. A restart never resumes an experiment,
+but the settle timers do survive one: they ride in `model.json` as seconds
+already settled, the outage is subtracted from them on load, and a zone
+spends what is left only when it is trusted and fault-free again (nothing
+unobserved is ever counted as settled; `ident_settle_resume_max_gap_s`
+caps the outage). A start that arrives between `plan_tick` and
+`record_tick` arms offset 0 one tick further out, because the tick whose
+plan the loop already holds cannot carry the overrides.
+
+On the truth simulator (`tests/test_ident_sim.py`), with
+`config.example-das.yaml`, the PI-like DAS solver and every bay at 35 %
+activity: `basic` seeds 1–5 keep a worst true margin of 10.73–10.74 °C with
+the experiment against 10.72–10.73 °C without it, zero limit violations, the
+excitation visible on the fans (max PWM 0.527 against 0.501); `rich` seeds
+3–5 keep 9.81 / 10.06 / 8.32 °C from the start on, the same with and without,
+zero violations, and `rich` seeds 1–2 are drawn saturated and the start is
+refused. Experiments are needed where PI-DAS acts: a model converges only
+with them.
 
 ### Track A — core (dev machine / CI, no Pi)
 
@@ -2914,6 +2943,7 @@ aqua-bridge/
     test_modelstore.py
     test_fancurve.py         # online PWM -> RPM fit, its acceptance rules and the store
     test_ident_experiment.py
+    test_ident_sim.py        # experiments against the DAS truth plant
     test_recorder.py
     test_tools_fit_replay.py
     test_sim_das.py
@@ -3610,7 +3640,7 @@ tests carry the `nightly` marker.
 | `tests/test_sigma_trust.py` | `trust_rule: sigma` (§3, §8 item 8): thresholds inclusive, empty and undeclared bays, an uninitialised zone, a sigma that is not a number, time faults, unknown keys and setpoint groups still fault, `strict` ignores the estimator; the `sigma_fault_c` floor; switching rules by config only; the verdict reads this tick's σ across a crossing; an estimator fault applies `strict`; a zone in fault returns without its lost sensor only under `sigma`; on the truth sim 2 % DS18B20 dropouts fault far fewer zones than `strict` with no violation (both DAS solvers), a replay without a bay's only proximal sensor never lowers its zone's airflow beyond 2 % and raises it within ten minutes (PI-like DAS), losing either member of a redundant pair changes almost nothing, a bay's or a zone's sensors lost for good fault the zone (on the drive σ, or on the blind air clock of item 70) and it holds, then ramps high; the example's redundant pairs fault no zone on `rich` with their σ at the floor (item 67); a hot swap no longer faults its zone but a swapped bay that goes blind faults at once, and a flapping proximal sensor spends `bay_settle_max_s` and then faults its zone on every jump again (item 69); a zone that loses only its air sensor faults on `air_blind_fault_s`, and never at all with that key set wide (item 70); the soft sigma floor (§8 item 68): it holds the command before the loss, ends on the σ growth or the hold time, falls at its rate, reopens on a further lost group, keeps its episode on an estimator fault, starts over from malformed memory, its config keys; on the DAS MPC without a bay's only sensor the no-floor run reproduces the drop (−0.04, about 21 % less airflow) and the soft floor holds, then releases | PR: `basic`; nightly: dropout sweep on `basic` and `rich`, the redundant pairs on `rich` seeds 0–5 and both solvers, a sensor lost for good on both presets and solvers, the soft floor's margin, noise and no-ratchet bounds on `basic` seeds 1–5 and `rich` 0–2, both solvers, two sensors, and its margin bounds on the DAS MPC until the floor has released (`basic` b02 and b13, `rich` b02) |
 | `tests/test_das_core.py` | the core invariants, closed loops and DAS goldens for `pi_das` and `mpc_das` (§4.2) | PR |
 | `tests/test_pi_das.py`, `tests/test_estimates.py`, `tests/test_das_config.py` | the margin-deficit PI (served zones, unconstrained channels, fixed channels, occupancy), the estimates block and prior map, `noise` / `limit_c` / served-zone config | PR |
-| `tests/test_estimator.py` | exact discretisation and Joseph form (random sequences keep P symmetric PSD); first tick and constant readings; σ grows while a bay is unobserved and shrinks back; redundant members; placement offsets (a constant disagreement is an offset and not a swap, `proximal_offset_c: 0` reproduces item 67, one sensor carries no offset state, a swap still widens a bay with two, either member keeps the bay observed); per-bay seeding (a bay missing on the first tick is seeded by its first reading, a sensor returning after a later loss still widens its bay), `settling` expiring and its wall-clock budget (repeated jumps at four cadences spend `bay_settle_max_s` and stop exempting, a clean run earns it back, an empty bay spends nothing, 0 grants none), `air_blind_s` and a tick gap counted in full; the occupancy machine incl. "never empty while zone air is unobserved"; SMART calibration acceptance, rejection, serial change and expiry after `calibration_max_age_days`; a guessed serial never relaxes a class; determinism, JSON round trip, malformed memory | PR |
+| `tests/test_estimator.py` | exact discretisation and Joseph form (random sequences keep P symmetric PSD); first tick and constant readings; σ grows while a bay is unobserved and shrinks back; redundant members; placement offsets (a constant disagreement is an offset and not a swap, `proximal_offset_c: 0` reproduces item 67, one sensor carries no offset state, a swap still widens a bay with two, either member keeps the bay observed); the fast-swap rule needs a bay's proximal members to agree, so a standing disagreement between a redundant pair never locks the bay's SMART out while a step both members see together still fires it (§8 item 17); per-bay seeding (a bay missing on the first tick is seeded by its first reading, a sensor returning after a later loss still widens its bay), `settling` expiring and its wall-clock budget (repeated jumps at four cadences spend `bay_settle_max_s` and stop exempting, a clean run earns it back, an empty bay spends nothing, 0 grants none), `air_blind_s` and a tick gap counted in full; the occupancy machine incl. "never empty while zone air is unobserved"; SMART calibration acceptance, rejection, serial change and expiry after `calibration_max_age_days`; a guessed serial never relaxes a class; determinism, JSON round trip, malformed memory | PR |
 | `tests/test_associate.py` | detrended correlation, greedy assignment with margins, confirmation, full-window history, drops on silence / jump / empty, a declared serial wins; on the truth sim the right bays are found and indistinguishable bays refused | PR |
 | `tests/test_stuck_sim.py` | Stuck evidence on the truth sim (§3 Stuck sizing, §8 items 3 and 58): healthy `rich` runs flag no sensor and fault no zone; a frozen DS18B20 or thermistor proximal reading is flagged once its zone's airflow moves, or, with the fans held by the rate limit, once its zone air has risen past `stuck_zone_air_dT_c` and another bay has followed it; a zone-air sensor drifting on a healthy enclosure flags no proximal reading; only a bay's last proximal sensor faults its zone | PR: 2 seeds, 3 frozen runs, 1 drifting-air run; nightly: 48 seeds, 2.5-hour runs of both DAS solvers, and the per-seed coverage sweep (each proximal reading frozen in turn) |
 | `tests/test_hotswap.py` | slow swap, quick swap (never through `empty`, margin widens, class follows the new drive) and empty-at-boot on the truth sim: no limit violation, no zone fault, fans rise, constraints removed on empty | PR |
@@ -3619,11 +3649,12 @@ tests carry the `nightly` marker.
 | `tests/test_thermal_ident.py` | identifiability with group experiments on the truth sim: in-zone `E` within 15 % (PR seed), per-bay `k` within 25 %, `leak` / `κ` at prior, convergence; regulation only never converges; the seed sweep (bound 25 %), sensor offsets, the rich preset | PR: 4 cases; nightly: sweeps |
 | `tests/test_solver_das.py` | active-piece SQP vs a projected-gradient reference, monotone objective, iteration cap, forbidden-band snap and hysteresis, zero-order hold, prediction vs thermal Jacobians, noise index and surrogate, bumpless offset, fixed channels, validity gate and model fallback with dwell (the entry dwell, the model rate through the drives' filter, the air-disturbance check, the prediction guard on eligible rows only), a clock stepped back, horizon and block extremes | PR |
 | `tests/test_model_fallback_sim.py` | the validity gate against the truth plant: the observed drive rate (ramp, restarts, memory), a sound model returns within `model_return_dwell_s + 2 · mpc_every_ticks · dt` and does not re-enter (§8 items 10, 64), a model with wrong bay gains is caught and held, a healthy enclosure never reaches the fallback (§8 item 65), a fouling jump to 0.15× airflow does (§8 item 66) and the same run without it does not, every drive within its limit and bumpless switches; the plain drift holds the same step | PR: 1 return, 1 broken model, 3 healthy seeds and the fouling pair per preset; nightly: zones × seeds on `basic` and `rich`, more broken gains, 8 healthy seeds and 4 fouling seeds per preset |
-| `tests/test_noise_regression.py` | calibrated DAS MPC noise ≤ 0.8× the quietest uniform curve at equal or better worst true margin (measured 0.31–0.48×); uncalibrated bound 2.0 (0.30–0.69×); rich preset bound 1.35 (up to 1.30×); MPC vs PI-DAS reported, not asserted (PI-DAS has not settled within the window on several seeds) | PR: 2 seeds; nightly: 8-seed sweeps |
+| `tests/test_noise_regression.py` | calibrated DAS MPC noise ≤ 0.8× the quietest uniform curve at equal or better worst true margin (measured 0.31–0.48×); uncalibrated bound 2.0 (0.30–0.69×); rich preset bound 1.25 (up to 1.18×); on `rich` every bay calibrates and the estimate follows the drive-*reported* temperature to 2.5 °C rms (§8 item 17); MPC vs PI-DAS reported, not asserted (PI-DAS has not settled within the window on several seeds) | PR: 2 seeds; nightly: 8-seed sweeps |
 | `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× (named constant) the legacy MPC p99, the 75th percentile of several interleaved, warm-up-discarded repeats (§8 item 6); `bench_step.py` runs both DAS solvers; absolute p99 ≤ `mpc.budget_ms` only on `armv6l`; the Zero W fallback of §8 item 73 (`budget_ms` 1000 with `budget_alarm_ms` 1250 loads, `budget_ms` 1000 alone is rejected, `mpc_every_ticks: 3` solves a third of the ticks and a solve tick is the expensive one) | PR / Pi |
-| `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise; a `tools/fit_model.py` report in the store's place loads as a model, ages like a store file, drops a model of another structure and is refused outright when its `store_fingerprint` is another config's or missing (item 15) | PR |
+| `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise; a `tools/fit_model.py` report in the store's place loads as a model, ages like a store file, drops a model of another structure and is refused outright when its `store_fingerprint` is another config's or missing (item 15); the settle timers round-trip through the file as seconds already settled minus the daemon's outage, drop on a long outage, a stale file or an unknown age, a malformed section is dropped with a warning, and the persister asks the supervisor for them before a save (item 20) | PR |
 | `tests/test_fancurve.py` | the online PWM → RPM fit (item 14): a swept fan is identified per fan model, one duty or a ramping command is never enough, a noisy tachometer is refused by the residual, the bins stay bounded and follow a fan that changes, a malformed memory or a changed channel → fan-model map starts over, `curve_pair` falls back to the config for anything unusable, `step` publishes the fit into the store's `fan_curves` and reports it, the curve round-trips through `model.json`, and `model_use_rpm` keeps the configured `rpm_max` as its reference so a worn fan still reads as less air | PR |
-| `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes; legacy refuses | PR |
+| `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes a run but the settle timers come back from the store and a start between `plan_tick` and `record_tick` keeps its tick (§8 item 20); `k·σ` counted once and the absolute abort from `ident_abort_below_limit_c` (items 53, 54); a lost sensor group blocks a start and aborts a run (item 72); legacy refuses | PR |
+| `tests/test_ident_sim.py` | an experiment on the truth plant never takes a drive over a limit and never leaves the enclosure hotter than the same seed without one, with the excitation visible on the fans; a drawn enclosure that is already saturated refuses the start | PR: `basic` seed 1; nightly: `basic` and `rich` seeds 1–5 |
 | `tests/test_sim_das.py` | the truth plant: energy balance through transients and hot swap, steady state, more airflow never warms anything, dead band and exponent, quantisation per sensor type, lags, SMART cadence, determinism per seed | PR |
 
 Test cost: the PR selection is about 1,900 tests in under five minutes
@@ -4385,8 +4416,37 @@ Owner decision (2026-09-16):
     prediction error crosses the `suspect` rule still becomes `suspect` and
     learns again, so the switch cannot hold a model the data has
     contradicted (§3 *Identification*).
-17. Estimator accuracy on the `rich` sim preset: calibrated estimates up to
-    2 °C off make the MPC up to 1.30× the uniform-curve noise.
+17. **Done** (2026-09-16): the fast-swap rule now needs a bay's proximal
+    members to agree before it fires (§3, *DAS thermal model and estimator*),
+    so a bay with a redundant pair calibrates. Estimator accuracy on the
+    `rich` sim preset. Measured over seeds 1–8 in the noise scenario's
+    window, `tests/test_noise_regression.py`:
+
+    | | uncalibrated bays | worst per-bay error | noise ratio |
+    |---|---|---|---|
+    | before | 2 of 16 on 7 of 8 seeds | 5.2–18.5 °C | 0.43–1.30 |
+    | after | none, on every seed | 0.27–7.6 °C | 0.29–1.18 |
+
+    The cause was not the calibration but the fast-swap rule: the example's
+    two bays with a redundant proximal pair (`b03`, `b10`) draw different
+    placements on `rich`, their readings disagree by a couple of degrees for
+    the whole run, one of them tripped the rule on nearly every tick, and
+    `jumped[bay]` gates SMART out of the calibration — so those bays never
+    calibrated and their estimates sat on the prior map, 6–8 °C off, which is
+    what the MPC then over-cooled against. With the agreement test every bay
+    calibrates on every seed. `RICH_BOUND` drops 1.35 → 1.25 and a nightly
+    test asserts that every bay calibrates.
+
+    What is left is **not** an accuracy defect. The residual error against
+    the physical drive node is the preset's per-drive SMART offset
+    (±2 °C, `sim/das.py`): the estimator is calibrated to what the drive
+    *reports*, which is the only temperature the daemon can see and the one
+    the limit is written against, so that offset is invisible to any
+    controller. Against the drive-reported temperature the rms error is
+    0.12–1.97 °C over the seeds. The one outlier inside that (bay `b10`,
+    up to 3 °C on two seeds, over-estimating, i.e. the conservative
+    direction) is the single sensor node per bay: two proximal sensors at
+    different placements cannot both be represented → item 101.
 18. **Done** (2026-09-16): a correlation pair now has to keep proving itself.
     An association is a claim about correlation, so the claim is re-tested with
     the statistic that made it: the bay series and the serial's SMART history go
@@ -4450,9 +4510,20 @@ Owner decision (2026-09-16):
     insert variance against 0-105. Nothing else moves: 0 limit violations
     either way, the same hottest drive to 0.01 °C, and the mean noise index
     equal or 0.16 dB lower. It is a loudness fix, as the item said.
-20. Experiments: settle timers are not persisted (after a restart a start
-    waits `ident_settle_s` + `bay_settle_s`); a start that arrives between
-    `plan_tick` and `record_tick` shifts the levels by one tick.
+20. **Done** (2026-09-16): the settle timers ride in `model.json` as
+    seconds already settled (`ident_settle`), `persist.apply_seed` subtracts
+    the daemon's outage from them and drops them when the file is stale, its
+    age unknown or the outage longer than the new
+    `ident_settle_resume_max_gap_s`, and a zone spends what is left only when
+    it is trusted and fault-free again, minus the time that took — so no
+    second the daemon did not observe is counted as settled (§5). `plan_tick`
+    marks the plan pending and `record_tick` clears it, so a start between
+    the two arms offset 0 one tick further out. A restart still never resumes
+    a running experiment, and `bay_settle_s` deliberately still runs again
+    (occupancy restarts `unknown`: a drive may have moved while the daemon
+    was down). Experiments: settle timers are not persisted (after a restart
+    a start waits `ident_settle_s` + `bay_settle_s`); a start that arrives
+    between `plan_tick` and `record_tick` shifts the levels by one tick.
 
 21. Live MQTT and Home Assistant check against the owner's Home Assistant
     broker (host and credentials in `private.md`). Needs the Pi, the broker
@@ -4594,13 +4665,20 @@ Owner decision (2026-09-16):
     matching §10, with every command and flag checked against
     `deploy/install-pi.sh`, `deploy/host-usb.sh` and the `tools/*.py`
     `--help` output (README.md).
-53. Experiments count `k·σ` twice: `control/ident.py` checks `T̂ + k·σ`
-    against `soft` and `hard`, which already subtract `k·σ`. Now that
-    PI-like DAS settles at `soft`, a settled enclosure is refused by the
-    start band (`ident_start_band_c`) and sits on the `ident_max_over_c`
-    abort edge; the module docstring is also stale.
-54. `control/ident.py` hardcodes `ABORT_BELOW_LIMIT_C = 1.0` (the
-    absolute abort margin below the limit); make it a config key.
+53. **Done** (2026-09-16): the soft and hard rules read `T̂` and only the
+    absolute abort, measured against the raw limit, adds `k·σ` back (§5).
+    The absolute rule is the one that binds and it did not move, so nothing
+    got looser where it matters; on the truth simulator an experiment keeps
+    the same worst true margin as the same seed without one and never takes a
+    drive over a limit (`tests/test_ident_sim.py`, numbers in §5). The module
+    docstring no longer defends the old formulas. Experiments count `k·σ`
+    twice: `control/ident.py` checks `T̂ + k·σ` against `soft` and `hard`,
+    which already subtract `k·σ`. Now that PI-like DAS settles at `soft`, a
+    settled enclosure is refused by the start band (`ident_start_band_c`) and
+    sits on the `ident_max_over_c` abort edge.
+54. **Done** (2026-09-16): `mpc.ident_abort_below_limit_c` (1.0 °C, > 0,
+    §3). `control/ident.py` hardcoded `ABORT_BELOW_LIMIT_C = 1.0` (the
+    absolute abort margin below the limit).
 55. **Done:** `test_noise_sweep_basic_preset` now asserts zero true
     limit violations over the whole run for the calibrated PI-like DAS
     result too (MPC calibrated/uncalibrated already had the check).
@@ -4790,6 +4868,16 @@ Owner decision (2026-09-16):
     (the uncalibrated floor), no drive over its limit, and the estimated
     offsets sit on the drawn placement difference (4.87 °C on b10, seed 1).
     The example's goldens moved with it: item 99.
+
+    **Residual** (found completing item 17, 2026-09-16): item 17's agreement
+    test removes the *standing* half of this — a settled redundant pair no
+    longer re-arms the fast-swap rule — but not the *dropout* half: when one
+    member of a pair drops out and returns, the returning reading is the
+    bay's only trusted member that tick, the rule fires on it anyway, and σ
+    jumps. Measured with `REDUNDANT = ()` in `tests/test_sigma_trust.py` (the
+    `rich` masking removed): 9 of 123 tests still fail, all in the dropout
+    sweep. The masking stays in place until item 101 gives every proximal
+    sensor its own node.
 68. **Done:** the hard sigma floor is a soft floor that holds the command before the loss until `zones.sigma_floor_hold_s` or a `zones.sigma_floor_growth_c` σ growth, then falls at `zones.sigma_floor_release_per_min` (§3 per-zone trust). Soft sigma floor (owner decision 2026-09-14). Today a zone with a
     lost sensor group keeps its fans at or above `prev`, which ratchets
     the DAS MPC's fans up until the zone faults when a bay's only sensor
@@ -4892,9 +4980,13 @@ Owner decision (2026-09-16):
     the goldens' `1e-6` tolerance, so the files are untouched. Every other
     key reproduces its trajectory bit-for-bit (checked by running the four
     scenarios with the pre-item-71 spellings: `MISMATCHES 0`).
-72. Under `sigma`, an identification experiment can start in a zone that
-    has a lost sensor, because the zone is still trusted
-    (`control/ident.py` precondition).
+72. **Done** (2026-09-16): `sensor_lost:<zone>` is a start precondition
+    and an abort reason — a served zone with a zone-air or bay group that has
+    no trusted, confirmed member this tick, read from
+    `diagnostics["sigma_floor"]` (§5). Under `strict` such a zone is in fault
+    and `settle` / `degraded` catch it first, as before. Under `sigma`, an
+    identification experiment could start in a zone that has a lost sensor,
+    because the zone is still trusted.
 73. DAS step budget on the Zero W after items 3, 8, 9 and 10. Measured
     on the Pi: DAS MPC p99 609–615 ms (solve ticks 643 ms) against
     `mpc.budget_ms` 600, so `pytest -m pi` fails again (it was
@@ -5312,6 +5404,23 @@ Owner decision (2026-09-16):
     noise index should move with a fitted curve at all: it changes the
     objective, not the safety, and `noise_db_at_max` is a datasheet figure
     the fit says nothing about.
+101. One sensor node per bay: a bay with two `drive_proximal` sensors at
+    different placements cannot be represented. The estimator's state has a
+    single `T_s` per bay and a single calibrated map `s, b` for it, so two
+    members at different `β` are fused into one node that matches neither,
+    and the calibration fits the compromise. What it costs, measured on the
+    `rich` sim (§8.2 items 17 and 67): after item 17 those bays do calibrate,
+    but one of them still reads up to 3 °C off on two of eight seeds (over-
+    estimating, the conservative direction), and their σ still jumps when one
+    member drops out and returns, which is what keeps `trust_rule: sigma`
+    unusable with the example's redundant pairs (item 67) and keeps the
+    `rich` masking in `tests/test_sigma_trust.py`. The fix is a sensor node
+    and a map per proximal *sensor* rather than per bay: the state grows by
+    one row per redundant member (the DAS example has two), the measurement
+    update stays scalar and sequential, the calibration RLS becomes one entry
+    per sensor and serial, and the jump rule can then compare like with like.
+    Check the step budget afterwards (item 73) and the goldens, which have
+    one sensor per bay and should not move.
 
 ### 8.3 Open — needs the DAS hardware
 
