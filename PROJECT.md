@@ -4086,11 +4086,24 @@ Owner decision (2026-09-16):
     of `tests/test_*.py`, inside both `test` matrix jobs (§12).
 27. Test gap: the DS18B20 plateau test uses an 1800 s sine, so no plateau
     is longer than `stuck_s`; add one.
-28. `tools/bench_step.py` reports `plant.preset: basic` for
-    `--sim-plant das`.
-29. Stale docstrings: `thermal.py` and `noise.py` still call experiments
-    and `fit_fans` a later milestone; `FanSpec` says `forbidden_pwm` is not
-    honoured.
+28. **Done** (2026-09-16): `tools/bench_step.py --sim-plant das` takes
+    `--sim-preset` (`basic`, default, or `rich`, item 17) and reports the
+    preset it actually ran in `plant.preset`, instead of the literal
+    `"basic"` regardless of what ran.
+29. **Done** (2026-09-16): the stale docstrings, checked against the code
+    and rewritten. `noise.py` named `tools/fit_fans.py` a later milestone;
+    it exists and fits `rpm(u)` per fan model from a recording today (its
+    output is still copied into `fan_models` by hand -- wiring it into the
+    model store automatically, `fan_curves`, stays item 14). `thermal.py`
+    said the fan group's shared `E` split per channel waits on
+    experiments (later milestone); `control/ident.py`'s active
+    identification experiments exist and already run each channel of a
+    group alone in turn, so the data to split `E` exists -- the split
+    itself is still open (item 13), and the docstring now says so instead
+    of naming experiments as unbuilt. `FanSpec.forbidden_pwm` said the
+    solver that honours it was a later milestone; the DAS solver
+    (`control/solver_das.snap_bands`) has honoured it since that solver
+    shipped, on both its PI-like and MPC paths.
 30. **Done:** README carries a condensed, numbered bring-up checklist
     matching §10, with every command and flag checked against
     `deploy/install-pi.sh`, `deploy/host-usb.sh` and the `tools/*.py`
@@ -4409,12 +4422,25 @@ Owner decision (2026-09-16):
     (item 89). `config.example-das.yaml` commands the Quadro through the
     aquaero. Tests with captures with and without the Quadro on aquabus
     (§4.7). Follow-ups: items 89, 90, 91.
-88. A commissioning command for the saved configuration (item 84): a tool
-    that opens one controller, shows what its control report holds and,
-    after a confirmation, calls `AquacomputerAdapter.save()` once, refusing
-    while the `aqua-bridge` service is active. On the hardware: confirm that
-    the Quadro's save report (identical to the Farbwerk 360's) persists a
-    configuration over a power cycle, as report 6 does on the aquaero.
+88. **Done** (2026-09-16): a commissioning command for the saved
+    configuration (item 84), `tools/aquacomputer_commission.py`: it opens
+    the one configured controller named by `--device` (`--serial` narrows
+    several entries of one kind), prints every output's duty, source and
+    limits and the active profile -- exactly what `save()` is about to
+    store, since `save()` persists whatever the control report holds *now*
+    and this tool changes nothing about it first -- and, only with `--save`
+    and a typed confirmation (the flag alone never saves), calls
+    `AquacomputerAdapter.save()` once. Refuses while `systemctl is-active
+    <unit>` (default `aqua-bridge.service`) answers active, activating or
+    reloading, or cannot be determined at all (a missing `systemctl`, a
+    timeout, an unrecognised answer): undeterminable fails closed, the same
+    as running. Names the Quadro's save report as unverified (item 86)
+    before asking to send it. `AquacomputerAdapter.control_snapshot()`
+    (new: a control-report GET that adopts the result like `apply()` does,
+    writing nothing) is what reads the report to show. Fake-transport
+    tests only (`tests/test_aquacomputer_commission.py`,
+    `tests/test_hw_aquacomputer_adapter.py`); confirming the Quadro's save
+    persists over a power cycle on the hardware is item 96.
 90. **Done** (2026-09-16): an aquabus output or tachometer with nothing
     behind it (rpm `0xFFFF`) faults **only its own channel**. `read()`
     returns the observation with that channel's `rpm` and `pwm` as `None`;
@@ -4731,6 +4757,13 @@ Owner decision (2026-09-16):
     hardware: the aquaero's own thermistors and outputs keep working with
     `pwm5..pwm8` absent, one error line instead of a read failure per tick,
     and the channels back when the Quadro returns.
+
+96. Item 88's hardware half: confirm that the Quadro's save report
+    (identical to the Farbwerk 360's) persists a configuration over a power
+    cycle, the way report 6 does on the aquaero (verified 2026-09-15, item
+    86). Run `tools/aquacomputer_commission.py --device quadro --save`
+    against the real Quadro, power-cycle it, and confirm the duties and
+    limits it read back before the save are still there after.
 
 ### 8.4 Open — Zero 2 W upgrade
 
