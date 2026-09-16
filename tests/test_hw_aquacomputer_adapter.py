@@ -1045,6 +1045,34 @@ def test_nothing_the_daemon_does_sends_the_save_report() -> None:
     assert len(device.sets()) >= 3 and device.saves() == []
 
 
+# --- control_snapshot (item 88: the commissioning tool's read of what save() would store) ----
+
+
+def test_control_snapshot_is_a_get_only_and_caches_the_report() -> None:
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={"a": 1})
+    adapter, device, _bus, _clock, _sleep = _setup(binding)
+    assert adapter.control_report is None
+
+    report = adapter.control_snapshot()
+
+    assert report == bytes(device.ctrl)
+    assert adapter.control_report == report
+    assert [op.what for op in device.ops] == ["get"]
+    assert device.sets() == [] and device.saves() == []
+
+
+def test_control_snapshot_is_not_retried() -> None:
+    binding = DeviceBinding(kind=QUADRO, pwm_map={"a": 1}, timing=_timing(QUADRO, ctrl_retries=3))
+    adapter, device, _bus, _clock, _sleep = _setup(binding)
+    device.failures = [FeatureReportError("EPIPE", errno.EPIPE)]
+    with pytest.raises(DeviceUnavailable, match="control report GET failed 1 time"):
+        adapter.control_snapshot()
+    assert [op.what for op in device.ops] == ["get"]
+
+    report = adapter.control_snapshot()  # the fake device answers normally now
+    assert report == bytes(device.ctrl) and [op.what for op in device.ops] == ["get", "get"]
+
+
 # --- software-sensor heartbeat and the active profile (item 84) ------------------------------
 
 #: The owner's configuration: software sensor 1, a heartbeat well below its alarm.
