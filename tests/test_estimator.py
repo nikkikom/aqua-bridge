@@ -870,7 +870,10 @@ def test_a_manual_calibration_is_the_same_sample_as_smart():
     smart_entry = by_smart.memory["cal"]["a1"]["A"]
     manual_entry = by_manual.memory["manual"]["a1"]["cal"]
     assert manual_entry == smart_entry
-    assert by_smart.summary["smart_used"] == by_manual.summary["smart_used"] == len(readings)
+    assert by_smart.summary["smart_used"] == by_manual.summary["manual_used"] == len(readings)
+    # ... told apart in the running totals, so the SMART counters stay a SMART diagnostic
+    assert (by_manual.summary["smart_used"], by_manual.summary["smart_rejected"]) == (0, 0)
+    assert (by_smart.summary["manual_used"], by_smart.summary["manual_rejected"]) == (0, 0)
     # ... and so is everything the views show, apart from the serial and the source.
     shown = ("calibrated", "sigma_cal_c", "calibration", "occupancy")
     manual_view = {k: by_manual.bays["a1"][k] for k in shown}
@@ -922,15 +925,17 @@ def test_a_manual_calibration_far_from_the_estimate_is_rejected_and_counted():
     cfg = das_cfg(setpoints={})
     up = tick(cfg, None, 0.0)
     up = tick(cfg, up.memory, 10.0, calibration=_manual("a1", 90.0, 10.0))
-    assert up.summary["smart_rejected"] == 1 and up.summary["smart_used"] == 0
+    assert up.summary["manual_rejected"] == 1 and up.summary["manual_used"] == 0
     assert up.bays["a1"]["calibration"] is None
     assert up.bays["a1"]["calibration_source"] is None
     up = tick(cfg, up.memory, 20.0, calibration=_manual("a1", 45.0, 20.0))
-    assert up.summary["smart_used"] == 1 and up.bays["a1"]["calibration"]["samples"] == 1
+    assert up.summary["manual_used"] == 1 and up.bays["a1"]["calibration"]["samples"] == 1
     # the same reading offered again on later ticks is not a new sample
     for ts in (30.0, 40.0):
         up = tick(cfg, up.memory, ts, calibration=_manual("a1", 45.0, 20.0))
-    assert up.summary["smart_used"] == 1
+    assert up.summary["manual_used"] == 1
+    # neither door ever touches the other's totals
+    assert (up.summary["smart_used"], up.summary["smart_rejected"]) == (0, 0)
 
 
 def test_a_stale_or_malformed_manual_calibration_is_ignored_and_never_raises():
@@ -999,6 +1004,59 @@ def test_a_serials_calibration_wins_over_the_bays_manual_one():
     assert up.memory["manual"]["a1"]["cal"] is not None  # the manual entry is still kept
     assert up.bays["a1"]["calibration_source"] == "smart"
     assert up.bays["a1"]["calibration"]["slope"] == up.memory["cal"]["a1"]["A"]["th"][0]
+
+
+def test_a_hand_calibrated_bay_keeps_its_map_until_the_serials_one_is_accepted():
+    """A SMART entry in its first samples must not displace an accepted manual map.
+
+    The trigger is ordinary -- the PC-side agent comes online, or POST /api/bay
+    declares a serial, on a bay the owner has hand-calibrated. Falling back to the
+    prior there would re-map the drive state through a map nothing fitted, on a bay
+    whose proximal sensor is weakly coupled (which is why it was calibrated by hand).
+    """
+    plain = das_cfg(setpoints={})
+    up = _manual_run(plain)  # 60 handheld readings: the manual map is in force
+    assert up.bays["a1"]["calibration_source"] == "manual" and up.bays["a1"]["calibrated"]
+    manual_slope = up.bays["a1"]["calibration"]["slope"]
+    t_before = up.estimates["a1"]["t"]
+
+    declared = das_cfg(setpoints={}, topology=_serial_topology("a1", "A"))
+    mem, seen = up.memory, None
+    for k in range(61, 76):  # the serial's own calibration starts from the prior
+        ts = float(k) * 10.0
+        temp = 44.0 + 3.0 * math.sin(0.7 * k)
+        seen = tick(
+            declared,
+            mem,
+            ts,
+            smart={"A": {"temp_c": temp, "age_s": 0.0, "model": None}},
+            prox_a1=PROX_C,
+        )
+        mem = seen.memory
+        info = seen.bays["a1"]
+        assert info["calibration_source"] == "manual" and info["calibrated"]
+        assert info["sigma_cal_c"] != est.SIGMA_UNCALIBRATED_C
+        assert info["calibration"]["slope"] == pytest.approx(manual_slope)
+        assert mem["bays"]["a1"]["map"] == E.MANUAL_MAP  # never re-mapped through the prior
+    assert seen is not None
+    assert abs(seen.estimates["a1"]["t"] - t_before) < 1.0  # no step on the estimate
+    assert mem["cal"]["a1"]["A"]["used"] is False  # the SMART entry is still collecting
+
+    for k in range(76, 101):  # ... and once it is accepted the serial's map takes over
+        ts = float(k) * 10.0
+        temp = 44.0 + 3.0 * math.sin(0.7 * k)
+        seen = tick(
+            declared,
+            mem,
+            ts,
+            smart={"A": {"temp_c": temp, "age_s": 0.0, "model": None}},
+            prox_a1=PROX_C,
+        )
+        mem = seen.memory
+    assert mem["cal"]["a1"]["A"]["used"] is True
+    assert seen.bays["a1"]["calibration_source"] == "smart"
+    assert seen.bays["a1"]["calibration"]["slope"] == mem["cal"]["a1"]["A"]["th"][0]
+    assert mem["bays"]["a1"]["map"] == "A"
 
 
 def test_smart_far_from_the_estimate_is_rejected_and_counted():
