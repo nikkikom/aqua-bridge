@@ -2584,6 +2584,7 @@ aqua-bridge/
     fit_fans.py              # PWM -> RPM curve per fan model
     replay.py                # replay recordings through the thermal model
     http_user.py             # create or update an HTTPS API user (Pi, as root)
+    ha_check.py              # read-only MQTT / Home Assistant check against the broker (Pi)
   tests/
     conftest.py              # Hypothesis profiles, fixtures, SolverCase, hardware auto-skip
     invariants.py            # §4.1 helpers, incl. per-zone checks
@@ -2627,6 +2628,8 @@ aqua-bridge/
     test_http_api.py
     test_http_auth.py        # HTTPS, basic auth, credentials file, http_user.py
     test_mqtt_ha.py
+    test_ha_check.py         # ha_check.py against what MqttClient publishes (no broker)
+    test_mqtt_live.py        # marker mqtt_live: the publisher against a real broker
     test_inputs_smart.py
     test_smart_agent.py
     test_hostinfo.py
@@ -2698,7 +2701,10 @@ when no aquaero hidraw node, USB `0c70:f001` interface 2, exists), `fuzzy`
 (long closed-loop runs, subprocess SIGTERM), `nightly` (heavy sweeps and
 long simulations: excluded from PR and `main` runs, run by the nightly
 job), `solver_cases(*cases)` (restricts `solver_kind`), `pi` (only on the
-Raspberry Pi, e.g. the absolute step budget; skipped elsewhere). PR and
+Raspberry Pi, e.g. the absolute step budget; skipped elsewhere),
+`mqtt_live` (the publisher against a **real** broker: skipped unless
+`$AQUA_BRIDGE_MQTT_TEST_HOST` names one, with `_PORT`, `_USERNAME` and
+`_PASSWORD` completing the set, so CI stays offline; §8 item 21). PR and
 `main` CI run `-m "not hardware and not nightly"`; the nightly job runs
 `-m "not hardware"`.
 
@@ -3228,8 +3234,31 @@ runners allow it.
   in manual and deleted on leaving it, state payload, command parsing
   never raises, `on_message` never raises, `cmd/ident` and a retained
   `start` that never starts an experiment, `add_topic_handler` /
-  `topic_matches`. No broker. DAS entities and topics:
+  `topic_matches`; and the whole Discovery contract item 21 confirms
+  live: the exact entity table per config and control mode (component,
+  unit, device class, state class), every payload's config topic, unique
+  id, state topic, device block and availability trio, only numbers
+  carrying a command topic and every one of them subscribed, their range
+  and step, a setpoint / limit / manual-PWM command reaching the
+  supervisor on the entity's own command topic, a SMART message reaching
+  the inbox, the qos and retain flags of every publish, the last will,
+  and `online → Discovery → state → offline` under the configured
+  `node_id` / `discovery_prefix`. No broker. DAS entities and topics:
   `tests/test_das_intents.py`.
+- `tests/test_ha_check.py` — `tools/ha_check.py` against exactly what
+  `MqttClient` publishes (fake paho): a clean checklist, a missing
+  entity, a stale retained PWM number, a config payload from another
+  build, a missing or `offline` availability topic, no state topic, SMART
+  ages, a retained command; `--send` naming the command and doing nothing
+  without a typed `yes`, credentials never printed, never the daemon's
+  client id. No broker.
+- `tests/test_mqtt_live.py` (`mqtt_live`) — the publisher against a real
+  broker when `$AQUA_BRIDGE_MQTT_TEST_HOST` names one: retained
+  Discovery and state, a command from another client reaching the
+  supervisor, `in/smart` reaching the inbox, `ha_check` clean, a clean
+  stop leaving a retained `offline`. Its own `node_id`
+  (`aqua-bridge-test-<pid>`); every retained message it leaves is deleted
+  afterwards.
 - `tests/test_inputs_smart.py`, `tests/test_smart_agent.py` — inbox
   staleness by receipt time and rejection of malformed payloads; the
   agent's discovery, `smartctl -j` fixtures including `-n standby`, never
@@ -3824,8 +3853,16 @@ publish on them: unlike the HTTPS API (§6), they rely entirely on the
 **broker's authentication and ACLs**. Use a broker that requires a user
 and password (Home Assistant's Mosquitto add-on does), give aqua-bridge
 its own account, and limit publishing to `{node_id}/cmd/#` and
-`{node_id}/in/smart/#` to the accounts that need it. Not yet
-exercised against a live broker or Home Assistant (§8).
+`{node_id}/in/smart/#` to the accounts that need it.
+
+Everything above is pinned by tests with a fake client
+(`tests/test_mqtt_ha.py`, §4.9): the entity table, every payload's fixed
+keys, the command topics and the intents they produce, the SMART route,
+the qos and retain flags, the availability transitions. What needs a
+broker is `tools/ha_check.py` (a read-only checklist run on the Pi
+against the real broker, §10 step 12) and `tests/test_mqtt_live.py`
+(marker `mqtt_live`); the run against the owner's Home Assistant is §8
+item 21.
 
 ---
 
@@ -3883,6 +3920,13 @@ Owner decision (2026-09-15):
 
 Owner decision (2026-09-16):
 
+- **Item 21 is no longer deferred** (it was deferred on 2026-09-15, above).
+  The live MQTT and Home Assistant check runs against the owner's Home
+  Assistant broker (host in `private.md`). Everything that does not need
+  the broker is done offline first — the Discovery contract in
+  `tests/test_mqtt_ha.py`, the read-only `tools/ha_check.py`, and the
+  opt-in `mqtt_live` suite — so the live run is a short confirmation
+  (item 21's remaining text is the commands and what to look at).
 - **Flow stays out of `PlantObservation`** (item 91). The DAS has no
   coolant loop, so a flow reading steers nothing and would only add a
   field every consumer must ignore. Flow is still decoded
@@ -3924,12 +3968,66 @@ Owner decision (2026-09-16):
 20. Experiments: settle timers are not persisted (after a restart a start
     waits `ident_settle_s` + `bay_settle_s`); a start that arrives between
     `plan_tick` and `record_tick` shifts the levels by one tick.
-21. **Deferred** (owner, 2026-09-15: does not block production).
-    Live MQTT and Home Assistant check against the owner's Home Assistant
-    broker (host in `private.md`): discovery entities appear, limit and
-    setpoint numbers work, PWM numbers exist only in manual, `in/smart`
-    arrives through the broker. Needs the Pi and Home Assistant, not the
-    DAS.
+
+21. Live MQTT and Home Assistant check against the owner's Home Assistant
+    broker (host and credentials in `private.md`). Needs the Pi, the broker
+    and Home Assistant, not the DAS. No longer deferred (owner, 2026-09-16,
+    §8.1). Everything that does not need them is done: the Discovery
+    contract is pinned in `tests/test_mqtt_ha.py` (§4.9), `tools/ha_check.py`
+    checks a live broker read-only against the daemon's own config, and
+    `pytest -m mqtt_live` runs the publisher against a real broker. What is
+    left is a confirmation.
+
+    **On the Pi**, as the service user, from `/opt/aqua-bridge`, with the
+    daemon running (`--config /etc/aqua-bridge/config.yaml` throughout):
+
+    - `.venv/bin/python tools/ha_check.py --config /etc/aqua-bridge/config.yaml`
+      — the checklist. Exit 0 and "0 problem(s)" is the whole claim: every
+      expected entity announced and retained, the availability topic
+      `online`, the state blob carrying what every template reads. Add
+      `--verbose` for every entity with its value, `--strict` to fail on the
+      warnings too.
+    - `AQUA_BRIDGE_MQTT_TEST_HOST=<broker> AQUA_BRIDGE_MQTT_TEST_USERNAME=<user>
+      AQUA_BRIDGE_MQTT_TEST_PASSWORD=<password> .venv/bin/python -m pytest -m
+      mqtt_live -q` — the publisher end to end against that broker. It uses
+      its own `node_id` (`aqua-bridge-test-<pid>`) and deletes its retained
+      messages afterwards, so it is safe to run next to the live daemon.
+    - the three commands, each of which names its topic and payload and waits
+      for a typed `yes`: `tools/ha_check.py ... --send cmd/mode manual`, then
+      `--send cmd/pwm/<channel> 0.5`, then `--send cmd/mode auto`. Each
+      prints the state topic again afterwards, so the effect is visible
+      without Home Assistant.
+
+    **In Home Assistant**: one device `aqua-bridge` (MQTT integration → the
+    device page). Confirm the entity list of §7 — the host sensors, a
+    temperature per `mpc.temps`, RPM and PWM per channel, `Controller
+    problem` as a diagnostic, the setpoint numbers (legacy) or the
+    `limit_<class>` numbers and the per-bay drive sensors (DAS) — and that
+    they have values, not "unknown". Move a limit or a setpoint number in the
+    UI and watch `/api/state` (or the next `ha_check` run) follow within a
+    tick. Put the daemon in manual and confirm the `pwm_cmd_<channel>`
+    numbers appear, then set it back to auto and confirm they disappear
+    rather than linger. Tap `Controller problem` and confirm its attributes
+    carry the whole `device_health` blob (item 83). With the PC's SMART agent
+    running, confirm the drive temperatures arrive through the broker
+    (`ha_check` lists the serials and their age). Finally `sudo systemctl
+    stop aqua-bridge`: every entity must go unavailable within seconds (the
+    LWT), and come back on start.
+
+    **What a failure would mean.** Entities missing altogether: the broker
+    account may not be allowed to publish retained messages under
+    `{discovery_prefix}/#`, or Home Assistant's MQTT integration uses another
+    discovery prefix than `mqtt.discovery_prefix`. Entities present but
+    permanently unavailable: the availability topic is not readable by Home
+    Assistant's account, or the daemon never connected (`/api/health`'s
+    `mqtt_connected`). Entities available but "unknown": the state blob and a
+    template disagree — `ha_check` names the missing path, and that is a bug
+    here, not a Home Assistant setting. A number that moves in the UI and
+    changes nothing: either the broker drops the command (an ACL on
+    `{node_id}/cmd/#`) or the supervisor refused it (the journal logs the
+    rejected intent, like HTTP's 409). No SMART: the agent's `--node-id` or
+    its broker account, not the daemon (§10 step 13).
+
 22. **Done:** `GET /api/zones` (§6 View) and the HA entity
     `zone_status_<zone>` (§7), both reusing `diagnostics["zones"]`.
 23. `POST /api/calibrate {bay, drive_temp_c}`: calibration with a handheld
@@ -5243,7 +5341,15 @@ on a Zero W; the hardware steps are waiting for the aquaero.
     `curl -k -u <name> https://<host>:8443/api/health`; `-k` for the
     self-signed certificate) and, in DAS mode, `/api/estimate` (every bay
     occupied or empty as physically true, no zone in fault) if HTTP is
-    enabled; MQTT entities in HA; Digole later.
+    enabled. **MQTT and Home Assistant**: `.venv/bin/python
+    tools/ha_check.py --config /etc/aqua-bridge/config.yaml` (read-only; it
+    exits non-zero when an expected entity is missing) prints which Discovery
+    entities the broker holds, whether the availability and state topics carry
+    what the code publishes, and what Home Assistant would show for each
+    entity; `--verbose` lists them all, `--send` is the only way it ever
+    publishes and it asks first. Then the device page in Home Assistant
+    (§8 item 21 says what to look at and what a failure would mean).
+    Digole later.
 13. Optional, on the PC with the DAS: the SMART agent,
     `python tools/smart_agent.py --mqtt HOST --node-id aqua-bridge
     --interval 60` or the user unit `deploy/aqua-bridge-smart-agent.service`
