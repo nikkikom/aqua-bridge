@@ -341,7 +341,26 @@ class _Structure:
     fingerprint: str
 
 
+#: Config-derived structure, keyed by config identity (``MpcConfig`` is frozen and the
+#: loop keeps one effective config between intents), exactly as
+#: :data:`aqua_bridge.control.thermal._DERIVED_CACHE`. A pure memo: same result as
+#: recomputing, only cheaper per tick (item 73).
+_STRUCTURE_CACHE: dict[int, tuple[MpcConfig, _Structure]] = {}
+_STRUCTURE_CACHE_MAX = 16
+
+
 def _structure(cfg: MpcConfig) -> _Structure:
+    hit = _STRUCTURE_CACHE.get(id(cfg))
+    if hit is not None and hit[0] is cfg:
+        return hit[1]
+    st = _build_structure(cfg)
+    while len(_STRUCTURE_CACHE) >= _STRUCTURE_CACHE_MAX:
+        del _STRUCTURE_CACHE[next(iter(_STRUCTURE_CACHE))]
+    _STRUCTURE_CACHE[id(cfg)] = (cfg, st)
+    return st
+
+
+def _build_structure(cfg: MpcConfig) -> _Structure:
     topo = cfg.topology
     assert topo is not None
     sensors = cfg.sensors
@@ -447,9 +466,12 @@ def _scalar_update(x: np.ndarray, p: np.ndarray, i: int, z: float, r: float) -> 
         return
     k = p[:, i] / s
     x += k * (z - x[i])
-    a1 = p - np.outer(k, p[i, :])  # (I - K H) P
-    p[:, :] = a1 - np.outer(a1[:, i], k) + r * np.outer(k, k)  # ... (I - K H)^T + K R K^T
-    p[:, :] = 0.5 * (p + p.T)
+    # ``a[:, None] * b`` is the elementwise product ``numpy.outer`` computes, without its
+    # wrapper (this runs ~20 times a tick; item 73).
+    a1 = p - k[:, None] * p[i, :]  # (I - K H) P
+    joseph = a1 - a1[:, i][:, None] * k + r * (k[:, None] * k)  # ... (I - K H)^T + K R K^T
+    np.add(joseph, joseph.T, out=p)
+    p *= 0.5
 
 
 def _sensor_var(cfg: MpcConfig, name: str) -> float:

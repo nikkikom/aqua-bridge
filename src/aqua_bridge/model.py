@@ -213,6 +213,11 @@ def is_finite_number(value: object) -> bool:
 
 
 def _is_real(value: object) -> bool:
+    # ``numbers.Real`` is an ABC, so the isinstance below walks the registry; the exact
+    # types cover every value a real observation carries (item 73). ``bool`` is a subclass
+    # of ``int`` but ``type(True) is int`` is False, so the fast path cannot accept one.
+    if type(value) is float or type(value) is int:
+        return True
     return isinstance(value, numbers.Real) and not isinstance(value, bool)
 
 
