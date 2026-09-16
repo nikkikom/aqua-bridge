@@ -268,13 +268,20 @@ mpc:
     proximal_offset_c: 3.0  # prior sigma of the placement offset the filter carries for every
                          # proximal sensor of a bay beyond the first (degC): two sensors on one
                          # bay sit differently and disagree by degrees, which is an offset to
-                         # estimate, not a drive swap. 0: one node for all of them, as before
+                         # estimate, not a drive swap. 0: one node for all of them (the per-bay
+                         # seeding of item 69 still applies, so 0 is not the pre-item-67 filter)
     smart_max_age_s: 300 # older SMART samples are ignored; a silent serial loses its bay
     smart_reject_c: 8.0  # a SMART value this far from the estimate is dropped
     occupied_dT_c: 2.0   # proximal minus zone air above this: a drive is there
     empty_dT_c: 0.7      # below this (and < 1 W) for empty_confirm_s: the bay is empty
     empty_confirm_s: 300
-    bay_settle_s: 600
+    bay_settle_s: 600   # zones.trust_rule: sigma suspends a bay's sigma check for this long
+                         # after the filter widens it on purpose (a swap, an occupancy change)
+                         # while the bay is still read by a proximal sensor
+    bay_settle_max_s: 1800  # ...and for at most this much in total, until the bay has run this
+                         # long with neither a window nor a sigma over sigma_fault_c: a swap
+                         # spends a window or two, a sensor that keeps jumping runs out and
+                         # faults its zone again. 0: no settling exemption at all
     calibration_max_age_days: 30  # a SMART calibration without samples this long is not trusted
     associate_window_s: 3600      # serial -> bay association by correlation (no SES)
     associate_min_corr: 0.8
