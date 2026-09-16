@@ -295,6 +295,7 @@ def test_every_input_name_of_both_kinds_is_accepted() -> None:
             r"sensors cannot be bound in the config \(PROJECT.md section 8 item 91\)",
         ),
         ("quadro", "temp", "flow1", r"got 'flow1'; 'flow1' is a flow sensor"),
+        ("aquaero", "pwm", "flow1", r"outputs pwm1..pwm8, got 'flow1'; 'flow1' is a flow sensor"),
     ],
 )
 def test_hwmon_era_input_names_are_rejected_with_the_new_name(
@@ -305,9 +306,39 @@ def test_hwmon_era_input_names_are_rejected_with_the_new_name(
     section = dict(_SECTION, device=device)
     if field == "temp":
         section["temp_map"] = {"coolant": value}
+    elif field == "pwm":
+        section["fans"] = {"radiator": {"pwm": value}}
     else:
         section["fans"] = {"radiator": {"pwm": "pwm1", "rpm": value}}
     with pytest.raises(ConfigError, match=match):
+        _parse(section)
+
+
+@pytest.mark.parametrize("field", ["pwm", "rpm", "temp"])
+def test_a_flow_name_is_rejected_everywhere_naming_the_aquaero_aquabus_tachometers(
+    field: str,
+) -> None:
+    """Item 91 (owner decision 2026-09-16): flow cannot be bound anywhere in a device
+    entry, and the message says so and that an aquaero's hwmon-era fan5/fan6 mean
+    aquabus tachometers here, not the flow sensors the driver called by those names."""
+    section = dict(_SECTION, device="aquaero")
+    if field == "temp":
+        section["temp_map"] = {"coolant": "flow2"}
+    elif field == "pwm":
+        section["fans"] = {"radiator": {"pwm": "flow2"}}
+    else:
+        section["fans"] = {"radiator": {"pwm": "pwm1", "rpm": "flow2"}}
+    with pytest.raises(ConfigError) as excinfo:
+        _parse(section)
+    message = str(excinfo.value)
+    assert "flow sensors cannot be bound in the config (PROJECT.md section 8 item 91)" in message
+    assert "publishes them with the device health" in message
+    assert "fan5..fan8 are the aquaero's aquabus tachometers" in message
+
+
+def test_the_quadro_hwmon_flow_name_also_names_the_aquaero_difference() -> None:
+    section = dict(_SECTION, device="quadro", fans={"radiator": {"pwm": "pwm1", "rpm": "fan5"}})
+    with pytest.raises(ConfigError, match="are aquabus tachometers now"):
         _parse(section)
 
 
