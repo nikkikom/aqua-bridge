@@ -17,12 +17,17 @@ curve of its fan model like any other.
 
 Which curve
 -----------
-``u0_m`` follows the curve **in force**: every function here takes ``curves``
-(``solver_memory["fan_curves"]``, the online fit of
+``u0_m`` follows the curve **in force**: every function here that reads a dead
+band takes ``curves`` (``solver_memory["fan_curves"]``, the online fit of
 :mod:`aqua_bridge.control.fancurve` with ``mpc.fan_curve_online``) and reads the
 fitted dead band where there is a usable entry for the fan model, the configured
 ``fan_models.<m>.deadband`` otherwise -- ``None`` (the legacy path, and the DAS
-with the fit switched off) is always the config. It changes the *objective*, not
+with the fit switched off) is always the config. Those are
+:func:`channel_deadband` and its three callers, :func:`rpm_model`,
+:func:`surrogate` and :func:`noise_diagnostics`. :func:`channel_power` and
+:func:`noise_db` read **no** dead band at all: they take a speed fraction the
+caller has already computed, so the curve behind them is whichever one produced
+that fraction. It changes the *objective*, not
 the safety: with a real dead band of 0.25 and a configured 0.1 the surrogate
 charges the solver for noise over a band where the fan does not turn, and its
 gradient sends the command to the wrong place. It also keeps one ``u0`` across
@@ -148,7 +153,11 @@ def _exponent(cfg: MpcConfig) -> float:
 
 
 def channel_power(cfg: MpcConfig, channel: str, frac: float) -> float:
-    """Linear sound power ``P_i`` of a channel at speed fraction ``frac`` (unweighted)."""
+    """Linear sound power ``P_i`` of a channel at speed fraction ``frac`` (unweighted).
+
+    No dead band enters here: ``frac`` is the speed fraction the caller computed, so the
+    curve behind this number is the one behind ``frac`` (module docstring, *Which
+    curve*)."""
     level, _ = _level(cfg, channel)
     frac = min(RPM_FRAC_MAX, max(0.0, float(frac)))
     return level * frac ** _exponent(cfg) if frac > 0 else 0.0
@@ -160,7 +169,9 @@ def reference_power(cfg: MpcConfig) -> float:
 
 
 def noise_db(cfg: MpcConfig, fracs: Mapping[str, float]) -> float:
-    """Energetic noise index from a speed fraction per channel (missing channel: 0)."""
+    """Energetic noise index from a speed fraction per channel (missing channel: 0).
+
+    Like :func:`channel_power` it reads no dead band: the fractions carry the curve."""
     total = sum(channel_power(cfg, ch, fracs.get(ch, 0.0)) for ch in cfg.channels)
     floor = 10.0 ** (NOISE_FLOOR_DB / 10.0)
     return 10.0 * math.log10(max(total, floor))
