@@ -1783,13 +1783,15 @@ class MpcConfig:
       level's time constant, and whether a thermal model that has not converged (its
       prior or what it learnt so far) may drive the fans. Inert in legacy mode.
     * ``fan_curve_online`` / ``fan_curve_settle_s`` / ``fan_curve_refit_s`` /
-      ``fan_curve_max_rmse_frac`` -- the online PWM -> RPM curve fit per fan model
-      (``control/fancurve.py``): whether it runs and its accepted curves replace
-      ``fan_models``' ``deadband`` / ``exponent`` / ``rpm_max`` in the thermal model,
-      how long a commanded duty must hold before a ``(pwm, rpm)`` pair is sampled, how
-      often the fit is recomputed, and the relative RMSE above which a fit is refused.
-      ``fan_curve_online: true`` needs ``topology``; the numeric keys are validated
-      always and inert in legacy mode.
+      ``fan_curve_max_rmse_frac`` / ``fan_curve_max_age_s`` -- the online PWM -> RPM
+      curve fit per fan model (``control/fancurve.py``): whether it runs and its
+      accepted curves replace ``fan_models``' ``deadband`` / ``exponent`` in the
+      readers that follow the fit (``control/fancurve.py``'s ``READERS``), how long a
+      commanded duty must hold before a ``(pwm, rpm)`` pair is sampled, how often the
+      fit is recomputed, the relative RMSE above which a fit is refused, and how long
+      an accepted fit stays in force without being re-confirmed before the configured
+      curve comes back. ``fan_curve_online: true`` needs ``topology``; the numeric keys
+      are validated always and inert in legacy mode.
     * ``model_store_interval_s`` / ``model_store_max_age_days`` / ``model_reconfirm_s`` --
       the model store (``modelstore.py``, ``control/persist.py``): the shortest interval
       between two writes of ``model.json``, the age above which a stored model loads
@@ -1876,6 +1878,7 @@ class MpcConfig:
     fan_curve_settle_s: float = 30.0
     fan_curve_refit_s: float = 600.0
     fan_curve_max_rmse_frac: float = 0.05
+    fan_curve_max_age_s: float = 3600.0
     mpc_pred_dt_s: float = 30.0
     mpc_blocks: tuple[int, ...] = ()
     mpc_every_ticks: int = 1
@@ -1998,6 +2001,7 @@ class MpcConfig:
             "fan_curve_settle_s",
             "fan_curve_refit_s",
             "fan_curve_max_rmse_frac",
+            "fan_curve_max_age_s",
             "model_lambda",
             "model_p_trace_max",
             "model_converged_rel_se",
@@ -2317,6 +2321,12 @@ class MpcConfig:
         if not 0.0 < self.fan_curve_max_rmse_frac <= 1.0:
             raise ConfigError(
                 f"mpc.fan_curve_max_rmse_frac must be in (0, 1], got {self.fan_curve_max_rmse_frac}"
+            )
+        if self.fan_curve_max_age_s < self.fan_curve_refit_s:
+            raise ConfigError(
+                "mpc.fan_curve_max_age_s must be >= mpc.fan_curve_refit_s (a fit would go "
+                f"stale before it could be re-confirmed), got {self.fan_curve_max_age_s} < "
+                f"{self.fan_curve_refit_s}"
             )
         if self.model_window_s <= 0 or self.model_window_s > 600:
             raise ConfigError(f"mpc.model_window_s must be in (0, 600], got {self.model_window_s}")

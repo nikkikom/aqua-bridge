@@ -8,6 +8,21 @@ model store already saves and loads (:mod:`aqua_bridge.modelstore`,
 :func:`aqua_bridge.control.persist.apply_seed`), in exactly the shape it already
 validates: ``{fan model: {"rpm_max", "deadband", "exponent"}}``.
 
+Who reads it
+------------
+Not every user of ``fan_models`` follows the fit; :data:`READERS` is the decision per
+reader, reported in ``diagnostics["fan_curves"]["readers"]`` (PROJECT.md section 3,
+*Fan curve*, and section 8 item 107). ``curve`` follows the curve in force, ``config``
+always reads the commissioned ``fan_models`` entry. What follows it plans on the air a
+fan moves -- the thermal model's identification and the DAS MPC's prediction, the
+estimator's airflow ``Q_z`` / ``Qn_z``, and the ``u0`` of the noise objective -- so the
+estimator, the model and the objective cannot disagree about the same fan. What does not
+follow it judges a fan against its commissioned figures, or is a validity rule:
+``health.py``'s rpm and power rules (a curve fitted to those same tachometer readings
+would follow a fan that slows down, and the deviation would never show), the gate's
+Stuck airflow evidence (derived from the config once at load), and every ``rpm_max``
+normalisation (below).
+
 The curve is the one the rest of the controller already uses,
 ``rpm(u) = rpm_max * phi(u; deadband, exponent)`` with
 :func:`aqua_bridge.control.thermal.phi` -- the ``u0.<m>`` / ``n.<m>`` rows of
@@ -42,6 +57,17 @@ scipy; a few hundred vector operations over at most :data:`BINS` bins, once per 
 The residual counts the scatter inside each bin, not only the bin means, so a noisy
 tachometer cannot look like a perfect fit.
 
+A fit **goes stale** when nothing has re-confirmed it for ``fan_curve_max_age_s``,
+which is two things at once: no refit has been *accepted* in that window (:func:`update`
+stamps every accepted fit with its tick, and a refused refit leaves the stamp alone), or
+no settled ``(pwm, rpm)`` **sample** has arrived in it (the bins keep their history, so a
+tachometer that has stopped reporting would otherwise let the fit be re-accepted from
+year-old data for ever). Past that age the fit stops being published: its entry leaves
+``solver_memory["fan_curves"]`` and every reader that follows the curve falls back to the
+configured one. A tachometer that dies, and a tachometer that lies badly enough that no
+refit passes again, so both return the controller to the commissioned curve instead of
+planning forever on a fit nothing confirms.
+
 A fit is **accepted** only when the data can carry it: at least :data:`MIN_BINS` bins
 with :data:`MIN_BIN_SAMPLES` samples each, spanning at least :data:`MIN_SPAN` of PWM, and
 a relative RMSE at most ``fan_curve_max_rmse_frac``. Otherwise the previous accepted
@@ -58,8 +84,9 @@ Memory (plain JSON)::
      "hold": {channel: [u, since_ts]},
      "models": {model: {"bins": [[n, su, sr, sr2], ... BINS],
                         "fit": {"rpm_max", "deadband", "exponent", "rmse_frac", "n",
-                                "bins", "span"} | null,
-                        "rejected": str | null, "last_ts": ts | null}}}
+                                "bins", "span", "ts"} | null,
+                        "rejected": str | null, "last_ts": ts | null,
+                        "sample_ts": ts | null}}}
 
 A memory that does not match the config's fans, or is malformed in any way, starts over
 (never an exception).
@@ -85,16 +112,19 @@ __all__ = [
     "MIN_BINS",
     "MIN_BIN_SAMPLES",
     "MIN_SPAN",
+    "READERS",
     "SETTLE_TOL",
     "VERSION",
     "FanCurveUpdate",
     "curve_pair",
     "fresh_memory",
+    "is_stale",
     "summary",
     "update",
+    "usable",
 ]
 
-VERSION = 1
+VERSION = 2
 
 #: Grid over the bounds of ``thermal.PARAMETERS`` (``u0`` in [0, 0.5), ``n`` in
 #: [0.5, 1.5]); ``tools/fit_fans.py`` searches the same one, so the online and the
@@ -114,6 +144,26 @@ MIN_SPAN = 0.25
 #: A commanded duty within this of the held one counts as unchanged (settling).
 SETTLE_TOL = 1e-6
 
+#: Every reader of the fan-curve data and whether it follows the curve in force
+#: (``curve``: the fit while one is accepted and not stale, else the configured entry)
+#: or always the commissioned ``fan_models`` entry (``config``). The reasons are the
+#: module docstring and PROJECT.md section 3, *Fan curve*; this table is what
+#: ``diagnostics["fan_curves"]["readers"]`` reports, so the running daemon says which
+#: curve produced which number.
+READERS: dict[str, str] = {
+    # plans on the air a fan moves: follows the fit
+    "thermal_model": "curve",  # thermal.model_params: the u0.<m> / n.<m> rows
+    "mpc_prediction": "curve",  # solver_das: the same parameters through the prediction
+    "estimator_airflow": "curve",  # estimator._airflow: Q_z, Qn_z
+    "noise_u0": "curve",  # noise._level / surrogate / diagnostics: the dead band
+    # judges a fan against its commissioned figures, or is a validity rule: stays put
+    "noise_rpm_max": "config",  # a tach normalised by a fitted rpm_max hides lost speed
+    "noise_db_at_max": "config",  # a datasheet figure the fit says nothing about
+    "model_use_rpm": "config",  # thermal._channel_phi, same reason as noise_rpm_max
+    "fan_health": "config",  # health.py rpm and power rules: the deviation must show
+    "stuck_airflow": "config",  # gate rule 3, derived from the config once at load
+}
+
 _EPS = 1e-12
 
 
@@ -125,31 +175,72 @@ def _finite(value: object) -> bool:
 
 @dataclass(frozen=True)
 class FanCurveUpdate:
-    """What :func:`update` returns: the next memory and the curves it accepts."""
+    """What :func:`update` returns: the next memory, the curves it publishes and the fan
+    models whose fit has gone stale (``fan_curve_max_age_s``), whose entry the caller
+    drops from ``solver_memory["fan_curves"]`` so the configured curve comes back."""
 
     memory: dict[str, Any]
     curves: dict[str, dict[str, float]]
+    stale: tuple[str, ...] = ()
+
+
+def _parse(curve: object) -> tuple[float, float, float] | None:
+    """``(deadband, exponent, rpm_max)`` of a usable ``fan_curves`` entry, else ``None``.
+
+    The single place that decides whether an entry is usable: a mapping of three finite
+    numbers inside the bounds ``fan_models`` validation and ``thermal.PARAMETERS`` give
+    them, so a malformed entry can never put a NaN or a negative dead band into a reader.
+    """
+    if not isinstance(curve, Mapping):
+        return None
+    d, n, r = (curve.get(k) for k in ("deadband", "exponent", "rpm_max"))
+    if not (_finite(d) and _finite(n) and _finite(r)):
+        return None
+    d, n, r = float(d), float(n), float(r)  # type: ignore[arg-type]
+    if not (0.0 <= d < 0.5 and 0.5 <= n <= 1.5 and r > 0.0):
+        return None
+    return d, n, r
 
 
 def curve_pair(
     curve: object, deadband: float, exponent: float, rpm_max: float
 ) -> tuple[float, float, float]:
-    """``(deadband, exponent, rpm_max)`` of a stored curve, or the configured triple.
+    """``(deadband, exponent, rpm_max)`` of a stored curve, or the configured triple
+    for anything :func:`_parse` refuses."""
+    parsed = _parse(curve)
+    return (deadband, exponent, rpm_max) if parsed is None else parsed
 
-    The single place that decides whether a ``fan_curves`` entry is usable: a mapping of
-    three finite numbers inside the bounds ``fan_models`` validation and
-    ``thermal.PARAMETERS`` give them. Anything else falls back to the config, so a
-    malformed entry can never put a NaN or a negative dead band into the model.
+
+def usable(curve: object) -> bool:
+    """Whether a ``fan_curves`` entry is one :func:`curve_pair` will follow -- what a
+    reader reports when it says a number came from the fit rather than the config."""
+    return _parse(curve) is not None
+
+
+def _age(stamp: object, ts: float) -> float | None:
+    """Seconds from ``stamp`` to ``ts``, or ``None`` when there is nothing to measure.
+    A clock that went backwards reads as age 0, never as an aged-out fit."""
+    if not _finite(stamp):
+        return None
+    return max(0.0, float(ts) - float(stamp))  # type: ignore[arg-type]
+
+
+def is_stale(block: object, cfg: MpcConfig, ts: float) -> bool:
+    """Whether a fan model's accepted fit has gone unconfirmed for
+    ``fan_curve_max_age_s`` -- no accepted refit and no new sample in that window
+    (module docstring, *A fit goes stale*).
+
+    ``block`` is one entry of the memory's ``models``. A model with no accepted fit is
+    never stale (there is nothing in force to abandon), and an unstamped fit -- one
+    written by an older memory version that the fingerprint let through -- counts as
+    unconfirmed, so the rule may only ever fall *back* to the configured curve.
     """
-    if not isinstance(curve, Mapping):
-        return deadband, exponent, rpm_max
-    d, n, r = (curve.get(k) for k in ("deadband", "exponent", "rpm_max"))
-    if not (_finite(d) and _finite(n) and _finite(r)):
-        return deadband, exponent, rpm_max
-    d, n, r = float(d), float(n), float(r)  # type: ignore[arg-type]
-    if not (0.0 <= d < 0.5 and 0.5 <= n <= 1.5 and r > 0.0):
-        return deadband, exponent, rpm_max
-    return d, n, r
+    if not isinstance(block, Mapping) or not isinstance(block.get("fit"), Mapping):
+        return False
+    limit = cfg.fan_curve_max_age_s
+    accepted = _age(block["fit"].get("ts"), ts)  # type: ignore[union-attr]
+    sampled = _age(block.get("sample_ts"), ts)
+    return accepted is None or sampled is None or accepted > limit or sampled > limit
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +272,7 @@ def fresh_memory(cfg: MpcConfig) -> dict[str, Any]:
                 "fit": None,
                 "rejected": None,
                 "last_ts": None,
+                "sample_ts": None,
             }
             for m in _models(cfg)
         },
@@ -219,12 +311,16 @@ def _load(memory: object, cfg: MpcConfig) -> dict[str, Any]:
             last = raw.get("last_ts")
             if last is not None and not _finite(last):
                 raise ValueError("last_ts")
+            sampled = raw.get("sample_ts")
+            if sampled is not None and not _finite(sampled):
+                raise ValueError("sample_ts")
             rejected = raw.get("rejected")
             models[m] = {
                 "bins": bins.tolist(),
                 "fit": None if fit is None else dict(fit),
                 "rejected": rejected if isinstance(rejected, str) else None,
                 "last_ts": None if last is None else float(last),
+                "sample_ts": None if sampled is None else float(sampled),
             }
         out["models"] = models
         return out
@@ -297,10 +393,10 @@ def update(
     """One tick of the online fit (module docstring).
 
     ``u`` is the command the fans have been on since the previous tick (``prev``) and
-    ``rpm`` is ``obs.rpm``. Returns the next memory and the curves accepted so far
-    (every model whose last fit passed; a model without one is absent, and its
-    configured curve stays in force). Never raises on data: a malformed memory starts
-    over and a non-finite reading is skipped.
+    ``rpm`` is ``obs.rpm``. Returns the next memory, the curves accepted so far (every
+    model whose last fit passed and is not stale; a model without one is absent, and its
+    configured curve stays in force) and the models whose fit has gone stale. Never
+    raises on data: a malformed memory starts over and a non-finite reading is skipped.
     """
     mem = _load(memory, cfg)
     ts = float(ts)
@@ -321,7 +417,9 @@ def update(
         if not _finite(reading) or float(reading) < 0.0:  # type: ignore[arg-type]
             continue
         speed = float(reading)  # type: ignore[arg-type]
-        bins = mem["models"][cfg.fans[ch].model]["bins"]
+        block = mem["models"][cfg.fans[ch].model]
+        block["sample_ts"] = ts  # the newest evidence under the fit (the stale rule)
+        bins = block["bins"]
         row = bins[min(BINS - 1, int(duty * BINS))]
         if row[0] >= BIN_CAPACITY:  # an exponential mean of BIN_CAPACITY samples
             decay = (BIN_CAPACITY - 1.0) / BIN_CAPACITY
@@ -337,6 +435,7 @@ def update(
         row[3] += speed * speed
 
     curves: dict[str, dict[str, float]] = {}
+    stale: list[str] = []
     for model, block in mem["models"].items():
         last = block["last_ts"]
         if last is None or ts < last:
@@ -347,25 +446,44 @@ def update(
                 np.asarray(block["bins"], dtype=float), cfg.fan_curve_max_rmse_frac
             )
             if fit is not None:
+                fit["ts"] = ts  # the tick that accepted it: the age the stale rule reads
                 block["fit"] = fit
             block["rejected"] = reason
         fit = block["fit"]
-        if isinstance(fit, Mapping):
-            curves[model] = {
-                "rpm_max": float(fit["rpm_max"]),
-                "deadband": float(fit["deadband"]),
-                "exponent": float(fit["exponent"]),
-            }
-    return FanCurveUpdate(memory=mem, curves=curves)
+        if not isinstance(fit, Mapping):
+            continue
+        if is_stale(block, cfg, ts):  # nothing has re-confirmed it: back to the config
+            stale.append(model)
+            continue
+        curves[model] = {
+            "rpm_max": float(fit["rpm_max"]),
+            "deadband": float(fit["deadband"]),
+            "exponent": float(fit["exponent"]),
+        }
+    return FanCurveUpdate(memory=mem, curves=curves, stale=tuple(stale))
 
 
 def summary(
-    memory: Mapping[str, Any] | None, cfg: MpcConfig, curves: Mapping[str, Any] | None
+    memory: Mapping[str, Any] | None,
+    cfg: MpcConfig,
+    curves: Mapping[str, Any] | None,
+    *,
+    ts: float | None = None,
 ) -> dict[str, Any]:
     """``diagnostics["fan_curves"]``: the curve in force per fan model and where it came
     from (``fit`` from this run, ``store`` from ``model.json``, else ``config``), with the
-    state of the online fit."""
-    out: dict[str, Any] = {"online": cfg.fan_curve_online, "models": {}}
+    state of the online fit, and :data:`READERS` -- which readers follow that curve and
+    which stay on the configured one.
+
+    ``stale`` on a row means the model has an accepted fit that nothing has re-confirmed
+    within ``fan_curve_max_age_s``: it is no longer published, so ``source`` is
+    ``config`` and ``age_s`` says how old the abandoned fit is. ``ts`` is the tick's
+    observation time; without it no row is judged stale."""
+    out: dict[str, Any] = {
+        "online": cfg.fan_curve_online,
+        "readers": dict(READERS),
+        "models": {},
+    }
     models = (memory or {}).get("models") if isinstance(memory, Mapping) else None
     for model in _models(cfg):
         spec = cfg.fan_models[model]
@@ -373,11 +491,22 @@ def summary(
         fit = entry.get("fit") if isinstance(entry, Mapping) else None
         stored = (curves or {}).get(model)
         deadband, exponent, rpm_max = curve_pair(stored, spec.deadband, spec.exponent, spec.rpm_max)
+        stale = ts is not None and is_stale(entry, cfg, ts)
         source = "config"
         if stored is not None:
             source = "fit" if isinstance(fit, Mapping) else "store"
+        age: float | None = None
+        sample_age: float | None = None
+        if ts is not None:
+            if isinstance(fit, Mapping):
+                age = _age(fit.get("ts"), ts)
+            if isinstance(entry, Mapping):
+                sample_age = _age(entry.get("sample_ts"), ts)
         row: dict[str, Any] = {
             "source": source,
+            "stale": stale,
+            "age_s": age,
+            "sample_age_s": sample_age,
             "rpm_max": rpm_max,
             "deadband": deadband,
             "exponent": exponent,
