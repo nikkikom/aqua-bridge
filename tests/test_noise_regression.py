@@ -20,7 +20,10 @@ noise is the plant's energetic truth index from fan speed; the ratio compares li
 sound power, ``10 ** ((L_mpc - L_uniform) / 10)``, with the MPC's power averaged over the
 window. The plan's bound for the calibrated MPC is 0.8.
 
-PR runs two seeds of the calibrated case. The nightly sweep adds seeds, the uncalibrated
+PR runs two seeds of the calibrated case, plus one with ``mpc.fan_curve_online`` and a
+fitted curve in force on a plant whose fans really have its dead band (section 8 item
+107: the fit moves the objective's ``u0``, so the bound has to hold under it too).
+The nightly sweep adds seeds, the uncalibrated
 case (ratio reported and bounded below 2.0), the ``rich`` preset (unknown physical
 parameters drawn from the seed: no limit violation after the first 10 minutes, and a
 ratio below :data:`RICH_BOUND` where a uniform curve below full speed exists; a
@@ -34,6 +37,7 @@ smaller margin), and at an equal margin the two are not comparable within one ru
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass
 
@@ -42,7 +46,7 @@ import pytest
 
 from aqua_bridge.config import load_config
 from aqua_bridge.control.mpc import step
-from aqua_bridge.model import Mode, MpcConfig, SolverKind
+from aqua_bridge.model import Mode, MpcConfig, MpcState, SolverKind
 from aqua_bridge.sim.das import (
     SENSOR_TYPES,
     DasPlant,
@@ -101,13 +105,18 @@ def scenario_config(*, solver: SolverKind, calibrated: bool) -> MpcConfig:
     return MpcConfig.from_mapping(data)
 
 
-def scenario_plant(cfg: MpcConfig, *, seed: int, preset: str) -> tuple[DasPlant, str]:
+def scenario_plant(
+    cfg: MpcConfig, *, seed: int, preset: str, fan_deadband: float | None = None
+) -> tuple[DasPlant, str]:
     topology = topology_from_config(cfg)
     for i, bay in enumerate(topology["bays"]):
         topology["bays"][bay]["serial"] = f"SN{i + 1:04d}"  # the drives always report SMART
     for entry in topology["sensors"].values():
         entry["noise_sigma_c"] = SENSOR_TYPES[entry["type"]].noise_sigma_c
     topology["inlet"] = {"base_c": 25.0}
+    if fan_deadband is not None:  # a fan that starts later than fan_models says (item 107)
+        for entry in topology["fans"].values():
+            entry["deadband"] = fan_deadband
     rng = np.random.default_rng(seed)
     hot = ZONES[seed % len(ZONES)]
     schedule = {}
@@ -167,10 +176,26 @@ class NoiseResult:
         return 10.0 * math.log10(self.power), 10.0 * math.log10(self.uniform)
 
 
-def run_scenario(*, seed: int, calibrated: bool, solver=SolverKind.MPC, preset="basic"):
+def run_scenario(
+    *,
+    seed: int,
+    calibrated: bool,
+    solver=SolverKind.MPC,
+    preset="basic",
+    fan_curves: dict | None = None,
+):
+    """``fan_curves`` runs the scenario with ``mpc.fan_curve_online`` and that curve in
+    force from the first tick, on a plant whose fans really have its dead band: the
+    objective's ``u0`` then follows the curve (section 8 item 107)."""
     cfg = scenario_config(solver=solver, calibrated=calibrated)
-    plant, hot = scenario_plant(cfg, seed=seed, preset=preset)
-    run = run_das_closed_loop(plant, cfg, step, int(T_END / cfg.dt))
+    state = None
+    deadband = None
+    if fan_curves is not None:
+        cfg = dataclasses.replace(cfg, fan_curve_online=True)
+        state = MpcState(solver_memory={"fan_curves": {m: dict(c) for m, c in fan_curves.items()}})
+        deadband = float(next(iter(fan_curves.values()))["deadband"])
+    plant, hot = scenario_plant(cfg, seed=seed, preset=preset, fan_deadband=deadband)
+    run = run_das_closed_loop(plant, cfg, step, int(T_END / cfg.dt), state=state)
     ts = np.array(run.series["ts"])
     window = ts >= T_END - WINDOW_S
     power = float(np.mean(10.0 ** (np.array(run.series["noise_db"])[window] / 10.0)))
@@ -236,6 +261,25 @@ def test_calibrated_mpc_is_quieter_than_the_quietest_uniform_curve(seed):
     assert_healthy(r)
     bays = r.run.records[-1].cmd.diagnostics["bays"]
     assert sum(1 for info in bays.values() if info["calibrated"]) >= 12
+    assert r.ratio <= CALIBRATED_BOUND, describe(r)
+
+
+#: A fan that only starts to turn at a quarter duty, against the example's configured
+#: ``deadband: 0.1`` -- the case item 107 moved the objective's ``u0`` for.
+FITTED_CURVE = {"case120": {"rpm_max": 1500.0, "deadband": 0.25, "exponent": 1.0}}
+
+
+def test_the_noise_bound_holds_with_a_fitted_curve_in_force():
+    """Item 107 moved the MPC's *objective*: the noise surrogate's ``u0`` follows the
+    curve in force. The plan's bound is on the controller, not on the configured curve,
+    so it has to hold with a fitted one too -- here on a plant whose fans really start at
+    0.25, where the configured 0.1 would charge the solver for noise over a band in which
+    no fan turns."""
+    r = run_scenario(seed=2, calibrated=True, fan_curves=FITTED_CURVE)
+    print(f"fitted curve: {describe(r)}")
+    assert_healthy(r)
+    u0 = {rec.cmd.diagnostics["noise"]["channels"]["xt1"]["u0"] for rec in r.run.records}
+    assert u0 == {0.25}, f"the objective must run on the fitted dead band, got {u0}"
     assert r.ratio <= CALIBRATED_BOUND, describe(r)
 
 
