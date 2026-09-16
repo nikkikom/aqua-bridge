@@ -678,6 +678,7 @@ ones get their defaults):
 | `estimator.smart_max_age_s` / `smart_reject_c` | 300 / 8.0 | ≥ `dt` / > 0 |
 | `estimator.occupied_dT_c` / `empty_dT_c` / `empty_confirm_s` | 2.0 / 0.7 / 300 | `occupied_dT_c > empty_dT_c > 0`; `empty_confirm_s ≥ 2 * dt` |
 | `estimator.bay_settle_s` | 600 | ≥ 0 |
+| `estimator.bay_settle_max_s` | 1800 | ≥ `bay_settle_s`, s; the most settling exemption one bay may draw from `trust_rule: sigma` before it has to run this long with neither a window nor a σ over `sigma_fault_c` (§3 per-zone trust, §8 item 69); 0 grants none at all |
 | `estimator.calibration_max_age_days` | 30 | > 0 |
 | `estimator.associate_window_s` / `associate_min_corr` / `associate_margin` | 3600 / 0.8 / 0.15 | ≥ 600 / `(0, 1)` / `(0, 1)` |
 
@@ -868,7 +869,13 @@ holds:
   change the filter widens it on purpose — that is the filter *following* a
   swap, not losing sight of it, and the margin carries the widening either
   way; a bay without a trusted proximal member this tick is never exempt, so
-  a blind bay still faults at once. And `sigma_air_fault_c` cannot decide at
+  a blind bay still faults at once. The exemption is bounded in wall-clock,
+  not by the σ coming back: a bay's σ falls back within a tick or two of every
+  jump, so one bay's windows may suspend the check for at most
+  `bay_settle_max_s` in total, until the bay has run that long with neither a
+  window nor a σ over `sigma_fault_c`. A swap spends one window or two; a
+  sensor that keeps jumping spends the budget and then faults its zone on every
+  tick it is over, as it did before item 69. And `sigma_air_fault_c` cannot decide at
   all, because the air node is observed by more than the zone-air sensors:
   every proximal sensor reads `(1 − s)·T_a` beside its drive, and the inlet
   and the fan command pin the rest. `air_blind_s` against
@@ -1576,9 +1583,13 @@ is the honest cost of not touching the drives: without SMART the absolute
 sensor-to-drive offset is a prior, and it decides how loud the fans run.
 Per bay the block also carries `observed` (a trusted proximal member this tick),
 `seeded`, `settling` (within `bay_settle_s` of a fast-swap jump or of an
-occupancy change into or out of `empty` — both widen the bay on purpose) and
-`offsets_c`; per zone `air_blind_s`, the time since a trusted `zone_air` reading
-was fused. `trust_rule: sigma` reads all of them (§3 per-zone trust).
+occupancy change into or out of `empty` — both widen the bay on purpose — and
+while the bay's windows have not yet totalled `bay_settle_max_s` of suspended
+σ check) and `offsets_c`; per zone `air_blind_s`, the wall-clock time since a
+trusted `zone_air` reading was fused (a tick gap counts in full, capped at the
+filter's 3600 s prediction horizon). `trust_rule: sigma` reads `observed`,
+`settling` and `air_blind_s` (§3 per-zone trust); `seeded` and `offsets_c` are
+diagnostics.
 
 **Occupancy** (`topology.bays.<b>.occupied`, runtime `POST /api/bay`):
 `true` is always `occupied`, `false` always `empty`; `auto` runs a machine
@@ -3507,10 +3518,10 @@ tests carry the `nightly` marker.
 | `tests/test_zones.py` | DAS config parsing, defaults and rejections; `strict` trust per group (`sigma` without an estimator update); closure `F*` with `declared` / `none`; per-zone timers and confirmation; `degraded` vs `fallback`; legacy = one implicit zone; per-channel `compose`; per-role Stuck sizing; the DEGRADED banner and health field | PR |
 | `tests/test_mpc_zone_fallback.py` | a fault in zone A never lowers any channel of its reach below `prev` (hold, then `max(prev, fallback_pwm)`); channels outside keep regulating; the solver request never carries faulted-zone sensors and healthy commands do not depend on their values; per-zone recovery is bumpless; Flicker in one zone never resets another; a dropout in a redundant group is no fault; solver faults; legacy `mpc` turns a zone fault into whole fallback | PR (one sweep nightly) |
 | `tests/test_sensor_confirm.py` | sensor confirmation (§3): a jumping redundant member (proximal, zone air, inlet) is not fused until it confirms and the zone does not fault, the estimates of the DAS example config match a run without the member until then; a real level change is fused after `confirm_ticks`; restart on a new jump or a dropout; a sole member costs `confirm_ticks` once; a sensor missing since boot confirms its first reading too, including while every zone is blind and on a time-faulted tick (item 61); a zone in fault waits for a confirmed member in every group; the outward `diagnostics["gate"]` agrees with itself about a confirming sensor -- `per_temp` `false`, `confirming` in `reasons`, `trusted` recomputed -- even on a tick its raw reading passes cleanly (item 63); a property over random jumps, dropouts and time faults (median3 on and off) that the counts follow the gate's raw verdict and no confirming sensor reaches the estimator, the solver or `last_good_obs`; malformed memory; JSON and determinism; legacy keeps no state | PR |
-| `tests/test_sigma_trust.py` | `trust_rule: sigma` (§3, §8 item 8): thresholds inclusive, empty and undeclared bays, an uninitialised zone, a sigma that is not a number, time faults, unknown keys and setpoint groups still fault, `strict` ignores the estimator; the `sigma_fault_c` floor; switching rules by config only; the verdict reads this tick's σ across a crossing; an estimator fault applies `strict`; a zone in fault returns without its lost sensor only under `sigma`; on the truth sim 2 % DS18B20 dropouts fault far fewer zones than `strict` with no violation (both DAS solvers), a replay without a bay's only proximal sensor never lowers its zone's airflow beyond 2 % and raises it within ten minutes (PI-like DAS), losing either member of a redundant pair changes almost nothing, a bay's or a zone's sensors lost for good fault the zone (on the drive σ, or on the blind air clock of item 70) and it holds, then ramps high; the example's redundant pairs fault no zone on `rich` with their σ at the floor (item 67); a hot swap no longer faults its zone but a swapped bay that goes blind faults at once (item 69); a zone that loses only its air sensor faults on `air_blind_fault_s`, and never at all with that key set wide (item 70); the soft sigma floor (§8 item 68): it holds the command before the loss, ends on the σ growth or the hold time, falls at its rate, reopens on a further lost group, keeps its episode on an estimator fault, starts over from malformed memory, its config keys; on the DAS MPC without a bay's only sensor the no-floor run reproduces the drop (−0.04, about 21 % less airflow) and the soft floor holds, then releases | PR: `basic`; nightly: dropout sweep on `basic` and `rich`, the redundant pairs on `rich` seeds 0–5 and both solvers, a sensor lost for good on both presets and solvers, the soft floor's margin, noise and no-ratchet bounds on `basic` seeds 1–5 and `rich` 0–2, both solvers, two sensors, and its margin bounds on the DAS MPC until the floor has released (`basic` b02 and b13, `rich` b02) |
+| `tests/test_sigma_trust.py` | `trust_rule: sigma` (§3, §8 item 8): thresholds inclusive, empty and undeclared bays, an uninitialised zone, a sigma that is not a number, time faults, unknown keys and setpoint groups still fault, `strict` ignores the estimator; the `sigma_fault_c` floor; switching rules by config only; the verdict reads this tick's σ across a crossing; an estimator fault applies `strict`; a zone in fault returns without its lost sensor only under `sigma`; on the truth sim 2 % DS18B20 dropouts fault far fewer zones than `strict` with no violation (both DAS solvers), a replay without a bay's only proximal sensor never lowers its zone's airflow beyond 2 % and raises it within ten minutes (PI-like DAS), losing either member of a redundant pair changes almost nothing, a bay's or a zone's sensors lost for good fault the zone (on the drive σ, or on the blind air clock of item 70) and it holds, then ramps high; the example's redundant pairs fault no zone on `rich` with their σ at the floor (item 67); a hot swap no longer faults its zone but a swapped bay that goes blind faults at once, and a flapping proximal sensor spends `bay_settle_max_s` and then faults its zone on every jump again (item 69); a zone that loses only its air sensor faults on `air_blind_fault_s`, and never at all with that key set wide (item 70); the soft sigma floor (§8 item 68): it holds the command before the loss, ends on the σ growth or the hold time, falls at its rate, reopens on a further lost group, keeps its episode on an estimator fault, starts over from malformed memory, its config keys; on the DAS MPC without a bay's only sensor the no-floor run reproduces the drop (−0.04, about 21 % less airflow) and the soft floor holds, then releases | PR: `basic`; nightly: dropout sweep on `basic` and `rich`, the redundant pairs on `rich` seeds 0–5 and both solvers, a sensor lost for good on both presets and solvers, the soft floor's margin, noise and no-ratchet bounds on `basic` seeds 1–5 and `rich` 0–2, both solvers, two sensors, and its margin bounds on the DAS MPC until the floor has released (`basic` b02 and b13, `rich` b02) |
 | `tests/test_das_core.py` | the core invariants, closed loops and DAS goldens for `pi_das` and `mpc_das` (§4.2) | PR |
 | `tests/test_pi_das.py`, `tests/test_estimates.py`, `tests/test_das_config.py` | the margin-deficit PI (served zones, unconstrained channels, fixed channels, occupancy), the estimates block and prior map, `noise` / `limit_c` / served-zone config | PR |
-| `tests/test_estimator.py` | exact discretisation and Joseph form (random sequences keep P symmetric PSD); first tick and constant readings; σ grows while a bay is unobserved and shrinks back; redundant members; placement offsets (a constant disagreement is an offset and not a swap, `proximal_offset_c: 0` reproduces item 67, one sensor carries no offset state, a swap still widens a bay with two, either member keeps the bay observed); per-bay seeding (a bay missing on the first tick is seeded by its first reading, a sensor returning after a later loss still widens its bay), `settling` expiring, `air_blind_s`; the occupancy machine incl. "never empty while zone air is unobserved"; SMART calibration acceptance, rejection, serial change and expiry after `calibration_max_age_days`; a guessed serial never relaxes a class; determinism, JSON round trip, malformed memory | PR |
+| `tests/test_estimator.py` | exact discretisation and Joseph form (random sequences keep P symmetric PSD); first tick and constant readings; σ grows while a bay is unobserved and shrinks back; redundant members; placement offsets (a constant disagreement is an offset and not a swap, `proximal_offset_c: 0` reproduces item 67, one sensor carries no offset state, a swap still widens a bay with two, either member keeps the bay observed); per-bay seeding (a bay missing on the first tick is seeded by its first reading, a sensor returning after a later loss still widens its bay), `settling` expiring and its wall-clock budget (repeated jumps at four cadences spend `bay_settle_max_s` and stop exempting, a clean run earns it back, an empty bay spends nothing, 0 grants none), `air_blind_s` and a tick gap counted in full; the occupancy machine incl. "never empty while zone air is unobserved"; SMART calibration acceptance, rejection, serial change and expiry after `calibration_max_age_days`; a guessed serial never relaxes a class; determinism, JSON round trip, malformed memory | PR |
 | `tests/test_associate.py` | detrended correlation, greedy assignment with margins, confirmation, full-window history, drops on silence / jump / empty, a declared serial wins; on the truth sim the right bays are found and indistinguishable bays refused | PR |
 | `tests/test_stuck_sim.py` | Stuck evidence on the truth sim (§3 Stuck sizing, §8 items 3 and 58): healthy `rich` runs flag no sensor and fault no zone; a frozen DS18B20 or thermistor proximal reading is flagged once its zone's airflow moves, or, with the fans held by the rate limit, once its zone air has risen past `stuck_zone_air_dT_c` and another bay has followed it; a zone-air sensor drifting on a healthy enclosure flags no proximal reading; only a bay's last proximal sensor faults its zone | PR: 2 seeds, 3 frozen runs, 1 drifting-air run; nightly: 48 seeds, 2.5-hour runs of both DAS solvers, and the per-seed coverage sweep (each proximal reading frozen in turn) |
 | `tests/test_hotswap.py` | slow swap, quick swap (never through `empty`, margin widens, class follows the new drive) and empty-at-boot on the truth sim: no limit violation, no zone fault, fans rise, constraints removed on empty | PR |
@@ -4531,6 +4542,26 @@ Owner decision (2026-09-16):
     a sensor missing on the estimator's first tick tripped the fast-swap
     rule when it returned.
 
+    The exemption is bounded on the wall clock, by
+    `estimator.bay_settle_max_s` (1800 s): one bay's windows may suspend the
+    σ check for that long in total, until the bay has run that long with
+    neither a window nor a σ over `sigma_fault_c`. Bounding it on the σ
+    instead did not work — a bay's σ falls back within a tick or two of every
+    jump, so a window could re-open at every cadence but one jump per tick,
+    and a sensor that kept jumping kept its zone exempt for ever. Measured on
+    `sim/das.py` (example config, 75 min, `basic` seed 1, checked against
+    `rich` seed 0, both DAS solvers): b06's proximal sensor stepping +3.5 °C
+    (inside the gate's slew limit, so every value is trusted) every 60 s
+    faulted z1 75 times / 229 ticks with no exemption, **0 / 0** bounded on
+    the σ alone, and 35 / 107 with the budget — the same at every cadence
+    tried (120 s: 38 / 114, 0 / 0, 18 / 56; 240 s: 19 / 57, 0 / 0, 9 / 27;
+    600 s: 8 / 24, 0 / 0, 4 / 12; 1200 s: 4 / 12, 0 / 0, 1 / 3). The exemption
+    totals at most `bay_settle_max_s + bay_settle_s` = 2400 s over the whole
+    run — 2395 s of it at the 60 s cadence, where the first fault lands at
+    2400 s, and 1820 s at the 1200 s cadence, where it lands on the fourth
+    jump — after which the zone faults as it did before this item. No run had
+    a drive over its limit.
+
     The swap: `sim/das.py`, example config, b06's drive pulled at 300 s and a
     warm one inserted at 1200 s, seed 31 — 2 fault episodes / 6 fault ticks
     before, 0 / 0 after, with the bay's peak σ unchanged at 5.22 °C and the
@@ -4572,7 +4603,11 @@ Owner decision (2026-09-16):
     zone used to fault at 16.8 min on the drive σ, and the air-only loss never.
     `air_blind_fault_s: 0` faults on the first blind tick (as `strict` does);
     a large value leaves the drive σ to decide, which is the behaviour before
-    this item.
+    this item. `air_blind_s` is wall-clock: a gap in the ticks counts in full
+    (capped at the filter's 3600 s prediction horizon), not at the occupancy
+    horizon's 3·`dt`, which would have under-counted a gap by up to 240× and
+    delayed the fault — and the air σ cannot make that up, which is this
+    item's own premise.
 71. Hardcoded estimator tunables: `RESET_DRIVE_VAR`, `JUMP_MIN_C`,
     `JUMP_SIGMAS`, the `P0_*` values and `SIGMA_UNCALIBRATED_C`; make
     them config keys.
