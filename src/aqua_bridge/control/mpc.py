@@ -40,7 +40,8 @@ Order inside :func:`step`
    plan section 6 step 5a) runs every tick, fault ticks included, on the
    gate-trusted, confirmed temperatures of this tick (none on a tick whose time
    status is not ``first`` / ``ok``), the command ``prev`` and
-   ``obs.inputs["smart"]``; its memory is ``solver_memory["estimator"]`` and
+   ``obs.inputs["smart"]`` and the manual calibrations of ``obs.inputs["calibration"]``
+   (PROJECT.md section 8 item 23); its memory is ``solver_memory["estimator"]`` and
    its estimates block feeds the solver and the diagnostics. Its inputs depend
    on no zone verdict, so it runs before zone trust. Any exception from it is an
    *estimator fault*: its memory is dropped (the next tick starts over), the
@@ -581,6 +582,7 @@ def step(
                 u=prev,
                 ts=obs.ts,
                 smart=obs.inputs.get("smart"),
+                calibration=obs.inputs.get("calibration"),
             )
             est_block = est_update.estimates
         except Exception as exc:  # an estimator failure is a fault, never a raise out of step
