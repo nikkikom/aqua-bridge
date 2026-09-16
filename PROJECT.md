@@ -1698,7 +1698,14 @@ motion — at the prior split the model is the shared-`E` model term for term.
 The split redistributes the group's coefficient and never changes its total
 (`E_ch = E_zG w_ch/W + Es_ch − (w_ch/W) Σ Es`), the convergence rules still
 read the group coefficients alone, and `GET /api/model` reports
-`e_per_channel` per zone.
+`e_per_channel` per zone. After every window — and when a stored memory is
+read — the split is projected: it is scaled back by the largest factor in
+[0, 1] that keeps every `E_ch ≥ 0`, because `Q_zG = Σ E_ch φ_ch` exactly and
+a fan never cools less than nothing. The projection keeps the split's
+direction and its total, and a feasible split (every split at its prior
+included) is left untouched, so a noisy single-channel phase can mis-split a
+group but can never reverse a zone's modelled airflow or flatten its
+Jacobian.
 
 | Key | Unit | Bounds | Prior | Identified from |
 |-----|------|--------|-------|-----------------|
@@ -3594,7 +3601,7 @@ tests carry the `nightly` marker.
 | `tests/test_stuck_sim.py` | Stuck evidence on the truth sim (§3 Stuck sizing, §8 items 3 and 58): healthy `rich` runs flag no sensor and fault no zone; a frozen DS18B20 or thermistor proximal reading is flagged once its zone's airflow moves, or, with the fans held by the rate limit, once its zone air has risen past `stuck_zone_air_dT_c` and another bay has followed it; a zone-air sensor drifting on a healthy enclosure flags no proximal reading; only a bay's last proximal sensor faults its zone | PR: 2 seeds, 3 frozen runs, 1 drifting-air run; nightly: 48 seeds, 2.5-hour runs of both DAS solvers, and the per-seed coverage sweep (each proximal reading frozen in turn) |
 | `tests/test_hotswap.py` | slow swap, quick swap (never through `empty`, margin widens, class follows the new drive) and empty-at-boot on the truth sim: no limit violation, no zone fault, fans rise, constraints removed on empty | PR |
 | `tests/test_thermal_model.py` | structure, fan groups, parameter table, Jacobians vs finite differences, `eig` vs matrix exponential and the Euler fallback, windows, lag correction, RLS safeguards, status machine, never raising in `step`, shadow never changes the command | PR |
-| `tests/test_thermal_split.py` | the per-channel split (item 13): only a multi-channel group gets keys, the prior split reproduces the shared-`E` prediction and Jacobians bit for bit, a split redistributes without changing the group total, the Jacobian of a split group against finite differences, a whole-group experiment leaves the split at 0 while single-channel phases find a 60 % difference, and a store file written with the switch the other way is converted | PR |
+| `tests/test_thermal_split.py` | the per-channel split (item 13): only a multi-channel group gets keys, the prior split reproduces the shared-`E` prediction and Jacobians bit for bit, a split redistributes without changing the group total, the Jacobian of a split group against finite differences, a whole-group experiment leaves the split at 0 while single-channel phases find a 60 % difference, a store file written with the switch the other way is converted (and a corrupt coefficient on that path drops the thermal section alone, not the seed), and a split that would make a channel cool less than nothing is projected back so the zone's airflow and its Jacobian stay usable | PR |
 | `tests/test_thermal_ident.py` | identifiability with group experiments on the truth sim: in-zone `E` within 15 % (PR seed), per-bay `k` within 25 %, `leak` / `κ` at prior, convergence; regulation only never converges; the seed sweep (bound 25 %), sensor offsets, the rich preset | PR: 4 cases; nightly: sweeps |
 | `tests/test_solver_das.py` | active-piece SQP vs a projected-gradient reference, monotone objective, iteration cap, forbidden-band snap and hysteresis, zero-order hold, prediction vs thermal Jacobians, noise index and surrogate, bumpless offset, fixed channels, validity gate and model fallback with dwell (the entry dwell, the model rate through the drives' filter, the air-disturbance check, the prediction guard on eligible rows only), a clock stepped back, horizon and block extremes | PR |
 | `tests/test_model_fallback_sim.py` | the validity gate against the truth plant: the observed drive rate (ramp, restarts, memory), a sound model returns within `model_return_dwell_s + 2 · mpc_every_ticks · dt` and does not re-enter (§8 items 10, 64), a model with wrong bay gains is caught and held, a healthy enclosure never reaches the fallback (§8 item 65), a fouling jump to 0.15× airflow does (§8 item 66) and the same run without it does not, every drive within its limit and bumpless switches; the plain drift holds the same step | PR: 1 return, 1 broken model, 3 healthy seeds and the fouling pair per preset; nightly: zones × seeds on `basic` and `rich`, more broken gains, 8 healthy seeds and 4 fouling seeds per preset |
@@ -4296,7 +4303,15 @@ Owner decision (2026-09-16):
     stop a model converging. `GET /api/model` reports `e_per_channel` per
     zone, and a store file written with the switch the other way round is
     converted rather than dropped (shared keys keep their value, variance
-    and covariances; a new key starts at its prior). Measured on the truth
+    and covariances; a new key starts at its prior; a corrupt coefficient
+    on that path raises `ValueError` like every other malformed field, so
+    it costs the thermal section and not the whole seed). After every
+    window, and when a stored memory is read, the split is projected: it is
+    scaled back by the largest factor in [0, 1] that leaves every `E_ch ≥
+    0`, since `Q_zG = Σ E_ch φ_ch` exactly and a fan never cools less than
+    nothing — direction and total kept, a feasible split untouched, so a
+    mis-split group can never reverse a zone's modelled airflow or flatten
+    its Jacobian row. Measured on the truth
     simulator with a group whose channels differ by 60 % (84 W/K against
     26, a ratio of 3.23 where the count-weighted prior says 2.0): after
     whole-group phases and then each channel alone, 78.6 / 28.6, ratio 2.75,

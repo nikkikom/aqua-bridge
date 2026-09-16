@@ -130,6 +130,80 @@ def test_the_split_only_bites_when_the_group_members_differ() -> None:
     assert apart != baseline
 
 
+def test_a_split_that_would_reverse_a_channel_is_projected_back() -> None:
+    """``Es`` is bounded at +-200 against a group prior of 99, so a noisy single-channel
+    phase can propose a split under which one channel cools *less than nothing*. The
+    projection scales the whole split back by the largest factor that leaves every
+    per-channel effectiveness at or above zero: direction kept, total kept, and a
+    feasible split (the prior split included) untouched."""
+    split = split_cfg()
+    st = thermal.structure(split)
+    group = next(gr for gr in st.zones["za"].groups if gr.name == "front")
+    theta = dict(thermal.prior_theta(split, st))
+    assert thermal.split_scale(group, theta) == 1.0  # the prior split is feasible
+    theta["Es.za.front.fa2"] = 12.0
+    assert thermal.split_scale(group, theta) == 1.0
+
+    theta["Es.za.front.fa2"] = -180.0  # a corrupted phase
+    assert min(thermal.channel_effectiveness(group, theta).values()) < 0.0
+    alpha = thermal.split_scale(group, theta)
+    assert 0.0 < alpha < 1.0
+    scaled = dict(theta)
+    scaled["Es.za.front.fa2"] *= alpha
+    per_channel = thermal.channel_effectiveness(group, scaled)
+    assert min(per_channel.values()) == pytest.approx(0.0, abs=1e-9)
+    assert sum(per_channel.values()) == pytest.approx(theta["E.za.front"])
+    assert thermal.split_scale(group, scaled) == pytest.approx(1.0)
+
+
+def test_a_stored_split_that_would_reverse_the_airflow_is_projected_on_load() -> None:
+    """The zone's modelled airflow never goes negative and its Jacobian row never goes
+    flat: an optimiser told that no fan in the zone moves any air would drop the zone to
+    the hold-then-high fallback for what is only a mis-split group."""
+    split = split_cfg()
+    st = thermal.structure(split)
+    saved = thermal.fresh_memory(split, status="converged")
+    keys = st.zones["za"].air_keys
+    theta_row = list(saved["zones"]["za"]["air"]["theta"])
+    theta_row[keys.index("Es.za.front.fa2")] = -180.0
+    saved["zones"]["za"]["air"]["theta"] = theta_row
+    restored = thermal.restore(json.loads(json.dumps(saved)), split, stale=False)
+
+    theta = thermal.theta_from_memory(split, restored, st=st)
+    group = next(gr for gr in st.zones["za"].groups if gr.name == "front")
+    assert min(thermal.channel_effectiveness(group, theta).values()) >= -1e-9
+    assert -180.0 < theta["Es.za.front.fa2"] < 0.0  # scaled back, direction kept
+
+    params = thermal.model_params(split, theta, st=st)
+    zi = st.i_air("za")
+    for u in (np.array([1.0, 0.0, 0.5, 0.5]), np.array([0.0, 1.0, 0.5, 0.5])):
+        q, _, dq, _ = thermal._airflow(st, params, u)
+        assert q[zi] >= 0.0
+        assert np.any(dq[zi] != 0.0)  # the zone still knows its fans move air
+
+
+def test_a_corrupt_coefficient_on_the_conversion_path_costs_only_the_thermal_section() -> None:
+    """A null in a stored coefficient must raise ``ValueError`` on the conversion path
+    too, the way it does without the switch -- ``apply_seed``'s outer handler would
+    otherwise throw the whole seed away, calibrations and bay associations included."""
+    plain = das_cfg(model_shadow=True)
+    saved = thermal.fresh_memory(plain, status="converged")
+    saved["zones"]["za"]["air"]["theta"] = [40.0, 2.0, None, 3.1, 5.0]
+    stored = json.loads(json.dumps(saved))
+
+    split = split_cfg()
+    with pytest.raises(ValueError, match="leak.za is not a finite number"):
+        thermal.restore(stored, split, stale=False)
+
+    seed = {"source": "fresh", "thermal": stored, "calibration": {}, "fan_curves": {}}
+    mem: dict[str, Any] = {}
+    summary = persist.apply_seed(mem, split, seed, 0.0)
+    assert summary["source"] == "fresh"  # not thrown away
+    assert summary["sections"]["thermal"] == "dropped"
+    assert any("not a finite number" in w for w in summary["warnings"]), summary["warnings"]
+    assert "estimator" in mem
+
+
 def test_the_jacobian_of_a_split_group_matches_finite_differences() -> None:
     split = split_cfg()
     st = thermal.structure(split)
