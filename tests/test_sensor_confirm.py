@@ -120,6 +120,26 @@ def test_a_jumping_redundant_member_is_not_fused_until_it_confirms(ccfg, member)
     assert jumped[k][1].last_good_obs.temps[member] == level  # type: ignore[union-attr]
 
 
+def test_a_confirming_sensor_is_not_reported_trusted_in_diagnostics(ccfg):
+    """Item 63: ``diagnostics["gate"]["per_temp"]`` must not read ``True`` for a
+    confirming sensor, even on a tick after the jump where its raw reading is already
+    self-consistent (would otherwise pass the gate cleanly) -- HTTP and MQTT read this
+    dict directly and must not show a value the estimator and the solver both ignore."""
+    base = settled(ccfg)
+    member = "prox_a1b"
+    level = default_temps(ccfg)[member] + JUMP_C  # type: ignore[operator]
+    n = ccfg.confirm_ticks + 2
+    rec = run(ccfg, lambda i: patched(ccfg, **{member: level}), n, state=base, t0=SETTLE_TICKS)
+    for k, (cmd, _state) in enumerate(rec):
+        confirming = cmd.diagnostics["sensor_confirm"]
+        per_temp = cmd.diagnostics["gate"]["per_temp"]
+        if member in confirming:
+            assert per_temp[member] is False, k
+        else:
+            assert per_temp[member] is True, k
+    assert ccfg.confirm_ticks > 1  # the loop above exercised at least one clean-but-confirming tick
+
+
 def test_the_group_stays_trusted_through_the_other_member(ccfg):
     base = settled(ccfg)
     rec = run(
@@ -441,13 +461,20 @@ def test_no_unconfirmed_value_is_ever_used(events, offset, median3, repeated_ts)
             cmd, state = checked_step(obs, cfg, state, solver=solver)
             gate = cmd.diagnostics["gate"]
 
-            # the reference counter, from the gate's verdict and the time status alone
+            # the reference counter, from the gate's *raw* verdict (item 63 makes the
+            # outward "per_temp" false while confirming, so the raw check is read from
+            # "reasons" instead: empty means the gate itself did not reject the value)
+            # and the time status alone
             time_ok = cmd.diagnostics["time"]["status"] in ("ok", "first")
+
+            def raw_trusted(name: str, gate: Mapping[str, Any] = gate) -> bool:
+                return not gate["reasons"].get(name)
+
             for name in cfg.temps:
                 if set(gate["reasons"].get(name, ())) & {"range", "slew", "stuck"}:
                     expected[name] = 0
                 elif name in expected:
-                    if gate["per_temp"][name] and time_ok:
+                    if raw_trusted(name) and time_ok:
                         expected[name] += 1
                         if expected[name] >= cfg.confirm_ticks:
                             del expected[name]
@@ -463,14 +490,15 @@ def test_no_unconfirmed_value_is_ever_used(events, offset, median3, repeated_ts)
                 old = None if before is None else before.temps.get(name)
                 new = None if state.last_good_obs is None else state.last_good_obs.temps.get(name)
                 assert new == old, (k, name)
+                # item 63: the outward diagnostics never call a confirming sensor trusted,
+                # even though its raw reading may have passed the gate cleanly this tick
+                assert gate["per_temp"][name] is False, (k, name)
             # with every sole member trusted and a confirmed trusted member on bay a1, za is
             # trusted: a redundant member, confirming or not, never faults the zone by itself
             groups_ok = (
-                gate["per_temp"]["air_a"]
-                and gate["per_temp"]["prox_a2"]
-                and any(
-                    gate["per_temp"][m] and m not in confirming for m in ("prox_a1", "prox_a1b")
-                )
+                raw_trusted("air_a")
+                and raw_trusted("prox_a2")
+                and any(raw_trusted(m) and m not in confirming for m in ("prox_a1", "prox_a1b"))
             )
             if groups_ok and time_ok:
                 assert cmd.diagnostics["zones"]["za"]["trusted"] is True, k

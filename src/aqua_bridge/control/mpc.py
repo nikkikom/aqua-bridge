@@ -831,9 +831,21 @@ def step(
     )
     fan_stall = {ch: n >= STALL_TICKS for ch, n in stall_ticks.items()}
 
+    # item 63: a confirming sensor's raw reading can pass the gate (it is not itself a
+    # Jump/Spike/Stuck this tick); report that, not "trusted", to whoever reads
+    # diagnostics["gate"]["per_temp"] (HTTP, MQTT) -- it is excluded from the estimator,
+    # the solver and last_good_obs (step 3b) exactly like a rejected one. The gate's own
+    # per_temp (used above and by zones.py) is untouched; only this outward copy changes.
+    gate_diag = gate.to_dict()
+    if das:
+        gate_diag["per_temp"] = {
+            name: (trusted_bit and name not in confirming)
+            for name, trusted_bit in gate_diag["per_temp"].items()
+        }
+
     diagnostics: dict[str, Any] = {
         "trusted": trusted,
-        "gate": gate.to_dict(),
+        "gate": gate_diag,
         "time": {
             "status": time_status,
             "dt_obs": None if last_ts is None else obs.ts - last_ts,
