@@ -134,6 +134,77 @@ def test_record_from_tick_legacy_config_has_no_das_fields(cfg: MpcConfig) -> Non
     assert rec["prev"] == {"fa1": 0.55, "fb1": 0.8}
 
 
+def test_record_from_tick_keeps_the_per_output_fan_readings(cfg: MpcConfig) -> None:
+    """Item 79: ``inputs["fans"]`` becomes the record's ``fans`` key, the numeric
+    fields only, so a recording carries what the controller reported per output."""
+    reading = {
+        "device": "aquaero",
+        "output": "pwm7",
+        "rpm": 1105.0,
+        "duty": 1.0,
+        "voltage_v": 12.1,
+        "current_ma": 27.0,
+        "power_w": 0.32,
+        "power_reported": True,
+        "aquabus": True,
+    }
+    obs = PlantObservation(
+        temps={"air_a": 30.0},
+        rpm={"fa1": 1200.0},
+        pwm={"fa1": 0.6},
+        ts=10.0,
+        inputs={"fans": {"fa1": reading}, "smart": {"S1": {"temp_c": 30.0}}},
+    )
+    cmd = MpcCommand(pwm=dict.fromkeys(cfg.channels, 0.5), mode=Mode.AUTO)
+    result = TickResult(index=1, obs=obs, mpc_cmd=cmd, cmd=cmd, state=MpcState.cold(), applied=True)
+    rec = record_from_tick(result, cfg)
+    assert rec["fans"] == {
+        "fa1": {
+            "duty": 1.0,
+            "rpm": 1105.0,
+            "voltage_v": 12.1,
+            "current_ma": 27.0,
+            "power_w": 0.32,
+            "power_reported": True,
+        }
+    }
+    json.dumps(rec, allow_nan=False)  # a record must stay serialisable
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    [{}, {"smart": {}}, {"fans": {}}, {"fans": {"fa1": "not a mapping"}}, {"fans": 7}],
+)
+def test_record_from_tick_has_an_empty_fans_key_without_readings(
+    cfg: MpcConfig, inputs: Any
+) -> None:
+    """A source that reports none (the simulator) and a malformed one both give ``{}``,
+    so the record shape only ever grows a key."""
+    obs = PlantObservation(temps={}, rpm={}, pwm={}, ts=1.0, inputs=inputs)
+    cmd = MpcCommand(pwm=dict.fromkeys(cfg.channels, 0.5), mode=Mode.AUTO)
+    result = TickResult(index=1, obs=obs, mpc_cmd=cmd, cmd=cmd, state=MpcState.cold(), applied=True)
+    assert record_from_tick(result, cfg)["fans"] == {}
+
+
+def test_a_record_written_before_the_fans_key_still_replays() -> None:
+    """The ``fans`` key is a new key of schema version 1, not a new version: every
+    reader takes fields by name with a default."""
+    cfg = _small_das_cfg()
+    old = {
+        "v": RECORD_VERSION,
+        "i": 0,
+        "ts": 1.0,
+        "das": True,
+        "trusted_temps": {"air_a": 30.0},
+        "prev": {"fa1": 0.5},
+        "zones_ok": ["za"],
+        "rpm": {"fa1": 1200.0},
+    }
+    assert "fans" not in old
+    kwargs = thermal_inputs(cfg, old)
+    assert kwargs["ts"] == 1.0 and kwargs["u"] == {"fa1": 0.5}
+
+
 def test_record_from_tick_tolerates_emergency_diagnostics() -> None:
     """A controller-error tick's command carries ``{"policy", "controller_error"}``
     only (loop.emergency_command) -- no gate/zones/bays/prev_pwm at all."""

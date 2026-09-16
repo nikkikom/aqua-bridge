@@ -392,6 +392,9 @@ class Supervisor:
         self._usb_present = False
         self._mqtt_connected: bool | None = None
         self._extra: dict[str, Any] = {}
+        #: Last published device / fan health (:mod:`aqua_bridge.health`), empty
+        #: until a monitor reports one.
+        self._device_health: dict[str, Any] = {}
 
     # -- read side --------------------------------------------------------
 
@@ -495,6 +498,7 @@ class Supervisor:
                 uptime_s=max(0.0, self._clock() - self._started_at),
                 version=self._version,
                 extra=extra,
+                device_health=dict(self._device_health),
                 limits=self._limits_in_force(),
                 bays=self._bays_in_force(),
                 step_ms_last=step_ms_last,
@@ -871,6 +875,16 @@ class Supervisor:
     def set_mqtt_connected(self, connected: bool | None) -> None:
         with self._lock:
             self._mqtt_connected = connected
+
+    def set_device_health(self, health: Mapping[str, Any] | None) -> None:
+        """What :class:`aqua_bridge.health.HealthMonitor` found this tick, for
+        ``/api/state``, ``/api/health``, the MQTT state blob and the page
+        (PROJECT.md section 8 items 79 and 83). Purely a view: nothing in the
+        control path reads it, so a monitor that stops reporting only freezes a
+        number on the page. The caller hands over ownership -- the monitor builds
+        a fresh payload every tick -- so only the top level is copied."""
+        with self._lock:
+            self._device_health = {} if not health else dict(health)
 
     def set_usb_present(self, present: bool) -> None:
         with self._lock:

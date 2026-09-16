@@ -76,6 +76,56 @@ def test_discovery_has_a_sensor_per_temp_and_fan(cfg: MpcConfig) -> None:
         assert f"pwm_{ch}" in object_ids
 
 
+def test_discovery_has_one_device_problem_sensor_in_both_modes(
+    cfg: MpcConfig, das_example_cfg: MpcConfig
+) -> None:
+    """Item 83: one Home Assistant entity for the whole daemon's device health, with
+    the detail as its attributes from the same retained state topic."""
+    for config in (cfg, das_example_cfg):
+        entities = build_discovery_entities(
+            config, node_id=NODE_ID, discovery_prefix=PREFIX, control_mode=ControlMode.AUTO
+        )
+        found = [e for e in entities if e.object_id == "device_problem"]
+        assert len(found) == 1
+        entity = found[0]
+        assert entity.component == "binary_sensor"
+        assert entity.config_topic == f"{PREFIX}/binary_sensor/{NODE_ID}/device_problem/config"
+        assert entity.payload["device_class"] == "problem"
+        assert entity.payload["entity_category"] == "diagnostic"
+        assert "value_json.health.device_health.ok" in entity.payload["value_template"]
+        assert entity.payload["json_attributes_topic"] == f"{NODE_ID}/state"
+        assert "value_json.device_health" in entity.payload["json_attributes_template"]
+
+
+def test_the_device_problem_template_reads_the_published_state_blob(cfg: MpcConfig) -> None:
+    """The two keys the template and the attributes name must exist in the blob the
+    daemon actually publishes (ControlSnapshot.to_dict())."""
+    from aqua_bridge.control.intents import ControlSnapshot, Preset, SolverStatus
+
+    snapshot = ControlSnapshot(
+        obs=None,
+        last_cmd=None,
+        control_mode=ControlMode.AUTO,
+        setpoints={},
+        overrides={},
+        preset=Preset.NORMAL,
+        channels=cfg.channels,
+        temps=cfg.temps,
+        pwm_min=cfg.pwm_min,
+        pwm_max=cfg.pwm_max,
+        solver_status=SolverStatus.FAULT,
+        fault_reason=None,
+        fault_since_ts=None,
+        usb_present=False,
+        mqtt_connected=None,
+        uptime_s=0.0,
+        device_health={"devices": [], "fans": {}, "problems": ["x"], "ok": False},
+    )
+    blob = state_payload(snapshot.to_dict(), {})
+    assert blob["health"]["device_health"] == {"ok": False, "problems": ["x"]}
+    assert blob["device_health"]["problems"] == ["x"]
+
+
 def test_discovery_has_a_setpoint_number_per_setpoint(cfg: MpcConfig) -> None:
     entities = build_discovery_entities(
         cfg, node_id=NODE_ID, discovery_prefix=PREFIX, control_mode=ControlMode.AUTO

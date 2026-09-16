@@ -6,6 +6,18 @@ GET ``/api/model`` and GET ``/api/zones``, and the eight ``POST /api/{mode,setpo
 pwm,preset,auto,limit,bay,ident}`` intents against a
 :class:`aqua_bridge.control.intents.ControlSurface`.
 
+``GET /api/state`` carries a top-level ``device_health`` key (PROJECT.md section 8
+items 79 and 83): per controller its stuck outputs, the aquabus slots with no
+device behind them, the commanded outputs not in PWM mode, unconfigured
+controller blocks, the flow sensors and -- once another change publishes one --
+the aquaero's active profile; per channel the rpm, output duty, 12 V rail
+voltage, current and power the status report gives, with the fitted curve's
+expected rpm and power and any drift found; plus ``problems`` and ``ok``.
+``GET /api/health`` carries the same ``ok`` and ``problems`` under
+``device_health``, the pair a Home Assistant problem sensor needs. Both are empty
+and ``ok`` before the first tick and with a source that has no device health
+(the simulator).
+
 ``GET /api/state`` also carries a top-level ``host`` key (host machine metrics,
 :mod:`aqua_bridge.hostinfo`): the same numbers as the MQTT state blob's ``host``
 key, refreshed at most every ``host.interval_s`` seconds (default 5.0) through a

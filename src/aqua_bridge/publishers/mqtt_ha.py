@@ -24,6 +24,17 @@ Topic layout (``node_id`` from ``config.yaml`` ``mqtt.node_id``):
   identification experiment (DAS mode, ``POST /api/ident``); a retained ``start`` is
   ignored (it would be redelivered on every reconnect), only a live one starts
 
+Device health (PROJECT.md section 8 items 79 and 83) is one binary sensor,
+``device_problem`` (``device_class: problem``, diagnostic): on whenever
+``value_json.health.device_health.ok`` is false, that is whenever any controller
+reports a stuck output, an aquabus slot with no device behind it, a commanded
+output not in PWM mode or an unconfigured controller block, or whenever a fan has
+drifted from its fitted curve, its rail has sagged or its power is out of line
+with its duty. Its attributes are the whole ``device_health`` blob from the same
+retained state topic -- per controller and per channel, with the flow sensors and
+(once another change publishes one) the aquaero's active profile -- so the detail
+is one tap away in Home Assistant without a second entity per output.
+
 DAS mode (``mpc.topology``) subscribes to the limit and bay topics and adds one
 ``limit_<class>`` number entity per drive class (state from
 ``value_json.limits.classes.<class>``, range ``temp_min_c`` .. the configured
@@ -361,6 +372,39 @@ def build_discovery_entities(
                 unit="%",
             )
         )
+
+    # Device health (PROJECT.md section 8 item 83): one problem sensor for the whole
+    # daemon. Its attributes carry the detail -- per controller the stuck outputs,
+    # the absent aquabus slots, the outputs not in PWM mode and the flow sensors,
+    # per channel the fan-health verdict -- from the same retained state topic.
+    object_id = "device_problem"
+    unique_id = f"{node_id}_{object_id}"
+    entities.append(
+        MqttEntity(
+            "binary_sensor",
+            object_id,
+            f"{discovery_prefix}/binary_sensor/{node_id}/{object_id}/config",
+            {
+                "name": "Controller problem",
+                "unique_id": unique_id,
+                "object_id": unique_id,
+                "state_topic": state_topic(node_id),
+                "value_template": (
+                    "{{ 'OFF' if value_json.health.device_health.ok | default(true) else 'ON' }}"
+                ),
+                "payload_on": "ON",
+                "payload_off": "OFF",
+                "device_class": "problem",
+                "entity_category": "diagnostic",
+                "json_attributes_topic": state_topic(node_id),
+                "json_attributes_template": (
+                    "{{ value_json.device_health | default({}) | tojson }}"
+                ),
+                "device": _device_block(node_id),
+                **_availability(node_id),
+            },
+        )
+    )
 
     for temp in cfg.setpoints:
         object_id = f"setpoint_{temp}"

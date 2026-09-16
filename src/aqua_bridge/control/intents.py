@@ -401,6 +401,16 @@ class ControlSnapshot:
     experiment's levels are overrides of the supervisor itself, shown in
     ``extra["experiment"]["overrides"]``.
 
+    ``device_health`` is what :class:`aqua_bridge.health.HealthMonitor` last reported
+    (PROJECT.md section 8 items 79 and 83): ``devices`` (per controller: stuck
+    outputs, absent aquabus slots, outputs not in PWM mode, flow sensors, and the
+    active profile once another change publishes one), ``fans`` (per channel the
+    rpm, duty, rail voltage, current and power with the curve's expected rpm and
+    power and any drift found), ``problems`` and ``ok``. :meth:`state_payload`
+    carries all of it; :meth:`health_payload` only ``ok`` and ``problems``, the two
+    a Home Assistant problem sensor needs. It is empty (``ok`` true) before the
+    first tick and with a source that has no device health, such as the simulator.
+
     ``step_ms_last`` / ``step_ms_max`` / ``budget_warn_count`` / ``budget_alarm_count``
     are the loop's step budget alarm (``control/loop.py``, ``mpc.budget_ms`` /
     ``mpc.budget_alarm_ms``): the last and largest ``step()`` wall time in
@@ -426,6 +436,7 @@ class ControlSnapshot:
     uptime_s: float
     version: str = ""
     extra: dict[str, Any] = field(default_factory=dict)  # host stats etc., JSON-serialisable
+    device_health: dict[str, Any] = field(default_factory=dict)
     limits: dict[str, Any] = field(default_factory=dict)
     bays: dict[str, Any] = field(default_factory=dict)
     step_ms_last: float = 0.0
@@ -457,6 +468,7 @@ class ControlSnapshot:
             "temps": list(self.temps),
             "pwm_min": self.pwm_min,
             "pwm_max": self.pwm_max,
+            "device_health": dict(self.device_health),
         }
         if self.limits:
             out["limits"] = {k: dict(v) for k, v in self.limits.items()}
@@ -479,6 +491,10 @@ class ControlSnapshot:
             "step_ms_max": self.step_ms_max,
             "budget_warn_count": self.budget_warn_count,
             "budget_alarm_count": self.budget_alarm_count,
+            "device_health": {
+                "ok": bool(self.device_health.get("ok", True)),
+                "problems": list(self.device_health.get("problems") or ()),
+            },
         }
 
     def to_dict(self) -> dict[str, Any]:

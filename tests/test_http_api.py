@@ -80,6 +80,7 @@ class StubSurface:
     accepted: list[Intent] = field(default_factory=list)
     obs: PlantObservation | None = None
     last_cmd: MpcCommand | None = None
+    device_health: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.setpoints: dict[str, float] = dict(self.cfg.setpoints)
@@ -104,6 +105,7 @@ class StubSurface:
             mqtt_connected=None,
             uptime_s=1.0,
             version="test",
+            device_health=dict(self.device_health),
         )
 
     def submit(self, intent: Intent) -> None:
@@ -197,8 +199,46 @@ def test_get_state_shape_matches_model(surface: StubSurface, cfg: MpcConfig) -> 
             "temps",
             "pwm_min",
             "pwm_max",
+            "device_health",
             "host",
         }
+
+    _run(scenario())
+
+
+def test_get_state_and_health_carry_the_device_health(surface: StubSurface) -> None:
+    """Items 79 and 83: /api/state the whole blob, /api/health only {ok, problems}."""
+    health = {
+        "devices": [{"label": "aquaero", "stuck_channels": ["qd3"], "flows": {"flow1": 0}}],
+        "fans": {"qd3": {"rpm": 0.0, "expected_rpm": 1100.0, "problems": ["qd3: 0 rpm"]}},
+        "problems": ["aquaero: qd3 do not follow the written duty", "qd3: 0 rpm"],
+        "ok": False,
+    }
+
+    async def scenario() -> None:
+        surface.device_health = health
+        client = await _client(surface)
+        try:
+            state = await (await client.get("/api/state")).json()
+            api_health = await (await client.get("/api/health")).json()
+        finally:
+            await client.close()
+        assert state["device_health"] == health
+        assert api_health["device_health"] == {"ok": False, "problems": health["problems"]}
+
+    _run(scenario())
+
+
+def test_device_health_is_empty_and_ok_before_the_first_tick(surface: StubSurface) -> None:
+    async def scenario() -> None:
+        client = await _client(surface)
+        try:
+            state = await (await client.get("/api/state")).json()
+            api_health = await (await client.get("/api/health")).json()
+        finally:
+            await client.close()
+        assert state["device_health"] == {}
+        assert api_health["device_health"] == {"ok": True, "problems": []}
 
     _run(scenario())
 
@@ -274,6 +314,7 @@ def test_get_health_shape(surface: StubSurface) -> None:
             "step_ms_max",
             "budget_warn_count",
             "budget_alarm_count",
+            "device_health",
         }
         assert body["solver"] == SolverStatus.FAULT.value  # no last_cmd yet
 
