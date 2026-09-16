@@ -4823,6 +4823,21 @@ Owner decision (2026-09-16):
     against the real Quadro, power-cycle it, and confirm the duties and
     limits it read back before the save are still there after.
 
+97. Tune `mpc.stuck_zone_air_dT_c` on the real enclosure (item 58). Its
+    default, 1.5 °C, is the simulator's number: it clears the largest
+    zone-air move (1.20 °C) seen at a steady airflow on a healthy proximal
+    reading inside its band over 256 `rich` 2.5-hour runs. On the hardware
+    the quantity to measure is the same — with the recorder running, take
+    every window in which a proximal reading stayed inside its
+    `stuck_eps_c` band while its zone's relative airflow stayed inside
+    `stuck_airflow_net`, and look at how far that zone's air moved. The key
+    should sit above the largest such move with room to spare; if the real
+    spread is much tighter than the simulator's, lowering it catches a dead
+    sensor sooner (on the sim, 1.25 raised the coverage from 28 of 51 frozen
+    readings to 38). Same measurement for `mpc.stuck_air_oppose_max_c`
+    (item 59, default 3.0 °C against 1.19 °C on the sim), from the windows
+    where the zone air moved against the airflow.
+
 ### 8.4 Open — Zero 2 W upgrade
 
 50. Run on a Zero 2 W with the same config.
