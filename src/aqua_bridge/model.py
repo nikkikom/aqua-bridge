@@ -106,7 +106,7 @@ choice for cooling:
   ``ident_max_over_c > 0``, ``ident_abort_below_limit_c > 0``,
   ``ident_settle_resume_max_gap_s >= 0``, ``ident_seed >= 0``, ``ident_hold_s``
   a non-empty list of positive numbers, ``ident_levels`` ``above`` |
-  ``symmetric``); the
+  ``symmetric``, ``ident_replan`` a bool); the
   rules that depend on ``dt`` and ``confirm_s`` (every hold ``>= 5 * dt``,
   ``ident_settle_s >= confirm_s``) are checked only with ``ident_enabled`` so a
   default never invalidates a legacy config with a long ``dt``. There is no
@@ -1708,13 +1708,14 @@ class MpcConfig:
       between two writes of ``model.json``, the age above which a stored model loads
       ``stale``, and how long a stale model must stay converged with its prediction
       error in bounds before it may act again. Inert in legacy mode.
-    * ``ident_enabled`` / ``ident_amplitude`` / ``ident_levels`` / ``ident_hold_s`` /
-      ``ident_max_duration_s`` / ``ident_settle_s`` / ``ident_start_band_c`` /
-      ``ident_max_over_c`` / ``ident_abort_below_limit_c`` /
+    * ``ident_enabled`` / ``ident_amplitude`` / ``ident_levels`` / ``ident_replan`` /
+      ``ident_hold_s`` / ``ident_max_duration_s`` / ``ident_settle_s`` /
+      ``ident_start_band_c`` / ``ident_max_over_c`` / ``ident_abort_below_limit_c`` /
       ``ident_settle_resume_max_gap_s`` / ``ident_seed`` -- active identification
       experiments
       (``control/ident.py``): whether ``POST /api/ident`` may start one, the PWM step,
-      the two levels, the hold times the seeded sequence draws from, the total
+      the two levels, whether the levels follow the live solver demand every tick,
+      the hold times the seeded sequence draws from, the total
       duration, how long every zone the experiment serves must have been trusted,
       the start band and the envelope above each drive's soft target, how far below
       each drive's limit the absolute abort sits, the longest daemon outage after
@@ -1808,6 +1809,7 @@ class MpcConfig:
     ident_enabled: bool = False
     ident_amplitude: float = 0.15
     ident_levels: str = "above"
+    ident_replan: bool = True
     ident_hold_s: tuple[float, ...] = (60.0, 120.0, 180.0)
     ident_max_duration_s: float = 1800.0
     ident_settle_s: float = 600.0
@@ -1933,6 +1935,7 @@ class MpcConfig:
         blocks = _cfg_list("mpc_blocks", self.mpc_blocks)
         s(self, "mpc_blocks", tuple(_cfg_int(f"mpc_blocks[{i}]", b) for i, b in enumerate(blocks)))
         _cfg_bool("ident_enabled", self.ident_enabled)
+        _cfg_bool("ident_replan", self.ident_replan)
         s(self, "ident_levels", _choice("ident_levels", self.ident_levels, IDENT_LEVELS))
         holds = _cfg_list("ident_hold_s", self.ident_hold_s)
         s(
