@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from aqua_bridge.hw.aquacomputer import AQUAERO, QUADRO
+from aqua_bridge.hw.aquacomputer import AQUAERO, QUADRO, software_sensor_report
 from aqua_bridge.hw.hidraw import (
     AmbiguousDevice,
     DeviceUnavailable,
@@ -280,3 +280,49 @@ def test_open_device_finds_and_opens_the_node(sysfs: Path, tmp_path: Path) -> No
             transport.read_reports()
     finally:
         transport.close()
+
+
+def test_write_report_sends_an_output_report(socket_pair) -> None:
+    """The software-sensor heartbeat is an output report: a plain write of the report
+    id plus its payload (PROJECT.md section 8 item 84)."""
+    device_side, host_side = socket_pair
+    transport = HidrawTransport(_info(Path("/dev/hidraw2")), host_side.fileno())
+    report = software_sensor_report(AQUAERO, {1: 20.0})
+    transport.write_report(report)
+    assert device_side.recv(64) == report
+
+
+def test_a_short_write_is_a_feature_report_error(monkeypatch) -> None:
+    transport = HidrawTransport(_info(Path("/dev/hidraw2")), 7)
+    monkeypatch.setattr(os, "write", lambda fd, data: len(data) - 1)
+    with pytest.raises(FeatureReportError, match="wrote 16 of 17 bytes"):
+        transport.write_report(software_sensor_report(AQUAERO, {1: 20.0}))
+
+
+@pytest.mark.parametrize(
+    ("err", "expected"),
+    [
+        (errno.ENODEV, DeviceUnavailable),
+        (errno.EPIPE, FeatureReportError),
+        (errno.EAGAIN, FeatureReportError),
+    ],
+    ids=lambda v: getattr(v, "__name__", errno.errorcode.get(v, str(v))),
+)
+def test_write_report_errors_are_classified(monkeypatch, err: int, expected) -> None:
+    transport = HidrawTransport(_info(Path("/dev/hidraw2")), 7)
+
+    def failing(fd: int, data: bytes) -> int:
+        raise OSError(err, os.strerror(err))
+
+    monkeypatch.setattr(os, "write", failing)
+    with pytest.raises(expected) as exc:
+        transport.write_report(software_sensor_report(AQUAERO, {1: 20.0}))
+    if expected is FeatureReportError:
+        assert exc.value.errno == err and "OUTPUT report 0x07" in str(exc.value)
+
+
+def test_write_report_on_a_closed_transport_is_unavailable() -> None:
+    transport = HidrawTransport(_info(Path("/dev/hidraw2")), os.open(os.devnull, os.O_RDONLY))
+    transport.close()
+    with pytest.raises(DeviceUnavailable):
+        transport.write_report(software_sensor_report(AQUAERO, {1: 20.0}))

@@ -23,9 +23,14 @@ from aqua_bridge.hw.aquacomputer import (
     FAN_ABSENT_RPM,
     KINDS,
     QUADRO,
+    SENSOR_NOT_CONNECTED,
+    SOFT_SENSOR_REPORT_ID,
     SOURCE_UNCONFIGURED,
+    TEMP_MAX_C,
+    TEMP_MIN_C,
     DeviceKind,
     ReportError,
+    active_profile,
     capture_channel,
     channel_holds,
     channel_state,
@@ -39,6 +44,7 @@ from aqua_bridge.hw.aquacomputer import (
     output_mode,
     patch_duties,
     restore_channel,
+    software_sensor_report,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "aquacomputer"
@@ -475,3 +481,73 @@ def test_patched_duties_read_back_and_hold(kind: DeviceKind, data) -> None:
 def test_duty_fraction_round_trips(duty: int) -> None:
     """The adapter reports duty / 10000 and commands round(value * 10000)."""
     assert round((duty / DUTY_MAX) * DUTY_MAX) == duty
+
+
+# --- software sensors and profiles (item 84) ----------------------------------------------
+
+
+def test_software_sensor_report_sets_one_sensor_and_leaves_the_others_alone() -> None:
+    """Report 0x07, 17 bytes: the id then eight centi-degC s16 values; every slot the
+    call does not name reads 0x7FFF ("no data"), so the device keeps its own value
+    (verified on the aquaero, PROJECT.md section 8 item 84)."""
+    report = software_sensor_report(AQUAERO, {1: 20.0})
+    assert len(report) == 1 + 2 * 8 == 17
+    assert report[0] == SOFT_SENSOR_REPORT_ID == 0x07
+    assert report == bytes.fromhex("07 07d0" + " 7fff" * 7)
+    assert software_sensor_report(AQUAERO, {8: 90.0}) == bytes.fromhex("07" + " 7fff" * 7 + " 2328")
+    both = software_sensor_report(AQUAERO, {1: -1.5, 3: 0.0})
+    assert both == bytes.fromhex("07 ff6a 7fff 0000" + " 7fff" * 5)
+    assert software_sensor_report(AQUAERO, {}) == bytes.fromhex("07" + " 7fff" * 8)
+
+
+def test_software_sensor_report_rejects_what_it_cannot_carry() -> None:
+    for number in (0, 9, True, 1.0, "1"):
+        with pytest.raises(ValueError, match="software sensor number"):
+            software_sensor_report(AQUAERO, {number: 20.0})
+    for value in (TEMP_MIN_C - 0.01, TEMP_MAX_C + 0.01, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="can carry"):
+            software_sensor_report(AQUAERO, {1: value})
+    with pytest.raises(ValueError, match="must be a number"):
+        software_sensor_report(AQUAERO, {1: "20"})
+    # The top value is "no data", so it is not a temperature the report can carry.
+    assert round(TEMP_MAX_C * 100) == SENSOR_NOT_CONNECTED - 1
+    with pytest.raises(ValueError, match="software-sensor report is not known"):
+        software_sensor_report(QUADRO, {1: 20.0})  # the Quadro's report is unknown
+
+
+def test_the_software_sensor_report_writes_where_the_status_report_reads_soft() -> None:
+    """The slot a value lands in is the one the status report shows as softN."""
+    soft = next(group for group in AQUAERO.temp_groups if group.prefix == "soft")
+    assert (soft.count, AQUAERO.soft_sensor_count) == (8, 8)
+    assert AQUAERO.soft_sensor_report_id == SOFT_SENSOR_REPORT_ID
+    assert (QUADRO.soft_sensor_report_id, QUADRO.soft_sensor_count) == (None, None)
+    status = bytearray(_bin("aquaero-status.bin"))
+    report = software_sensor_report(AQUAERO, {2: 33.33})
+    status[soft.offset + 2 : soft.offset + 4] = report[3:5]
+    assert decode_status(AQUAERO, bytes(status)).temp("soft2") == pytest.approx(33.33)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "aquaero-ctrl-firmware.bin",
+        "aquaero-ctrl-after-writes.bin",
+        "aquaero-ctrl-aquabus-before-fan7-write.bin",
+    ],
+)
+def test_every_captured_aquaero_control_report_runs_profile_1(name: str) -> None:
+    """Byte 0x06 is the active profile, 0-based; it read 0 in every capture taken
+    before the owner configured profiles (PROJECT.md section 8 item 84)."""
+    data = _bin(name)
+    assert AQUAERO.profile_offset is not None and data[AQUAERO.profile_offset] == 0
+    assert active_profile(AQUAERO, data) == 1
+
+
+def test_the_profile_byte_is_read_where_the_kind_has_one() -> None:
+    data = bytearray(_bin("aquaero-ctrl-firmware.bin"))
+    assert AQUAERO.profile_offset == 0x06
+    for raw in range(4):
+        data[0x06] = raw
+        assert active_profile(AQUAERO, bytes(data)) == raw + 1
+    assert QUADRO.profile_offset is None
+    assert active_profile(QUADRO, _bin("quadro-ctrl-firmware.bin")) is None

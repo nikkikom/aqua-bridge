@@ -18,7 +18,8 @@ found again by these attributes, never by number.
 
 :class:`HidrawTransport` opens ``/dev/hidrawN`` non-blocking. Input reports
 (one per ``read``) are drained with :meth:`HidrawTransport.read_reports`;
-feature reports go through ``HIDIOCGFEATURE`` / ``HIDIOCSFEATURE``. Errors
+feature reports go through ``HIDIOCGFEATURE`` / ``HIDIOCSFEATURE`` and an output
+report (the aquaero's software sensors) through ``write``. Errors
 that mean the device node is gone raise :class:`DeviceUnavailable`; any other
 failed feature report raises :class:`FeatureReportError` (the caller retries).
 
@@ -278,6 +279,10 @@ class HidTransport(Protocol):
 
     def set_feature(self, data: bytes) -> None: ...
 
+    def write_report(self, data: bytes) -> None:
+        """Sends one HID *output* report (``data[0]`` = report id)."""
+        ...
+
     def close(self) -> None: ...
 
 
@@ -366,6 +371,27 @@ class HidrawTransport:
         if count != len(buf):
             raise FeatureReportError(
                 f"{what} on {self._info.node}: sent {count} of {len(buf)} bytes"
+            )
+
+    def write_report(self, data: bytes) -> None:
+        """Sends one HID output report with ``write`` (``data[0]`` = the report id).
+
+        An output report goes out over the device's interrupt OUT endpoint (the
+        kernel falls back to a SET_REPORT control transfer), so this call is
+        synchronous like a feature report even on the non-blocking node: the
+        caller must treat it as one device operation and give it a time budget.
+        """
+        fd = self._require_fd()
+        what = f"OUTPUT report 0x{data[0]:02X}"
+        try:
+            count = os.write(fd, data)
+        except OSError as exc:
+            if exc.errno in _GONE_ERRNOS:
+                raise DeviceUnavailable(f"{self._info.node} is gone: {what}: {exc}") from exc
+            raise FeatureReportError(f"{what} on {self._info.node}: {exc}", exc.errno) from exc
+        if count != len(data):
+            raise FeatureReportError(
+                f"{what} on {self._info.node}: wrote {count} of {len(data)} bytes"
             )
 
     def close(self) -> None:
