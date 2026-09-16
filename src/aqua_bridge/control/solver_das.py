@@ -145,7 +145,10 @@ On every solve tick the model must pass (:func:`check_model`):
 * the **air disturbance** ``max_z |d_air,z - d_air,z(slow)| <=
   model_max_air_dist_c_per_min`` over the zones of the constrained bays: the estimator's
   per-zone air disturbance against its own slow level (``model_air_dist_tau_s``), the one
-  piece of evidence about the fan gains ``E`` (below). This limit is the only one
+  piece of evidence about the fan gains ``E`` (below). A zone whose level has not been
+  running for ``model_air_dist_tau_s`` yet (a fresh track, or one a gap over
+  :data:`_RATE_GAP_S` made stale) has no reference to move away from and reports ``None``,
+  not a move of zero. This limit is the only one
   ``model_return_factor`` does not scale: it is a move, not a level, and asking the
   enclosure to be twice as steady to come back only delays the return.
 
@@ -198,8 +201,16 @@ for what the default limit catches on the truth simulator and what it does not.
 
 Both are rates the plant itself moves, so on the **entry** they must keep failing for
 ``model_drift_dwell_s`` before they fault the model (:attr:`ModelCheck.rate_only`); until
-then the MPC stays active and ``reason`` names the failing check. Every other check faults
-the model on the tick it fails. The return has its own, longer dwell and is unchanged.
+then the MPC stays active and ``reason`` names the failing check. The dwell **leaks**: a
+tick that passes does not restart it, and only a passing spell as long as the dwell itself
+does (``drift_since`` is kept while a rate check has failed within the last
+``model_drift_dwell_s``). A moderate parameter error holds its residual just over the
+limit and sensor noise dips it under every few ticks, which a contiguous dwell would
+restart for ever -- measured on the truth simulator: bay gains 1.5x, ``basic`` seed 2, the
+drift 0.49-0.54 degC/min against the limit 0.5 for 18 minutes and never 120 s together.
+Every other check faults the model on the tick it fails. A switch either way clears the
+dwell: it belongs to the entry, not to the fallback. The return has its own, longer dwell
+and is unchanged.
 The PI-like DAS fallback regulates every drive at its soft target with the same margins,
 so a model fallback changes loudness, not safety. A clock stepped back (``step``
 re-confirms the zones and then calls the solver with the earlier ``ts``) drops a pending
@@ -239,8 +250,10 @@ Memory (``solver_memory["mpc"]``, plain JSON)::
      "bias": {ch: offset}, "band": {ch: band index}, "pred": {"ts", "t": {bay: degC}},
      "err2": mean-square prediction error | None,
      "mrate": {"ts", "r", "since"} (the model's own drive rate, low-passed),
-     "dslow": {"ts", "d"} (the slow level of the estimator's air disturbances),
+     "dslow": {"ts", "d", "age"} (the slow level of the estimator's air disturbances
+         and how long each zone's level has been running, capped at its time constant),
      "drift_since": ts at which a rate check started failing | None,
+     "drift_last": ts of the last failing rate check | None (the dwell leaks),
      "rate": {"ts", "t": {bay: degC}, "r": {bay: degC/min}, "since": {bay: since_ts}},
      "checks": {...}, "status": str,
      "fresh": {"pwm", "integrator", "iterations", "diagnostics"} | None}
@@ -1011,8 +1024,9 @@ def _fresh_memory() -> dict[str, Any]:
         "err2": None,
         "rate": _fresh_rate(),
         "mrate": {"ts": None, "r": {}, "since": {}},
-        "dslow": {"ts": None, "d": {}},
+        "dslow": {"ts": None, "d": {}, "age": {}},
         "drift_since": None,
+        "drift_last": None,
         "checks": {},
         "status": None,
         "fresh": None,
@@ -1067,6 +1081,7 @@ def _parse(raw: object, cfg: MpcConfig) -> dict[str, Any]:
     mem["since"] = _opt_num(raw.get("since"))
     mem["ok_since"] = _opt_num(raw.get("ok_since"))
     mem["drift_since"] = _opt_num(raw.get("drift_since"))
+    mem["drift_last"] = _opt_num(raw.get("drift_last"))
     reason = raw.get("reason")
     mem["reason"] = reason if isinstance(reason, str) else None
     tick = raw.get("tick", 0)
@@ -1128,7 +1143,11 @@ def _parse(raw: object, cfg: MpcConfig) -> dict[str, Any]:
         }
     dslow = raw.get("dslow")
     if dslow is not None:
-        mem["dslow"] = {"ts": _opt_num(dslow.get("ts")), "d": _num_map(dslow["d"])}
+        mem["dslow"] = {
+            "ts": _opt_num(dslow.get("ts")),
+            "d": _num_map(dslow["d"]),
+            "age": _num_map(dslow.get("age", {})),
+        }
     rate = raw.get("rate")
     if rate is not None:
         since = rate["since"]
@@ -1491,18 +1510,37 @@ class DasMpcSolver:
     def _track_air_dist(cfg: MpcConfig, mem: dict[str, Any], ts: float) -> None:
         """The slow level of the estimator's zone-air disturbances (module docstring,
         validity gate): the same disturbances the prediction uses, through a second
-        low-pass of ``model_air_dist_tau_s``. A zone seen for the first time starts at its
-        current value, so a fresh track reports no move."""
+        low-pass of ``model_air_dist_tau_s``, with the seconds each zone's level has been
+        running (``age``, capped at that time constant).
+
+        A level only becomes a reference once it has run for its own time constant, so a
+        zone seen for the first time -- and one whose level a gap over :data:`_RATE_GAP_S`
+        has made stale -- starts again at the current disturbance with ``age`` 0 and the
+        check reports nothing (``None``) until it is established, rather than reporting no
+        move against a level snapped to whatever the disturbance is now. A clock that did
+        not advance or stepped back keeps every level and its age: only the filter refuses
+        to advance, and it resumes on the new clock, so a step of the wall clock cannot
+        re-reference the check to an already faulted disturbance."""
         old = mem["dslow"]
         last = old["ts"]
         elapsed = 0.0 if last is None else ts - last
         usable = last is not None and 0.0 < elapsed <= _RATE_GAP_S
-        w = 1.0 - math.exp(-elapsed / cfg.model_air_dist_tau_s) if usable else 0.0
+        hold = last is not None and elapsed <= 0.0
+        tau = cfg.model_air_dist_tau_s
+        w = 1.0 - math.exp(-elapsed / tau) if usable else 0.0
         new: dict[str, float] = {}
+        age: dict[str, float] = {}
         for zone, value in mem["dist"]["d"].items():
             prev = old["d"].get(zone)
-            new[zone] = value if prev is None or not usable else prev + (value - prev) * w
-        mem["dslow"] = {"ts": ts, "d": new}
+            prev_age = min(max(old["age"].get(zone, 0.0), 0.0), tau)
+            if prev is None or not (usable or hold):
+                new[zone], age[zone] = value, 0.0
+            elif hold:
+                new[zone], age[zone] = prev, prev_age
+            else:
+                new[zone] = prev + (value - prev) * w
+                age[zone] = min(prev_age + elapsed, tau)
+        mem["dslow"] = {"ts": ts, "d": new, "age": age}
 
     @staticmethod
     def _evidence(cfg: MpcConfig, mem: dict[str, Any], model: _Model, ts: float) -> None:
@@ -1542,13 +1580,16 @@ class DasMpcSolver:
         model.drift_return = max(
             (abs(v - observed.get(b, 0.0)) for b, v in model.rate.items()), default=None
         )
-        slow = mem["dslow"]["d"]
+        # only a level that has run for its own time constant is a reference to move away
+        # from; until then the check has no evidence, which is not the same as no move
+        slow, age = mem["dslow"]["d"], mem["dslow"]["age"]
+        established = [
+            z
+            for z in model.zones_checked
+            if z in mem["dist"]["d"] and z in slow and age.get(z, 0.0) >= cfg.model_air_dist_tau_s
+        ]
         model.air_dist = max(
-            (
-                abs(mem["dist"]["d"][z] - slow.get(z, mem["dist"]["d"][z])) * 60.0
-                for z in model.zones_checked
-                if z in mem["dist"]["d"]
-            ),
+            (abs(mem["dist"]["d"][z] - slow[z]) * 60.0 for z in established),
             default=None,
         )
 
@@ -1711,9 +1752,9 @@ class DasMpcSolver:
         """Run the validity gate and switch the active model; ``True`` on a switch."""
         in_fallback = mem["active"] == PI_DAS
         # a clock stepped back: the times of the last switch, of the first passing check and
-        # of the first failing rate check count from now (the dwells restart rather than
-        # waiting for the old clock)
-        for name in ("since", "ok_since", "drift_since"):
+        # of the first and last failing rate check count from now (the dwells restart rather
+        # than waiting for the old clock)
+        for name in ("since", "ok_since", "drift_since", "drift_last"):
             if mem[name] is not None and mem[name] > ts:
                 mem[name] = ts
         err = None if mem["err2"] is None else math.sqrt(mem["err2"])
@@ -1729,11 +1770,18 @@ class DasMpcSolver:
             relax=cfg.model_return_factor if in_fallback else 1.0,
             error=model.error,
         )
+        # the entry dwell is a leaky one: a check that fails, passes for a moment and fails
+        # again keeps its dwell, and only a spell of passing as long as the dwell itself
+        # clears it. A residual that sits just over its limit dips under it every few ticks
+        # on sensor noise, which a contiguous dwell would restart for ever
         if verdict.rate_only:
+            mem["drift_last"] = ts
             if mem["drift_since"] is None:
                 mem["drift_since"] = ts
-        else:
-            mem["drift_since"] = None
+        elif mem["drift_since"] is not None:
+            last = mem["drift_last"]
+            if last is None or ts - last >= cfg.model_drift_dwell_s:
+                mem["drift_since"] = mem["drift_last"] = None
         checks = dict(verdict.checks)
         checks["cache_hit"] = model.hit
         checks["drift_abs_c_per_min"] = model.drift
@@ -1759,7 +1807,14 @@ class DasMpcSolver:
             if verdict.rate_only and ts - mem["drift_since"] < cfg.model_drift_dwell_s:
                 mem["reason"] = verdict.reason
                 return False
-            mem.update(active=PI_DAS, since=ts, ok_since=None, reason=verdict.reason)
+            mem.update(
+                active=PI_DAS,
+                since=ts,
+                ok_since=None,
+                reason=verdict.reason,
+                drift_since=None,
+                drift_last=None,
+            )
             return True
         # fallback active: come back after passing the relaxed checks (the drift relative
         # to the drives' observed rate) for the dwell
@@ -1772,7 +1827,9 @@ class DasMpcSolver:
         since = mem["since"] if mem["since"] is not None else ts
         dwell = cfg.model_return_dwell_s
         if ts - mem["ok_since"] >= dwell and ts - since >= dwell:
-            mem.update(active=MPC, since=ts, reason=None)
+            # the entry dwell belongs to the entry: a return starts it over, whatever the
+            # rate checks did while the fallback regulated
+            mem.update(active=MPC, since=ts, reason=None, drift_since=None, drift_last=None)
             return True
         mem["reason"] = "dwell"
         return False
