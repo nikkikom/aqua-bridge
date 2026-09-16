@@ -276,9 +276,13 @@ class Loop:
         obs, read_error = self._read()
         if read_error is not None:
             _LOG.warning("tick %d: read failed (%s); running the fallback path", index, read_error)
-        self.last_obs = obs
-
         plan = self.supervisor.plan_tick()
+        if plan.calibrations:
+            # Manual calibrations (item 23) ride into ``step`` the way SMART does, as an
+            # observation input: the estimator is the only reader and ``step`` stays a
+            # pure function of ``(obs, cfg, state)``.
+            obs = dataclasses.replace(obs, inputs={**obs.inputs, "calibration": plan.calibrations})
+        self.last_obs = obs
         cfg = plan.cfg
         mpc_cmd: MpcCommand | None = None
         controller_error: str | None = None

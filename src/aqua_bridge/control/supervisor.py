@@ -36,6 +36,20 @@ Rules (section 6 "Control", section 4.8, section 5 "Modes")
   declaration: ``occupied: false`` removes the bay's constraints like it does in
   the config file, and a declared serial wins over the estimator's association
   by correlation.
+* ``Calibrate`` (DAS mode only, PROJECT.md section 8 item 23) records one drive
+  temperature measured with a handheld thermometer for one bay -- the stand-in for
+  SMART on an enclosure whose drives no agent can read. The bay must exist
+  (:class:`IntentInvalid`) and ``drive_temp_c`` must lie in
+  ``[estimator.calibrate_min_c, estimator.calibrate_max_c]`` (:class:`IntentInvalid`);
+  the reading is refused as meaningless or unsafe (:class:`IntentConflict`, naming the
+  bay and the reason) before the first tick, when the bay holds no drive, and when the
+  bay's zone is untrusted or in fault -- a map fitted to a reading the gate does not
+  believe would quietly bias every later estimate of that bay, and the estimate is what
+  decides how hard the fans run. An accepted reading is kept for
+  ``estimator.smart_max_age_s`` (the SMART staleness rule) and handed to the loop in
+  :attr:`TickPlan.calibrations`, which merges it into
+  ``PlantObservation.inputs["calibration"]``; the estimator then treats it exactly like
+  a SMART sample of that bay. A second reading for the same bay replaces the first.
 * ``SetMode(auto)`` clears every override. ``SetMode(manual)`` gives every
   channel without an override one, seeded from the last applied PWM (or
   ``fallback_pwm`` before anything was applied) so entering manual does
@@ -169,6 +183,7 @@ from typing import Any
 from aqua_bridge.control import ident
 from aqua_bridge.control.intents import (
     INTENT_KINDS,
+    Calibrate,
     ClearOverride,
     ControlMode,
     ControlSnapshot,
@@ -342,7 +357,9 @@ class TickPlan:
 
     The loop runs ``step`` with ``cfg`` and composes with ``overrides``;
     ``released`` names channels whose override was cleared since the last
-    plan (drop their integrator entry for a bumpless return to the solver).
+    plan (drop their integrator entry for a bumpless return to the solver);
+    ``calibrations`` are the manual drive readings the loop merges into
+    ``PlantObservation.inputs["calibration"]`` before ``step``.
     """
 
     cfg: MpcConfig
@@ -351,6 +368,10 @@ class TickPlan:
     released: frozenset[str] = frozenset()
     preset: Preset = Preset.NORMAL
     experiment: dict[str, Any] | None = None  # ident.status while an experiment runs
+    #: Manual calibrations still fresh (``Calibrate``, item 23):
+    #: ``{bay: {"temp_c": float, "age_s": float}}``, the shape
+    #: ``PlantObservation.inputs["calibration"]`` carries. Empty in legacy mode.
+    calibrations: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -422,6 +443,9 @@ class Supervisor:
         self._preset = Preset(preset)
         self._limits = RuntimeLimits()
         self._bays = RuntimeBays()
+        #: Manual calibrations (``Calibrate``, item 23): bay -> (monotonic receipt, degC).
+        #: In memory only, like every other runtime intent.
+        self._calibrations: dict[str, tuple[float, float]] = {}
         self._effective = apply_preset(cfg, self._setpoints, self._preset, self._limits, self._bays)
         self._released: set[str] = set()
 
@@ -525,6 +549,9 @@ class Supervisor:
                 extra["experiment"] = ident.status(
                     self._experiment, self._ident_last, self._effective
                 )
+                # Manual calibrations still pending (item 23), so a client sees that a
+                # reading was accepted before the next tick folds it into the estimator.
+                extra["calibrations"] = self._fresh_calibrations()
             # Step budget alarm (control/loop.py): loop-reported via record_tick's
             # extra, promoted to dedicated ControlSnapshot fields, not duplicated here.
             step_ms_last = extra.pop("step_ms_last", 0.0)
@@ -590,6 +617,8 @@ class Supervisor:
                 self._set_limit(intent)
             elif isinstance(intent, SetBay):
                 self._set_bay(intent)
+            elif isinstance(intent, Calibrate):
+                self._calibrate(intent)
             elif isinstance(intent, ClearOverride):
                 self._clear_override(intent.channel)
             else:
@@ -700,6 +729,83 @@ class Supervisor:
         candidate = RuntimeBays(declared)
         self._effective = self._validated(self._setpoints, self._preset, self._limits, candidate)
         self._bays = candidate
+
+    def _calibrate(self, intent: Calibrate) -> None:
+        """One handheld drive reading for one bay (module docstring, item 23)."""
+        cfg = self._effective
+        topo = cfg.topology
+        spec = cfg.estimator
+        if topo is None or spec is None or not cfg.is_das:
+            raise IntentInvalid(
+                "manual calibration needs a DAS config (mpc.topology): a legacy config has "
+                "no drive estimates to calibrate"
+            )
+        bay = intent.bay
+        if bay not in topo.bays:
+            raise IntentInvalid(f"unknown bay {bay!r}; bays are {sorted(topo.bays)}")
+        temp = intent.drive_temp_c
+        if not spec.calibrate_min_c <= temp <= spec.calibrate_max_c:
+            raise IntentInvalid(
+                f"drive_temp_c {temp} for bay {bay!r} must lie in "
+                f"[{spec.calibrate_min_c}, {spec.calibrate_max_c}] "
+                "(mpc.estimator.calibrate_min_c / calibrate_max_c)"
+            )
+        stamp = self._check_calibratable(bay, topo.bays[bay].zone)
+        self._calibrations[bay] = (stamp, temp)
+        _LOG.info("manual calibration: bay %s at %.2f degC (ts %.1f)", bay, temp, stamp)
+
+    def _check_calibratable(self, bay: str, zone: str) -> float:
+        """The observation clock to stamp the reading with, or :class:`IntentConflict`.
+
+        The stamp is the last tick's observation time, the same clock the estimator
+        measures a SMART sample's age on, so a reading that waits for a tick keeps one
+        fixed sample time instead of looking new again every tick.
+        """
+        facts = self._ident_facts
+        if facts is None or facts.mode is None or facts.ts is None or not facts.zones:
+            raise IntentConflict(
+                f"no_tick: bay {bay!r} has no estimate yet; the estimator needs one "
+                "completed tick before a calibration means anything"
+            )
+        info = facts.zones.get(zone)
+        info = info if isinstance(info, Mapping) else {}
+        if info.get("trusted") is not True or info.get("fault") is True:
+            reasons = info.get("reasons")
+            named = ", ".join(str(r) for r in reasons) if isinstance(reasons, list | tuple) else ""
+            raise IntentConflict(
+                f"untrusted:{zone}: bay {bay!r} sits in zone {zone!r}, which the gate does "
+                f"not trust{f' ({named})' if named else ''}; a map fitted to a reading the "
+                "gate does not believe would bias every later estimate of this bay"
+            )
+        bay_info = facts.bays.get(bay)
+        bay_info = bay_info if isinstance(bay_info, Mapping) else {}
+        if bay_info.get("occupancy") == "empty":
+            raise IntentConflict(
+                f"empty:{bay}: bay {bay!r} holds no drive (occupancy 'empty'), so there is "
+                "nothing a drive temperature could calibrate"
+            )
+        return float(facts.ts)
+
+    def _fresh_calibrations(self) -> dict[str, dict[str, float]]:
+        """Pending manual readings still within ``estimator.smart_max_age_s``.
+
+        ``{bay: {"temp_c", "ts"}}`` on the observation clock. Stale entries are dropped
+        here, so a reading no tick ever consumed (a long fallback stretch) expires by
+        the same rule a SMART sample does instead of landing in the filter minutes
+        later. A reading is *not* consumed on the first plan: the estimator decides
+        what is new from its sample time, exactly as it does for SMART.
+        """
+        spec = self._effective.estimator
+        facts = self._ident_facts
+        now = None if facts is None else facts.ts
+        if spec is None or not self._calibrations or now is None:
+            return {}
+        out: dict[str, dict[str, float]] = {}
+        for bay, (stamp, temp) in sorted(self._calibrations.items()):
+            if 0.0 <= float(now) - stamp <= spec.smart_max_age_s:
+                out[bay] = {"temp_c": temp, "ts": stamp}
+        self._calibrations = {b: v for b, v in self._calibrations.items() if b in out}
+        return out
 
     def _ident(self, intent: Ident) -> None:
         cfg = self._effective
@@ -815,6 +921,7 @@ class Supervisor:
                 released=released,
                 preset=self._preset,
                 experiment=experiment,
+                calibrations=self._fresh_calibrations(),
             )
 
     def compose(
