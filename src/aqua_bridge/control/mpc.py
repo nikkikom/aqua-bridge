@@ -561,8 +561,18 @@ def step(
         if fit.curves or fit.stale:
             stored = mem.get("fan_curves")
             merged = dict(stored) if isinstance(stored, Mapping) else {}
-            for model in fit.stale:  # unconfirmed for fan_curve_max_age_s: back to config
-                merged.pop(model, None)
+            seeded = mem.get(persist.SEED_CURVES_KEY)
+            seeded = seeded if isinstance(seeded, Mapping) else {}
+            for model in fit.stale:  # unconfirmed for fan_curve_max_age_s: back one step
+                # back to the curve that was in force before this run's fit: the store's,
+                # when the seed carried one (which the store's own age rule judged at
+                # load), else out of the section altogether and on to fan_models. The
+                # stale rule abandons a fit; it never erases the stored curve from the
+                # section modelstore writes back (item 107).
+                if model in seeded:
+                    merged[model] = dict(seeded[model])
+                else:
+                    merged.pop(model, None)
             merged.update(fit.curves)
             mem["fan_curves"] = merged
         curves = mem.get("fan_curves")

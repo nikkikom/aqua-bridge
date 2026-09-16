@@ -60,9 +60,13 @@ tachometer cannot look like a perfect fit.
 A fit **goes stale** when nothing has re-confirmed it for ``fan_curve_max_age_s``,
 which is two things at once: no refit has been *accepted* in that window (:func:`update`
 stamps every accepted fit with its tick, and a refused refit leaves the stamp alone), or
-no settled ``(pwm, rpm)`` **sample** has arrived in it (the bins keep their history, so a
-tachometer that has stopped reporting would otherwise let the fit be re-accepted from
-year-old data for ever). Past that age the fit stops being published: its entry leaves
+no **tachometer reading** has arrived in it from any channel of that fan model (the bins
+keep their history, so a tachometer that has stopped reporting would otherwise let the
+fit be re-accepted from year-old data for ever). The second stamp is every finite,
+non-negative reading, *not* only a settled sample: a regulator that moves the duty each
+tick -- the DAS QP does, every solve -- never settles one, and a controller whose fans
+are simply being regulated must not lose the fit its live tachometers keep confirming.
+Past that age the fit stops being published: its entry leaves
 ``solver_memory["fan_curves"]`` and every reader that follows the curve falls back to the
 configured one. A tachometer that dies, and a tachometer that lies badly enough that no
 refit passes again, so both return the controller to the commissioned curve instead of
@@ -80,13 +84,17 @@ seed a fan's speed anyway).
 
 Memory (plain JSON)::
 
-    {"v": 1, "fp": <channel -> fan model fingerprint>,
+    {"v": VERSION, "fp": <channel -> fan model fingerprint>,
      "hold": {channel: [u, since_ts]},
      "models": {model: {"bins": [[n, su, sr, sr2], ... BINS],
                         "fit": {"rpm_max", "deadband", "exponent", "rmse_frac", "n",
                                 "bins", "span", "ts"} | null,
                         "rejected": str | null, "last_ts": ts | null,
                         "sample_ts": ts | null}}}
+
+``sample_ts`` is the tick of the newest tachometer reading of that fan model (the stale
+rule), ``fit["ts"]`` the tick that accepted the fit, and ``last_ts`` the tick of the last
+refit attempt.
 
 A memory that does not match the config's fans, or is malformed in any way, starts over
 (never an exception).
@@ -155,7 +163,7 @@ READERS: dict[str, str] = {
     "thermal_model": "curve",  # thermal.model_params: the u0.<m> / n.<m> rows
     "mpc_prediction": "curve",  # solver_das: the same parameters through the prediction
     "estimator_airflow": "curve",  # estimator._airflow: Q_z, Qn_z
-    "noise_u0": "curve",  # noise._level / surrogate / diagnostics: the dead band
+    "noise_u0": "curve",  # noise.channel_deadband: surrogate, _level, diagnostics
     # judges a fan against its commissioned figures, or is a validity rule: stays put
     "noise_rpm_max": "config",  # a tach normalised by a fitted rpm_max hides lost speed
     "noise_db_at_max": "config",  # a datasheet figure the fit says nothing about
@@ -227,8 +235,8 @@ def _age(stamp: object, ts: float) -> float | None:
 
 def is_stale(block: object, cfg: MpcConfig, ts: float) -> bool:
     """Whether a fan model's accepted fit has gone unconfirmed for
-    ``fan_curve_max_age_s`` -- no accepted refit and no new sample in that window
-    (module docstring, *A fit goes stale*).
+    ``fan_curve_max_age_s`` -- no accepted refit, or no tachometer reading at all, in
+    that window (module docstring, *A fit goes stale*).
 
     ``block`` is one entry of the memory's ``models``. A model with no accepted fit is
     never stale (there is nothing in force to abandon), and an unstamped fit -- one
@@ -402,6 +410,14 @@ def update(
     ts = float(ts)
     hold: dict[str, list[float]] = mem["hold"]
     for ch in cfg.channels:
+        reading = None if rpm is None else rpm.get(ch)
+        live = _finite(reading) and float(reading) >= 0.0  # type: ignore[arg-type]
+        if live:
+            # The stale rule's evidence: this fan's tachometer is reporting. Every
+            # reading counts, not only a settled sample -- a regulator that moves the
+            # duty each tick (the DAS QP does) never settles one, and that is no reason
+            # to abandon a fit the hardware is still confirming (module docstring).
+            mem["models"][cfg.fans[ch].model]["sample_ts"] = ts
         value = u.get(ch)
         if not _finite(value):
             hold.pop(ch, None)
@@ -413,12 +429,10 @@ def update(
             continue
         if ts - held[1] < cfg.fan_curve_settle_s:
             continue
-        reading = None if rpm is None else rpm.get(ch)
-        if not _finite(reading) or float(reading) < 0.0:  # type: ignore[arg-type]
+        if not live:
             continue
         speed = float(reading)  # type: ignore[arg-type]
         block = mem["models"][cfg.fans[ch].model]
-        block["sample_ts"] = ts  # the newest evidence under the fit (the stale rule)
         bins = block["bins"]
         row = bins[min(BINS - 1, int(duty * BINS))]
         if row[0] >= BIN_CAPACITY:  # an exponential mean of BIN_CAPACITY samples
@@ -476,8 +490,9 @@ def summary(
     which stay on the configured one.
 
     ``stale`` on a row means the model has an accepted fit that nothing has re-confirmed
-    within ``fan_curve_max_age_s``: it is no longer published, so ``source`` is
-    ``config`` and ``age_s`` says how old the abandoned fit is. ``ts`` is the tick's
+    within ``fan_curve_max_age_s``: it is no longer published, so ``source`` is what was
+    in force before it -- ``store`` when the model store's seed carried a curve, else
+    ``config`` -- and ``age_s`` says how old the abandoned fit is. ``ts`` is the tick's
     observation time; without it no row is judged stale."""
     out: dict[str, Any] = {
         "online": cfg.fan_curve_online,
@@ -494,7 +509,9 @@ def summary(
         stale = ts is not None and is_stale(entry, cfg, ts)
         source = "config"
         if stored is not None:
-            source = "fit" if isinstance(fit, Mapping) else "store"
+            # a stale fit is no longer what is published, so whatever is in the section
+            # came from the store's seed, not from this run's fit (item 107)
+            source = "fit" if isinstance(fit, Mapping) and not stale else "store"
         age: float | None = None
         sample_age: float | None = None
         if ts is not None:

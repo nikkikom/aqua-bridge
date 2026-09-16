@@ -33,7 +33,9 @@ testable without files:
   that section current and the thermal model and the DAS MPC plan on it in place of the
   ``fan_models`` entry, so a fitted curve survives a restart through the store. Without
   the switch the section is still loaded and saved, but nothing reads it: the configured
-  curves are used.
+  curves are used. What this seed installed is also kept under :data:`SEED_CURVES_KEY`,
+  so that a fit of this run going stale falls back to the stored curve instead of
+  deleting it from the section the store writes back (section 8 item 107).
 * ``ident_settle`` -- how long each zone had been trusted and fault-free, in seconds,
   when the file was written (:func:`aqua_bridge.control.ident.settle_snapshot`). The
   daemon's outage is subtracted here and the whole section is dropped when the file is
@@ -71,10 +73,14 @@ from typing import Any
 from aqua_bridge.control import estimator, thermal
 from aqua_bridge.model import STORE_KEY, MpcConfig
 
-__all__ = ["MAX_WARNINGS", "SOURCES", "apply_seed"]
+__all__ = ["MAX_WARNINGS", "SEED_CURVES_KEY", "SOURCES", "apply_seed"]
 
 #: What a store file was: younger than ``model_store_max_age_days``, older, or unusable.
 SOURCES: tuple[str, ...] = ("fresh", "stale", "prior")
+#: ``solver_memory`` key holding the ``fan_curves`` this seed installed, kept beside the
+#: live section so that a fit going stale returns to the stored curve instead of deleting
+#: it from the section the store writes (``mpc.step`` step 3b'', section 8 item 107).
+SEED_CURVES_KEY = "fan_curves_seed"
 #: Warnings kept in the summary (the rest are counted).
 MAX_WARNINGS = 20
 
@@ -254,6 +260,13 @@ def apply_seed(mem: dict[str, Any], cfg: MpcConfig, seed: object, ts: float) -> 
         if curves is not None:
             staged["fan_curves"] = _fan_curves(curves, cfg, warnings)
             sections["fan_curves"] = len(staged["fan_curves"])
+            # kept beside the live section: a fit that goes stale falls back to the
+            # stored curve rather than erasing it from what the store saves (item 107)
+            if staged["fan_curves"]:
+                staged[SEED_CURVES_KEY] = {
+                    m: dict(c)
+                    for m, c in staged["fan_curves"].items()  # type: ignore[union-attr]
+                }
 
         bays = seed.get("bays")
         if bays is not None:
