@@ -911,11 +911,11 @@ def test_an_accepted_manual_calibration_is_the_map_the_filter_uses():
     assert up.memory["bays"]["a1"]["map"] == E.MANUAL_MAP  # the map in force, not the prior
     # sigma_cal is the calibration's own residual now, not the uncalibrated floor
     assert info["sigma_cal_c"] == pytest.approx(math.sqrt(info["calibration"]["rms_c"] ** 2))
-    assert info["sigma_cal_c"] != est.SIGMA_UNCALIBRATED_C
+    assert info["sigma_cal_c"] != FLOOR_C
     # ... and the estimate is a different number from the one the prior map gives
     bare = _manual_run(cfg, calibrate=False)
     assert bare.bays["a1"]["calibrated"] is False
-    assert bare.bays["a1"]["sigma_cal_c"] == est.SIGMA_UNCALIBRATED_C
+    assert bare.bays["a1"]["sigma_cal_c"] == FLOOR_C
     assert abs(up.estimates["a1"]["t"] - bare.estimates["a1"]["t"]) > 1.0
     # the entry is the bay's own, never one of the model store's per-serial entries
     assert up.memory["cal"] == {}
@@ -982,7 +982,7 @@ def test_a_manual_calibration_expires_like_a_smart_one():
     slope = up.bays["a1"]["calibration"]["slope"]
     silent = tick(short, up.memory, 60.0 * 10.0 + 700.0)
     assert not silent.bays["a1"]["calibrated"]
-    assert silent.bays["a1"]["sigma_cal_c"] == est.SIGMA_UNCALIBRATED_C
+    assert silent.bays["a1"]["sigma_cal_c"] == FLOOR_C
     assert silent.bays["a1"]["calibration"]["slope"] == pytest.approx(slope)  # theta kept
     assert silent.bays["a1"]["calibration"]["fresh_samples"] == 0
 
@@ -1035,7 +1035,7 @@ def test_a_hand_calibrated_bay_keeps_its_map_until_the_serials_one_is_accepted()
         mem = seen.memory
         info = seen.bays["a1"]
         assert info["calibration_source"] == "manual" and info["calibrated"]
-        assert info["sigma_cal_c"] != est.SIGMA_UNCALIBRATED_C
+        assert info["sigma_cal_c"] != FLOOR_C
         assert info["calibration"]["slope"] == pytest.approx(manual_slope)
         assert mem["bays"]["a1"]["map"] == E.MANUAL_MAP  # never re-mapped through the prior
     assert seen is not None
