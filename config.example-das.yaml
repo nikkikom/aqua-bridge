@@ -87,16 +87,17 @@ mpc:
   mpc_estimator_gain: 0.1
   # Step budget (§8.1 owner decisions 2026-09-14, §8 item 73). If the DAS MPC misses
   # budget_ms on the Zero W after the item 73 optimisations, the owner's fallback is to
-  # set all three of these together -- budget_ms must stay strictly below
-  # budget_alarm_ms, so raising it to 1000 means raising the alarm above 1000 too
-  # (1250 keeps the 1.25 ratio, still a quarter of dt), and mpc_every_ticks: 3 below
-  # cuts the mean step and the CPU share, not the p99 (a solve tick is the slow one):
-  #   budget_ms: 1000.0
-  #   budget_alarm_ms: 1250.0
-  #   mpc_every_ticks: 3
+  # change all three values together: budget_ms and budget_alarm_ms here, mpc_every_ticks
+  # further down. Each comment below names the value to write. Edit the value in place --
+  # a second copy of a key in this mapping is not an override, it is the only one YAML
+  # keeps (the last), so a repeated key would drop what is written here; since item 73 the
+  # loader refuses a repeated key instead of picking one.
   budget_ms: 600.0        # runtime alarm + CI/Pi bench gate: warn past this step() time, ms (> 0);
-                           # measured DAS MPC p99 609-615 ms on the Zero W (item 73, to be re-measured)
-  budget_alarm_ms: 750.0  # error instead past this, ms (> budget_ms)
+                          # measured DAS MPC p99 609-615 ms on the Zero W (item 73, to be re-measured).
+                          # item 73 fallback: 1000.0 -- budget_ms must stay strictly below
+                          # budget_alarm_ms, so raise that one with it
+  budget_alarm_ms: 750.0  # error instead past this, ms (> budget_ms).
+                          # item 73 fallback: 1250.0 (the same 1.25 ratio, still a quarter of dt)
   budget_log_interval_s: 60.0  # rate limit for both budget log lines, seconds (> 0)
   pi_kp: 0.02            # PWM per degC of margin deficit (> 0)
   pi_ki: 0.0001          # PWM per (degC * s); integral time pi_kp / pi_ki = 200 s
@@ -274,8 +275,10 @@ mpc:
   # otherwise regulates exactly like solver: pi, with mode staying auto.
   mpc_pred_dt_s: 30.0    # prediction step, seconds (>= dt)
   mpc_blocks: [1, 1, 2, 4, 6, 6]  # move blocks, sum = horizon
-  mpc_every_ticks: 2     # solve every 2nd tick (Zero W budget at dt = 5 s); replay the plan between
-                         # (item 73 fallback: 3, together with the raised budget_ms above)
+  mpc_every_ticks: 2     # solve every 2nd tick (Zero W budget at dt = 5 s); replay the plan between.
+                         # item 73 fallback: 3, together with the raised budget_ms / budget_alarm_ms
+                         # above; it cuts the mean step and the CPU share, not the p99 (the p99 over
+                         # all ticks stays a solve tick while solve ticks are more than 1 % of them)
   rho_soft: 40.0         # penalty per degC^2 above a drive's soft target (limit - comfort - k sigma)
   rho_hard: 4000.0       # penalty per degC^2 above its hard target (limit - k sigma)
   solver_outer_max: 4    # active-piece iterations per solve

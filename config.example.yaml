@@ -39,7 +39,10 @@ mpc:
   mpc_estimator_gain: 0.1  # MPC offset-free disturbance estimator, per-tick gain in (0, 1]
   budget_ms: 600.0        # runtime alarm: log a warning when step() takes longer than this, ms (> 0)
   budget_alarm_ms: 750.0  # runtime alarm: log an error instead past this, ms (> budget_ms; raising
-                          # budget_ms means raising this above it, see config.example-das.yaml)
+                          # budget_ms means changing this value too, or the config does not load).
+                          # The Zero W fallback of §8 item 73 -- budget_ms 1000.0 with
+                          # budget_alarm_ms 1250.0 and mpc_every_ticks 3 -- is for the DAS MPC and
+                          # is spelled out on the live keys of config.example-das.yaml.
   budget_log_interval_s: 60.0  # rate limit for both budget log lines, seconds (> 0)
   pi_kp: 0.05            # PI proportional gain, PWM per °C of error (> 0)
   pi_ki: 0.002           # PI integral gain, PWM per (°C * s) (>= 0)
@@ -90,7 +93,8 @@ mpc:
   # DAS MPC (control/solver_das.py: solver "mpc" with topology and no setpoints); inert in legacy mode.
   mpc_pred_dt_s: 30.0    # prediction step, seconds (> 0; >= dt with topology); horizon counts these steps
   mpc_blocks: []         # move blocks summing to horizon; [] = [1, 1, 2, 4, 6, 6] cut to horizon
-  mpc_every_ticks: 1     # solve every n-th tick, replay the plan in between (>= 1)
+  mpc_every_ticks: 1     # solve every n-th tick, replay the plan in between (>= 1; inert without
+                         # topology. The DAS MPC's Zero W fallback is 3, see config.example-das.yaml)
   rho_soft: 40.0         # penalty per degC^2 above a drive's soft target (> 0)
   rho_hard: 4000.0       # penalty per degC^2 above its hard target (>= rho_soft)
   solver_outer_max: 4    # active-piece iterations per solve (>= 1)

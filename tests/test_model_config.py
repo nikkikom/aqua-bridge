@@ -293,6 +293,28 @@ def test_load_config_errors(tmp_path):
         load_config(empty)
 
 
+def test_a_key_written_twice_is_refused_instead_of_silently_dropped(
+    tmp_path, example_das_config_path
+):
+    """Item 73: plain YAML keeps the *last* of repeated keys and drops the rest without
+    a word, so a raised ``mpc.budget_ms`` written next to the shipped one would load
+    cleanly and change nothing. The loader names the key and the line instead."""
+    text = example_das_config_path.read_text()
+    assert "  budget_ms: 600.0" in text
+    doubled = tmp_path / "doubled.yaml"
+    doubled.write_text(
+        text.replace("  budget_ms: 600.0", "  budget_ms: 1000.0\n  budget_ms: 600.0", 1)
+    )
+    with pytest.raises(ConfigError, match="'budget_ms' is written twice"):
+        load_config(doubled)
+    # A repeated *section* is refused the same way, and one copy of a key still loads.
+    twice = tmp_path / "twice.yaml"
+    twice.write_text(text + "\nmpc: {}\n")
+    with pytest.raises(ConfigError, match="'mpc' is written twice"):
+        load_config(twice)
+    assert load_config(example_das_config_path).mpc.budget_ms == 600.0
+
+
 # ---------------------------------------------------------------------------
 # PlantObservation construction
 # ---------------------------------------------------------------------------
