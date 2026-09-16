@@ -55,6 +55,13 @@ DETECT_BOUND_S = 300.0
 #: basic simulator; the entry is unchanged by this item).
 SLOW_GAINS = (0.5,)
 DETECT_SLOW_BOUND_S = 1200.0
+#: Bay gains 1.5x: the band where the relative drift sits just over its limit instead of
+#: far above it (0.49-0.54 degC/min against 0.5) and dips under it every few ticks, so the
+#: model is faulted only because the entry dwell leaks. Caught 220-530 s after the step on
+#: the combinations below; where the drift never reaches its limit at all (``basic`` z2:
+#: two ticks over in a whole run) no threshold on it can see the error.
+MODERATE_GAIN = 1.5
+DETECT_MODERATE_BOUND_S = 900.0
 
 #: Fouling scenario (section 8 item 66): the enclosure keeps a steady load, then every
 #: fan's ``e`` drops to :data:`FOUL_FACTOR` of it -- a blocked filter or a dust mat, not a
@@ -256,6 +263,59 @@ def test_observed_rate_follows_a_ramp_and_restarts_at_zero():
     assert _track(cfg, probe, ts + cfg.dt, {"b01": {"t": None}, "b02": {"t": 30.0}}) == {"b02": 0.0}
 
 
+# ---------------------------------------------------------------------------
+# the slow level of the estimator's air disturbances
+# ---------------------------------------------------------------------------
+
+
+def _track_air(cfg: MpcConfig, mem: dict[str, Any], ts: float, d: dict[str, float]):
+    mem["dist"] = {**mem["dist"], "d": dict(d)}
+    DasMpcSolver._track_air_dist(cfg, mem, ts)
+    return mem["dslow"]
+
+
+def test_the_air_disturbance_level_holds_over_a_clock_step_and_restarts_after_a_gap():
+    """Section 8 item 66: the level the air-disturbance check measures a move against is a
+    reference only once it has run for ``model_air_dist_tau_s``, and a clock that steps
+    back must not re-reference it to a disturbance that has already moved."""
+    cfg = scenario_cfg()
+    mem = _fresh_memory()
+    tau = cfg.model_air_dist_tau_s
+    slow = _track_air(cfg, mem, 0.0, {"z0": 1.0})
+    assert slow["d"] == {"z0": 1.0} and slow["age"] == {"z0": 0.0}  # no reference yet
+    ts = 0.0
+    while ts < tau:
+        ts += cfg.dt
+        slow = _track_air(cfg, mem, ts, {"z0": 1.0})
+    assert slow["age"]["z0"] == tau  # a reference now, and it followed a steady disturbance
+    assert slow["d"]["z0"] == pytest.approx(1.0)
+    ts += cfg.dt
+    slow = _track_air(cfg, mem, ts, {"z0": 3.0})  # the disturbance moves, the level crawls
+    assert 1.0 < slow["d"]["z0"] < 1.1 and slow["age"]["z0"] == tau
+    level = slow["d"]["z0"]
+
+    json.loads(json.dumps(mem))  # plain JSON
+    restored = _parse_memory(json.loads(json.dumps(mem)), cfg)
+    assert restored["dslow"] == mem["dslow"]
+    assert restored["mrate"] == mem["mrate"]
+    assert (restored["drift_since"], restored["drift_last"]) == (None, None)
+
+    stepped = _parse_memory(json.loads(json.dumps(mem)), cfg)
+    back = _track_air(cfg, stepped, ts - 86_400.0, {"z0": 3.0})
+    assert back["d"]["z0"] == pytest.approx(level) and back["age"]["z0"] == tau
+    assert back["ts"] == ts - 86_400.0  # the filter resumes on the new clock
+
+    gapped = _parse_memory(json.loads(json.dumps(mem)), cfg)
+    after = _track_air(cfg, gapped, ts + 3601.0, {"z0": 3.0})
+    assert after["d"]["z0"] == 3.0 and after["age"]["z0"] == 0.0  # no reference again
+
+
+def test_the_entry_dwell_times_survive_the_memory():
+    mem = {**_fresh_memory(), "drift_since": 120.0, "drift_last": 300.0}
+    restored = _parse_memory(json.loads(json.dumps(mem)), scenario_cfg())
+    assert (restored["drift_since"], restored["drift_last"]) == (120.0, 300.0)
+
+
 @pytest.mark.parametrize(
     "rate",
     [
@@ -339,6 +399,25 @@ def test_broken_model_sweep(monkeypatch, preset, gain, zone):
     run = load_step_run(cfg, monkeypatch, zone=zone, seed=2, preset=preset, gain=gain)
     assert_safe_and_bumpless(run)
     assert_caught_and_held(run, DETECT_SLOW_BOUND_S if gain in SLOW_GAINS else DETECT_BOUND_S)
+
+
+@pytest.mark.nightly
+@pytest.mark.parametrize(
+    ("preset", "zone", "seed"),
+    [("basic", "z0", 2), ("basic", "z0", 3), ("rich", "z0", 2), ("rich", "z2", 1)],
+)
+def test_a_moderate_parameter_error_is_caught_and_held(monkeypatch, preset, zone, seed):
+    """The band between a sound model and the sweep's 2x: bay gains :data:`MODERATE_GAIN`
+    hold the drift just over its limit and sensor noise dips it under every few ticks. The
+    entry dwell leaks, so it is a model fault -- with a dwell that had to be contiguous
+    three of these four combinations never entered the fallback at all (``basic`` z0
+    seed 2: 112 ticks over the limit over 18 minutes, no fallback). The zones and seeds are
+    the ones where a 1.5x error reaches the drift at all; on ``basic`` z2 it does not, and
+    the run stays on the MPC (the drives stay 10.8 degC inside their limits either way)."""
+    cfg = scenario_cfg()
+    run = load_step_run(cfg, monkeypatch, zone=zone, seed=seed, preset=preset, gain=MODERATE_GAIN)
+    assert_safe_and_bumpless(run)
+    assert_caught_and_held(run, DETECT_MODERATE_BOUND_S)
 
 
 # ---------------------------------------------------------------------------

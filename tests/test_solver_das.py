@@ -53,25 +53,24 @@ def base_cfg() -> MpcConfig:
 
 
 def mpc_cfg(**changes) -> MpcConfig:
-    """The DAS example config with the DAS MPC acting on the prior model.
+    """The DAS example config with the DAS MPC acting on the prior model, every shipped
+    limit kept -- the validity gate's air-disturbance check included.
 
     The synthetic observations of this module hold every zone-air reading at 35 degC and
     every drive at its given temperature while the fans move, which no plant does: the
     estimator has to grow its per-zone air disturbance without bound to explain air that
-    never answers the airflow, and the validity gate's air-disturbance check
-    (``model_max_air_dist_c_per_min``, section 8 item 66) is exactly the check for that.
-    It is relaxed here so these cases keep testing what they are about;
-    :func:`test_the_air_disturbance_check_sees_airflow_the_model_does_not_have` covers it
-    with its shipped limit, and ``tests/test_model_fallback_sim.py`` on the truth plant.
+    never answers the airflow. The check (``model_max_air_dist_c_per_min``, section 8
+    item 66) does not fire on that here, because a case shorter than
+    ``model_air_dist_tau_s`` has no reference level yet and the check reports nothing --
+    which is the same thing a daemon reports for its first 15 minutes. The cases that do
+    establish a level drive ``d_air`` themselves
+    (:func:`test_the_air_disturbance_check_sees_airflow_the_model_does_not_have` and the
+    two clock cases next to it), and ``tests/test_model_fallback_sim.py`` covers the check
+    on the truth plant.
     """
     return dataclasses.replace(
         base_cfg(),
-        **{
-            "solver": SolverKind.MPC,
-            "model_accept_prior": True,
-            "model_max_air_dist_c_per_min": 1e6,
-            **changes,
-        },
+        **{"solver": SolverKind.MPC, "model_accept_prior": True, **changes},
     )
 
 
@@ -1031,6 +1030,12 @@ STEP_W = 300.0
 #: Calm ticks before an injected fault, so the solver is on the MPC when it arrives (a
 #: cold solver starts on whichever model passes, without the entry dwell).
 WARM_TICKS = 2
+#: One tick of observed drive rate (degC/min) injected into a failing drift every
+#: :data:`DIP_EVERY` ticks: enough to put the ~0.8 degC/min drift of :data:`HOT_W` under
+#: its limit for that one tick, the shape sensor noise gives a residual sitting just over
+#: the limit.
+DIP_C_PER_MIN = 0.6
+DIP_EVERY = 5
 
 
 def ticks_with(cfg: MpcConfig, req: SolverRequest, plants, t0: float = 0.0):
@@ -1106,6 +1111,53 @@ def test_a_drift_that_stops_failing_restarts_the_entry_dwell():
     assert results[-1].diagnostics["model"]["checks"]["drift_since_ts"] >= second
 
 
+def over_the_limit(results) -> list[bool]:
+    """Whether each tick's entry drift is over the gate's limit."""
+    out = []
+    for res in results:
+        checks = res.diagnostics["model"]["checks"]
+        drift, limit = checks["drift_c_per_min"], checks["max_drift_c_per_min"]
+        out.append(drift is not None and drift > limit)
+    return out
+
+
+def longest_run(flags: list[bool]) -> int:
+    best = run = 0
+    for flag in flags:
+        run = run + 1 if flag else 0
+        best = max(best, run)
+    return best
+
+
+def test_a_drift_that_only_dips_under_its_limit_still_faults_the_model():
+    """The entry dwell leaks: a residual that sits just over its limit and dips under it
+    for single ticks -- the shape a moderate parameter error takes under sensor noise --
+    faults the model, where a dwell that had to be contiguous would restart for ever and
+    never fault it at all (measured on the truth simulator with bay gains 1.5x)."""
+    cfg = fast_rate_cfg()
+    req = recorded_request(cfg, drive=40.0, ticks=4)
+    bump = DIP_C_PER_MIN * cfg.dt / 60.0  # one tick of observed rate, and back the next
+    n = int((4 * DIST_TAU_S + 3 * cfg.model_drift_dwell_s) / cfg.dt)
+    plants = [copy.deepcopy(req.plant) for _ in range(WARM_TICKS)]
+    for i in range(n):
+        plant = copy.deepcopy(req.plant)
+        plant["bays"]["b06"]["q_w"] = HOT_W
+        if i % DIP_EVERY == DIP_EVERY - 1:
+            plant["bays"]["b06"]["t"] += bump
+        plants.append(plant)
+    results = ticks_with(cfg, req, plants)
+    actives = [r.diagnostics["model"]["active"] for r in results]
+    assert "pi_das" in actives, "the flickering drift never faulted the model"
+    switch = actives.index("pi_das")
+    fails = first_failing(results)
+    assert (switch - fails) * cfg.dt >= cfg.model_drift_dwell_s  # the dwell still held
+    # and it never failed for the dwell together: a contiguous dwell would never fire
+    flags = over_the_limit(results[: switch + 1])
+    assert longest_run(flags) * cfg.dt < cfg.model_drift_dwell_s
+    assert not all(flags[fails : switch + 1])
+    assert results[switch].diagnostics["model"]["reason"].startswith("drift:")
+
+
 def test_the_models_own_rate_goes_through_the_drives_rate_filter():
     """Section 8 item 64: the model's equilibrium rate answers a command or a load change
     at once while the drives' observed rate lags by ``model_drift_rate_tau_s``. Both sides
@@ -1128,37 +1180,112 @@ def test_the_models_own_rate_goes_through_the_drives_rate_filter():
     assert last["drift_c_per_min"] > 4.0 * first["drift_c_per_min"]
 
 
+def air_plant(req: SolverRequest, d_air: float):
+    """The recorded plant with every zone's air disturbance held at ``d_air``."""
+    plant = copy.deepcopy(req.plant)
+    for info in plant["zones"].values():
+        info["d_air"] = d_air
+    return plant
+
+
+def settled_ticks(cfg: MpcConfig) -> int:
+    """Ticks after which a zone's slow level has run for ``model_air_dist_tau_s`` and is a
+    reference the check can measure a move against."""
+    return int(cfg.model_air_dist_tau_s / cfg.dt)
+
+
 def test_the_air_disturbance_check_sees_airflow_the_model_does_not_have():
     """Section 8 item 66: the fan gains ``E`` only move the air node, whose model the
     estimator's per-zone air disturbance re-balances, so the drive rows stay clean. A
     disturbance that steps away from its own slow level is the evidence that is left."""
-    cfg = dataclasses.replace(mpc_cfg(mpc_every_ticks=1), model_max_air_dist_c_per_min=5.0)
+    cfg = mpc_cfg(mpc_every_ticks=1)
     req = recorded_request(cfg, drive=40.0, ticks=4)
-    steady = copy.deepcopy(req.plant)
-    for info in steady["zones"].values():
-        info["d_air"] = 0.5  # 30 degC/min, and steady: no evidence of anything
+    settled = settled_ticks(cfg)
     n = int((cfg.model_drift_dwell_s + 4 * DIST_TAU_S) / cfg.dt)
-    results = ticks_with(cfg, req, [copy.deepcopy(steady) for _ in range(n)])
+    # 0.5 degC/s is 30 degC/min, and steady: no evidence of anything
+    results = ticks_with(cfg, req, [air_plant(req, 0.5) for _ in range(settled + n)])
+    air = [r.diagnostics["model"]["checks"]["air_dist_c_per_min"] for r in results]
     assert {r.diagnostics["model"]["active"] for r in results} == {"mpc"}
-    assert max(r.diagnostics["model"]["checks"]["air_dist_c_per_min"] for r in results) < 1e-6
+    # no reference level for its own time constant: nothing to report, which is not a move
+    assert all(v is None for v in air[: settled - 1])
+    assert all(v is not None for v in air[settled + 1 :])
+    assert max(v for v in air[settled + 1 :]) < 1e-6
 
-    stepped = copy.deepcopy(req.plant)
-    for info in stepped["zones"].values():
-        info["d_air"] = 0.0
-    plants = [copy.deepcopy(stepped) for _ in range(20)]
-    jumped = copy.deepcopy(stepped)
-    for info in jumped["zones"].values():
-        info["d_air"] = 0.5
-    plants += [copy.deepcopy(jumped) for _ in range(n)]
+    plants = [air_plant(req, 0.0) for _ in range(settled + 4)]
+    plants += [air_plant(req, 0.5) for _ in range(n)]
     results = ticks_with(cfg, req, plants)
     actives = [r.diagnostics["model"]["active"] for r in results]
-    assert set(actives[:20]) == {"mpc"}
+    assert set(actives[: settled + 4]) == {"mpc"}
     switch = actives.index("pi_das")
     assert results[switch].diagnostics["model"]["reason"].startswith("air_dist:")
-    assert switch * cfg.dt >= 20 * cfg.dt + cfg.model_drift_dwell_s
+    assert switch * cfg.dt >= (settled + 4) * cfg.dt + cfg.model_drift_dwell_s
     checks = results[switch].diagnostics["model"]["checks"]
     assert checks["drift_c_per_min"] < checks["max_drift_c_per_min"]  # the drives look fine
-    assert checks["max_air_dist_c_per_min"] == 5.0
+    assert checks["max_air_dist_c_per_min"] == cfg.model_max_air_dist_c_per_min
+
+
+def air_ticks(cfg: MpcConfig, solver, req: SolverRequest, memory, ts: float, n: int, d_air: float):
+    """``n`` solves from ``ts`` with every zone's air disturbance at ``d_air``."""
+    res = None
+    for i in range(n):
+        changes = {"ts": ts + i * cfg.dt, "memory": memory, "plant": air_plant(req, d_air)}
+        res = solver.solve(cfg, dataclasses.replace(req, **changes))
+        memory = res.memory
+    return res, memory
+
+
+def test_a_clock_stepped_back_keeps_the_air_disturbances_reference_level():
+    """A wall clock stepped back (NTP, or a daemon that restarts) must not re-reference the
+    air-disturbance check to a disturbance that has already moved: the levels and their
+    ages are kept and only the filter refuses to advance, so a fouling caught mid-dwell is
+    still caught. The entry dwell itself restarts from the new clock."""
+    cfg = mpc_cfg(mpc_every_ticks=1)
+    req = fresh_req(recorded_request(cfg, drive=40.0, ticks=4))
+    solver = DasMpcSolver()
+    settled = settled_ticks(cfg)
+    t0 = 100_000.0
+    res, memory = air_ticks(cfg, solver, req, req.memory, t0, settled + 1, 0.0)
+    assert res.diagnostics["model"]["checks"]["air_dist_c_per_min"] == pytest.approx(0.0, abs=1e-6)
+
+    t1 = t0 + (settled + 1) * cfg.dt
+    half = int(0.5 * cfg.model_drift_dwell_s / cfg.dt)
+    res, memory = air_ticks(cfg, solver, req, memory, t1, half, 0.5)
+    moved = res.diagnostics["model"]["checks"]["air_dist_c_per_min"]
+    assert moved > cfg.model_max_air_dist_c_per_min
+    assert res.diagnostics["model"]["active"] == "mpc"  # still inside the entry dwell
+    assert res.diagnostics["model"]["reason"].startswith("air_dist:")
+
+    back = t1 + half * cfg.dt - 86_400.0
+    res, memory = air_ticks(cfg, solver, req, memory, back, 1, 0.5)
+    checks = res.diagnostics["model"]["checks"]
+    assert checks["air_dist_c_per_min"] == pytest.approx(moved, rel=0.05)  # still the move
+    assert checks["drift_since_ts"] == pytest.approx(back)  # the dwell counts from now
+    n = int(cfg.model_drift_dwell_s / cfg.dt) + 1
+    res, memory = air_ticks(cfg, solver, req, memory, back + cfg.dt, n, 0.5)
+    assert res.diagnostics["model"]["active"] == "pi_das"
+    assert res.diagnostics["model"]["reason"].startswith("air_dist:")
+
+
+def test_a_gap_leaves_the_air_disturbance_check_without_a_reference_level():
+    """After a gap the slow level cannot bridge (a daemon an hour offline) the check has no
+    reference: it reports nothing until the level has run again for its own time constant,
+    rather than 'no move' against whatever the disturbance happens to be now."""
+    cfg = mpc_cfg(mpc_every_ticks=1)
+    req = fresh_req(recorded_request(cfg, drive=40.0, ticks=4))
+    solver = DasMpcSolver()
+    settled = settled_ticks(cfg)
+    t0 = 100_000.0
+    res, memory = air_ticks(cfg, solver, req, req.memory, t0, settled + 1, 0.0)
+    assert res.diagnostics["model"]["checks"]["air_dist_c_per_min"] == pytest.approx(0.0, abs=1e-6)
+
+    after = t0 + (settled + 1) * cfg.dt + 3601.0
+    res, memory = air_ticks(cfg, solver, req, memory, after, 1, 0.5)
+    assert res.diagnostics["model"]["checks"]["air_dist_c_per_min"] is None
+    assert res.diagnostics["model"]["active"] == "mpc"
+    res, memory = air_ticks(cfg, solver, req, memory, after + cfg.dt, settled, 0.5)
+    # the level is a reference again, and the disturbance it re-started from is steady
+    assert res.diagnostics["model"]["checks"]["air_dist_c_per_min"] == pytest.approx(0.0, abs=1e-6)
+    assert res.diagnostics["model"]["active"] == "mpc"
 
 
 def test_the_prediction_error_guard_skips_a_bay_whose_zone_is_in_fault():
