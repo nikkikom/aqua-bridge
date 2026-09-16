@@ -106,6 +106,16 @@ Identification experiments (DAS plan section 5, :mod:`aqua_bridge.control.ident`
   ``TickPlan.experiment`` and ``diagnostics["supervisor"]["experiment"]`` carry the
   experiment's status on its ticks only (absent otherwise, so legacy diagnostics
   keep their shape).
+* **A rise in the solver's demand wins over the experiment's plan** (``ident_replan``,
+  :mod:`~aqua_bridge.control.ident`): an experiment's own override (not a human one)
+  is floored in ``compose`` with the solver's command for that tick,
+  ``max(override, mpc_cmd.pwm[ch] - ident.dip_below_solver(cfg))`` -- nothing under
+  ``above``, the owner-accepted ``ident_amplitude`` dip under ``symmetric`` -- before
+  the usual rate limit and clamp. The experiment's levels follow the demand from the
+  next tick on; this floor closes the one tick in between, so no tick of an
+  experiment puts less on a fan than the controller would have. With
+  ``ident_replan: false`` (the Zero W behaviour) neither happens and the levels stay
+  frozen at the base of the start.
 * Any other intent submitted while an experiment runs aborts it first
   (``human_intent:<kind>``), whether or not that intent is then accepted
   (conservative: the fans go back to the solver).
@@ -342,6 +352,26 @@ class TickPlan:
 
 def _clamp(value: float, lo: float, hi: float) -> float:
     return lo if value < lo else hi if value > hi else value
+
+
+def _experiment_floor(mpc_cmd: MpcCommand, plan: TickPlan, cfg: MpcConfig) -> dict[str, float]:
+    """Lowest PWM an experiment channel may be composed to this tick (module docstring).
+
+    Empty without a running experiment or with ``ident_replan: false``. Only channels
+    the experiment itself drives are floored: a human override of the same channel
+    (which aborts the experiment anyway) keeps its value."""
+    experiment = plan.experiment
+    if not cfg.ident_replan or experiment is None:
+        return {}
+    levels = experiment.get("overrides")
+    if not isinstance(levels, Mapping):
+        return {}
+    dip = ident.dip_below_solver(cfg)
+    return {
+        ch: float(mpc_cmd.pwm[ch]) - dip
+        for ch, value in levels.items()
+        if ch in cfg.channels and plan.overrides.get(ch) == value and ch in mpc_cmd.pwm
+    }
 
 
 def _fallback_channels(cmd: MpcCommand, cfg: MpcConfig) -> frozenset[str]:
@@ -810,6 +840,7 @@ class Supervisor:
             return MpcCommand(pwm=dict(mpc_cmd.pwm), mode=mpc_cmd.mode, diagnostics=diagnostics)
 
         blocked = _fallback_channels(mpc_cmd, cfg)
+        floor = _experiment_floor(mpc_cmd, plan, cfg)
         pwm: dict[str, float] = {}
         limited: dict[str, bool] = {}
         applied_any = False
@@ -817,6 +848,8 @@ class Supervisor:
             if ch in plan.overrides and ch not in blocked:
                 applied_any = True
                 want = float(plan.overrides[ch])
+                if ch in floor:
+                    want = max(want, floor[ch])
                 prev = float(prev_pwm[ch])
                 moved = _clamp(want, prev - cfg.d_pwm_max, prev + cfg.d_pwm_max)
                 limited[ch] = abs(moved - want) > _EPS
