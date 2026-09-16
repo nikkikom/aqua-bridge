@@ -79,7 +79,13 @@ from typing import Any
 from aqua_bridge.config import AppConfig, ConfigError, load_config
 from aqua_bridge.control.loop import Loop, Sink, Source
 from aqua_bridge.control.supervisor import Supervisor
-from aqua_bridge.health import FanHealthConfig, HealthMonitor, HostHealthConfig
+from aqua_bridge.health import (
+    FanHealthConfig,
+    HealthMonitor,
+    HostHealthConfig,
+    host_metrics_reader,
+    validate_host_health,
+)
 from aqua_bridge.hostinfo import CachedHostInfo
 from aqua_bridge.model import MpcCommand, MpcConfig, MpcState, PlantObservation
 from aqua_bridge.modelstore import ModelPersister, initial_state, store_path
@@ -345,23 +351,33 @@ def build_health_monitor(
 
     ``fan_health:`` and ``host_health:`` are validated here, so a bad threshold is a
     startup :class:`ConfigError` (exit 2) rather than a rule that silently never
-    fires. The board's own metrics come from a
+    fires -- ``main`` runs the same checks before anything is opened, so this one
+    never raises in the daemon. The board's own metrics come from a
     :class:`~aqua_bridge.hostinfo.CachedHostInfo` of this monitor's own, refreshed
     at most every ``host.interval_s`` seconds like the HTTP app's and the MQTT
     service's -- a tick shorter than that costs no ``/proc`` or ``/sys`` read.
+
+    This reader has the ``vcgencmd`` fallback switched off
+    (:func:`~aqua_bridge.health.host_metrics_reader`): it runs on the loop thread,
+    where a fork/exec would stretch the tick -- and the watchdog ping behind it --
+    without showing in the step budget, which is measured before the tick's
+    observers run. On a board whose firmware exposes no sysfs ``get_throttled``
+    attribute the loop simply sees ``throttled: null``; the HTTP and MQTT readers,
+    which are not on the loop thread, keep the fallback and still publish the word.
     """
     settings = FanHealthConfig.from_section(app.section("fan_health"))
     host_settings = HostHealthConfig.from_section(app.section("host_health"))
     if not settings.enabled and not host_settings.enabled and not hasattr(source, "device_health"):
         return None
     interval_s = float(app.section("host").get("interval_s", 5.0))
+    reader = host_metrics_reader(host_settings, subprocess_fallback=False)
     return HealthMonitor(
         app.mpc,
         settings,
         source=source,
         publish=supervisor.set_device_health,
         host_settings=host_settings,
-        hostinfo=CachedHostInfo(interval_s=interval_s).get,
+        hostinfo=CachedHostInfo(interval_s=interval_s, reader=reader).get,
     )
 
 
@@ -475,7 +491,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         recorder = build_recorder(app, cfg, args.record)
         # fail before anything opens
         FanHealthConfig.from_section(app.section("fan_health"))
-        HostHealthConfig.from_section(app.section("host_health"))
+        # host_health.air_temps is cross-checked against mpc.temps here too: that
+        # check needs the controller config, so it cannot live in the section model,
+        # and running it only in HealthMonitor.__init__ (built after build_io) would
+        # let a typo'd sensor name escape as a traceback with the hidraw handles open
+        # and the section 9 stop path -- the only fallback_pwm write -- skipped.
+        validate_host_health(cfg, HostHealthConfig.from_section(app.section("host_health")))
         initial, persister = build_model_store(
             cfg,
             args.model_store,
@@ -521,7 +542,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         state=initial,
     )
 
-    health = build_health_monitor(app, supervisor, source)
+    try:
+        health = build_health_monitor(app, supervisor, source)
+    except ConfigError as exc:
+        # Unreachable: the same sections were validated above, before build_io opened
+        # anything. Kept so a future check added only here still exits 2 with the
+        # hardware handed back, instead of leaking the open hidraw handles.
+        _LOG.error("config: %s", exc)
+        if release is not None:
+            try:
+                release()
+            except Exception:
+                _LOG.exception("release failed")
+        return 2
     http_service, mqtt_service = start_publishers(app, supervisor, smart_inbox=smart_inbox)
     # The health monitor runs before the MQTT publisher, so the tick it evaluated is
     # the tick the state blob carries.
