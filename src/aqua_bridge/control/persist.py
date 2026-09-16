@@ -135,13 +135,17 @@ def _ident_settle(
         warnings.append("ident_settle: not a mapping, section dropped")
         return {}
     gap = cfg.ident_settle_resume_max_gap_s
-    if stale or age_s is None or age_s < 0.0 or age_s > gap:
+    cause: str | None = None
+    if age_s is None or age_s < 0.0:
+        # modelstore only leaves the age unknown when the wall clock is behind the file.
+        cause = "the file's age is unknown (the wall clock is behind it)"
+    elif stale:
+        cause = f"the file is stale ({age_s:.0f} s old, past model_store_max_age_days)"
+    elif age_s > gap:
+        cause = f"the outage ({age_s:.0f} s) is past ident_settle_resume_max_gap_s ({gap:g} s)"
+    if cause is not None:
         if raw:
-            warnings.append(
-                f"ident_settle: the outage ({'unknown' if age_s is None else f'{age_s:.0f} s'}) "
-                f"is past ident_settle_resume_max_gap_s ({gap:g} s), the experiments' "
-                "settle timers start over"
-            )
+            warnings.append(f"ident_settle: {cause}, the experiments' settle timers start over")
         return {}
     zones = set(cfg.zone_layout.zones)
     out: dict[str, float] = {}

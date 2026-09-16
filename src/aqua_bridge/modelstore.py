@@ -52,8 +52,9 @@ that ``mpc.fan_curve_online`` fits online (:mod:`aqua_bridge.control.fancurve`),
 without the switch.
 ``ident_settle`` is the experiments' settle timers
 (:func:`aqua_bridge.control.ident.settle_snapshot`, through the ``ident_settle``
-callable this class is constructed with) as **seconds already settled**, not times,
-so they need no clock conversion;
+callable :class:`ModelPersister` is constructed with -- without it the section stays
+empty and a restart starts every settle timer over) as **seconds already settled**, not
+times, so they need no clock conversion;
 :func:`aqua_bridge.control.persist.apply_seed` subtracts the outage from them and
 drops them altogether when it was too long.
 

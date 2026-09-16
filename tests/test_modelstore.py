@@ -173,6 +173,23 @@ def test_store_path_cli_env_and_legacy(cfg):
     assert main_mod.build_model_store(cfg, None, env={"STATE_DIRECTORY": "/tmp"}) == (None, None)
 
 
+def test_build_model_store_passes_the_settle_timers_through(tmp_path):
+    """Section 8 item 20: the ``ident_settle`` callable is a parameter, not an attribute
+    a caller has to remember to set afterwards -- forgetting it writes the section empty
+    and a restart starts every settle timer over."""
+    das = load_config(EXAMPLE_DAS_CONFIG).mpc
+    path = tmp_path / "model.json"
+    _, persister = main_mod.build_model_store(
+        das, str(path), env={}, wall=lambda: NOW, ident_settle=lambda: {"z0": 300.0}
+    )
+    assert persister is not None
+    assert persister.ident_settle is not None
+    assert persister.ident_settle() == {"z0": 300.0}
+    # and without one the persister is inert rather than broken
+    _, plain = main_mod.build_model_store(das, str(path), env={}, wall=lambda: NOW)
+    assert plain is not None and plain.ident_settle is None
+
+
 def test_fingerprint_covers_structure_not_policy():
     base = MpcConfig.from_mapping(das_mapping())
     fp = modelstore.fingerprint(base)
@@ -959,14 +976,25 @@ def test_the_settle_timers_go_into_the_file_as_seconds_and_come_back_minus_the_o
 def test_a_long_outage_a_stale_file_or_an_unknown_age_drop_the_settle_timers(tmp_path):
     cfg = shadow_cfg()
     gap = cfg.ident_settle_resume_max_gap_s
-    for age, source in ((gap + 1.0, "fresh"), (-60.0, "stale"), (40 * 86400.0, "stale")):
+    # The three causes are three different messages: each names the key or the clock the
+    # owner has to look at, and none blames the gap for the other two.
+    cases = (
+        (gap + 1.0, "fresh", "ident_settle_resume_max_gap_s"),
+        (-60.0, "stale", "the wall clock is behind it"),
+        (40 * 86400.0, "stale", "model_store_max_age_days"),
+    )
+    for age, source, expected in cases:
         result = settle_seed(cfg, tmp_path, age_s=age, z0=9000.0)
         assert result.source == source
         cmd, _, _ = run(cfg, modelstore.initial_state(result), 1)
         store = cmd.diagnostics["store"]
         assert "ident_settle" not in store, (age, store)
         assert store["sections"]["ident_settle"] == 0
-        assert any("ident_settle" in w for w in store["warnings"]), age
+        said = [w for w in store["warnings"] if "ident_settle" in w]
+        assert said, age
+        assert any(expected in w for w in said), (age, said)
+        if expected != "ident_settle_resume_max_gap_s":
+            assert not any("ident_settle_resume_max_gap_s" in w for w in said), (age, said)
 
 
 def test_a_malformed_settle_section_is_dropped_with_a_warning(tmp_path):

@@ -881,8 +881,9 @@ class Supervisor:
     def ident_settle_snapshot(self) -> dict[str, float]:
         """The experiments' settle timers for the model store: ``{zone: seconds settled}``.
 
-        ``aqua_bridge.modelstore.ModelPersister`` is constructed with this; empty in
-        legacy mode and before the first zoned tick."""
+        ``aqua_bridge.__main__.build_model_store`` hands
+        ``aqua_bridge.modelstore.ModelPersister`` a callable that reaches this once the
+        supervisor exists; empty in legacy mode and before the first zoned tick."""
         with self._lock:
             return ident.settle_snapshot(self._ident_tracker)
 
