@@ -120,6 +120,17 @@ def test_record_from_tick_extracts_das_fields() -> None:
     json.dumps(rec, allow_nan=False)
 
 
+def test_record_from_tick_excludes_a_confirming_sensor() -> None:
+    """Item 62: a sensor still confirming is skipped even though the gate already shows
+    it as trusted -- ``mpc.step`` does not fuse it live either (module docstring)."""
+    cfg = _small_das_cfg()
+    diag = _das_diagnostics(sensor_confirm={"prox_a1": 1})
+    cmd = MpcCommand(pwm={ch: 0.5 for ch in cfg.channels}, mode=Mode.AUTO, diagnostics=diag)
+    rec = record_from_tick(_result(cmd), cfg)
+    # air_a still fused; prox_a1 dropped even though gate.per_temp["prox_a1"] is True
+    assert rec["trusted_temps"] == {"air_a": 30.0}
+
+
 def test_record_from_tick_legacy_config_has_no_das_fields(cfg: MpcConfig) -> None:
     diag = _das_diagnostics()  # a das-shaped diagnostics dict would never occur live, but
     # record_from_tick must ignore it when the *config* is legacy regardless.

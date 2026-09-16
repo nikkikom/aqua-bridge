@@ -29,8 +29,10 @@ Every field a record needs to *replay* the tick through
 directly from the fields ``mpc.step`` already computed for that tick --
 ``diagnostics["prev_pwm"]`` (the command the thermal model treats as ``u`` in
 effect over the interval ending at this tick), ``diagnostics["gate"]``
-(``filtered``/``per_temp``) restricted to ``time.status in (ok, first)`` for
-``trusted_temps``, ``diagnostics["zones"]`` (``trusted`` and not ``fault``) for
+(``filtered``/``per_temp``) restricted to ``time.status in (ok, first)`` and
+with the names of ``diagnostics["sensor_confirm"]`` excluded (a confirming
+sensor is not fused live either -- item 62) for ``trusted_temps``,
+``diagnostics["zones"]`` (``trusted`` and not ``fault``) for
 ``zones_ok``, and ``diagnostics["bays"]`` (occupancy, class, calibration, serial)
 verbatim -- the exact shape ``control.mpc._thermal_shadow`` reads from
 ``EstimatorUpdate.bays`` live. A tick whose controller raised (``TickResult.
@@ -150,9 +152,12 @@ def record_from_tick(result: TickResult, cfg: MpcConfig) -> dict[str, Any]:
     gate = diagnostics.get("gate")
     filtered = _mapping(gate.get("filtered")) if isinstance(gate, Mapping) else {}
     per_temp = _mapping(gate.get("per_temp")) if isinstance(gate, Mapping) else {}
+    confirming = _mapping(diagnostics.get("sensor_confirm"))
     trusted_temps: dict[str, float] = {}
     if das and time_status in ("ok", "first"):
         for name in cfg.temps:
+            if name in confirming:  # not fused live either (item 62); exclude it here too
+                continue
             if per_temp.get(name) and _finite(filtered.get(name)):
                 trusted_temps[name] = float(filtered[name])
     zones_ok: list[str] = []

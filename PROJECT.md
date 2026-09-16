@@ -4251,8 +4251,10 @@ Owner decision (2026-09-16):
     instead of fusing it on trust alone (`tests/test_sensor_confirm.py`).
     The whole run's genuine first tick (`last_good_obs is None`) is
     unaffected and stays bumpless.
-62. `src/aqua_bridge/recorder.py` still records a sensor while it is
-    confirming; skip the names in `diagnostics["sensor_confirm"]`.
+62. **Done** (2026-09-16): `record_from_tick` now skips the names of
+    `diagnostics["sensor_confirm"]` when building `trusted_temps`, the
+    same exclusion `mpc.step` itself applies before fusing a sensor
+    (`tests/test_recorder.py`).
 63. `diagnostics["gate"]["per_temp"]` shows a confirming sensor as
     trusted, so HTTP and MQTT show it trusted while the estimator
     ignores it.
