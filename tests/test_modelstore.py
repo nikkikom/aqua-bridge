@@ -932,6 +932,75 @@ def test_persister_never_writes_an_unapplied_seed_and_never_raises(tmp_path):
         modelstore.ModelPersister(load_config(EXAMPLE_CONFIG).mpc, path)
 
 
+# ---------------------------------------------------------------------------
+# the experiments' settle timers (section 8 item 20)
+# ---------------------------------------------------------------------------
+
+
+def settle_seed(cfg: MpcConfig, tmp_path: Path, *, age_s: float, **settle: float):
+    doc = stored_doc(cfg, saved_wall=NOW - age_s, ident_settle=settle)
+    return modelstore.load(write_doc(tmp_path / "m.json", doc), cfg, now_wall=NOW)
+
+
+def test_the_settle_timers_go_into_the_file_as_seconds_and_come_back_minus_the_outage(tmp_path):
+    cfg = shadow_cfg()
+    doc = modelstore.build_document(
+        cfg, {}, ts=500.0, wall=NOW, ident_settle={"z0": 900.0, "z1": 0.0, "z2": "no"}
+    )
+    assert doc["ident_settle"] == {"z0": 900.0, "z1": 0.0}  # seconds, no clock conversion
+    result = settle_seed(cfg, tmp_path, age_s=120.0, z0=900.0, z1=60.0)
+    cmd, _, _ = run(cfg, modelstore.initial_state(result), 1)
+    store = cmd.diagnostics["store"]
+    assert store["sections"]["ident_settle"] == 1  # z1's 60 s did not survive a 120 s outage
+    assert store["ident_settle"]["credit_s"] == {"z0": 780.0}
+    assert store["ident_settle"]["ts"] == 0.0
+
+
+def test_a_long_outage_a_stale_file_or_an_unknown_age_drop_the_settle_timers(tmp_path):
+    cfg = shadow_cfg()
+    gap = cfg.ident_settle_resume_max_gap_s
+    for age, source in ((gap + 1.0, "fresh"), (-60.0, "stale"), (40 * 86400.0, "stale")):
+        result = settle_seed(cfg, tmp_path, age_s=age, z0=9000.0)
+        assert result.source == source
+        cmd, _, _ = run(cfg, modelstore.initial_state(result), 1)
+        store = cmd.diagnostics["store"]
+        assert "ident_settle" not in store, (age, store)
+        assert store["sections"]["ident_settle"] == 0
+        assert any("ident_settle" in w for w in store["warnings"]), age
+
+
+def test_a_malformed_settle_section_is_dropped_with_a_warning(tmp_path):
+    cfg = shadow_cfg()
+    doc = stored_doc(cfg, saved_wall=NOW - 10.0, ident_settle="nonsense")
+    result = modelstore.load(write_doc(tmp_path / "m.json", doc), cfg, now_wall=NOW)
+    assert any("ident_settle" in w for w in result.warnings)
+    result = settle_seed(cfg, tmp_path, age_s=10.0, z0="soon", nowhere=10.0)
+    cmd, _, _ = run(cfg, modelstore.initial_state(result), 1)
+    store = cmd.diagnostics["store"]
+    assert "ident_settle" not in store
+    assert any("not a zone" in w for w in store["warnings"])
+
+
+def test_the_persister_asks_the_supervisor_for_the_settle_timers(tmp_path):
+    cfg = shadow_cfg()
+    path = tmp_path / "model.json"
+    timers: dict[str, Any] = {"z0": 120.0}
+    persister = modelstore.ModelPersister(
+        cfg,
+        path,
+        clock=FakeClock(),
+        wall=lambda: NOW,
+        interval_s=0.0,
+        ident_settle=lambda: timers,
+    )
+    _, state, _ = run(cfg, MpcState.cold(), 1)
+    persister.on_tick(SimpleNamespace(state=state, mpc_cmd=None))
+    assert json.loads(path.read_text())["ident_settle"] == {"z0": 120.0}
+    timers = None  # type: ignore[assignment]
+    persister.on_tick(SimpleNamespace(state=state, mpc_cmd=None))
+    assert json.loads(path.read_text())["ident_settle"] == {}
+
+
 def test_calibration_times_in_the_future_of_the_snapshot_are_undated():
     cfg = serial_cfg("SER-A")
     section = saved_calibration(cfg, 100.0, {"SER-A": cal_entry(ts=150.0)})
