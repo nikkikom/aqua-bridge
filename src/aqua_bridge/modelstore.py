@@ -85,11 +85,13 @@ SMART calibrations or the bay view of the machine that loads it) and ``saved_wal
 the report's ``generated_at``, so a fit from last year loads ``stale`` exactly like a
 store file from last year. ``tools/fit_model.py --store-out PATH`` writes the converted
 document next to the report, and :func:`load` also accepts a *report* in the store's own
-place, so copying the tool's ``model.json`` to ``$STATE_DIRECTORY`` works. Two
-differences from a file the daemon wrote, both warned about on load: the report carries
-no store fingerprint, so its structure is checked only by the thermal model's own
-fingerprint (:func:`aqua_bridge.control.thermal.restore`), and the persister replaces
-the file with a store document at its first save -- keep the tool's output elsewhere.
+place, so copying the tool's ``model.json`` to ``$STATE_DIRECTORY`` works. The report
+carries the store fingerprint of the config it was fitted against
+(``store_fingerprint``), so a report of another machine's structure is refused on exactly
+the rule a store file is refused on; a report from a tool older than that field is
+refused too, and re-running the fit gives one. The one difference from a file the daemon
+wrote, warned about on load: the persister replaces the file with a store document at its
+first save -- keep the tool's output elsewhere.
 
 Save (:class:`ModelPersister`)
 ------------------------------
@@ -293,9 +295,8 @@ def load(path: str | os.PathLike[str], cfg: MpcConfig, *, now_wall: float) -> Lo
                 return _prior(result, f"store: {p} is a fit report but {exc}")
             result.warnings.append(
                 f"store: {p} is a tools/fit_model.py report; its fitted model is loaded "
-                "and the other sections start at their prior. Its structure is checked "
-                "against the thermal model's own fingerprint, not the store's, and the "
-                "daemon replaces the file with a store document at its first save."
+                "and the other sections start at their prior. The daemon replaces the "
+                "file with a store document at its first save."
             )
         if doc.get("schema") != SCHEMA or doc.get("v") != SCHEMA_VERSION:
             return _prior(result, f"store: unknown schema {doc.get('schema')!r} v{doc.get('v')!r}")
@@ -417,14 +418,22 @@ def document_from_fit(
     """A store document from a ``tools/fit_model.py`` report (module docstring, *A fitted
     model*).
 
-    ``payload`` is the report as the tool writes it (``kind``/``v`` and ``memory``, which
-    is already in exactly the shape ``solver_memory["thermal"]`` uses). The thermal
-    section is that memory; ``fan_curves``, ``calibration`` and ``bays`` are empty,
-    because a fit of a recording knows nothing about the SMART calibrations or the bay
-    view of the machine that will load it. ``wall`` defaults to the report's
+    ``payload`` is the report as the tool writes it (``kind``/``v``, ``memory`` -- which
+    is already in exactly the shape ``solver_memory["thermal"]`` uses -- and
+    ``store_fingerprint``, :func:`fingerprint` of the config the fit ran against). The
+    thermal section is that memory; ``fan_curves``, ``calibration`` and ``bays`` are
+    empty, because a fit of a recording knows nothing about the SMART calibrations or the
+    bay view of the machine that will load it. ``wall`` defaults to the report's
     ``generated_at``, so the file's age -- and with it the ``fresh`` / ``stale`` rule --
-    is the age of the *fit*, not of the conversion. Raises ``ValueError`` for anything
-    that is not such a report.
+    is the age of the *fit*, not of the conversion.
+
+    The document's ``fingerprint`` is the report's ``store_fingerprint``, never
+    :func:`fingerprint` of the config doing the conversion: that is what makes
+    :func:`load`'s fingerprint check bite on a report as it does on a store file, so a
+    fit of another machine's structure is refused rather than loaded. A report without
+    it (written before it was recorded) raises ``ValueError`` -- re-run the fit.
+
+    Raises ``ValueError`` for anything that is not such a report.
     """
     if not isinstance(payload, Mapping) or payload.get("kind") != FIT_KIND:
         raise ValueError(f"not an {FIT_KIND} report")
@@ -433,6 +442,14 @@ def document_from_fit(
     memory = payload.get("memory")
     if not isinstance(memory, Mapping):
         raise ValueError("it carries no thermal memory")
+    fp = payload.get("store_fingerprint")
+    if not isinstance(fp, str) or not fp:
+        raise ValueError(
+            "it carries no store_fingerprint (a report from an older tools/fit_model.py; "
+            "re-run the fit to get one)"
+        )
+    if fp != fingerprint(cfg):
+        raise ValueError("it was fitted against another config structure")
     if wall is None:
         generated = payload.get("generated_at")
         if not _finite(generated):
@@ -441,7 +458,7 @@ def document_from_fit(
     return {
         "schema": SCHEMA,
         "v": SCHEMA_VERSION,
-        "fingerprint": fingerprint(cfg),
+        "fingerprint": fp,
         "saved_wall": float(wall),
         "thermal": dict(memory),
         "fan_curves": {},

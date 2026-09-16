@@ -118,6 +118,11 @@ def test_fit_end_to_end_on_a_synthetic_recording(
     assert payload["summary"]["status"] in thermal.STATUSES
     st = thermal.structure(cfg)
     assert payload["fingerprint"] == st.fingerprint
+    # the model store's own structure fingerprint travels with the report, so a report
+    # copied into $STATE_DIRECTORY is checked on the rule a store file is checked on
+    from aqua_bridge import modelstore
+
+    assert payload["store_fingerprint"] == modelstore.fingerprint(cfg)
     assert set(payload["bay_ranking"][0]) >= {
         "bay",
         "zone",

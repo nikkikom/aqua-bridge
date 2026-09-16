@@ -52,9 +52,11 @@ thermal.theta_from_memory`.
 ``--model-store PATH`` or ``$STATE_DIRECTORY/model.json``: the fitted memory becomes
 the store's ``thermal`` section and its ``saved_wall`` is this run's clock, so the
 usual ``fresh`` / ``stale`` rule applies to the age of the fit. The daemon also
-accepts the *report* itself in the store's place, but it replaces that file with a
-store document at its first save, so write the store copy separately and keep the
-report.
+accepts the *report* itself in the store's place -- it carries ``store_fingerprint``,
+the store's own structure fingerprint of this config, so a report meant for another
+machine is refused there exactly as a store file would be -- but it replaces that file
+with a store document at its first save, so write the store copy separately and keep
+the report.
 """
 
 from __future__ import annotations
@@ -473,6 +475,9 @@ def fit(
         "v": 1,
         "kind": "aqua_bridge.thermal_model",
         "fingerprint": st.fingerprint,
+        # the model store's own structure fingerprint, so a report copied into
+        # $STATE_DIRECTORY is refused for a config it was not fitted against
+        "store_fingerprint": modelstore.fingerprint(cfg),
         "n_records": len(records),
         "n_train": len(train),
         "n_holdout": len(holdout),

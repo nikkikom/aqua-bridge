@@ -265,6 +265,7 @@ def fit_report(cfg: MpcConfig, *, generated_at: float, **changes: Any) -> dict[s
         "v": modelstore.FIT_VERSION,
         "kind": modelstore.FIT_KIND,
         "fingerprint": thermal.cached_structure(cfg).fingerprint,
+        "store_fingerprint": modelstore.fingerprint(cfg),
         "memory": thermal.fresh_memory(cfg, status="converged"),
         "generated_at": generated_at,
     }
@@ -309,14 +310,38 @@ def test_a_fit_report_for_another_structure_drops_its_model(tmp_path):
     assert cmd.diagnostics["thermal"]["status"] == "prior"
 
 
+def _fans_with_count(cfg: MpcConfig, channel: str, count: int) -> dict[str, Any]:
+    fans = dict(cfg.fans)
+    fans[channel] = dataclasses.replace(fans[channel], count=count)
+    return fans
+
+
+def test_a_fit_report_of_another_config_is_refused_on_the_store_fingerprint(tmp_path):
+    """The workflow item 15 documents -- copy the tool's model.json to $STATE_DIRECTORY --
+    must be as safe as a store file: the report carries the store's own structure
+    fingerprint, so a fit for a machine with a different fan count, sensor role or dt is
+    refused here, not half-checked by the thermal model's own fingerprint (which covers
+    neither)."""
+    cfg = shadow_cfg()
+    other = shadow_cfg(fans=_fans_with_count(cfg, next(iter(cfg.fans)), 4))
+    assert thermal.cached_structure(other).fingerprint == thermal.cached_structure(cfg).fingerprint
+    assert modelstore.fingerprint(other) != modelstore.fingerprint(cfg)
+    doc = fit_report(other, generated_at=NOW - 60)
+    result = modelstore.load(write_doc(tmp_path / "model.json", doc), cfg, now_wall=NOW)
+    assert result.source == "prior" and "thermal" not in (result.seed or {})
+    assert "another config structure" in result.warnings[0], result.warnings
+
+
 @pytest.mark.parametrize(
     ("change", "needle"),
     [
         ({"v": 2}, "its version is 2"),
         ({"memory": "not a mapping"}, "no thermal memory"),
         ({"generated_at": None}, "no finite generated_at"),
+        ({"store_fingerprint": None}, "no store_fingerprint"),
+        ({"store_fingerprint": "0" * 64}, "another config structure"),
     ],
-    ids=["version", "memory", "generated_at"],
+    ids=["version", "memory", "generated_at", "no-fingerprint", "other-fingerprint"],
 )
 def test_a_malformed_fit_report_loads_the_prior(tmp_path, change, needle):
     cfg = shadow_cfg()
