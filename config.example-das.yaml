@@ -85,8 +85,17 @@ mpc:
   mpc_tau_s: 120.0       # legacy MPC model only
   mpc_gain_c_per_pwm: 8.0
   mpc_estimator_gain: 0.1
+  # Step budget (§8.1 owner decisions 2026-09-14, §8 item 73). If the DAS MPC misses
+  # budget_ms on the Zero W after the item 73 optimisations, the owner's fallback is to
+  # set all three of these together -- budget_ms must stay strictly below
+  # budget_alarm_ms, so raising it to 1000 means raising the alarm above 1000 too
+  # (1250 keeps the 1.25 ratio, still a quarter of dt), and mpc_every_ticks: 3 below
+  # cuts the mean step and the CPU share, not the p99 (a solve tick is the slow one):
+  #   budget_ms: 1000.0
+  #   budget_alarm_ms: 1250.0
+  #   mpc_every_ticks: 3
   budget_ms: 600.0        # runtime alarm + CI/Pi bench gate: warn past this step() time, ms (> 0);
-                           # §8.1 owner decision 2026-09-14, measured DAS MPC p99 507-552 ms on the Zero W
+                           # measured DAS MPC p99 609-615 ms on the Zero W (item 73, to be re-measured)
   budget_alarm_ms: 750.0  # error instead past this, ms (> budget_ms)
   budget_log_interval_s: 60.0  # rate limit for both budget log lines, seconds (> 0)
   pi_kp: 0.02            # PWM per degC of margin deficit (> 0)
@@ -266,6 +275,7 @@ mpc:
   mpc_pred_dt_s: 30.0    # prediction step, seconds (>= dt)
   mpc_blocks: [1, 1, 2, 4, 6, 6]  # move blocks, sum = horizon
   mpc_every_ticks: 2     # solve every 2nd tick (Zero W budget at dt = 5 s); replay the plan between
+                         # (item 73 fallback: 3, together with the raised budget_ms above)
   rho_soft: 40.0         # penalty per degC^2 above a drive's soft target (limit - comfort - k sigma)
   rho_hard: 4000.0       # penalty per degC^2 above its hard target (limit - k sigma)
   solver_outer_max: 4    # active-piece iterations per solve

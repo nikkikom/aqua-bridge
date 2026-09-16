@@ -719,7 +719,12 @@ long `dt`):
 `budget_ms` / `budget_alarm_ms` (600 ms / 750 ms default, at `dt = 5 s` in the
 DAS example) gate both the benchmark (`tools/bench_step.py`,
 `tests/test_bench_budget.py`) and the runtime alarm (`control/loop.py`, §4.3
-"Loop / glue"); both read the config, never a hardcoded literal.
+"Loop / glue"); both read the config, never a hardcoded literal. They move
+together: `budget_ms` must stay strictly below `budget_alarm_ms`, so raising
+one to or past the other is a rejected config, not a silent clamp. Both log
+lines name the key that was exceeded and the keys an operator can change --
+including `mpc_every_ticks` where the DAS MPC is the solver, which is the only
+place that key does anything.
 
 Derived tick quantities are properties, never YAML keys:
 
@@ -1649,24 +1654,52 @@ demand` so the first output equals `prev`; the offset decays with 15 s
 when more cooling is wanted and 60 s when less. `integrator` holds the
 first block per driven channel.
 
-**Budget at `dt = 5 s`.** The Zero W is about 100× slower than the
-development machine for numpy-heavy code (legacy MPC: p99 0.3–0.4 ms
-there, 34.5 ms on the Zero W). Hard gate per tick 600 ms (12 % of `dt`; raised from 500 ms by the owner
-after the Zero W measured a DAS MPC p99 of 507–552 ms), alarm 750 ms. Measured with `tools/bench_step.py` on the development
-machine (`--sim-plant das` for the DAS rows); the Zero W column is the
-100× extrapolation, to be replaced by the hardware validation:
+**Budget at `dt = 5 s`.** Hard gate per tick 600 ms (12 % of `dt`; raised
+from 500 ms by the owner after the Zero W measured a DAS MPC p99 of
+507–552 ms), alarm 750 ms. Measured with `tools/bench_step.py` on the
+development machine (`--sim-plant das` for the DAS rows). The Zero W
+column is measured, not extrapolated. The factor between the two machines
+is **not** the single 100× the plan first assumed: the legacy MPC scales
+by about 100× (0.3–0.4 ms against 34.5 ms), the DAS MPC by about 180×
+(3.3–3.6 ms against 609–615 ms) and the PI-like DAS form by about 220×
+(1.5 ms against 322 ms). The more of a step is small numpy calls and
+Python bookkeeping rather than the few large matrix operations the ×100
+was measured on, the worse the Zero W does — so an extrapolation from
+this machine is a lower bound on the Pi, never a promise.
 
-| Configuration | Step p99 (dev machine) | Zero W (×100) | Verdict |
-|---------------|------------------------|---------------|---------|
-| Legacy MPC, 2 temps × 2 channels, `dt = 2` | 0.3–0.4 ms | 34.5 ms measured | legacy reference |
-| DAS MPC, 25 sensors, 15 bays, 8 channels, N = 20 × 30 s, blocks `[1, 1, 2, 4, 6, 6]`, estimator every tick | 3.3–3.6 ms (9–11× the legacy MPC) | ~350 ms on a solve tick | within the gate with `mpc_every_ticks: 2` (solve every 10 s) |
-| PI-like DAS form + estimator, same layout | ~1.4 ms | ~140 ms | always available |
+| Configuration | Step p99 (dev machine) | Zero W | Verdict |
+|---------------|------------------------|--------|---------|
+| Legacy MPC, 2 temps × 2 channels, `dt = 2` | 0.3–0.4 ms | 34.5 ms measured (×100) | legacy reference |
+| DAS MPC, 25 sensors, 15 bays, 8 channels, N = 20 × 30 s, blocks `[1, 1, 2, 4, 6, 6]`, estimator every tick | 2.8–2.9 ms after item 73, 3.3–3.4 before (9–11× the legacy MPC) | 609–615 ms measured before item 73 (×180) | over the 600 ms gate before item 73; to be re-measured (§8 item 73) |
+| PI-like DAS form + estimator, same layout | ~1.5 ms | 322 ms measured (×220) | always available |
+
+Where the DAS MPC's step goes after item 73 (development machine,
+`config.example-das.yaml` against the DAS truth plant, 240 ticks with 20
+discarded, per-phase wall time on a **solve** tick; timing wrappers add a
+few per cent to every figure): the SQP with its box QPs 0.73 ms, the
+estimator 0.64 ms, building the penalised QP and the noise surrogate
+0.21 ms, the prediction 0.28 ms (of which the linearisation rebuild
+0.15 ms — it misses the memo on about half the solve ticks, 51 % over 380
+ticks and 65 % over the 220 measured here, and a bigger memo does not
+help: the command keeps landing on new quantisation points, so the miss
+rate is the same at cache sizes 8 through 256), the operating point and
+the model checks 0.17 ms, the solver's
+own bookkeeping 0.28 ms, the sensor gate 0.10 ms, the `json.dumps` guard
+on the solver memory and the diagnostics 0.10 ms, the rest of `step`
+0.20 ms. Cutting the first two means changing the arithmetic, which would
+move the goldens.
 
 CI checks the ratio (DAS MPC p99 ≤ 12× legacy MPC p99 in the same
-process, `tests/test_bench_budget.py`); the absolute 600 ms gate runs only
-on the Pi (marker `pi`). If the Pi measures worse, the reductions in
-order: `mpc_every_ticks: 4`, fewer or longer blocks with a shorter
-horizon, a Zero 2 W.
+process, `tests/test_bench_budget.py`); the absolute `mpc.budget_ms` gate
+runs only on the Pi (marker `pi`). If the Pi still measures worse, the
+owner's fallback (§8.1, 2026-09-14) is config, not a code change:
+`budget_ms: 1000.0` **with** `budget_alarm_ms: 1250.0` (the model rejects
+a `budget_ms` that is not below the alarm) and `mpc_every_ticks: 3`.
+Solving every third tick lowers the mean step and the CPU share, not the
+p99: while solve ticks are more than 1 % of ticks the p99 over all ticks
+is a solve tick, so the raised `budget_ms` is what covers it. Further
+reductions, in order: `mpc_every_ticks: 4`, fewer or longer blocks with a
+shorter horizon, a Zero 2 W.
 
 ### DAS persistence, stale rule and experiments
 
@@ -2854,7 +2887,9 @@ Loop / glue (`tests/test_loop.py`, still no HID):
 - step budget alarm: `step()` wall time (a monotonic clock outside
   `step`, which stays pure) past `mpc.budget_ms` logs a warning, past
   `mpc.budget_alarm_ms` an error instead, each rate limited to one line per
-  `mpc.budget_log_interval_s` naming the exceedances since the last line;
+  `mpc.budget_log_interval_s` naming the exceedances since the last line,
+  the key that was exceeded and the keys an operator can change (raise both
+  budgets; with the DAS MPC also `mpc.mpc_every_ticks`, §8 item 73);
   `step_ms_last`, `step_ms_max` and both cumulative counters reach
   `/api/health` and the MQTT state blob (an injected clock drives the test)
 
@@ -3170,7 +3205,8 @@ runners allow it.
   overrides and bumpless release through the loop, an override on frozen
   temperatures tripping Stuck, run scheduling, the `on_tick` hook, the
   step budget alarm (injected clock: tracking, warn/error thresholds,
-  log rate limiting, `/api/health` and the MQTT state blob), sim
+  log rate limiting, the raised thresholds of the §8 item 73 fallback, the
+  config keys both lines name, `/api/health` and the MQTT state blob), sim
   closed loops (`slow`).
 - `tests/test_main.py` — CLI parsing, exit codes, `--once`, sim wiring
   (`--sim-plant basic|rich|das`), xt6 map mismatch → exit 2, `--source
@@ -3246,7 +3282,7 @@ tests carry the `nightly` marker.
 | `tests/test_solver_das.py` | active-piece SQP vs a projected-gradient reference, monotone objective, iteration cap, forbidden-band snap and hysteresis, zero-order hold, prediction vs thermal Jacobians, noise index and surrogate, bumpless offset, fixed channels, validity gate and model fallback with dwell, a clock stepped back, horizon and block extremes | PR |
 | `tests/test_model_fallback_sim.py` | return from the model fallback after a load step (§8 item 10): the observed drive rate (ramp, restarts, memory), a sound model returns within `model_return_dwell_s + 2 · mpc_every_ticks · dt`, a model with wrong bay gains is caught and held, every drive within its limit and bumpless switches; the plain drift holds the same step | PR: 1 return, 1 broken model; nightly: zones × seeds on `basic` and `rich`, more broken gains |
 | `tests/test_noise_regression.py` | calibrated DAS MPC noise ≤ 0.8× the quietest uniform curve at equal or better worst true margin (measured 0.31–0.48×); uncalibrated bound 2.0 (0.30–0.69×); rich preset bound 1.35 (up to 1.30×); MPC vs PI-DAS reported, not asserted (PI-DAS has not settled within the window on several seeds) | PR: 2 seeds; nightly: 8-seed sweeps |
-| `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× (named constant) the legacy MPC p99, the 75th percentile of several interleaved, warm-up-discarded repeats (§8 item 6); `bench_step.py` runs both DAS solvers; absolute p99 ≤ `mpc.budget_ms` only on `armv6l` | PR / Pi |
+| `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× (named constant) the legacy MPC p99, the 75th percentile of several interleaved, warm-up-discarded repeats (§8 item 6); `bench_step.py` runs both DAS solvers; absolute p99 ≤ `mpc.budget_ms` only on `armv6l`; the Zero W fallback of §8 item 73 (`budget_ms` 1000 with `budget_alarm_ms` 1250 loads, `budget_ms` 1000 alone is rejected, `mpc_every_ticks: 3` solves a third of the ticks and a solve tick is the expensive one) | PR / Pi |
 | `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise | PR |
 | `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes; legacy refuses | PR |
 | `tests/test_sim_das.py` | the truth plant: energy balance through transients and hot swap, steady state, more airflow never warms anything, dead band and exponent, quantisation per sensor type, lags, SMART cadence, determinism per seed | PR |
@@ -3807,8 +3843,9 @@ them as "§8 item N".
 - The HTTP API is served over **HTTPS with basic auth** (item 4).
 - The DAS step budget on the Zero W is **600 ms** p99 (was 500 ms), alarm
   750 ms (implemented in `tools/bench_step.py` and
-  `tests/test_bench_budget.py`; `pytest -m pi` passes on the Zero W, where
-  the DAS MPC measured p99 507–552 ms).
+  `tests/test_bench_budget.py`; `pytest -m pi` passed on the Zero W at the
+  time, where the DAS MPC measured p99 507–552 ms — it measured 609–615 ms
+  after items 3, 8, 9 and 10, which is item 73).
 - Live MQTT and Home Assistant checks use the owner's Home Assistant
   broker; its host name is in `private.md` (item 21).
 - An experiment holding back a cooling increase is deferred to the
@@ -3995,33 +4032,70 @@ Owner decision (2026-09-16):
 72. Under `sigma`, an identification experiment can start in a zone that
     has a lost sensor, because the zone is still trusted
     (`control/ident.py` precondition).
-73. DAS step budget on the Zero W after items 3, 8, 9 and 10: DAS MPC
-    p99 609–615 ms (solve ticks 643 ms) against `mpc.budget_ms` 600, so
-    `pytest -m pi` fails again (it was 507–552 ms); PI-like DAS p99
-    322 ms. Owner decision 2026-09-14: optimise; if the DAS MPC still
-    misses 600 ms, raise `mpc.budget_ms` to 1000; solve every third tick
-    (`mpc_every_ticks: 3`). Note that p99 over all ticks is set by the
-    solve ticks while they are more than 1 % of ticks, so solving less
-    often lowers the mean, not the p99. Run the runtime alarm against the
-    DAS MPC on the Pi (the 20-minute run used PI-like DAS).
-79. **Done** (2026-09-16): the per-output readings ride
-    `PlantObservation.inputs["fans"]` (exogenous, never gated, never in
-    `mpc.step`, so no golden changed), are written as the recorder's `fans`
-    key and are published in `/api/state`'s `device_health`, the MQTT state
-    blob and the page; `health.HealthMonitor` warns on rpm away from the
-    fitted `fan_models` curve, a rail outside its window and power out of
-    line with the duty, each sustained and each with its own `fan_health:`
-    key (§3 "Fan and device health"). Nothing is judged below `min_duty`,
-    and the rpm and power rules judge a reading against the band the duty
-    spanned over the last `settle_s` (never against one tick's duty alone),
-    so the aquabus rpm lag never fires while a duty that keeps moving is
-    still judged; the rail rule needs no duty and runs at any. The power
-    rule only runs where the device reports power, so the aquaero's own
-    0 mA / 0 W is not a fault. Left for the hardware (item 94):
-    `power_w_at_max` is unmeasured, so the power rule is off by default,
-    and the default thresholds are wide guesses until a recording of the
-    real enclosure exists.
-    Fan-health drift monitoring. Every status report carries each
+73. DAS step budget on the Zero W after items 3, 8, 9 and 10. Measured
+    on the Pi: DAS MPC p99 609–615 ms (solve ticks 643 ms) against
+    `mpc.budget_ms` 600, so `pytest -m pi` fails again (it was
+    507–552 ms); PI-like DAS p99 322 ms. Owner decision 2026-09-14:
+    optimise; if the DAS MPC still misses 600 ms, raise `mpc.budget_ms`
+    to 1000; solve every third tick (`mpc_every_ticks: 3`). Note that the
+    p99 over all ticks is set by the solve ticks while they are more than
+    1 % of ticks, so solving less often lowers the mean, not the p99.
+
+    **Optimised (2026-09-16), still open.** Four changes, all bit-identical
+    (the closed loop dumps every tick's mode, command and diagnostics as
+    `float.hex` and matches the same run on the previous revision across
+    nine scenarios: DAS MPC and PI-like DAS, `mpc_every_ticks` 1/2/3, two
+    seeds, `median3` on and off, and the legacy MPC and PI on the RC plant;
+    the golden files are untouched):
+
+    - the gate sanitises only the window samples a check reads (the
+      pre-filter needs the newest three; the Stuck band check stops at the
+      first sample outside the band), and takes the exact-`float` fast path;
+    - the estimator memoises its config-derived structure by config
+      identity (as `thermal._derived` does) and drops the `numpy.outer`
+      wrappers and a temporary from the Joseph update;
+    - `model._is_real`, called for every value of every observation and
+      command, answers exact `float` / `int` before the `numbers.Real` ABC;
+    - `thermal.state_jacobian` gives the DAS MPC's linearisation `A` and
+      the airflow gradients from one airflow evaluation instead of three,
+      and stops building an input matrix, a derivative vector and an affine
+      term it then discarded.
+
+    Development machine, `config.example-das.yaml` against the DAS truth
+    plant, 240 ticks with 20 discarded as warm-up, gc paused, 5 repeats per
+    measurement and three rounds alternating before/after so machine state
+    cannot favour one side; medians of the per-repeat statistics: median
+    step 1.886 → 1.575 ms (−16 %), p99 3.381 → 2.876 ms (−15 %), p99 over
+    the solve ticks 3.398 → 2.892 ms (−15 %). At the Zero W's measured ×180
+    for this step that is roughly 520 ms p99 — under the 600 ms gate, but
+    by 13 %, on an extrapolation that §4 says is a lower bound. It has to
+    be measured, not assumed. Where the remaining time goes is in §4
+    "Budget at `dt = 5 s`": the SQP, its box QPs and the estimator's Kalman
+    update are most of it, and cutting those means changing the arithmetic,
+    which would move the goldens.
+
+    The owner's fallback is documented config, not a new default:
+    `mpc.budget_ms: 1000.0` **with** `mpc.budget_alarm_ms: 1250.0` (the
+    config model rejects a `budget_ms` that is not strictly below the
+    alarm, so raising one alone fails to load) and `mpc_every_ticks: 3`.
+    Both example configs carry the three lines commented out next to the
+    live keys, and both budget log lines now name the key that was
+    exceeded and the keys to change (`mpc.mpc_every_ticks` only where the
+    DAS MPC is the solver). `tests/test_bench_budget.py` checks that the
+    three values load, that `budget_ms: 1000` alone is rejected, that
+    `mpc_every_ticks: 3` really solves on a third of the ticks against the
+    truth plant, and that a solve tick is the expensive one;
+    `tests/test_loop.py` checks the raised thresholds and the two log lines.
+
+    **On the Pi (main session).** Re-measure the DAS MPC p99 with
+    `tools/bench_step.py --sim-plant das` and run `pytest
+    tests/test_bench_budget.py -m pi`; if the p99 is still over 600 ms,
+    put the three fallback keys into the Pi's config and re-run. Then run
+    the runtime alarm against the **DAS MPC** for at least 20 minutes
+    (`budget_warn_count` / `budget_alarm_count` in the health payload; the
+    earlier 20-minute run used the PI-like DAS form) and record the
+    numbers here.
+79. Fan-health drift monitoring. Every status report carries each
     output's rpm, output duty, voltage (the 12 V rail) and current and
     power (the Quadro reports both; the aquaero reports 0 in PWM mode).
     `hw/aquacomputer.py` decodes them and `AquacomputerAdapter.last_status`
@@ -5216,9 +5290,10 @@ ssh USER@PI-HOST 'cd /opt/aqua-bridge && .venv/bin/python tools/bench_step.py --
 ssh USER@PI-HOST 'cd /opt/aqua-bridge && HYPOTHESIS_PROFILE=pi .venv/bin/python -m pytest tests/test_bench_budget.py -m pi'
 ```
 
-The DAS bench on the Pi is the budget check of §3: p99 ≤ 600 ms at
-`dt = 5 s` with `mpc_every_ticks: 2`, else apply the reductions listed
-there.
+The DAS bench on the Pi is the budget check of §3: p99 ≤ `mpc.budget_ms`
+at `dt = 5 s` with `mpc_every_ticks: 2`, else apply the owner's fallback
+(`budget_ms: 1000.0`, `budget_alarm_ms: 1250.0`, `mpc_every_ticks: 3`;
+§8 item 73) and then the reductions listed there.
 
 Rerun `deploy/install-pi.sh --user USER` on the Pi when `pyproject.toml`,
 the unit or the udev rule changed. Or `git pull` from GitHub on the Pi.

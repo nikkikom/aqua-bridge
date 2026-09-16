@@ -38,7 +38,8 @@ mpc:
   mpc_gain_c_per_pwm: 8.0  # MPC model: steady-state °C drop of a temperature per +1.0 PWM on one of its channels
   mpc_estimator_gain: 0.1  # MPC offset-free disturbance estimator, per-tick gain in (0, 1]
   budget_ms: 600.0        # runtime alarm: log a warning when step() takes longer than this, ms (> 0)
-  budget_alarm_ms: 750.0  # runtime alarm: log an error instead past this, ms (> budget_ms)
+  budget_alarm_ms: 750.0  # runtime alarm: log an error instead past this, ms (> budget_ms; raising
+                          # budget_ms means raising this above it, see config.example-das.yaml)
   budget_log_interval_s: 60.0  # rate limit for both budget log lines, seconds (> 0)
   pi_kp: 0.05            # PI proportional gain, PWM per °C of error (> 0)
   pi_ki: 0.002           # PI integral gain, PWM per (°C * s) (>= 0)
