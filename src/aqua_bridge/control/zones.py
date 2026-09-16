@@ -52,13 +52,32 @@ status is ``first`` / ``ok``, ``obs.temps`` has no key outside
   groups (:func:`sigma_reasons`): for every bay of the zone declared
   ``occupied: true`` / ``auto`` that the estimator does not report
   ``empty`` this tick, the bay has an estimate whose ``sigma`` is at most
-  ``estimator.sigma_fault_c``, and the zone's air estimate is initialised
-  with ``sigma_air_c`` at most ``estimator.sigma_air_fault_c``. A lost
+  ``estimator.sigma_fault_c``; the zone's air estimate is initialised
+  with ``sigma_air_c`` at most ``estimator.sigma_air_fault_c``; and the zone's
+  air node has had a trusted ``zone_air`` reading within
+  ``estimator.air_blind_fault_s`` (``air_blind_s``). A lost
   sensor is then not a fault by itself: the estimator predicts the
   unobserved node, its variance grows every tick, the margin ``k * sigma``
   widens and the solver raises the fans; the zone faults only once the
-  estimator can no longer bound a drive or the air (observability loss). The
-  setpoint groups stay required with the confirmation rule above (a zoned
+  estimator can no longer bound a drive or the air (observability loss).
+  Two exceptions the variance alone gets wrong:
+
+  - a bay the estimator reports ``settling`` *and* ``observed`` carries no sigma
+    check. Within ``estimator.bay_settle_s`` of a fast-swap jump or of an
+    occupancy change the filter widens that bay on purpose, which is it
+    *following* a swap, not losing sight of it; the margin still carries the
+    widening, so the fans rise either way. A bay without a trusted proximal
+    member this tick is never exempt, so a blind bay still faults its zone.
+  - ``sigma_air_fault_c`` alone cannot see a zone that has lost its air
+    sensors: every proximal sensor reads ``(1 - s) T_a`` beside its drive, and
+    the inlet and the fan command pin the rest, so the air variance stays small
+    (0.25 degC with every sensor of a zone lost for 65 minutes on the
+    simulator, 0.07 degC with only the zone-air sensor lost -- while the drive
+    sigmas stay at the uncalibrated floor, so nothing ever faulted such a
+    zone). ``air_blind_s`` is the decidable form of the same question: how long
+    the air node has run with nothing measuring it.
+
+  The setpoint groups stay required with the confirmation rule above (a zoned
   setpoint config regulates on those sensors directly, and nothing stands in
   for them). The zone-air and bay groups, and their confirmation
   (:func:`groups_confirmed`), are not checked: a confirming sensor is not
@@ -204,14 +223,29 @@ def _sigma_text(value: object) -> str:
     return f"{float(value):.3f}"
 
 
+def _blind_ok(value: object, window: float) -> bool:
+    """``value`` is a number at most ``window`` (a missing or non-numeric blind time is
+    not: an update that cannot say how long the zone has been blind is not evidence)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    return value <= window
+
+
 def sigma_reasons(zone: str, cfg: MpcConfig, estimator: EstimatorUpdate) -> list[str]:
     """Why the ``sigma`` rule does not trust ``zone`` this tick (empty: it does).
 
-    Reads this tick's estimator update: ``zones[zone]["sigma_air_c"]`` of an initialised
-    zone, and ``estimates[bay]["sigma"]`` for every bay of the zone declared ``occupied:
-    true`` / ``auto`` that ``bays[bay]["occupancy"]`` does not report ``empty``. A zone
-    that is not initialised, a missing estimate or a sigma that is not a number at most
-    its threshold is a reason (module docstring).
+    Reads this tick's estimator update: ``zones[zone]["sigma_air_c"]`` and
+    ``["air_blind_s"]`` of an initialised zone, and ``estimates[bay]["sigma"]`` for every
+    bay of the zone declared ``occupied: true`` / ``auto`` that ``bays[bay]["occupancy"]``
+    does not report ``empty``. A zone that is not initialised, a missing estimate, a sigma
+    that is not a number at most its threshold, or an air node with no trusted reading for
+    longer than ``estimator.air_blind_fault_s`` is a reason (module docstring).
+
+    A bay the estimator reports as ``settling`` (within ``estimator.bay_settle_s`` of the
+    fast-swap rule or of an occupancy change, both of which widen its variance on purpose)
+    **and** ``observed`` (a trusted proximal member this tick) carries no sigma check: that
+    widening is the filter following a swap, not a loss of observability. A bay that is not
+    observed on this tick is never exempt, so a blind bay still faults its zone.
     """
     topo = cfg.topology
     spec = cfg.estimator
@@ -219,16 +253,20 @@ def sigma_reasons(zone: str, cfg: MpcConfig, estimator: EstimatorUpdate) -> list
         return ["sigma:no_estimator"]
     reasons: list[str] = []
     air = estimator.zones.get(zone)
-    sigma_air = (
-        air.get("sigma_air_c") if isinstance(air, Mapping) and air.get("initialised") else None
-    )
+    initialised = isinstance(air, Mapping) and air.get("initialised")
+    sigma_air = air.get("sigma_air_c") if initialised else None  # type: ignore[union-attr]
     if not _sigma_ok(sigma_air, spec.sigma_air_fault_c):
         reasons.append(f"sigma:zone_air={_sigma_text(sigma_air)}>{spec.sigma_air_fault_c:g}")
+    blind = air.get("air_blind_s") if initialised else None  # type: ignore[union-attr]
+    if not _blind_ok(blind, spec.air_blind_fault_s):
+        reasons.append(f"sigma:zone_air_blind={_sigma_text(blind)}>{spec.air_blind_fault_s:g}")
     for bay, bay_spec in topo.bays.items():
         if bay_spec.zone != zone or not bay_spec.constrained:
             continue
         info = estimator.bays.get(bay)
         if isinstance(info, Mapping) and info.get("occupancy") == "empty":
+            continue
+        if isinstance(info, Mapping) and info.get("settling") is True and info.get("observed"):
             continue
         est = estimator.estimates.get(bay)
         sigma = est.get("sigma") if isinstance(est, Mapping) else None
