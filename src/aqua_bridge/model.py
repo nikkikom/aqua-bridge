@@ -1258,6 +1258,7 @@ ESTIMATOR_DEFAULTS: dict[str, float] = {
     "q_offset": 1e-4,
     "sensor_noise_c": 0.03,
     "proximal_offset_c": 3.0,
+    "proximal_slope_spread": 0.0,
     "air_blind_fault_s": 900.0,
     "smart_max_age_s": 300.0,
     "smart_reject_c": 8.0,
@@ -1266,6 +1267,8 @@ ESTIMATOR_DEFAULTS: dict[str, float] = {
     "empty_confirm_s": 300.0,
     "bay_settle_s": 600.0,
     "bay_settle_max_s": 1800.0,
+    "bay_uncertain_var_c2": 1.0,
+    "bay_cal_step_c": 0.05,
     "calibration_max_age_days": 30.0,
     "calibrate_min_c": 5.0,
     "calibrate_max_c": 80.0,
@@ -1333,9 +1336,19 @@ class EstimatorSpec:
       association
     * ``sensor_noise_c``           -- white noise of a temperature sensor, degC (>= 0);
       the measurement variance is ``sensor_noise_c ** 2 + quant_c ** 2 / 12``
-    * ``proximal_offset_c``        -- prior standard deviation of the placement offset
-      the estimator carries for every proximal sensor of a bay beyond the first, degC
-      (``>= 0``; 0 fuses them all on one node, as before this key existed)
+    * ``proximal_offset_c``        -- prior standard deviation of the *offset* between two
+      proximal sensors of one bay, degC (``>= 0``; 0 puts them at the same offset)
+    * ``proximal_slope_spread``    -- prior standard deviation of the *slope* difference
+      between two proximal sensors of one bay (``0 <= x <= 0.5``, dimensionless): how far
+      apart two placements on one bay may sit in the fraction ``1 - beta`` of the drive
+      each sees. **0 (the default) keeps one sensor node per bay** with a constant
+      placement offset per further member (PROJECT.md section 8 item 67); a positive
+      value gives every proximal member of a bay **its own sensor node**, with its own
+      lag ``tau_s`` and its own map ``(s, b)`` learned as a difference from the anchor's
+      (item 101). A constant offset cannot represent a difference in ``beta``, whose
+      contribution moves with the drive-to-air rise; the spread is the prior on that
+      difference, so 0 is exactly the statement "both sensors see the same fraction of
+      the drive", which is what the fused node assumes
     * ``smart_max_age_s``          -- a SMART sample older than this is ignored and an
       association whose serial stays silent this long is dropped (``>= dt``)
     * ``smart_reject_c``           -- a SMART value this far from the estimate is dropped
@@ -1363,6 +1376,15 @@ class EstimatorSpec:
       the ``sigma`` trust rule before it has to run this long without one, seconds
       (``>= bay_settle_s``; 0 grants none at all): a hot swap opens a window or two,
       a sensor that keeps jumping cannot stay exempt for ever
+    * ``bay_uncertain_var_c2``     -- a bay whose drive variance ``sigma ** 2 -
+      sigma_cal ** 2`` exceeds this, degC^2 (> 0), is too uncertain to score the thermal
+      model against: the DAS MPC's validity gate leaves it out of the prediction-error,
+      drift and air-disturbance checks for ``bay_settle_s`` afterwards. A *level*, not an
+      event -- unlike the deliberate widenings below it also covers a bay nobody is
+      watching (PROJECT.md section 8 item 100)
+    * ``bay_cal_step_c``           -- a change of a bay's ``sigma_cal`` floor above this,
+      degC (> 0), is a calibration event: an accepted or expired map re-maps the drive
+      estimate, which the same validity gate must not read as a model error
     * ``calibration_max_age_days`` -- a SMART calibration without an accepted sample for
       this long is no longer trusted (> 0)
     * ``calibrate_min_c`` / ``calibrate_max_c`` -- the drive temperature a manual
@@ -1389,6 +1411,7 @@ class EstimatorSpec:
     q_offset: float = ESTIMATOR_DEFAULTS["q_offset"]
     sensor_noise_c: float = ESTIMATOR_DEFAULTS["sensor_noise_c"]
     proximal_offset_c: float = ESTIMATOR_DEFAULTS["proximal_offset_c"]
+    proximal_slope_spread: float = ESTIMATOR_DEFAULTS["proximal_slope_spread"]
     air_blind_fault_s: float = ESTIMATOR_DEFAULTS["air_blind_fault_s"]
     smart_max_age_s: float = ESTIMATOR_DEFAULTS["smart_max_age_s"]
     smart_reject_c: float = ESTIMATOR_DEFAULTS["smart_reject_c"]
@@ -1397,6 +1420,8 @@ class EstimatorSpec:
     empty_confirm_s: float = ESTIMATOR_DEFAULTS["empty_confirm_s"]
     bay_settle_s: float = ESTIMATOR_DEFAULTS["bay_settle_s"]
     bay_settle_max_s: float = ESTIMATOR_DEFAULTS["bay_settle_max_s"]
+    bay_uncertain_var_c2: float = ESTIMATOR_DEFAULTS["bay_uncertain_var_c2"]
+    bay_cal_step_c: float = ESTIMATOR_DEFAULTS["bay_cal_step_c"]
     calibration_max_age_days: float = ESTIMATOR_DEFAULTS["calibration_max_age_days"]
     calibrate_min_c: float = ESTIMATOR_DEFAULTS["calibrate_min_c"]
     calibrate_max_c: float = ESTIMATOR_DEFAULTS["calibrate_max_c"]
@@ -1447,6 +1472,8 @@ class EstimatorSpec:
             "sigma_uncalibrated_c",
             "jump_min_c",
             "jump_sigmas",
+            "bay_uncertain_var_c2",
+            "bay_cal_step_c",
         ):
             if getattr(self, key) <= 0:
                 raise ConfigError(f"{where}.{key} must be > 0, got {getattr(self, key)}")
@@ -1486,6 +1513,11 @@ class EstimatorSpec:
         if self.empty_confirm_s < 2 * dt:
             raise ConfigError(
                 f"{where}.empty_confirm_s must be >= 2 * dt ({2 * dt}), got {self.empty_confirm_s}"
+            )
+        if not 0.0 <= self.proximal_slope_spread <= 0.5:
+            raise ConfigError(
+                f"{where}.proximal_slope_spread must be in [0, 0.5], got "
+                f"{self.proximal_slope_spread}"
             )
         if self.bay_settle_s < 0:
             raise ConfigError(f"{where}.bay_settle_s must be >= 0, got {self.bay_settle_s}")
