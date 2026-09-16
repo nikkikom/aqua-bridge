@@ -76,8 +76,8 @@ choice for cooling:
 * The ``model_*`` keys configure the zoned thermal model's online identification
   (``aqua_bridge.control.thermal``). They are flat keys like the plan's table.
   ``model_shadow: true`` (learn and predict without acting),
-  ``model_use_rpm: true`` and ``model_freeze: true`` need ``topology``; the
-  numeric keys are validated
+  ``model_use_rpm: true``, ``model_freeze: true`` and
+  ``model_split_channels: true`` need ``topology``; the numeric keys are validated
   always and inert in legacy mode, and ``model_window_s >= 2 * dt`` is checked
   only with ``model_shadow`` so a default never invalidates a legacy config with
   a long ``dt``.
@@ -1665,12 +1665,14 @@ class MpcConfig:
       of the window carries evidence, so fewer readings are flagged Stuck).
     * ``model_shadow`` / ``model_window_s`` / ``model_lambda`` / ``model_p_trace_max`` /
       ``model_converged_rel_se`` / ``model_max_pred_err_c`` / ``model_use_rpm`` /
-      ``model_freeze`` -- the
+      ``model_freeze`` / ``model_split_channels`` -- the
       zoned thermal model's online identification (``control/thermal.py``): shadow
       learning on/off, regression window, RLS forgetting per window, covariance trace
       bound, relative standard error and prediction error for ``converged``, fan
-      airflow from the tachometer instead of the PWM curve, and whether a zone that
-      reaches ``converged`` is frozen there instead of adapting on.
+      airflow from the tachometer instead of the PWM curve, whether a zone that
+      reaches ``converged`` is frozen there instead of adapting on, and whether a fan
+      group's effectiveness carries per-channel split coefficients the single-channel
+      experiment phases identify.
     * ``model_reset_on_swap`` -- reset a bay's identified coefficients (``g0``, ``k``,
       ``q_s``) to the prior when the estimator reports a hot swap on it (default
       ``true``; they describe the drive that left). Validated always, inert in legacy
@@ -1774,6 +1776,7 @@ class MpcConfig:
     model_use_rpm: bool = False
     model_reset_on_swap: bool = True
     model_freeze: bool = False
+    model_split_channels: bool = False
     fan_curve_online: bool = False
     fan_curve_settle_s: float = 30.0
     fan_curve_refit_s: float = 600.0
@@ -1888,6 +1891,7 @@ class MpcConfig:
             "model_accept_prior",
             "model_reset_on_swap",
             "model_freeze",
+            "model_split_channels",
             "fan_curve_online",
         ):
             _cfg_bool(name, getattr(self, name))
@@ -2200,6 +2204,7 @@ class MpcConfig:
             "model_use_rpm",
             "model_accept_prior",
             "model_freeze",
+            "model_split_channels",
             "fan_curve_online",
         ):
             if getattr(self, name) and self.topology is None:

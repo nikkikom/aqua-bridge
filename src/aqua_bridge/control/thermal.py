@@ -39,11 +39,28 @@ when ``z`` is declared ``coupled_to`` a zone that lists it (the weak cross-zone
 prior), else not at all. Channels of one ``fans.<ch>.group`` (default: the
 channel itself) share one coefficient per zone, ``E_zG`` (prior
 ``sum_{i in G} w_zi``), with ``phi_zG = sum_i w_zi phi_i / sum_i w_zi``: one
-multiplier on the group's prior effectiveness, shared by every channel of the
-group. Active identification experiments (:mod:`aqua_bridge.control.ident`)
-already run each channel of a group alone in turn so the *data* to split it
-exists; the split itself -- turning that into one ``E`` per channel instead
-of per group -- is still open (PROJECT.md section 8 item 13).
+multiplier on the group's prior effectiveness.
+
+**Split** (``model_split_channels``, plan section 8 item 13). Regulation moves a
+group's channels together, so only ``E_zG`` is identifiable from it; the
+single-channel phases of an experiment (``control/ident.py``: the whole group,
+then each channel alone) move them apart. With the switch on, each group of more
+than one channel in a zone carries one extra coefficient per channel beyond the
+first, ``Es.<z>.<G>.<ch>``, in the same air-block regression::
+
+    Q_zG = E_zG phi_zG + sum_{ch != ref} Es_zGch (phi_ch - phi_zG)
+
+The extra regressors are **exactly zero** while the group's channels hold the same
+duty, so under regulation the ridge keeps them at their prior of 0 and the model is
+the shared-``E`` model, term for term. A single-channel phase makes them the only
+regressors that move, and what they learn is a redistribution: the implied per-channel
+effectiveness is ``E_ch = E_zG w_ch / W + Es_ch - (w_ch / W) sum Es``
+(:func:`channel_effectiveness`), whose sum over the group is ``E_zG`` whatever the
+split. So the split never changes what the group as a whole does, only how its
+channels share it -- and the convergence rules below still read the group
+coefficients alone (``Es`` is not a gain for ``rel_se``, and the excitation and PE
+monitors still see ``phi_zG``), so turning the switch on cannot stop a model
+converging. ``GET /api/model`` reports ``e_per_channel`` per zone.
 
 Parameter table (:data:`PARAMETERS`; keys as in :func:`parameter_keys`)
 ------------------------------------------------------------------------
@@ -53,6 +70,8 @@ Parameter table (:data:`PARAMETERS`; keys as in :func:`parameter_keys`)
     key          unit  bounds          prior                           identified from
     E.z.G        W/K   [0, 200]        33/fan x count / zones listing  air-node RLS, fan excitation
                                        (0.1x for a coupled zone)       (weak cross-zone E: ridge)
+    Es.z.G.ch    W/K   [-200, 200]     0 (model_split_channels)        air-node RLS, single-channel
+                                                                       excitation only (ridge to 0)
     leak.z       W/K   [0, 20]         1                               air-node RLS, ridge (weak)
     kappa.z.z2   W/K   [0, 50]         3 (declared pairs only)         air-node RLS, ridge (weak)
     p_air.z      W     [-100, 100]     0                               air-node RLS constant
@@ -268,7 +287,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Collection, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any
 
@@ -313,6 +332,7 @@ __all__ = [
     "ThermalParams",
     "ThermalUpdate",
     "cached_structure",
+    "channel_effectiveness",
     "current_model",
     "derivatives",
     "discretise",
@@ -418,6 +438,14 @@ PARAMETERS: dict[str, ParamSpec] = {
         "33 W/K per fan x count / zones listing the channel; 0.1x for a coupled zone",
         "air-node RLS with fan excitation (weak cross-zone entries: ridge)",
     ),
+    "Es": ParamSpec(
+        "W/K",
+        -200.0,
+        200.0,
+        "0 (the group's prior split, model_split_channels)",
+        "air-node RLS, single-channel excitation only (ridge toward 0)",
+        scale=E_W_PER_K_PER_FAN,
+    ),
     "leak": ParamSpec("W/K", 0.0, 20.0, "1", "air-node RLS, ridge (weak)", var0=1.0),
     "kappa": ParamSpec("W/K", 0.0, 50.0, "3 for declared pairs", "air-node RLS, ridge", var0=1.0),
     "p_air": ParamSpec(
@@ -443,8 +471,9 @@ PARAMETERS: dict[str, ParamSpec] = {
 
 #: Random walk per window on the constants, scaled units.
 _CONST_WALK = {"p_air": 0.02, "q_s": 0.1}
-#: Kinds pulled toward the prior by the ridge.
-_RIDGED = frozenset({"leak", "kappa", "g0", "p_air"})
+#: Kinds pulled toward the prior by the ridge (``Es`` toward 0: without single-channel
+#: excitation a group keeps its prior split, which is the shared-``E`` model exactly).
+_RIDGED = frozenset({"Es", "leak", "kappa", "g0", "p_air"})
 #: Kinds that are constants (no trust region, random walk).
 _CONSTANTS = frozenset({"p_air", "q_s"})
 #: Row noise: initial RMS and floor of the a-priori residual (air W, proximal K).
@@ -463,7 +492,8 @@ def _kind(key: str) -> str:
 
 @dataclass(frozen=True)
 class Group:
-    """One effectiveness coefficient ``E.<zone>.<group>``."""
+    """One effectiveness coefficient ``E.<zone>.<group>``, with the per-channel split
+    coefficients ``Es.<zone>.<group>.<channel>`` of ``model_split_channels``."""
 
     key: str
     zone: str
@@ -471,6 +501,9 @@ class Group:
     weak: bool
     weights: dict[str, float]  # channel -> prior W/K at phi = 1
     prior: float
+    #: ``(key, channel)`` per split coefficient: every member but the reference channel
+    #: (the first). Empty for a single-channel group and without the switch.
+    splits: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -505,6 +538,11 @@ class Structure:
     zones: dict[str, ZoneStruct]
     bays: dict[str, BayStruct]
     fingerprint: str
+    #: The same structure with ``model_split_channels`` the other way round: its air keys
+    #: per zone and its fingerprint, so :func:`restore` can convert a store file written
+    #: before the switch was turned on (or off) instead of dropping the model.
+    alt_air_keys: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    alt_fingerprint: str = ""
 
     # cached: the index helpers below run in the per-tick loops of the model
     @cached_property
@@ -569,6 +607,12 @@ def structure(cfg: MpcConfig) -> Structure:
                 elif any(z in topo.zones[other].coupled_to for other in listed[ch]):
                     weights[ch] = WEAK_E_FACTOR * base
             if weights:
+                members = [ch for ch in channels if ch in weights]
+                splits = (
+                    tuple((f"Es.{z}.{g}.{ch}", ch) for ch in members[1:])
+                    if cfg.model_split_channels and len(members) > 1
+                    else ()
+                )
                 groups.append(
                     Group(
                         key=f"E.{z}.{g}",
@@ -577,6 +621,7 @@ def structure(cfg: MpcConfig) -> Structure:
                         weak=not strong,
                         weights=weights,
                         prior=sum(weights.values()),
+                        splits=splits,
                     )
                 )
         zone_bays = tuple(b for b, bay in topo.bays.items() if bay.zone == z)
@@ -596,6 +641,7 @@ def structure(cfg: MpcConfig) -> Structure:
             bay_index += 1
         air_keys = (
             *(gr.key for gr in groups),
+            *(key for gr in groups for key, _ in gr.splits),
             f"leak.{z}",
             *(f"kappa.{z}.{o}" for o in spec.coupled_to),
             f"p_air.{z}",
@@ -614,13 +660,43 @@ def structure(cfg: MpcConfig) -> Structure:
             tau_air=sum(sensor_lag_s(cfg, t) for t in air) / len(air),
             tau_inlet=sum(sensor_lag_s(cfg, t) for t in inlet) / len(inlet),
         )
-    fingerprint = json.dumps(
-        [list(channels)]
-        + [[z, list(zs.bays), list(zs.air), list(zs.air_keys)] for z, zs in zones.items()]
-        + [[b, list(bs.sensors)] for b, bs in bays.items()],
-        separators=(",", ":"),
+
+    def fp(air_keys: Mapping[str, tuple[str, ...]]) -> str:
+        return json.dumps(
+            [list(channels)]
+            + [[z, list(zs.bays), list(zs.air), list(air_keys[z])] for z, zs in zones.items()]
+            + [[b, list(bs.sensors)] for b, bs in bays.items()],
+            separators=(",", ":"),
+        )
+
+    # the same structure with model_split_channels the other way round, so restore() can
+    # convert a file written before the switch was flipped instead of dropping the model
+    alt_air_keys = {
+        z: _alt_air_keys(zs, split=not cfg.model_split_channels) for z, zs in zones.items()
+    }
+    return Structure(
+        channels=channels,
+        zones=zones,
+        bays=bays,
+        fingerprint=fp({z: zs.air_keys for z, zs in zones.items()}),
+        alt_air_keys=alt_air_keys,
+        alt_fingerprint=fp(alt_air_keys),
     )
-    return Structure(channels=channels, zones=zones, bays=bays, fingerprint=fingerprint)
+
+
+def _alt_air_keys(zone: ZoneStruct, *, split: bool) -> tuple[str, ...]:
+    """A zone's air keys with the per-channel split coefficients present or absent."""
+    without = tuple(k for k in zone.air_keys if _kind(k) != "Es")
+    if not split:
+        return without
+    groups = tuple(gr.key for gr in zone.groups)
+    extra = tuple(f"Es.{zone.name}.{gr.name}.{ch}" for gr in zone.groups for ch in _members(gr)[1:])
+    return (*groups, *extra, *without[len(groups) :])
+
+
+def _members(gr: Group) -> tuple[str, ...]:
+    """The group's channels in this zone, in the structure's channel order."""
+    return tuple(gr.weights)
 
 
 def parameter_keys(st: Structure) -> tuple[str, ...]:
@@ -640,6 +716,8 @@ def prior_theta(cfg: MpcConfig, st: Structure | None = None) -> dict[str, float]
     for zone in st.zones.values():
         for gr in zone.groups:
             out[gr.key] = gr.prior
+            for key, _ in gr.splits:
+                out[key] = 0.0
         out[f"leak.{zone.name}"] = LEAK_W_PER_K
         for other in zone.coupled:
             out[f"kappa.{zone.name}.{other}"] = KAPPA_W_PER_K
@@ -793,6 +871,32 @@ def _group_phi(gr: Group, phis: Mapping[str, float]) -> float:
     return sum(w * phis[ch] for ch, w in gr.weights.items()) / gr.prior if gr.prior > 0 else 0.0
 
 
+def channel_effectiveness(gr: Group, theta: Mapping[str, float]) -> dict[str, float]:
+    """The group's effectiveness split over its channels, W/K (module docstring, *Split*).
+
+    ``E_ch = E_G w_ch / W + dE_ch - (w_ch / W) sum dE``, with ``dE`` of the reference
+    channel fixed at 0 -- so the split redistributes the group's coefficient and never
+    changes its total, and every ``dE`` at its prior of 0 gives exactly the shared-``E``
+    model's ``E_G w_ch / W``.
+    """
+    total = gr.prior
+    e = float(theta[gr.key])
+    if total <= 0:
+        return dict.fromkeys(gr.weights, 0.0)
+    shares = {ch: w / total for ch, w in gr.weights.items()}
+    out = {ch: e * share for ch, share in shares.items()}
+    if not gr.splits:
+        return out
+    net = 0.0
+    for key, ch in gr.splits:
+        value = float(theta[key])
+        out[ch] += value
+        net += value
+    for ch, share in shares.items():
+        out[ch] -= share * net
+    return out
+
+
 def _vec_u(st: Structure, u: Mapping[str, float] | np.ndarray | Any) -> np.ndarray:
     if isinstance(u, Mapping):
         return np.array([float(u[ch]) for ch in st.channels])
@@ -815,6 +919,7 @@ def _airflow(
     col = {ch: i for i, ch in enumerate(st.channels)}
     for zone in st.zones.values():
         zi = zone.index
+        split = False
         for gr in zone.groups:
             e = p.theta[gr.key]
             total[zi] += e
@@ -823,6 +928,21 @@ def _airflow(
             q[zi] += e * _group_phi(gr, phis)
             for ch, w in gr.weights.items():
                 dq[zi, col[ch]] += e * w * dphis[ch] / gr.prior
+            if not gr.splits:
+                continue
+            # the split terms vanish exactly when the group's channels move together,
+            # so a group at its prior split is bit-identical to the shared-E model
+            split = True
+            group_phi = _group_phi(gr, phis)
+            for key, ch in gr.splits:
+                value = p.theta[key]
+                q[zi] += value * (phis[ch] - group_phi)
+                dq[zi, col[ch]] += value * dphis[ch]
+                for other, w in gr.weights.items():
+                    dq[zi, col[other]] -= value * w * dphis[other] / gr.prior
+        if split and q[zi] < 0.0:  # a split redistributes; it never reverses the airflow
+            q[zi] = 0.0
+            dq[zi] = 0.0
     qn = np.divide(q, total, out=np.zeros(n_z), where=total > _EPS)
     dqn = np.divide(dq, total[:, None], out=np.zeros_like(dq), where=total[:, None] > _EPS)
     return q, qn, dq, dqn
@@ -1679,6 +1799,9 @@ def update(
         group_phi = [_group_phi(gr, phis) for gr in zone.groups]
         e_total = sum(theta[gr.key] for gr in zone.groups)
         q_flow = sum(theta[gr.key] * v for gr, v in zip(zone.groups, group_phi, strict=True))
+        for i, gr in enumerate(zone.groups):  # the split terms (0 under common motion)
+            q_flow += sum(theta[key] * (phis[ch] - group_phi[i]) for key, ch in gr.splits)
+        q_flow = max(q_flow, 0.0)
         qn = q_flow / e_total if e_total > _EPS else 0.0
         ta0, ta1 = prev["ta"], sample["ta"]
         tau_a = zone.tau_air
@@ -1772,6 +1895,10 @@ def update(
         for i, value in enumerate(group_phi):
             acc["x"][i] += value * din
         i_leak = len(zone.groups)
+        for i, gr in enumerate(zone.groups):
+            for _, ch in gr.splits:  # regressor (phi_ch - phi_zG): 0 under common motion
+                acc["x"][i_leak] += (phis[ch] - group_phi[i]) * din
+                i_leak += 1
         acc["x"][i_leak] += din
         for j, other in enumerate(zone.coupled):
             nb = half * (w0 * (nb0[j] - ta0) + w1 * (nb1[j] - ta1))
@@ -1992,6 +2119,48 @@ def _check_block_bounds(raw: object, spec: _BlockSpec, where: str) -> None:
         raise ValueError(f"{where}: s2 must be a finite number > 0")
 
 
+def _convert_air_block(
+    raw: object, old_keys: tuple[str, ...], spec: _BlockSpec, where: str
+) -> dict[str, Any]:
+    """One zone's air block re-indexed from ``old_keys`` to ``spec.keys``.
+
+    Only the per-channel split coefficients differ between the two (``model_split_channels``
+    on or off), so every shared key keeps its value, its variance and its covariances with
+    the other shared keys, and a key that is new starts at its prior with its initial
+    variance and no covariance. The open window is dropped (its accumulator has the old
+    width) and the relative standard errors come back on the next closing window.
+    """
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{where}: not a mapping")
+    theta_in = raw.get("theta")
+    p_in = raw.get("P")
+    n_old = len(old_keys)
+    if not isinstance(theta_in, list) or len(theta_in) != n_old:
+        raise ValueError(f"{where}: theta has the wrong shape")
+    try:
+        p_old = np.asarray(p_in, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{where}: P is not a matrix") from exc
+    if p_old.shape != (n_old, n_old):
+        raise ValueError(f"{where}: P is not a finite {n_old}x{n_old} matrix")
+    where_old = {key: i for i, key in enumerate(old_keys)}
+    theta = list(spec.prior)
+    p = np.diag(spec.var0).astype(float)
+    shared = [(i, where_old[key]) for i, key in enumerate(spec.keys) if key in where_old]
+    for i, j in shared:
+        theta[i] = float(theta_in[j])
+    rows = np.array([i for i, _ in shared], dtype=int)
+    cols = np.array([j for _, j in shared], dtype=int)
+    if rows.size:
+        p[np.ix_(rows, rows)] = p_old[np.ix_(cols, cols)]
+    out = dict(raw)
+    out["theta"] = theta
+    out["P"] = p.tolist()
+    out["rel"] = None
+    out["acc"] = None
+    return out
+
+
 def restore(stored: object, cfg: MpcConfig, *, stale: bool) -> dict[str, Any]:
     """A thermal memory saved by the model store, ready for :func:`update`.
 
@@ -2009,12 +2178,29 @@ def restore(stored: object, cfg: MpcConfig, *, stale: bool) -> dict[str, Any]:
     st = d.st
     if not isinstance(stored, Mapping) or stored.get("v") != VERSION:
         raise ValueError("thermal: unknown schema version")
+    converted = False
     if stored.get("fp") != st.fingerprint:
-        raise ValueError("thermal: the model structure differs from the config")
+        if stored.get("fp") != st.alt_fingerprint:
+            raise ValueError("thermal: the model structure differs from the config")
+        converted = True  # written with model_split_channels the other way round
     zones = stored.get("zones")
     bays = stored.get("bays")
     if not isinstance(zones, Mapping) or not isinstance(bays, Mapping):
         raise ValueError("thermal: zones or bays missing")
+    if converted:
+        rebuilt: dict[str, Any] = {}
+        for z in st.zones:
+            raw = zones.get(z)
+            if not isinstance(raw, Mapping):
+                raise ValueError(f"thermal: zone {z!r} missing")
+            rebuilt[z] = {
+                **raw,
+                "air": _convert_air_block(
+                    raw.get("air"), st.alt_air_keys[z], d.zone_specs[z], f"thermal: zone {z!r}"
+                ),
+            }
+        stored = {**stored, "fp": st.fingerprint, "zones": rebuilt}
+        zones = rebuilt
     for z in st.zones:
         raw = zones.get(z)
         if not isinstance(raw, Mapping):
@@ -2117,15 +2303,22 @@ def summary(
         pred = None if zm["err2"] is None else math.sqrt(float(zm["err2"]))
         if pred is not None:
             worst = pred if worst is None else max(worst, pred)
+        theta = dict(zip(zone.air_keys, block["theta"], strict=True))
         zones_out[z] = {
             "status": zm["status"],
             "pred_err_c": pred,
             "windows": block["w"],
             "excited_windows": block["n"],
             "pe_min": block["pe"],
-            "theta": dict(zip(zone.air_keys, block["theta"], strict=True)),
+            "theta": theta,
             "rel_se": dict(zip(zone.air_keys, rel, strict=True)),
         }
+        if any(gr.splits for gr in zone.groups):
+            # what the split says each channel contributes, W/K (module docstring, *Split*)
+            per_channel: dict[str, float] = {}
+            for gr in zone.groups:
+                per_channel.update(channel_effectiveness(gr, theta))
+            zones_out[z]["e_per_channel"] = per_channel
     bays_out: dict[str, Any] = {}
     for b, bay in st.bays.items():
         block = memory["bays"][b]

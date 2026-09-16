@@ -1689,9 +1689,21 @@ weight `33 W/K × count / (zones listing i)` when `z` lists it, `0.1×`
 when `z` is only coupled to such a zone, else not at all. Channels of one
 `fans.<ch>.group` share one coefficient per zone.
 
+**Per-channel split** (`model_split_channels`, item 13). Regulation moves a
+group's channels together, so only `E_zG` is identifiable from it; an
+experiment's single-channel phases move them apart. With the switch on each
+multi-channel group carries one `Es.<zone>.<group>.<channel>` per channel
+beyond the first, whose regressor `φ_ch − φ_zG` is exactly zero under common
+motion — at the prior split the model is the shared-`E` model term for term.
+The split redistributes the group's coefficient and never changes its total
+(`E_ch = E_zG w_ch/W + Es_ch − (w_ch/W) Σ Es`), the convergence rules still
+read the group coefficients alone, and `GET /api/model` reports
+`e_per_channel` per zone.
+
 | Key | Unit | Bounds | Prior | Identified from |
 |-----|------|--------|-------|-----------------|
 | `E.<zone>.<group>` | W/K | [0, 200] | 33/fan × count / zones listing (0.1× coupled) | air-node RLS with fan excitation; weak cross-zone E ridged |
+| `Es.<zone>.<group>.<ch>` | W/K | [−200, 200] | 0 (`model_split_channels`) | air-node RLS, single-channel experiment phases only (ridge to 0) |
 | `leak.<zone>` | W/K | [0, 20] | 1 | air-node RLS, ridge |
 | `kappa.<z>.<z2>` | W/K | [0, 50] | 3, declared pairs only | air-node RLS, ridge |
 | `p_air.<zone>` | W | [−100, 100] | 0 | air-node constant, ridged toward 0 |
@@ -2873,6 +2885,7 @@ aqua-bridge/
     test_stuck_sim.py        # Stuck evidence on sim/das (sweeps: nightly)
     test_pi_das.py
     test_thermal_model.py
+    test_thermal_split.py    # per-channel split of a fan group's E (item 13)
     test_thermal_ident.py    # identifiability on sim/das (sweeps: nightly)
     test_solver_das.py
     test_noise_regression.py # MPC noise vs the quietest uniform curve (sweeps: nightly)
@@ -3581,6 +3594,7 @@ tests carry the `nightly` marker.
 | `tests/test_stuck_sim.py` | Stuck evidence on the truth sim (§3 Stuck sizing, §8 items 3 and 58): healthy `rich` runs flag no sensor and fault no zone; a frozen DS18B20 or thermistor proximal reading is flagged once its zone's airflow moves, or, with the fans held by the rate limit, once its zone air has risen past `stuck_zone_air_dT_c` and another bay has followed it; a zone-air sensor drifting on a healthy enclosure flags no proximal reading; only a bay's last proximal sensor faults its zone | PR: 2 seeds, 3 frozen runs, 1 drifting-air run; nightly: 48 seeds, 2.5-hour runs of both DAS solvers, and the per-seed coverage sweep (each proximal reading frozen in turn) |
 | `tests/test_hotswap.py` | slow swap, quick swap (never through `empty`, margin widens, class follows the new drive) and empty-at-boot on the truth sim: no limit violation, no zone fault, fans rise, constraints removed on empty | PR |
 | `tests/test_thermal_model.py` | structure, fan groups, parameter table, Jacobians vs finite differences, `eig` vs matrix exponential and the Euler fallback, windows, lag correction, RLS safeguards, status machine, never raising in `step`, shadow never changes the command | PR |
+| `tests/test_thermal_split.py` | the per-channel split (item 13): only a multi-channel group gets keys, the prior split reproduces the shared-`E` prediction and Jacobians bit for bit, a split redistributes without changing the group total, the Jacobian of a split group against finite differences, a whole-group experiment leaves the split at 0 while single-channel phases find a 60 % difference, and a store file written with the switch the other way is converted | PR |
 | `tests/test_thermal_ident.py` | identifiability with group experiments on the truth sim: in-zone `E` within 15 % (PR seed), per-bay `k` within 25 %, `leak` / `κ` at prior, convergence; regulation only never converges; the seed sweep (bound 25 %), sensor offsets, the rich preset | PR: 4 cases; nightly: sweeps |
 | `tests/test_solver_das.py` | active-piece SQP vs a projected-gradient reference, monotone objective, iteration cap, forbidden-band snap and hysteresis, zero-order hold, prediction vs thermal Jacobians, noise index and surrogate, bumpless offset, fixed channels, validity gate and model fallback with dwell (the entry dwell, the model rate through the drives' filter, the air-disturbance check, the prediction guard on eligible rows only), a clock stepped back, horizon and block extremes | PR |
 | `tests/test_model_fallback_sim.py` | the validity gate against the truth plant: the observed drive rate (ramp, restarts, memory), a sound model returns within `model_return_dwell_s + 2 · mpc_every_ticks · dt` and does not re-enter (§8 items 10, 64), a model with wrong bay gains is caught and held, a healthy enclosure never reaches the fallback (§8 item 65), a fouling jump to 0.15× airflow does (§8 item 66) and the same run without it does not, every drive within its limit and bumpless switches; the plain drift holds the same step | PR: 1 return, 1 broken model, 3 healthy seeds and the fouling pair per preset; nightly: zones × seeds on `basic` and `rich`, more broken gains, 8 healthy seeds and 4 fouling seeds per preset |
@@ -4265,8 +4279,28 @@ Owner decision (2026-09-16):
     `k = 1.12–1.18`, within 2–6 %, from 119 windows in the 4 h after the swap.
     No other bay is touched (`k.b05` moves by less than 0.01 between the two
     runs), and one swap produced exactly one reset.
-13. Split a fan group's shared `E` into per-channel coefficients from the
-    single-channel experiment phases.
+13. **Done** (2026-09-16): `mpc.model_split_channels` (needs `topology`,
+    default `false`). A fan group of more than one channel in a zone carries
+    one extra air-block coefficient per channel beyond the first,
+    `Es.<zone>.<group>.<channel>`, in the same regression:
+    `Q_zG = E_zG φ_zG + Σ_{ch ≠ ref} Es_zGch (φ_ch − φ_zG)`. The extra
+    regressor is **exactly zero** while the group's channels hold the same
+    duty, so regulation and a whole-group phase leave the shared-`E` model
+    term for term (the prediction and the Jacobians are bit-identical at the
+    prior split) and only an experiment's single-channel phases move it.
+    What it learns is a redistribution: the implied per-channel
+    `E_ch = E_zG w_ch/W + Es_ch − (w_ch/W) Σ Es` sums to `E_zG` whatever the
+    split, so the group as a whole never changes. The convergence rules read
+    the group coefficients alone (`Es` is not a gain for `rel_se`;
+    excitation and the PE monitor still see `φ_zG`), so the switch cannot
+    stop a model converging. `GET /api/model` reports `e_per_channel` per
+    zone, and a store file written with the switch the other way round is
+    converted rather than dropped (shared keys keep their value, variance
+    and covariances; a new key starts at its prior). Measured on the truth
+    simulator with a group whose channels differ by 60 % (84 W/K against
+    26, a ratio of 3.23 where the count-weighted prior says 2.0): after
+    whole-group phases and then each channel alone, 78.6 / 28.6, ratio 2.75,
+    group total 107 against 110 (`tests/test_thermal_split.py`).
 14. **Done** (2026-09-16): `mpc.fan_curve_online` (needs `topology`,
     default `false`) fits each fan model's PWM → RPM curve online
     (`control/fancurve.py`, pure). Settled pairs only: a channel
