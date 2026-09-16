@@ -48,8 +48,8 @@ from aqua_bridge.control.gate import evaluate_gate
 from aqua_bridge.control.mpc import step
 from aqua_bridge.control.solver_pi import PiSolver, SolverRequest, SolverResult
 from aqua_bridge.model import (
+    ESTIMATOR_DEFAULTS,
     SIGMA_FLOOR_DEFAULTS,
-    SIGMA_UNCALIBRATED_C,
     ConfigError,
     Mode,
     MpcConfig,
@@ -316,7 +316,7 @@ def test_strict_ignores_the_estimator_update(patch, status):
 
 
 def test_sigma_fault_c_must_exceed_the_uncalibrated_floor_under_sigma():
-    floor = SIGMA_UNCALIBRATED_C
+    floor = ESTIMATOR_DEFAULTS["sigma_uncalibrated_c"]
     with pytest.raises(ConfigError, match="sigma_fault_c must be > the uncalibrated"):
         with_rule(lcfg("strict"), "sigma", sigma_fault_c=floor)
     assert with_rule(lcfg("strict"), "strict", sigma_fault_c=floor).zones.trust_rule == "strict"
@@ -776,7 +776,7 @@ def assert_redundant_pairs_do_not_fault_a_healthy_zone(ticks: int, seed: int, so
             for r in run.records
             if bay in r.cmd.diagnostics["estimates"]
         ]
-        assert max(sigma) < SIGMA_UNCALIBRATED_C + 0.1, (bay, max(sigma))
+        assert max(sigma) < ESTIMATOR_DEFAULTS["sigma_uncalibrated_c"] + 0.1, (bay, max(sigma))
     offsets = run.records[-1].cmd.diagnostics["bays"]
     assert set(offsets["b03"]["offsets_c"]) == {"prox_b03b"}
     assert set(offsets["b10"]["offsets_c"]) == {"prox_b10b"}
@@ -1186,7 +1186,7 @@ def test_a_zone_that_loses_only_its_air_sensor_faults_on_the_blind_clock():
     ]
     assert max(every) < cfg.estimator.sigma_fault_c / 2, max(every)
     air = [r.cmd.diagnostics["estimator"]["zones"]["z0"]["sigma_air_c"] for r in run.records]
-    assert max(air[1:]) < 0.1, max(air[1:])  # air[0] is the prior sqrt(P0_T_AIR)
+    assert max(air[1:]) < 0.1, max(air[1:])  # air[0] is the prior sqrt(p0_t_air)
     wide = example_cfg("sigma", air_blind_fault_s=10_000.0)
     never = sim_run(wide, 300, hook=without(("air_z0",), since_s=LOST_S))
     assert not any(r.cmd.diagnostics["zones_in_fault"] for r in never.records)

@@ -236,7 +236,7 @@ def test_step_reports_estimates_in_diagnostics(lcfg):
     a1 = diag["a1"]
     assert a1["t_c"] == pytest.approx(est.prior_drive_temp(PROX_C, SP))
     sigma = a1["sigma_c"]
-    assert est.SIGMA_UNCALIBRATED_C < sigma < 1.55
+    assert lcfg.estimator.sigma_uncalibrated_c < sigma < 1.55
     assert a1["margin_c"] == pytest.approx(2.0 * sigma)
     assert a1["soft_c"] == pytest.approx(50.0 - 5.0 - 2.0 * sigma)
     assert a1["hard_c"] == pytest.approx(50.0 - 2.0 * sigma)

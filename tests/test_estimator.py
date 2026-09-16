@@ -41,6 +41,9 @@ from invariants import checked_step
 # helpers
 # ---------------------------------------------------------------------------
 
+#: The uncalibrated sigma floor as the config model defaults it (``estimator`` item 71).
+FLOOR_C = ESTIMATOR_DEFAULTS["sigma_uncalibrated_c"]
+
 
 def lcfg(**estimator: Any) -> MpcConfig:
     """The small zoned fixture without setpoints (limit regulation), estimator overrides."""
@@ -157,6 +160,15 @@ def test_estimator_section_parses_and_round_trips():
         {"associate_window_s": 599.0},
         {"associate_min_corr": 1.0},
         {"associate_margin": 0.0},
+        {"sigma_uncalibrated_c": 0.0},
+        {"p0_t_air": 0.0},
+        {"p0_d_air": -1e-6},
+        {"p0_t_drive": 0.0},
+        {"p0_t_sensor": 0.0},
+        {"p0_heat": 0.0},
+        {"reset_drive_var": 0.0},
+        {"jump_min_c": 0.0},
+        {"jump_sigmas": -1.0},
         {"k_sigma": "wide"},
         {"window": 1},
         [],
@@ -167,6 +179,26 @@ def test_estimator_section_rejects_bad_values(section):
     m["estimator"] = section
     with pytest.raises(ConfigError):
         MpcConfig.from_mapping(m)
+
+
+def test_the_filter_reads_its_tunables_from_the_config(cfg):
+    """Item 71: no estimator tunable is a module constant any more."""
+    assert not hasattr(E, "RESET_DRIVE_VAR") and not hasattr(E, "JUMP_MIN_C")
+    assert not hasattr(E, "JUMP_SIGMAS") and not hasattr(E, "P0_T_AIR")
+    assert not hasattr(est, "SIGMA_UNCALIBRATED_C")
+    wide = lcfg(p0_t_air=4.0, p0_t_drive=9.0, p0_t_sensor=1.0, p0_heat=1e-3, p0_d_air=1e-3)
+    plain = lcfg()
+    p_wide = np.array(tick(wide, None, 0.0).memory["zones"]["za"]["P"])
+    p_plain = np.array(tick(plain, None, 0.0).memory["zones"]["za"]["P"])
+    assert np.diag(p_wide)[0] > np.diag(p_plain)[0]  # T_a starts wider
+    assert (
+        tick(wide, None, 0.0).estimates["a1"]["sigma"]
+        > tick(plain, None, 0.0).estimates["a1"]["sigma"]
+    )
+    # the uncalibrated floor is the config's, not a literal
+    high = lcfg(sigma_uncalibrated_c=3.0)
+    assert tick(high, None, 0.0).bays["a1"]["sigma_cal_c"] == 3.0
+    assert tick(plain, None, 0.0).bays["a1"]["sigma_cal_c"] == FLOOR_C
 
 
 def test_estimator_section_requires_topology(cfg):
@@ -248,6 +280,7 @@ def test_the_pair_update_is_the_joseph_form_with_h_on_two_states(seed):
 @given(data=st.data())
 def test_joseph_form_keeps_every_covariance_symmetric_and_psd(data):
     cfg = lcfg()
+    floor = cfg.estimator.sigma_uncalibrated_c
     names = list(cfg.temps)
     mem = None
     ts = 0.0
@@ -265,7 +298,7 @@ def test_joseph_form_keeps_every_covariance_symmetric_and_psd(data):
             eig = np.linalg.eigvalsh(p)
             assert eig.min() >= -1e-9 * max(1.0, eig.max()), eig.min()
         for entry in up.estimates.values():
-            assert math.isfinite(entry["t"]) and entry["sigma"] >= est.SIGMA_UNCALIBRATED_C
+            assert math.isfinite(entry["t"]) and entry["sigma"] >= floor
         json.dumps(mem, allow_nan=False)
 
 
@@ -285,7 +318,7 @@ def test_first_tick_inverts_the_prior_map_and_constant_readings_hold():
         assert up.estimates["a1"]["t"] == pytest.approx(first["t"], abs=1e-6)
         assert up.zones["za"]["drift_c_per_min"] < 1e-6
     assert all(b <= a + 1e-4 for a, b in zip(sigmas, sigmas[1:], strict=False))  # settles
-    assert sigmas[-1] < sigmas[0] and sigmas[-1] >= est.SIGMA_UNCALIBRATED_C
+    assert sigmas[-1] < sigmas[0] and sigmas[-1] >= cfg.estimator.sigma_uncalibrated_c
     assert set(ups[-1].estimates) == {"a1", "a2", "b1"}  # c1 is declared empty
 
 
@@ -326,7 +359,7 @@ def test_two_proximal_sensors_at_different_placements_are_an_offset_not_a_swap()
     cfg = lcfg()
     ups = run_ticks(cfg, 60, prox_a1b=PROX_C - PLACEMENT_GAP_C)
     sigmas = [up.estimates["a1"]["sigma"] for up in ups]
-    assert max(sigmas) < est.SIGMA_UNCALIBRATED_C + 0.05, max(sigmas)
+    assert max(sigmas) < est.sigma_uncalibrated_c(cfg) + 0.05, max(sigmas)
     offsets = [up.bays["a1"]["offsets_c"]["prox_a1b"] for up in ups]
     assert offsets[0] == 0.0
     assert offsets[-1] == pytest.approx(-PLACEMENT_GAP_C, abs=0.05)
@@ -379,7 +412,7 @@ def test_the_anchor_alone_is_enough_and_so_is_the_other_member():
         -1
     ]
     for up in (anchor, other):
-        assert up.estimates["a1"]["sigma"] < est.SIGMA_UNCALIBRATED_C + 0.1
+        assert up.estimates["a1"]["sigma"] < est.sigma_uncalibrated_c(cfg) + 0.1
         assert up.estimates["a1"]["t"] == pytest.approx(both.estimates["a1"]["t"], abs=0.3)
 
 
@@ -397,7 +430,7 @@ def test_a_bay_missing_on_the_first_tick_is_seeded_by_its_first_reading():
     assert "b1" in first.estimates  # still constrained, on the prior
     back = run_ticks(cfg, 3, mem=first.memory, t0=3.0)
     assert back[0].bays["b1"]["seeded"] is True
-    assert max(up.estimates["b1"]["sigma"] for up in back) < est.SIGMA_UNCALIBRATED_C + 0.05
+    assert max(up.estimates["b1"]["sigma"] for up in back) < est.sigma_uncalibrated_c(cfg) + 0.05
     assert back[-1].estimates["b1"]["t"] == pytest.approx(est.prior_drive_temp(PROX_C, SP), abs=0.5)
     assert not any(up.bays["b1"]["settling"] for up in back)
 
@@ -636,7 +669,7 @@ def test_fresh_smart_of_an_associated_serial_keeps_a_bay_occupied():
 
 def test_calibration_rls_converges_on_excited_rows():
     rng = np.random.default_rng(3)
-    entry = E._fresh_calibration()
+    entry = E._fresh_calibration(FLOOR_C)
     for k in range(200):
         x = 8.0 + 4.0 * math.sin(k / 7.0)
         y = 0.62 * x + 0.4 + rng.normal(0.0, 0.3)
@@ -649,7 +682,7 @@ def test_calibration_rls_converges_on_excited_rows():
 
 
 def test_calibration_rls_does_not_wind_up_on_a_constant_input_stream():
-    entry = E._fresh_calibration()
+    entry = E._fresh_calibration(FLOOR_C)
     for k in range(2000):
         entry, _ = E.calibration_update(entry, 10.0, 0.7 * 10.0 - 2.1 + 0.5, float(k))
     slope, offset = entry["th"]
@@ -665,7 +698,7 @@ def test_calibration_is_keyed_by_serial_within_the_bay():
     cfg_a = das_cfg(setpoints={}, topology=_serial_topology("a1", "A"))
     up = tick(cfg_a, None, 0.0)
     mem = json.loads(json.dumps(up.memory))
-    entry = E._fresh_calibration()
+    entry = E._fresh_calibration(FLOOR_C)
     for k in range(40):
         x = 4.0 + 3.0 * math.sin(k)
         entry, _ = E.calibration_update(entry, x, 0.7 * x - 2.1, 0.0)
@@ -676,7 +709,7 @@ def test_calibration_is_keyed_by_serial_within_the_bay():
     cfg_b = das_cfg(setpoints={}, topology=_serial_topology("a1", "B"))  # another drive
     up_b = tick(cfg_b, up.memory, 1.0)
     assert not up_b.bays["a1"]["calibrated"] and up_b.bays["a1"]["calibration"] is None
-    assert up_b.bays["a1"]["sigma_cal_c"] == est.SIGMA_UNCALIBRATED_C
+    assert up_b.bays["a1"]["sigma_cal_c"] == cfg_b.estimator.sigma_uncalibrated_c
     up_a = tick(cfg_a, up_b.memory, 1.5)  # the first drive is back in the bay
     assert up_a.bays["a1"]["calibrated"]
 
@@ -803,14 +836,14 @@ def calibrated_run():
 
 
 def test_smart_calibration_converges_and_calibrated_estimates_are_within_1c(calibrated_run):
-    _, _, up, errs = calibrated_run
+    cfg, _, up, errs = calibrated_run
     calibrated = [b for b, info in up.bays.items() if info["calibrated"]]
     assert len(calibrated) >= 12, {b: info["calibration"] for b, info in up.bays.items()}
     for bay in calibrated:
         info = up.bays[bay]
         assert info["association"] == "declared"
         assert E.SIGMA_CAL_FLOOR_C <= info["sigma_cal_c"] < 1.0
-        assert up.estimates[bay]["sigma"] < est.SIGMA_UNCALIBRATED_C
+        assert up.estimates[bay]["sigma"] < cfg.estimator.sigma_uncalibrated_c
     errs_arr = np.abs(np.array(errs))
     assert errs_arr.size > 1000
     assert np.mean(errs_arr <= 1.0) >= 0.95
@@ -821,16 +854,17 @@ def test_calibration_expires_without_samples_and_comes_back_with_them(calibrated
     m = cfg.to_dict()
     m["estimator"] = dict(m["estimator"], calibration_max_age_days=600.0 / 86400.0)
     short = MpcConfig.from_mapping(m)
+    floor = short.estimator.sigma_uncalibrated_c
     mem = copy.deepcopy(up.memory)
     slopes = {b: info["calibration"]["slope"] for b, info in up.bays.items() if info["calibrated"]}
     # the agent stops: no SMART for 15 minutes
     silent = run_truth(short, plant, 180, smart=False, mem=mem)
     for bay in slopes:
         info = silent.bays[bay]
-        assert not info["calibrated"] and info["sigma_cal_c"] == est.SIGMA_UNCALIBRATED_C
+        assert not info["calibrated"] and info["sigma_cal_c"] == floor
         assert info["calibration"]["slope"] == pytest.approx(slopes[bay])  # theta kept
         assert info["calibration"]["fresh_samples"] == 0
-        assert silent.estimates[bay]["sigma"] >= est.SIGMA_UNCALIBRATED_C
+        assert silent.estimates[bay]["sigma"] >= floor
     # the agent is back: fresh samples confirm the calibration again
     back = run_truth(short, plant, 240, smart=True, mem=silent.memory)
     assert sum(1 for b in slopes if back.bays[b]["calibrated"]) >= len(slopes) // 2

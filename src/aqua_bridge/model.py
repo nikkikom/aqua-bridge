@@ -696,11 +696,6 @@ TRUST_RULES: tuple[str, ...] = ("strict", "sigma")
 FAULT_COUPLINGS: tuple[str, ...] = ("declared", "none")
 #: Label prefix of a setpoint sensor's own required group (``ZoneLayout.required_groups``).
 SETPOINT_GROUP_PREFIX = "setpoint:"
-#: Calibration floor of an uncalibrated bay, degC (plan section 2): no drive estimate of
-#: an uncalibrated bay has a smaller sigma, so ``zones.trust_rule: sigma`` needs
-#: ``estimator.sigma_fault_c`` above it (``aqua_bridge.control.estimates`` re-exports it).
-SIGMA_UNCALIBRATED_C = 1.5
-
 #: ``ident_levels`` values: ``above`` (base and base + amplitude, never less cooling
 #: than the solver's level at start) or ``symmetric`` (base +- amplitude, owner opt-in).
 IDENT_LEVELS: tuple[str, ...] = ("above", "symmetric")
@@ -1243,9 +1238,10 @@ class NoiseSpec:
 
 
 #: ``estimator`` defaults (plan sections 2 and 7): ``k`` of the ``k * sigma`` margin,
-#: sigma trust-rule thresholds, per-tick process noise of the Kalman filter states,
-#: sensor white noise, SMART staleness and rejection, occupancy thresholds, SMART
-#: calibration expiry and serial -> bay association.
+#: sigma trust-rule thresholds, per-tick process noise of the Kalman filter states, the
+#: initial covariance per state kind, sensor white noise, SMART staleness and rejection,
+#: occupancy thresholds and debounce, the fast-swap rule, SMART calibration expiry and
+#: serial -> bay association.
 ESTIMATOR_DEFAULTS: dict[str, float] = {
     "k_sigma": 2.0,
     "sigma_fault_c": 4.0,
@@ -1270,7 +1266,32 @@ ESTIMATOR_DEFAULTS: dict[str, float] = {
     "associate_window_s": 3600.0,
     "associate_min_corr": 0.8,
     "associate_margin": 0.15,
+    "sigma_uncalibrated_c": 1.5,
+    "p0_t_air": 0.25,
+    "p0_d_air": 0.0025,
+    "p0_t_drive": 0.1,
+    "p0_t_sensor": 0.1,
+    "p0_heat": 2.5e-05,
+    "reset_drive_var": 25.0,
+    "jump_min_c": 0.5,
+    "jump_sigmas": 6.0,
 }
+
+#: ``estimator`` keys that are a variance of a filter state (all ``> 0``).
+_ESTIMATOR_VARIANCE_KEYS: tuple[str, ...] = (
+    "q_t_air",
+    "q_d_air",
+    "q_t_drive",
+    "q_t_sensor",
+    "q_heat",
+    "q_offset",
+    "p0_t_air",
+    "p0_d_air",
+    "p0_t_drive",
+    "p0_t_sensor",
+    "p0_heat",
+    "reset_drive_var",
+)
 
 
 @dataclass(frozen=True)
@@ -1281,7 +1302,9 @@ class EstimatorSpec:
     * ``sigma_fault_c`` / ``sigma_air_fault_c`` -- thresholds of the ``sigma`` zone trust
       rule, degC (> 0): a zone is untrusted while a constrained bay's drive sigma or its
       air sigma is above them; with ``zones.trust_rule: sigma``, ``sigma_fault_c`` must
-      exceed :data:`SIGMA_UNCALIBRATED_C`
+      exceed ``sigma_uncalibrated_c``
+    * ``sigma_uncalibrated_c``     -- calibration floor of a bay without an accepted SMART
+      calibration, degC (> 0): no drive estimate of such a bay has a smaller sigma
     * ``air_blind_fault_s``        -- the ``sigma`` rule's air observability window,
       seconds (``>= 0``): a zone whose air node has had no trusted ``zone_air`` reading
       fused for longer than this is untrusted (the air sigma itself barely grows, so it
@@ -1289,6 +1312,13 @@ class EstimatorSpec:
     * ``q_t_air`` / ``q_d_air`` / ``q_t_drive`` / ``q_t_sensor`` / ``q_heat`` /
       ``q_offset`` -- process noise per tick of the filter states ``T_a``, ``d_a``,
       ``T_d``, ``T_s``, ``q`` and a proximal sensor's placement offset (> 0)
+    * ``p0_t_air`` / ``p0_d_air`` / ``p0_t_drive`` / ``p0_t_sensor`` / ``p0_heat`` -- the
+      initial variance of those same states when a zone's filter starts (> 0)
+    * ``reset_drive_var``          -- drive variance a bay's filter restarts from when a
+      drive (possibly) arrived, degC^2 (> 0)
+    * ``jump_min_c`` / ``jump_sigmas`` -- the fast-swap rule: a proximal innovation above
+      both (degC, > 0; sigmas, > 0) inflates the bay's variances and drops a correlation
+      association
     * ``sensor_noise_c``           -- white noise of a temperature sensor, degC (>= 0);
       the measurement variance is ``sensor_noise_c ** 2 + quant_c ** 2 / 12``
     * ``proximal_offset_c``        -- prior standard deviation of the placement offset
@@ -1335,6 +1365,15 @@ class EstimatorSpec:
     associate_window_s: float = ESTIMATOR_DEFAULTS["associate_window_s"]
     associate_min_corr: float = ESTIMATOR_DEFAULTS["associate_min_corr"]
     associate_margin: float = ESTIMATOR_DEFAULTS["associate_margin"]
+    sigma_uncalibrated_c: float = ESTIMATOR_DEFAULTS["sigma_uncalibrated_c"]
+    p0_t_air: float = ESTIMATOR_DEFAULTS["p0_t_air"]
+    p0_d_air: float = ESTIMATOR_DEFAULTS["p0_d_air"]
+    p0_t_drive: float = ESTIMATOR_DEFAULTS["p0_t_drive"]
+    p0_t_sensor: float = ESTIMATOR_DEFAULTS["p0_t_sensor"]
+    p0_heat: float = ESTIMATOR_DEFAULTS["p0_heat"]
+    reset_drive_var: float = ESTIMATOR_DEFAULTS["reset_drive_var"]
+    jump_min_c: float = ESTIMATOR_DEFAULTS["jump_min_c"]
+    jump_sigmas: float = ESTIMATOR_DEFAULTS["jump_sigmas"]
 
     @classmethod
     def coerce(cls, data: object) -> EstimatorSpec:
@@ -1356,10 +1395,17 @@ class EstimatorSpec:
         where = "mpc.estimator"
         if not 0.0 <= self.k_sigma <= 4.0:
             raise ConfigError(f"{where}.k_sigma must be in [0, 4], got {self.k_sigma}")
-        for key in ("sigma_fault_c", "sigma_air_fault_c", "smart_reject_c"):
+        for key in (
+            "sigma_fault_c",
+            "sigma_air_fault_c",
+            "smart_reject_c",
+            "sigma_uncalibrated_c",
+            "jump_min_c",
+            "jump_sigmas",
+        ):
             if getattr(self, key) <= 0:
                 raise ConfigError(f"{where}.{key} must be > 0, got {getattr(self, key)}")
-        for key in ("q_t_air", "q_d_air", "q_t_drive", "q_t_sensor", "q_heat", "q_offset"):
+        for key in _ESTIMATOR_VARIANCE_KEYS:
             if getattr(self, key) <= 0:
                 raise ConfigError(f"{where}.{key} must be > 0, got {getattr(self, key)}")
         for key in ("sensor_noise_c", "proximal_offset_c", "air_blind_fault_s"):
@@ -2417,12 +2463,13 @@ class MpcConfig:
         if (
             policy.trust_rule == "sigma"
             and isinstance(self.estimator, EstimatorSpec)
-            and not self.estimator.sigma_fault_c > SIGMA_UNCALIBRATED_C
+            and not self.estimator.sigma_fault_c > self.estimator.sigma_uncalibrated_c
         ):
             raise ConfigError(
                 "mpc.estimator.sigma_fault_c must be > the uncalibrated sigma floor "
-                f"{SIGMA_UNCALIBRATED_C} degC with zones.trust_rule: sigma (every zone with an "
-                f"uncalibrated bay would stay in fault), got {self.estimator.sigma_fault_c}"
+                f"{self.estimator.sigma_uncalibrated_c} degC with zones.trust_rule: sigma (every "
+                f"zone with an uncalibrated bay would stay in fault), got "
+                f"{self.estimator.sigma_fault_c}"
             )
 
         noise = self.noise

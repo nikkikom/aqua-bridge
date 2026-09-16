@@ -622,7 +622,7 @@ def test_an_expired_or_undated_calibration_restarts_its_fresh_count(tmp_path):
         restored = state.solver_memory["estimator"]["cal"]["b01"]["SER-A"]
         assert restored["fresh"] == 0 and restored["used"] is True
         assert cmd.diagnostics["bays"]["b01"]["calibrated"] is False
-        assert cmd.diagnostics["bays"]["b01"]["sigma_cal_c"] == est_prior.SIGMA_UNCALIBRATED_C
+        assert cmd.diagnostics["bays"]["b01"]["sigma_cal_c"] == est_prior.sigma_uncalibrated_c(cfg)
 
 
 def test_a_stale_file_inflates_sigma_cal_until_smart_confirms_it(tmp_path):

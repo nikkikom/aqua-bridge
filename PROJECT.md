@@ -939,7 +939,8 @@ holds:
   groups (a confirming sensor is not fused, so σ already carries it). On a
   tick with an estimator fault `strict` applies; `diagnostics["trust_rule"]`
   is the rule that ran. Switching rules is config only;
-  `sigma_fault_c` must exceed the uncalibrated floor 1.5 °C under `sigma`.
+  `sigma_fault_c` must exceed the uncalibrated floor `sigma_uncalibrated_c`
+  (1.5 °C) under `sigma`.
   Measured on `sim/das.py` (example config, `basic` physics with sensor
   noise, busy bays): 2 % per-tick dropouts on every DS18B20 fault no zone
   in 75 minutes under `sigma` against about 200 zone-fault episodes under
@@ -955,11 +956,11 @@ holds:
   at the uncalibrated floor — so before item 70 nothing ever faulted a zone
   that had lost its air sensors alone, though `strict` faults it at once. A
   hot swap puts the bay's σ above 4 °C for a tick (the fast-swap rule on
-  removal, the 25 °C² insert variance) with the bay still observed, so the
-  zone no longer faults for it (item 69); the insert still raises the zone's
-  fans (+0.31 PI-like DAS, +0.64 DAS MPC, against +0.22 and +0.65 with the
-  fault). Lose that bay's sensor right after the insert and the widened σ
-  faults the zone on the first blind tick.
+  removal, the `reset_drive_var` 25 °C² insert variance) with the bay still
+  observed, so the zone no longer faults for it (item 69); the insert still
+  raises the zone's fans (+0.31 PI-like DAS, +0.64 DAS MPC, against +0.22
+  and +0.65 with the fault). Lose that bay's sensor right after the insert
+  and the widened σ faults the zone on the first blind tick.
 
 **Sensor confirmation** (DAS, `zones.advance_confirmation`). A sensor whose
 present value the gate rejects (`range`, `slew`, `stuck`: a Jump, a Spike,
@@ -1541,8 +1542,8 @@ quant_c²/12` (an empty bay's sensor measures air at weight 0.5);
 untrusted sensors are skipped. SMART enters as a measurement of `T_d`
 (`R = 1 °C²`) only for a calibrated bay. The filter runs every tick,
 fault ticks included. A **fast-swap rule** inflates a bay's drive and
-sensor variance on a proximal innovation above 0.5 °C and 6σ, so a
-pulled-and-replaced drive widens its margin at once.
+sensor variance on a proximal innovation above `jump_min_c` (0.5 °C) and
+`jump_sigmas` (6) σ, so a pulled-and-replaced drive widens its margin at once.
 
 **Placement offsets** (item 67). A bay's sensor node is anchored on its first
 proximal member that is not `redundant`; every further member reads that node
@@ -1577,7 +1578,8 @@ been changed while nothing was watching.
 
 Output per constrained bay: `t = T̂_d`, `σ = sqrt(P_dd + σ_cal²)`, margin
 `k_sigma·σ`, `soft = limit − comfort − k·σ`, `hard = limit − k·σ`,
-`q_w`; per zone air estimate and drift. `σ_cal` is 1.5 °C uncalibrated and
+`q_w`; per zone air estimate and drift. `σ_cal` is `sigma_uncalibrated_c`
+(1.5 °C) uncalibrated and
 `max(0.5, EW-RMS residual)` calibrated; the filter cannot shrink it. This
 is the honest cost of not touching the drives: without SMART the absolute
 sensor-to-drive offset is a prior, and it decides how loud the fans run.
@@ -1603,7 +1605,8 @@ on `ΔT = T̂_s − T̂_a` and the heat the filter attributes to the drive:
   `ΔT < empty_dT_c`, heat < 1 W and no fresh SMART from an associated
   serial, every one of them on ticks with a trusted zone-air sensor;
 - `empty → occupied` when `ΔT > occupied_dT_c` on 3 consecutive ticks,
-  with the drive state reset to the sensor and a 25 °C² variance.
+  with the drive state reset to the sensor and a `reset_drive_var` (25 °C²)
+  variance.
 
 `unknown` and `occupied` both carry constraints (conservative). A removed
 drive never faults a zone; an inserted one raises the fans through its
@@ -1625,7 +1628,7 @@ variance < 0.01; the filter then uses its `s, b`. A different serial
 starts from the prior; the same serial re-inserted finds its calibration
 again. **Expiry (owner decision):** without an accepted sample for
 `calibration_max_age_days` (default 30) the calibration keeps `s, b` as
-a starting point but `σ_cal` returns to 1.5 °C until 20 fresh samples
+a starting point but `σ_cal` returns to `sigma_uncalibrated_c` until 20 fresh samples
 confirm it again. SMART is never a gate input and cannot fault a zone.
 
 **Association without SES** (`control/associate.py`). The PC reports
@@ -4608,9 +4611,27 @@ Owner decision (2026-09-16):
     horizon's 3·`dt`, which would have under-counted a gap by up to 240× and
     delayed the fault — and the air σ cannot make that up, which is this
     item's own premise.
-71. Hardcoded estimator tunables: `RESET_DRIVE_VAR`, `JUMP_MIN_C`,
-    `JUMP_SIGMAS`, the `P0_*` values and `SIGMA_UNCALIBRATED_C`; make
-    them config keys.
+71. **Done** (2026-09-16): the hardcoded estimator tunables are config keys
+    of the `estimator` section with one documented default each in
+    `ESTIMATOR_DEFAULTS`, validated in the config model and spelled out in
+    `config.example-das.yaml`: `reset_drive_var` (25 °C²), `jump_min_c`
+    (0.5 °C), `jump_sigmas` (6), `p0_t_air` (0.25), `p0_d_air` (2.5e-3),
+    `p0_t_drive` (0.1), `p0_t_sensor` (0.1), `p0_heat` (2.5e-5) and
+    `sigma_uncalibrated_c` (1.5 °C). `SIGMA_UNCALIBRATED_C` is gone from
+    `model.py`; `control/estimates.sigma_uncalibrated_c(cfg)` reads the key
+    (a legacy config without an `estimator` section falls back to the same
+    default), and the `zones.trust_rule: sigma` rule compares
+    `sigma_fault_c` with the config's value rather than a literal. The
+    module priors of the physical model (`C_a`, `leak`, `κ`, `E`, `g0`, `k`)
+    stay constants: they are the thermal model's, not the operator's.
+    At the defaults the behaviour is unchanged. One deliberate exception, a
+    single bit wide: `p0_d_air` was spelled `0.05 ** 2` in code and is
+    `0.0025` as a config number, which is the next float. The four DAS
+    goldens then reproduce with `max |Δpwm| = 1.4e-12` (PI-like DAS
+    1.2e-15), identical temperatures, modes and faulted zones — inside
+    the goldens' `1e-6` tolerance, so the files are untouched. Every other
+    key reproduces its trajectory bit-for-bit (checked by running the four
+    scenarios with the pre-item-71 spellings: `MISMATCHES 0`).
 72. Under `sigma`, an identification experiment can start in a zone that
     has a lost sensor, because the zone is still trusted
     (`control/ident.py` precondition).
