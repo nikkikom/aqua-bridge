@@ -685,6 +685,7 @@ ones get their defaults):
 | `estimator.bay_settle_s` | 600 | ≥ 0 |
 | `estimator.bay_settle_max_s` | 1800 | ≥ `bay_settle_s`, s; the most settling exemption one bay may draw from `trust_rule: sigma` before it has to run this long with neither a window nor a σ over `sigma_fault_c` (§3 per-zone trust, §8 item 69); 0 grants none at all |
 | `estimator.calibration_max_age_days` | 30 | > 0 |
+| `estimator.calibrate_min_c` / `calibrate_max_c` | 5.0 / 80.0 | °C; `calibrate_min_c < calibrate_max_c`, both inside `(temp_min_c, temp_max_c)`; the range `POST /api/calibrate` accepts for a handheld drive reading (item 23) |
 | `estimator.associate_window_s` / `associate_min_corr` / `associate_margin` | 3600 / 0.8 / 0.15 | ≥ 600 / `(0, 1)` / `(0, 1)` |
 | `estimator.associate_drop_corr` / `associate_drop_checks` | 0.3 / 3 | `0 < associate_drop_corr < associate_min_corr` / a whole number ≥ 1; a correlation pair re-scored below that on this many consecutive evaluations is dropped |
 
@@ -1663,6 +1664,22 @@ again. **Expiry (owner decision):** without an accepted sample for
 `calibration_max_age_days` (default 30) the calibration keeps `s, b` as
 a starting point but `σ_cal` returns to `sigma_uncalibrated_c` until 20 fresh samples
 confirm it again. SMART is never a gate input and cannot fault a zone.
+
+**Manual calibration (item 23).** Where no SMART agent can reach the drives,
+`POST /api/calibrate {bay, drive_temp_c}` carries one reading from a handheld
+thermometer. It is **keyed by the bay**, not by a serial — the operator names
+the bay, so there is nothing to associate — and is otherwise the same sample as
+a SMART one: the same `smart_reject_c` rejection, the same RLS row, the same
+acceptance rule, the same measurement of `T_d` at `R = 1 °C²` once accepted, the
+same presence evidence for the occupancy machine, and the same expiry after
+`calibration_max_age_days`. The reading reaches `step` as
+`obs.inputs["calibration"]` (`{bay: {temp_c, ts}}`, the supervisor's
+`TickPlan.calibrations`), so `step` stays a pure function of `(obs, cfg,
+state)`. Its entry lives in the estimator's `manual` memory, never in `cal`
+(which the model store owns per serial), so a swapped drive's SMART calibration
+and the bay's manual one can never be confused; a bay's associated serial's
+calibration wins while it exists. Manual calibrations do not survive a restart
+(item 104). The refusals are in §6 *Control*.
 
 **Association without SES** (`control/associate.py`). The PC reports
 serials, not bays. (1) A declared `bays.<b>.serial` (config or `POST
@@ -3683,7 +3700,13 @@ The DAS routes are tested in `tests/test_das_intents.py` (`POST
 /api/limit` and `/api/bay` on DAS and legacy configs, fuzzed bodies never
 5xx and never exceed a configured limit, `GET /api/estimate`, `/api/bays`,
 `/api/model`, 404 on legacy), `POST /api/ident` 200 / 400 / 409 with
-the reasons (here) and
+the reasons (here), `POST /api/calibrate` (here and in
+`tests/test_supervisor.py` / `tests/test_estimator.py`: the happy path
+through the real `Supervisor`, every refusal with its reason — unknown bay,
+out of range, legacy config, `no_tick`, `empty:<bay>`, `untrusted:<zone>` —
+`401` without credentials and `429` under the uncached-check limit, fuzzed
+bodies never 5xx, and that one manual reading produces byte-identical
+estimator state to the same value arriving as SMART) and
 `tests/test_inputs_smart.py` (`POST /api/in/smart`). Every app is built
 with an authenticator (`tests/http_fixtures.py`: a test user at the
 minimum iteration count) and the clients send its credentials.
@@ -4064,7 +4087,7 @@ Config `http:` (parsed and validated by `HttpSettings` in
 | `GET` | `/api/estimate` | DAS: `{"estimates": {bay: …}, "estimator": {…}}` of the last command; legacy: 404 |
 | `GET` | `/api/bays` | DAS: `{"bays": {bay: {"declared": {zone, occupied, class, serial}, "estimator": {occupancy, class, serial, association, calibration, candidates, …} \| null}}}`; legacy: 404 |
 | `GET` | `/api/zones` | DAS: `{"zones": {zone: {…}}, "zones_in_fault": […], "degraded": bool}`; legacy: 404 |
-| `GET` | `/api/model` | DAS: `{"thermal", "parameters", "calibration", "store", "experiment"}`; legacy: 404 |
+| `GET` | `/api/model` | DAS: `{"thermal", "parameters", "calibration", "manual_calibrations", "store", "experiment"}`; legacy: 404 |
 | `GET` | `/` | `publishers/static/index.html` |
 
 `/api/state` keys:
@@ -4135,7 +4158,10 @@ estimate, SMART counters). `/api/model`: `thermal` is
 coefficients with relative standard errors; `{"status": "off"}` without
 `model_shadow`), `parameters` the static table of §3 (unit, bounds,
 prior, identified from), `calibration` per bay (serial, calibrated,
-`sigma_cal_c`, calibration details), `store` what the model store loaded
+`sigma_cal_c`, `calibration_source` — `smart` | `manual` | `null` — and the
+calibration details), `manual_calibrations` the handheld readings still being
+offered to the estimator (`{bay: {temp_c, ts}}`, item 23), `store` what the
+model store loaded
 (`{"source": "off"}` without a store), `experiment` the identification
 experiment's status (running, target, phase, level, the base at the start,
 the anchor the levels are drawn around now (`plan_base`) with `levels` and
@@ -4176,9 +4202,12 @@ curve with rail voltage, current and power (a channel with a drift is marked
 DRIFT), then every problem line. In DAS mode (`"bays" in
 state`) it also polls `/api/estimate`, `/api/bays`, `/api/zones` and
 `/api/model` and shows Drives (per-bay estimate joined with the declared
-occupancy and class), Zones (trust, fault and which channels are held or
-ramped) and Model (thermal identification status, model store, noise index,
-experiment running); those three sections stay hidden on a legacy config.
+occupancy and class, and where that bay's sensor-to-drive map comes from —
+`cal smart`, `cal manual` or `uncal`), Zones (trust, fault and which channels are
+held or ramped) and Model (thermal identification status, model store, noise
+index, experiment running, the calibrated bays by source and the handheld
+readings still pending, item 23); those three sections stay hidden on a legacy
+config.
 The FAULT banner shows when `solver` is `fallback` or `fault`, or when a
 poll fails; a **DEGRADED** banner names the zones from
 `cmd.diagnostics.zones_in_fault` when `solver` is `degraded`. Controls are
@@ -4207,6 +4236,7 @@ route answers `401` (or `429` while the client backs off), above.
 | `POST` | `/api/preset` | `{ "name": "quiet"\|"normal"\|"cool" }` | Solver aggressiveness |
 | `POST` | `/api/auto` | `{ "channel": "xt1" }` or `{}` | Clear override (one channel or all) |
 | `POST` | `/api/ident` | `{ "action": "start", "group": "g" }`, `{ "action": "start", "channel": "xt1" }` or `{ "action": "stop" }` | DAS: start or stop an identification experiment |
+| `POST` | `/api/calibrate` | `{ "bay": "b03", "drive_temp_c": 41.5 }` | DAS: one handheld drive reading for one bay (the stand-in for SMART); legacy: 400 |
 | `POST` | `/api/in/smart` | `{ "serial", "model", "temp_c", "ts_wall" }` | The SMART agent's non-MQTT twin: into the `SmartInbox`; a malformed body is 400 |
 
 Rules (`control/supervisor.py`):
@@ -4242,6 +4272,26 @@ Rules (`control/supervisor.py`):
   removes the bay's constraints like the config file does; a declared
   serial wins over the association by correlation; `GET /api/bays` lists
   the candidates to confirm.
+- **`/api/calibrate`** (DAS, item 23): one drive temperature measured with a
+  handheld thermometer, for an enclosure whose drives no SMART agent can read.
+  Same authentication, same rate limit and same intent path as every other
+  command. `400` for a malformed body, an unknown bay, a `drive_temp_c` outside
+  `[estimator.calibrate_min_c, estimator.calibrate_max_c]` or a legacy config;
+  `409` when the reading would be meaningless or unsafe, the error naming which
+  bay and why: `no_tick` (no estimate yet — the estimator has to have run once),
+  `empty:<bay>` (the estimator calls the bay empty, so there is no drive a
+  temperature could describe), `untrusted:<zone>` (the bay's zone is untrusted
+  or in fault, and a map fitted to a reading the gate does not believe would
+  bias every later estimate of that bay, which is what decides how hard the fans
+  run). An accepted reading is offered to the estimator for
+  `estimator.smart_max_age_s` and reaches it exactly like a SMART sample of that
+  bay (§3) — folded in once, by sample time, exactly as a repeated SMART reading
+  is. It is visible in `GET /api/model` under `manual_calibrations` while it is
+  offered, and as the bay's `calibration` with `calibration_source: "manual"` in
+  `/api/bays` and `/api/model`, and on the page in Drives (`cal manual`) and
+  Model. A second reading for the same bay replaces the first. Like every other intent it
+  aborts a running identification experiment. There is no MQTT counterpart
+  (item 105).
 - **`/api/ident`** (DAS): `start` needs exactly one of `group` / `channel`
   (unknown → 400); `409` when `ident_enabled` is false, an experiment is
   already running, or a precondition fails — the error names every failed
@@ -4886,8 +4936,20 @@ Owner decision (2026-09-16):
 
 22. **Done:** `GET /api/zones` (§6 View) and the HA entity
     `zone_status_<zone>` (§7), both reusing `diagnostics["zones"]`.
-23. `POST /api/calibrate {bay, drive_temp_c}`: calibration with a handheld
-    thermometer when SMART is absent.
+23. **Done** (2026-09-16): `POST /api/calibrate {bay, drive_temp_c}` —
+    calibration with a handheld thermometer when SMART is absent. Same
+    authentication, rate limit and intent path as every other command
+    (`Calibrate` in `control/intents.py`, `Supervisor._calibrate`); the bay
+    and the range `estimator.calibrate_min_c` / `calibrate_max_c` are
+    validated, and the reading is refused with the reason named when it
+    would be meaningless or unsafe (`no_tick`, `empty:<bay>`,
+    `untrusted:<zone>`, §6 *Control*). An accepted reading rides to `step`
+    as `obs.inputs["calibration"]` and reaches the estimator exactly like a
+    SMART sample of that bay, keyed by bay instead of by serial (§3
+    *Manual calibration*). Visible in `GET /api/model`
+    (`manual_calibrations`, `calibration_source`), in `GET /api/bays` and on
+    the page (Drives `cal manual`, Model). Left open: persistence (item 104)
+    and an MQTT counterpart (item 105).
 24. **Done:** the HTML page shows drive estimates, bays, zone and model
     status (§6 View, `publishers/static/index.html`), reusing the existing
     `/api/estimate`, `/api/bays`, `/api/model` views plus the new
@@ -5778,6 +5840,20 @@ Owner decision (2026-09-16):
     on every tick and an under-voltage it sees force a word refresh ahead of
     the cadence. Not done — it complicates the chain for the one condition of
     the four the hwmon source already reports on its own.
+104. A manual calibration (item 23) does not survive a restart: its RLS entry
+    lives in the estimator's `manual` memory, which the model store neither
+    saves nor restores (the store's `calibration` section is keyed by drive
+    serial, and a manual reading has no serial). An owner who calibrated
+    fifteen bays by hand loses all of it on a daemon restart. The work is a
+    per-bay section in the store next to `calibration`, restored under the
+    same fresh/stale rule (`σ_cal × 2` until `confirm` new samples) and
+    dropped when the bay's occupancy changed while the daemon was down.
+105. No MQTT counterpart of `POST /api/calibrate` (item 23). The HTTPS route
+    has authentication of its own; an MQTT `cmd/calibrate` would rely on the
+    broker's ACL like `cmd/limit` and `cmd/bay` do (§7), and would need a
+    topic shape (`cmd/calibrate/<bay>` with a raw number) plus a Home
+    Assistant `number` entity per bay. Decide whether the owner wants it
+    before adding fifteen more entities.
 
 ### 8.3 Open — needs the DAS hardware
 
