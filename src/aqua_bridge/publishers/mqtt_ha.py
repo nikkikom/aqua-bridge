@@ -9,7 +9,8 @@ Topic layout (``node_id`` from ``config.yaml`` ``mqtt.node_id``):
 
 * ``{node_id}/status``            -- LWT, ``online``/``offline``
 * ``{node_id}/state``             -- retained JSON, one big blob every tick
-  (``ControlSnapshot.to_dict()`` plus a ``host`` key for host metrics)
+  (``ControlSnapshot.to_dict()`` plus a ``host`` key: the host metrics and the
+  board's decoded ``throttled`` word, :mod:`aqua_bridge.hostinfo`)
 * ``{node_id}/cmd/mode``          -- raw string, one of :class:`ControlMode`
 * ``{node_id}/cmd/preset``        -- raw string, one of :class:`Preset`
 * ``{node_id}/cmd/auto``          -- raw string channel name, or empty = all
@@ -34,6 +35,18 @@ with its duty. Its attributes are the whole ``device_health`` blob from the same
 retained state topic -- per controller and per channel, with the flow sensors and
 (once another change publishes one) the aquaero's active profile -- so the detail
 is one tap away in Home Assistant without a second entity per output.
+
+The Raspberry Pi the daemon runs on has its own binary sensor, ``host_problem``
+(PROJECT.md section 8 item 97): on whenever ``value_json.device_health.host.ok``
+is false, that is whenever the board has been above ``host_health.temp_limit_c``
+for ``temp_fault_s``, is throttling now, or (only while its CPU is idle) has sat
+further than ``divergence_c`` from the enclosure air for ``divergence_fault_s``.
+Its attributes are the host half of the same blob: the board's temperature, the
+air reference, the load average and the decoded ``get_throttled`` word. The board
+is a health signal only -- never a solver input, never a zone air sensor -- so it
+gets a sensor of its own rather than being read as a controller fault; the
+daemon-wide ``device_problem`` still covers it, since the board's problems join the
+one ``health.device_health.problems`` list.
 
 DAS mode (``mpc.topology``) subscribes to the limit and bay topics and adds one
 ``limit_<class>`` number entity per drive class (state from
@@ -399,6 +412,39 @@ def build_discovery_entities(
                 "json_attributes_topic": state_topic(node_id),
                 "json_attributes_template": (
                     "{{ value_json.device_health | default({}) | tojson }}"
+                ),
+                "device": _device_block(node_id),
+                **_availability(node_id),
+            },
+        )
+    )
+
+    # The board itself (PROJECT.md section 8 item 97): its own problem sensor, so a hot
+    # or throttling Pi is not read as a controller fault. Its attributes are the host
+    # half of the same blob -- the board's temperature, the enclosure-air reference it
+    # is compared against, the load average and the decoded get_throttled word.
+    object_id = "host_problem"
+    unique_id = f"{node_id}_{object_id}"
+    entities.append(
+        MqttEntity(
+            "binary_sensor",
+            object_id,
+            f"{discovery_prefix}/binary_sensor/{node_id}/{object_id}/config",
+            {
+                "name": "Board problem",
+                "unique_id": unique_id,
+                "object_id": unique_id,
+                "state_topic": state_topic(node_id),
+                "value_template": (
+                    "{{ 'OFF' if value_json.device_health.host.ok | default(true) else 'ON' }}"
+                ),
+                "payload_on": "ON",
+                "payload_off": "OFF",
+                "device_class": "problem",
+                "entity_category": "diagnostic",
+                "json_attributes_topic": state_topic(node_id),
+                "json_attributes_template": (
+                    "{{ value_json.device_health.host | default({}) | tojson }}"
                 ),
                 "device": _device_block(node_id),
                 **_availability(node_id),

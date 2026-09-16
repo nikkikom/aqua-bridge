@@ -18,6 +18,14 @@ expected rpm and power and any drift found; plus ``problems`` and ``ok``.
 and ``ok`` before the first tick and with a source that has no device health
 (the simulator).
 
+``device_health`` also carries a ``host`` key (PROJECT.md section 8 item 97): the
+board's own temperature, the enclosure-air reference it is compared against, the
+load average, the decoded ``get_throttled`` word and this board's own ``problems``
+and ``ok``. Its problems are part of the same ``problems`` list, so ``/api/health``
+shows them too. The board is a health signal and nothing else: it is not in
+``PlantObservation``, not in the ``diagnostics`` the solver reads, and no rule here
+can change a duty.
+
 ``GET /api/state`` also carries a top-level ``host`` key (host machine metrics,
 :mod:`aqua_bridge.hostinfo`): the same numbers as the MQTT state blob's ``host``
 key, refreshed at most every ``host.interval_s`` seconds (default 5.0) through a

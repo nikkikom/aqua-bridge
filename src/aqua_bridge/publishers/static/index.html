@@ -137,6 +137,34 @@ function renderDevices(health) {
   table("devices", rows);
 }
 
+// The board itself: /api/state's "device_health.host" -- its temperature against
+// the enclosure-air reference, whether the CPU was idle when that was judged, the
+// decoded get_throttled word, and the board's own problems. A health signal only:
+// nothing here is a solver input (§8 item 97).
+function hostHealthRows(health) {
+  const h = (health || {}).host;
+  if (!h) return [];
+  const rows = [];
+  if (h.air_c !== null && h.air_c !== undefined) {
+    const idle = h.idle === null || h.idle === undefined ? "?" : (h.idle ? "idle" : "busy");
+    rows.push(row("Board vs air", fmt(h.divergence_c) + " C (air " + fmt(h.air_c) +
+      " C, " + idle + ")"));
+  }
+  const t = h.throttled;
+  if (t) {
+    const now = ["under_voltage", "freq_capped", "throttled", "soft_temp_limit"]
+      .filter(n => t[n + "_now"]);
+    const ever = ["under_voltage", "freq_capped", "throttled", "soft_temp_limit"]
+      .filter(n => t[n + "_since_boot"]);
+    rows.push(row("Throttling now", now.length ? now.join(", ") : "no (" + t.hex + ")"));
+    rows.push(row("Since boot", ever.length ? ever.join(", ") : "none"));
+  } else {
+    rows.push(row("Throttling now", "-"));
+  }
+  for (const p of (h.problems || [])) rows.push(row("problem", p));
+  return rows;
+}
+
 async function poll() {
   try {
     const [stateRes, healthRes] = await Promise.all([
@@ -207,7 +235,7 @@ async function poll() {
     ]);
 
     const host = state.host || {};
-    table("host", [
+    const hostRows = [
       row("CPU temp", fmt(host.cpu_temp_c) + " C"),
       row("Load (1m)", fmt(host.load1)),
       row("RAM used", fmt(host.mem_used_pct, 0) + " %"),
@@ -215,7 +243,8 @@ async function poll() {
       row("Wi-Fi RSSI", fmt(host.wifi_rssi_dbm, 0) + " dBm"),
       row("MQTT", fmt(health.mqtt_connected)),
       row("USB", fmt(health.usb_present)),
-    ]);
+    ];
+    table("host", hostRows.concat(hostHealthRows(state.device_health)));
   } catch (e) {
     document.getElementById("fault").className = "show";
     document.getElementById("fault").textContent = "FAULT (UI: " + e + ")";
