@@ -280,6 +280,16 @@ hardware.
     recording) and the power rule needs `fan_models.<m>.power_w_at_max`,
     without which it stays off.
 
+    The Raspberry Pi itself is watched the same way (`host_health:`, §8
+    item 97): `/api/state`'s `device_health.host` and the page's **Host**
+    section show the board's temperature against the enclosure air, whether
+    its CPU was idle when that was judged, and the decoded
+    `get_throttled` word (throttling now, and what has occurred since boot);
+    in Home Assistant it is the `Board problem` binary sensor. The board is
+    a health signal only — it is never a solver input, a zone air sensor or
+    a model node — and the divergence rule is a hint about the air sensors
+    or the board's placement, not a verdict about either.
+
 12. **Optional SMART agent**, on the PC with the drives attached (not
     the Pi): `python tools/smart_agent.py --mqtt <broker-host>
     --node-id aqua-bridge --interval 60`, or install
