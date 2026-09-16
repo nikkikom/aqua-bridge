@@ -73,6 +73,10 @@ status is ``first`` / ``ok``, ``obs.temps`` has no key outside
     that long without one, so a sensor that keeps jumping -- its sigma falls back
     within a tick or two of each jump, at any cadence -- spends that budget and
     then faults its zone on every tick it is over, as it did before item 69.
+    This is **not** the DAS MPC validity gate's exemption, which reads the
+    estimator's ``model_exempt`` beside it and also covers a bay whose sigma is
+    simply too wide to score a model against -- the very observability loss this
+    rule exists to catch. One owner, two questions (section 8 item 100).
   - ``sigma_air_fault_c`` alone cannot see a zone that has lost its air
     sensors: every proximal sensor reads ``(1 - s) T_a`` beside its drive, and
     the inlet and the fan command pin the rest, so the air variance stays small
@@ -252,7 +256,10 @@ def sigma_reasons(zone: str, cfg: MpcConfig, estimator: EstimatorUpdate) -> list
     widening is the filter following a swap, not a loss of observability. A bay that is not
     observed on this tick is never exempt, so a blind bay still faults its zone, and the
     estimator stops reporting ``settling`` once the bay's windows have totalled
-    ``estimator.bay_settle_max_s`` of suspended check (module docstring).
+    ``estimator.bay_settle_max_s`` of suspended check (module docstring). The block's
+    ``settling_reason`` (``jump`` or ``occupancy``) and ``settling_until_s`` say which
+    widening and how much of the window is left; the estimator's ``model_exempt`` beside
+    them is the DAS MPC gate's separate verdict and is never read here (item 100).
     """
     topo = cfg.topology
     spec = cfg.estimator

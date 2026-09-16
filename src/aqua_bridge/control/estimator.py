@@ -41,6 +41,30 @@ With ``proximal_offset_c: 0`` there are no offset states and every member reads
 the node directly, as before this existed. A bay with one proximal sensor has no
 offset either, so its arithmetic is unchanged.
 
+**A node per proximal sensor** (plan section 8 item 101,
+``estimator.proximal_slope_spread``, default 0 = the layout above). An offset is a
+*constant*, and two placements do not differ by one: they see different fractions
+``1 - beta`` of the drive, so their disagreement is ``ds * (T_d - T_a) + db`` and moves
+with the drive-to-air rise. Above 0, every proximal member of a bay is its own state
+``T_s,i`` with its own lag ``sensors.<name>.tau_s`` and its own map ``s + ds_i``,
+``b + db_i`` (clipped to :data:`CAL_SLOPE_BOUNDS` and :data:`CAL_OFFSET_BOUNDS`), and it
+measures that node directly -- a plain scalar update, no offset row. The ``c`` block
+becomes those extra nodes, so **the state is exactly the same size** and the measurement
+is cheaper than the rank-two one it replaces.
+
+``(ds_i, db_i)`` is a two-parameter RLS without forgetting (:func:`_dmap_absorb`), prior
+``(0, 0)`` at ``diag(proximal_slope_spread ** 2, proximal_offset_c ** 2)``, one row
+``z_i - z_anchor = ds * rise + db`` per tick on which both members report, the bay is not
+``empty`` and the fast-swap rule did not fire, with variance
+``R_i + R_anchor + CAL_ROW_VAR``. No SMART is needed for it: both members see the same
+drive and the same air, so their *difference* is identifiable where the absolute map is
+not. The member's measurement carries ``h P h^T`` of that map in its ``R``, so an
+unconverged placement still cannot look like a swap, exactly as the offset's own variance
+does above. The bay's own node stays the anchor's: ``t_sensor``, the occupancy ``dT``,
+the association series and the SMART calibration all read it, so ``mem["cal"]`` and the
+model store are untouched. A config with one proximal sensor per bay is bit-identical
+either way (there is no further member to give a node to).
+
 Priors (plan section 3 table): ``C_a = 200``, ``leak = 1``, ``kappa = 3`` for
 declared ``coupled_to`` pairs (the neighbour's previous air estimate is a
 known input), ``g0 = 0.3``, ``k = 0.5``, ``C_d = tau_d_s * (g0 + k)`` (the
@@ -155,16 +179,36 @@ the filter cannot shrink it.
 
 Per bay the block also carries ``observed`` (a trusted proximal member this tick),
 ``seeded`` (the bay has had a reading of its own; see *Per bay* above),
-``settling`` (within ``bay_settle_s`` of a fast-swap jump or of an occupancy change
-into or out of ``empty``, both of which widen the bay's variance on purpose; the windows
-of one bay may total at most ``bay_settle_max_s`` of suspended sigma check before the bay
-has to run that long with neither a window nor a sigma over ``sigma_fault_c``, so readings
-that keep tripping the fast-swap rule cannot stay exempt for ever) and
-``offsets_c`` (the placement offset the filter carries per further member); per
-zone ``air_blind_s``, the wall-clock time since a trusted ``zone_air`` reading was last
-fused (a tick gap counts in full, at most :data:`MAX_PREDICT_S`).
-``zones.trust_rule: sigma`` reads ``observed``, ``settling`` and ``air_blind_s``
-(``aqua_bridge.control.zones``); ``seeded`` and ``offsets_c`` are diagnostics.
+``offsets_c`` (the disagreement the filter carries per further proximal member) and
+``proximal_map`` (that member's learned ``ds, db``); per zone ``air_blind_s``, the
+wall-clock time since a trusted ``zone_air`` reading was last fused (a tick gap counts in
+full, at most :data:`MAX_PREDICT_S`).
+
+**One owner, two exemptions** (plan section 8 item 100). "This bay is not itself" used to
+be decided twice: here, and again in ``control/solver_das.py`` out of the published sigma.
+The estimator is the one that widened the bay and the only one that knows why, so it marks
+every reason (:data:`SETTLE_JUMP`, :data:`SETTLE_OCCUPANCY`, :data:`SETTLE_UNCERTAIN`,
+:data:`SETTLE_CALIBRATION`) and publishes **two** verdicts per bay, each with its reason
+and the seconds it has left:
+
+* ``settling`` / ``settling_reason`` / ``settling_until_s`` / ``settling_spent_s`` /
+  ``settling_budget_s`` -- the ``zones.trust_rule: sigma`` exemption. Reasons ``jump`` and
+  ``occupancy`` only: a *deliberate widening*, granted while the bay is ``observed``, for
+  ``bay_settle_s`` per window and ``bay_settle_max_s`` in total, so readings that keep
+  tripping the fast-swap rule cannot stay exempt for ever.
+* ``model_exempt`` / ``model_exempt_reason`` / ``model_exempt_until_s`` -- the DAS MPC
+  validity gate's. Reasons ``occupancy`` (any change), ``uncertain``
+  (``sigma ** 2 - sigma_cal ** 2`` over ``bay_uncertain_var_c2``) and ``calibration``
+  (``sigma_cal`` moved by more than ``bay_cal_step_c``), for ``bay_settle_s``, with no
+  budget and no ``observed``.
+
+The two lists differ on purpose. The trust rule asks *did the filter widen this bay
+deliberately* -- an event. The model gate asks *is this bay tight enough to score a model
+against* -- a level, which a bay nobody is reading fails as surely as one just swapped,
+and which the trust rule must **not** excuse, because that is the observability loss it
+exists to catch. A jump reaches the model gate through ``uncertain``: the jump is what put
+the variance there. ``zones.trust_rule: sigma`` reads ``observed``, ``settling`` and
+``air_blind_s``; ``seeded``, ``offsets_c`` and ``proximal_map`` are diagnostics.
 
 Occupancy (``topology.bays.<b>.occupied``; runtime ``POST /api/bay``)
 -------------------------------------------------------------------
@@ -314,7 +358,9 @@ Memory (plain JSON)::
      "zones": {zone: {"x": [...], "P": [[...]], "t_in": float | None, "blind": s}},
      "bays": {bay: {"occ", "low", "rise", "blind", "rej" (failed re-checks),
                     "ver" (a re-check passed), "since", "assoc", "map", "init",
-                    "disturb", "spent", "clean"}},
+                    "disturb", "why", "spent", "clean",
+                    "unc", "calstep", "calseen" (the model gate's marks, item 100),
+                    "dmap": {sensor: {"th", "P", "n"}} (item 101)}},
      "cal": {bay: {serial: {"th", "P", "n", "fresh", "rms2", "ts", "used"
                             [, "inflate", "confirm"]}}},
      "smart": {serial: {"ts", "t", "model", "hist"}},
@@ -418,6 +464,19 @@ CAL_SERIALS_PER_BAY = 4
 #: drive serial. The parentheses keep it out of the space of real drive serials.
 MANUAL_MAP = "(manual)"
 
+#: Why a bay is not itself this tick (item 100). ``JUMP`` and ``OCCUPANCY`` are the
+#: estimator's own deliberate widenings and are what the ``sigma`` trust rule may
+#: excuse; ``UNCERTAIN`` and ``CALIBRATION`` are the two further reasons the DAS MPC's
+#: validity gate must not read as a model error.
+SETTLE_JUMP = "jump"
+SETTLE_OCCUPANCY = "occupancy"
+SETTLE_UNCERTAIN = "uncertain"
+SETTLE_CALIBRATION = "calibration"
+#: The trust rule's reasons, then the model gate's, each in the order a tie is broken.
+TRUST_REASONS: tuple[str, ...] = (SETTLE_JUMP, SETTLE_OCCUPANCY)
+MODEL_REASONS: tuple[str, ...] = (SETTLE_OCCUPANCY, SETTLE_UNCERTAIN, SETTLE_CALIBRATION)
+_SETTLE_REASONS = frozenset(TRUST_REASONS) | frozenset(MODEL_REASONS)
+
 #: Longest interval one prediction covers, seconds.
 MAX_PREDICT_S = 3600.0
 
@@ -455,14 +514,21 @@ class _Bay:
     index: int
     sensors: tuple[str, ...]
     #: The member the bay's sensor node is anchored on (the first that is not
-    #: ``redundant``): its lag and the bay's sensor map are the node's, and it is the
-    #: one member without a placement offset.
+    #: ``redundant``): the bay's sensor map is that node's map, and in the fused layout
+    #: its lag is the node's and it is the one member without a placement offset.
     primary: str
     tau_s: float
     #: Every proximal member beyond the first -> its index in the zone's offset block
-    #: (the first member anchors the node, so it has no offset; empty when
-    #: ``estimator.proximal_offset_c`` is 0).
+    #: (the first member anchors the node, so it has no offset; empty in the per-sensor
+    #: layout and when ``estimator.proximal_offset_c`` is 0).
     offsets: dict[str, int]
+    #: Every proximal member -> the index of the sensor node it reads, inside the zone's
+    #: sensor block. Fused layout: every member reads the bay's one node (``index``).
+    #: Per-sensor layout (``estimator.proximal_slope_spread > 0``): one node each.
+    nodes: dict[str, int]
+    #: The bay's own node: the anchor's. ``T_s`` of the estimates block and every
+    #: per-bay rule that needs one temperature (occupancy, association, calibration).
+    node: int
 
 
 @dataclass(frozen=True)
@@ -475,6 +541,18 @@ class _Zone:
     coupled: tuple[str, ...]
     #: Placement-offset states of the zone (``_Bay.offsets`` over its bays).
     n_offsets: int
+    #: Sensor-node states of the zone: one per bay (fused) or one per proximal member.
+    n_nodes: int
+    #: Per sensor node: the index of its bay in ``bays``, its lag, and the member it
+    #: belongs to (``None`` for a fused node, which every member of its bay reads).
+    node_bay: tuple[int, ...]
+    node_tau: tuple[float, ...]
+    node_sensor: tuple[str | None, ...]
+
+    @property
+    def dim(self) -> int:
+        """States: ``T_a, d_a, T_d(n), T_s(n_nodes), q(n), c(n_offsets)``."""
+        return 2 + 2 * len(self.bays) + self.n_nodes + self.n_offsets
 
 
 @dataclass(frozen=True)
@@ -507,7 +585,8 @@ def _build_structure(cfg: MpcConfig) -> _Structure:
     topo = cfg.topology
     assert topo is not None
     spec_est = cfg.estimator
-    with_offsets = spec_est is not None and spec_est.proximal_offset_c > 0
+    per_sensor = spec_est is not None and spec_est.proximal_slope_spread > 0
+    with_offsets = not per_sensor and spec_est is not None and spec_est.proximal_offset_c > 0
     sensors = cfg.sensors
     zones: dict[str, _Zone] = {}
     bays: dict[str, _Bay] = {}
@@ -515,19 +594,39 @@ def _build_structure(cfg: MpcConfig) -> _Structure:
     for z, spec in topo.zones.items():
         zone_bays = tuple(b for b, bay in topo.bays.items() if bay.zone == z)
         n_offsets = 0
+        node_bay: list[int] = []
+        node_tau: list[float] = []
+        node_sensor: list[str | None] = []
         for i, b in enumerate(zone_bays):
             members = tuple(
                 t for t in cfg.temps if sensors[t].role == "drive_proximal" and sensors[t].bay == b
             )
             primary = next((t for t in members if not sensors[t].redundant), members[0])
-            tau = sensors[primary].tau_s
+            tau = _tau(sensors[primary].tau_s)
             offsets: dict[str, int] = {}
             if with_offsets:
                 for name in members:
                     if name != primary:
                         offsets[name] = n_offsets
                         n_offsets += 1
-            bays[b] = _Bay(b, z, i, members, primary, float(tau) if tau else TAU_SENSOR_S, offsets)
+            if per_sensor:
+                # One node per proximal member (item 101): its own lag, its own map.
+                nodes = {}
+                anchor = len(node_bay)
+                for name in members:
+                    if name == primary:
+                        anchor = len(node_bay)
+                    nodes[name] = len(node_bay)
+                    node_bay.append(i)
+                    node_tau.append(_tau(sensors[name].tau_s))
+                    node_sensor.append(name)
+            else:  # one node per bay, anchored on ``primary`` (item 67)
+                anchor = len(node_bay)
+                nodes = dict.fromkeys(members, anchor)
+                node_bay.append(i)
+                node_tau.append(tau)
+                node_sensor.append(None)
+            bays[b] = _Bay(b, z, i, members, primary, tau, offsets, nodes, anchor)
         e: dict[str, float] = {}
         for ch in spec.channels:
             listed = sum(1 for other in topo.zones.values() if ch in other.channels)
@@ -542,13 +641,25 @@ def _build_structure(cfg: MpcConfig) -> _Structure:
             e_w_per_k=e,
             coupled=tuple(spec.coupled_to),
             n_offsets=n_offsets,
+            n_nodes=len(node_bay),
+            node_bay=tuple(node_bay),
+            node_tau=tuple(node_tau),
+            node_sensor=tuple(node_sensor),
         )
     fingerprint = json.dumps(
-        [[z, list(zs.bays), list(zs.air), zs.n_offsets] for z, zs in zones.items()]
+        [
+            [z, list(zs.bays), list(zs.air), zs.n_offsets, list(zs.node_sensor)]
+            for z, zs in zones.items()
+        ]
         + [[b, list(bs.sensors)] for b, bs in bays.items()],
         separators=(",", ":"),
     )
     return _Structure(zones=zones, bays=bays, fingerprint=fingerprint)
+
+
+def _tau(value: float | None) -> float:
+    """A sensor's lag, seconds: its ``tau_s`` or the default."""
+    return float(value) if value else TAU_SENSOR_S
 
 
 def drive_capacity(cfg: MpcConfig, drive_class: str) -> float:
@@ -695,8 +806,15 @@ def _fresh_bay() -> dict[str, Any]:
         "map": None,
         "init": False,
         "disturb": None,
+        "why": None,
         "spent": 0.0,
         "clean": 0.0,
+        # item 100: the model gate's own marks, beside the trust rule's ``disturb``
+        "unc": None,
+        "calstep": None,
+        "calseen": None,
+        # item 101: the learned map of every proximal member beyond the anchor
+        "dmap": {},
     }
 
 
@@ -727,7 +845,7 @@ def _parse(memory: object, st: _Structure) -> dict[str, Any]:
     out["ts"] = _opt_num(memory.get("ts"))
     for z, raw in dict(memory.get("zones") or {}).items():
         zone = st.zones[z]
-        n = 2 + 3 * len(zone.bays) + zone.n_offsets
+        n = zone.dim
         x = np.array(raw["x"], dtype=float)
         p = np.array(raw["P"], dtype=float)
         if x.shape != (n,) or p.shape != (n, n):
@@ -781,8 +899,17 @@ def _parse(memory: object, st: _Structure) -> dict[str, Any]:
             # of an initialised zone seeded, which is what ``True`` says.
             "init": bool(raw.get("init", True)),
             "disturb": _opt_num(raw.get("disturb")),
+            "why": _settle_reason(raw.get("why")),
             "spent": spent,
             "clean": clean,
+            "unc": _opt_num(raw.get("unc")),
+            "calstep": _opt_num(raw.get("calstep")),
+            "calseen": _opt_num(raw.get("calseen")),
+            "dmap": {
+                str(name): _parse_dmap_entry(entry)
+                for name, entry in dict(raw.get("dmap") or {}).items()
+                if name in st.bays[b].sensors
+            },
         }
     for b, per_serial in dict(memory.get("cal") or {}).items():
         if b not in st.bays:
@@ -842,6 +969,65 @@ def _parse(memory: object, st: _Structure) -> dict[str, Any]:
             raise ValueError("counter")
         out["count"][key] = value
     return out
+
+
+def _settle_reason(value: object) -> str | None:
+    if value is None:
+        return None
+    if value not in _SETTLE_REASONS:
+        raise ValueError("settling reason")
+    return str(value)
+
+
+def _fresh_dmap(spec: Any) -> dict[str, Any]:
+    """A proximal member's map difference before any evidence: ``(0, 0)`` at the config's
+    prior spread (item 101). The prior *is* the statement that two members of one bay
+    read alike; the spread says how far apart their placements may put them."""
+    return {
+        "th": [0.0, 0.0],
+        "P": [[spec.proximal_slope_spread**2, 0.0], [0.0, spec.proximal_offset_c**2]],
+        "n": 0,
+    }
+
+
+def _parse_dmap_entry(raw: object) -> dict[str, Any]:
+    """One stored ``(delta slope, delta offset)`` entry; raises on any malformed field."""
+    if not isinstance(raw, Mapping):
+        raise TypeError("dmap entry")
+    th = [_num(v) for v in raw["th"]]
+    p = [[_num(v) for v in row] for row in raw["P"]]
+    n_rows = raw["n"]
+    if len(th) != 2 or len(p) != 2 or any(len(row) != 2 for row in p):
+        raise ValueError("dmap shape")
+    if isinstance(n_rows, bool) or not isinstance(n_rows, int) or n_rows < 0:
+        raise ValueError("dmap count")
+    return {"th": th, "P": p, "n": n_rows}
+
+
+def _dmap_row_var(entry: Mapping[str, Any], rise: float) -> float:
+    """``h P h^T`` of the member's map at this tick's drive-to-air rise: how uncertain the
+    filter is about where this sensor sits, in degC^2 on its reading."""
+    p = entry["P"]
+    return rise * (rise * p[0][0] + p[0][1]) + rise * p[1][0] + p[1][1]
+
+
+def _dmap_absorb(entry: dict[str, Any], rise: float, z: float, r: float) -> None:
+    """One RLS row ``z = ds * rise + db`` (item 101), no forgetting, Joseph not needed
+    (the two parameters are the whole state and ``P`` stays symmetric by construction)."""
+    th, p = entry["th"], entry["P"]
+    ph = (rise * p[0][0] + p[0][1], rise * p[1][0] + p[1][1])
+    s = rise * ph[0] + ph[1] + r
+    if not s > 0:
+        return
+    k = (ph[0] / s, ph[1] / s)
+    nu = z - (th[0] * rise + th[1])
+    th[0] += k[0] * nu
+    th[1] += k[1] * nu
+    p00 = p[0][0] - k[0] * ph[0]
+    p11 = p[1][1] - k[1] * ph[1]
+    off = 0.5 * ((p[0][1] - k[0] * ph[1]) + (p[1][0] - k[1] * ph[0]))
+    entry["P"] = [[p00, off], [off, p11]]
+    entry["n"] += 1
 
 
 def _parse_calibration_entry(raw: object) -> dict[str, Any]:
@@ -1054,6 +1240,13 @@ def _drive_class(
     return base, "default"
 
 
+def _slots(zone: _Zone, bay: _Bay) -> tuple[int, int, int]:
+    """``(i_d, i_s, i_q)`` of one bay inside its zone's state vector: its drive, the
+    sensor node the bay is read through (the anchor's) and its heat."""
+    n = len(zone.bays)
+    return 2 + bay.index, 2 + n + bay.node, 2 + n + zone.n_nodes + bay.index
+
+
 def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
@@ -1064,9 +1257,12 @@ def _settling(bm: Mapping[str, Any], ts: float, window: float) -> bool:
     return mark is not None and 0.0 <= float(ts) - float(mark) < window
 
 
-def _mark_disturbed(bm: dict[str, Any], ts: float, budget: float) -> None:
+def _mark_disturbed(bm: dict[str, Any], ts: float, budget: float, why: str) -> None:
     """Open (or extend) a settling window on a deliberate widening (a fast-swap jump, an
     occupancy change into or out of ``empty``), while the bay has exemption left.
+
+    ``why`` is the reason the diagnostics report, so a reader of ``/api/state`` can tell a
+    swap the filter followed from a bay that has just changed occupancy (item 100).
 
     The bound is wall-clock, not sigma recovery: :func:`_account_settle` charges every tick
     the exemption actually suppressed a sigma check against ``estimator.bay_settle_max_s``,
@@ -1077,6 +1273,7 @@ def _mark_disturbed(bm: dict[str, Any], ts: float, budget: float) -> None:
     """
     if bm["spent"] < budget:
         bm["disturb"] = float(ts)
+        bm["why"] = why
 
 
 def _account_settle(
@@ -1104,14 +1301,109 @@ def _account_settle(
         bm["clean"] = budget
 
 
-def _seed_sensor(bay: _Bay, temps: Mapping[str, float]) -> float:
-    """The value a bay's sensor node starts at: its anchor member's reading if that one is
-    trusted, else the hottest trusted member (conservative). The offsets of the others are
-    seeded at 0, so a pair at different placements starts consistent instead of handing the
-    anchor a step the fast-swap rule would read as a swap."""
+def _mark_model_reasons(
+    bm: dict[str, Any], ts: float, spec: Any, sigma: float | None, sigma_cal: float | None
+) -> None:
+    """The two reasons beyond the deliberate widenings that keep a bay out of the DAS MPC's
+    model checks (item 100), marked here because the estimator is the one that knows them:
+
+    * ``uncertain`` -- the drive variance ``sigma ** 2 - sigma_cal ** 2`` is over
+      ``bay_uncertain_var_c2``. A *level*: it covers the ticks after a fast-swap jump while
+      the variance decays, and equally a bay nobody is watching, whose prediction error is
+      not evidence about a model. The trust rule must **not** excuse that second case,
+      which is why this reason is the model gate's alone;
+    * ``calibration`` -- the ``sigma_cal`` floor moved by more than ``bay_cal_step_c``, so
+      an accepted or expired map has just re-mapped the drive estimate.
+
+    A mark outside its window is forgotten rather than kept, so a clock that runs backwards
+    cannot bring an old one back. ``sigma`` is ``None`` for a bay with no estimate this
+    tick: nothing is marked and the last floor is forgotten, so the bay's next estimate
+    starts the comparison afresh instead of stepping against a stale one.
+    """
+    window = spec.bay_settle_s
+    for key in ("unc", "calstep"):
+        mark = bm[key]
+        if mark is not None and not 0.0 <= ts - float(mark) < window:
+            bm[key] = None
+    if sigma is None or sigma_cal is None:
+        bm["calseen"] = None
+        return
+    if sigma * sigma - sigma_cal * sigma_cal > spec.bay_uncertain_var_c2:
+        bm["unc"] = ts
+    last = bm["calseen"]
+    if last is not None and abs(sigma_cal - float(last)) > spec.bay_cal_step_c:
+        bm["calstep"] = ts
+    bm["calseen"] = sigma_cal
+
+
+def _settle_view(bm: Mapping[str, Any], ts: float, spec: Any, settling: bool) -> dict[str, Any]:
+    """What ``/api/state`` says about a bay's exemptions: which one, why and for how long.
+
+    Two consumers, one owner (item 100). ``settling`` is the ``sigma`` trust rule's
+    exemption -- a deliberate widening, ``jump`` or ``occupancy``, bounded by
+    ``bay_settle_max_s`` and granted only while the bay is ``observed``
+    (:mod:`aqua_bridge.control.zones` applies that part). ``model_exempt`` is the DAS MPC
+    validity gate's -- every ``occupancy`` change plus the two reasons above, with no
+    budget and no observation, because a bay nobody can bound is not evidence about a
+    model either way.
+    """
+    window = spec.bay_settle_s
+    live: dict[str, float] = {}
+    since = bm["since"]
+    if since is not None and 0.0 <= ts - float(since) < window:
+        live[SETTLE_OCCUPANCY] = float(since)
+    for key, reason in (("unc", SETTLE_UNCERTAIN), ("calstep", SETTLE_CALIBRATION)):
+        if bm[key] is not None:
+            live[reason] = float(bm[key])
+    model_reason = max(live, key=lambda r: (live[r], -MODEL_REASONS.index(r))) if live else None
+    return {
+        "settling": settling,
+        "settling_reason": bm["why"] if settling else None,
+        "settling_until_s": (max(0.0, window - (ts - float(bm["disturb"]))) if settling else None),
+        "settling_spent_s": float(bm["spent"]),
+        "settling_budget_s": float(spec.bay_settle_max_s),
+        "model_exempt": model_reason is not None,
+        "model_exempt_reason": model_reason,
+        "model_exempt_until_s": (
+            None if model_reason is None else max(0.0, window - (ts - live[model_reason]))
+        ),
+    }
+
+
+def _offsets_view(
+    zone: _Zone,
+    bay: _Bay,
+    arrays: tuple[np.ndarray, np.ndarray] | None,
+    per_sensor: bool,
+) -> dict[str, float]:
+    """The disagreement the filter carries for every proximal member beyond the anchor,
+    degC: the offset state in the fused layout, and the distance between the member's own
+    node and the anchor's in the per-sensor one (item 101)."""
+    if arrays is None:
+        return {}
+    x = arrays[0]
+    n = len(zone.bays)
+    if not per_sensor:
+        i_off = 2 + n + zone.n_nodes + n
+        return {name: float(x[i_off + k]) for name, k in bay.offsets.items()}
+    anchor = float(x[2 + n + bay.node])
+    return {
+        name: float(x[2 + n + k]) - anchor for name, k in bay.nodes.items() if name != bay.primary
+    }
+
+
+def _seed_sensor(bay: _Bay, temps: Mapping[str, float]) -> tuple[str, float]:
+    """The member a bay's sensor node starts from and its reading: the anchor if that one
+    is trusted, else the hottest trusted member (conservative). The offsets of the others
+    are seeded at 0, so a pair at different placements starts consistent instead of handing
+    the anchor a step the fast-swap rule would read as a swap; in the per-sensor layout
+    (item 101) the other nodes start at their own reading, or at their own map when they
+    are not reporting."""
     if bay.primary in temps:
-        return float(temps[bay.primary])
-    return max(float(temps[name]) for name in bay.sensors if name in temps)
+        return bay.primary, float(temps[bay.primary])
+    present = [name for name in bay.sensors if name in temps]
+    hottest = max(present, key=lambda name: (float(temps[name]), name))
+    return hottest, float(temps[hottest])
 
 
 def _forget_pair(mem: dict[str, Any], bay: str, serial: str | None) -> None:
@@ -1262,6 +1554,59 @@ def update(
             return entry["th"][0], entry["th"][1], assoc[b][0]
         return entry["th"][0], entry["th"][1], MANUAL_MAP
 
+    per_sensor = spec.proximal_slope_spread > 0
+
+    def dmap_entry(bay: _Bay, name: str) -> dict[str, Any]:
+        """The learned map difference of one proximal member beyond the anchor, created at
+        its prior on first use (item 101)."""
+        entries = mem["bays"][bay.name]["dmap"]
+        entry = entries.get(name)
+        if entry is None:
+            entry = entries[name] = _fresh_dmap(spec)
+        return entry
+
+    def member_map(bay: _Bay, name: str, s_bay: float, b_bay: float) -> tuple[float, float]:
+        """``(s, b)`` of one proximal member: the bay's map for the anchor, and for every
+        further member the bay's map plus that member's learned difference, clipped to the
+        same bounds an accepted calibration is (item 101). In the fused layout every member
+        reads the bay's own map and the difference is an additive state instead."""
+        if not per_sensor or name == bay.primary:
+            return s_bay, b_bay
+        th = dmap_entry(bay, name)["th"]
+        return (
+            min(max(s_bay + th[0], CAL_SLOPE_BOUNDS[0]), CAL_SLOPE_BOUNDS[1]),
+            min(max(b_bay + th[1], CAL_OFFSET_BOUNDS[0]), CAL_OFFSET_BOUNDS[1]),
+        )
+
+    def seed_nodes(
+        x: np.ndarray,
+        i_s: int,
+        bay: _Bay,
+        *,
+        t_ref: float,
+        air: float,
+        maps: tuple[float, float, float] | None,
+    ) -> None:
+        """Seed a bay's sensor node(s) (item 69, per member since item 101).
+
+        The fused layout has one node and it takes ``t_ref``. With a node per member every
+        reporting member starts at its own reading and every silent one at the map it is
+        believed to sit on: ``maps`` is ``(T_d, s, b)`` of the bay, or ``None`` for an
+        empty bay, whose nodes follow the air.
+        """
+        if not per_sensor:
+            x[i_s + bay.node] = t_ref
+            return
+        for name, k in bay.nodes.items():
+            if name in temps:
+                x[i_s + k] = float(temps[name])
+            elif maps is None:
+                x[i_s + k] = air
+            else:
+                t_d, s_map, b_map = maps
+                s_i, b_i = member_map(bay, name, s_map, b_map)
+                x[i_s + k] = s_i * t_d + (1.0 - s_i) * air + b_i
+
     prev_air = {z: float(zm["x"][0]) for z, zm in mem["zones"].items()}
     trusted_air = {z: [temps[t] for t in zone.air if t in temps] for z, zone in st.zones.items()}
     smart_arrived: dict[str, bool] = {}
@@ -1277,8 +1622,10 @@ def update(
     jump_var = spec.jump_sigmas**2
     for z, zone in st.zones.items():
         n = len(zone.bays)
-        i_d, i_s, i_q, i_off = 2, 2 + n, 2 + 2 * n, 2 + 3 * n
-        dim = 2 + 3 * n + zone.n_offsets
+        i_d, i_s = 2, 2 + n
+        i_q = i_s + zone.n_nodes
+        i_off = i_q + n
+        dim = zone.dim
         inlet_vals = [temps[t] for t in zone.inlet if t in temps]
         zm = mem["zones"].get(z)
         q_flow, qn = _airflow(cfg, zone, u)
@@ -1294,24 +1641,24 @@ def update(
             p_diag = np.zeros(dim)
             p_diag[0], p_diag[1] = spec.p0_t_air, spec.p0_d_air
             p_diag[i_off:] = offset_var
+            p_diag[i_s:i_q] = spec.p0_t_sensor
             f_air = 0.0
             for j, b in enumerate(zone.bays):
-                members = [temps[t] for t in st.bays[b].sensors if t in temps]
-                t_s = _seed_sensor(st.bays[b], temps) if members else air0
-                x[i_s + j] = t_s
-                mem["bays"][b]["init"] = bool(members)
-                p_diag[i_d + j], p_diag[i_s + j], p_diag[i_q + j] = (
-                    spec.p0_t_drive,
-                    spec.p0_t_sensor,
-                    spec.p0_heat,
-                )
+                bay = st.bays[b]
+                present = [t for t in bay.sensors if t in temps]
+                ref, t_ref = _seed_sensor(bay, temps) if present else (bay.primary, air0)
+                mem["bays"][b]["init"] = bool(present)
+                p_diag[i_d + j], p_diag[i_q + j] = spec.p0_t_drive, spec.p0_heat
                 occ = _declared_state(topo.bays[b].occupied, mem["bays"][b]["occ"])
+                s_map, b_map, source = sensor_map(b)
                 if occ == EMPTY:
                     x[i_d + j] = air0
+                    seed_nodes(x, i_s, bay, t_ref=t_ref, air=air0, maps=None)
                     continue
-                s_map, b_map, source = sensor_map(b)
                 mem["bays"][b]["map"] = source
-                t_d = air0 + (t_s - air0 - b_map) / s_map
+                s_ref, b_ref = member_map(bay, ref, s_map, b_map)
+                t_d = air0 + (t_ref - air0 - b_ref) / s_ref
+                seed_nodes(x, i_s, bay, t_ref=t_ref, air=air0, maps=(t_d, s_map, b_map))
                 g = G0_W_PER_K + K_W_PER_K * qn
                 cd = drive_capacity(cfg, classes[b][0])
                 x[i_d + j] = t_d
@@ -1340,7 +1687,8 @@ def update(
             s_map, b_map, source = sensor_map(b)
             if source != bm["map"]:
                 if bm["occ"] != EMPTY:
-                    x[i_d + j] = x[0] + (x[i_s + j] - x[0] - b_map) / s_map
+                    node = i_s + st.bays[b].node
+                    x[i_d + j] = x[0] + (x[node] - x[0] - b_map) / s_map
                 bm["map"] = source
 
         if h_pred > 0:
@@ -1356,26 +1704,38 @@ def update(
             qd = np.zeros(dim)
             qd[0], qd[1] = spec.q_t_air, spec.q_d_air
             qd[i_off:] = spec.q_offset  # the placement offsets are random walks
+            qd[i_s:i_q] = spec.q_t_sensor
             g = G0_W_PER_K + K_W_PER_K * qn
             for j, b in enumerate(zone.bays):
-                tau = st.bays[b].tau_s
-                qd[i_s + j] = spec.q_t_sensor
-                if mem["bays"][b]["occ"] == EMPTY:
-                    a[i_s + j, 0] += 1.0 / tau
-                    a[i_s + j, i_s + j] -= 1.0 / tau
-                    continue
+                bay = st.bays[b]
+                empty = mem["bays"][b]["occ"] == EMPTY
                 s_map, b_map, _ = sensor_map(b)
-                cd = drive_capacity(cfg, classes[b][0])
-                a[0, 0] -= g / C_AIR_J_PER_K
-                a[0, i_d + j] += g / C_AIR_J_PER_K
-                a[i_d + j, i_d + j] -= g / cd
-                a[i_d + j, 0] += g / cd
-                a[i_d + j, i_q + j] = 1.0
-                a[i_s + j, i_d + j] += s_map / tau
-                a[i_s + j, 0] += (1.0 - s_map) / tau
-                a[i_s + j, i_s + j] -= 1.0 / tau
-                c[i_s + j] += b_map / tau
-                qd[i_d + j], qd[i_q + j] = spec.q_t_drive, spec.q_heat
+                if not empty:
+                    cd = drive_capacity(cfg, classes[b][0])
+                    a[0, 0] -= g / C_AIR_J_PER_K
+                    a[0, i_d + j] += g / C_AIR_J_PER_K
+                    a[i_d + j, i_d + j] -= g / cd
+                    a[i_d + j, 0] += g / cd
+                    a[i_d + j, i_q + j] = 1.0
+                    qd[i_d + j], qd[i_q + j] = spec.q_t_drive, spec.q_heat
+                # every sensor node of the bay: its own lag, and its own map when the
+                # layout carries one node per member (item 101)
+                for k in sorted(set(bay.nodes.values())) if per_sensor else (bay.node,):
+                    row = i_s + k
+                    tau = zone.node_tau[k]
+                    if empty:  # no drive: the node follows the air
+                        a[row, 0] += 1.0 / tau
+                        a[row, row] -= 1.0 / tau
+                        continue
+                    name = zone.node_sensor[k]
+                    if name is None:
+                        s_i, b_i = s_map, b_map
+                    else:
+                        s_i, b_i = member_map(bay, name, s_map, b_map)
+                    a[row, i_d + j] += s_i / tau
+                    a[row, 0] += (1.0 - s_i) / tau
+                    a[row, row] -= 1.0 / tau
+                    c[row] += b_i / tau
             phi, gamma = _discretise(a, c, h_pred)
             x = phi @ x + gamma
             p = phi @ p @ phi.T + np.diag(qd * q_scale)
@@ -1388,50 +1748,69 @@ def update(
             bay = st.bays[b]
             bm = mem["bays"][b]
             occ = bm["occ"]
-            s_map = sensor_map(b)[0]
+            s_map, b_map, _ = sensor_map(b)
             present = [name for name in bay.sensors if name in temps]
             if present and not bm["init"]:
                 # No trusted member when the zone started: seed the bay from this first
                 # reading instead of leaving the fast-swap rule to see the gap (item 69).
-                t_s = _seed_sensor(bay, temps)
-                _reset_state(x, p, i_s + j, t_s, spec.p0_t_sensor)
+                ref, t_s = _seed_sensor(bay, temps)
+                air_now = float(x[0])
                 for k_off in bay.offsets.values():
                     _reset_state(x, p, i_off + k_off, 0.0, offset_var)
-                air_now = float(x[0])
                 if occ == EMPTY:
+                    seed_nodes(x, i_s, bay, t_ref=t_s, air=air_now, maps=None)
                     _reset_state(x, p, i_d + j, air_now, spec.p0_t_drive)
                 else:
-                    s_seed, b_seed, _ = sensor_map(b)
+                    s_seed, b_seed = member_map(bay, ref, s_map, b_map)
                     t_d = air_now + (t_s - air_now - b_seed) / s_seed
+                    seed_nodes(x, i_s, bay, t_ref=t_s, air=air_now, maps=(t_d, s_map, b_map))
                     g_seed = G0_W_PER_K + K_W_PER_K * qn
                     cd_seed = drive_capacity(cfg, classes[b][0])
                     _reset_state(x, p, i_d + j, t_d, spec.p0_t_drive)
                     _reset_state(x, p, i_q + j, g_seed * (t_d - air_now) / cd_seed, spec.p0_heat)
+                for k in sorted(set(bay.nodes.values())):
+                    _reset_state(x, p, i_s + k, float(x[i_s + k]), spec.p0_t_sensor)
                 bm["init"] = True
+            node = i_s + bay.node
             if present and occ != EMPTY:
                 # The bay-level test, before any of this tick's updates: the mean of the
-                # bay's trusted readings against the predicted node and the variance of
+                # bay's trusted readings against the predicted nodes and the variance of
                 # that mean. Per-sensor jumps below are sequential, so with two sensors
                 # one of them jumps whenever the two disagree, which is placement, not a
-                # swap; the mean of a pair that disagrees sits where the node already is.
+                # swap; the mean of a pair that disagrees sits where the nodes already are.
                 mean_v = sum(float(temps[name]) for name in present) / len(present)
                 mean_r = sum(_sensor_var(cfg, name) for name in present) / len(present) ** 2
-                nu_bay = mean_v - x[i_s + j]
-                if abs(nu_bay) > spec.jump_min_c and nu_bay * nu_bay > jump_var * (
-                    p[i_s + j, i_s + j] + mean_r
-                ):
+                if per_sensor:
+                    mean_x = sum(float(x[i_s + bay.nodes[nm]]) for nm in present) / len(present)
+                    mean_p = (
+                        sum(
+                            float(p[i_s + bay.nodes[a], i_s + bay.nodes[c]])
+                            for a in present
+                            for c in present
+                        )
+                        / len(present) ** 2
+                    )
+                else:
+                    mean_x, mean_p = float(x[node]), float(p[node, node])
+                nu_bay = mean_v - mean_x
+                if abs(nu_bay) > spec.jump_min_c and nu_bay * nu_bay > jump_var * (mean_p + mean_r):
                     stepped[b] = True
-            # The fast-swap test runs on the node before any member of the bay has
-            # updated it, and the members have to agree (module docstring): one bay,
+            # The fast-swap test runs on the nodes before any member of the bay has
+            # updated one, and the members have to agree (module docstring): one bay,
             # one drive, so a swap moves every proximal sensor of the bay the same way.
-            idx = i_s + j
-            members: list[tuple[float, float, float, bool, int | None]] = []
+            rise = float(x[i_d + j] - x[0]) if per_sensor else 0.0
+            members: list[tuple[str, float, float, float, bool, int | None, int]] = []
             for name in present:
                 value = float(temps[name])
                 r = _sensor_var(cfg, name)
                 if occ == EMPTY:
                     r /= EMPTY_WEIGHT
+                idx = i_s + bay.nodes[name]
                 k_off = bay.offsets.get(name)
+                if per_sensor and name != bay.primary:
+                    # the member reads its own node; what is uncertain is *where it sits*,
+                    # which is its map's own predictive variance at this tick's rise
+                    r = r + _dmap_row_var(dmap_entry(bay, name), rise)
                 if k_off is None:
                     nu = value - x[idx]
                     s_innov = p[idx, idx] + r
@@ -1440,17 +1819,33 @@ def update(
                     nu = value - x[idx] - x[off]
                     s_innov = p[idx, idx] + 2.0 * p[idx, off] + p[off, off] + r
                 big = abs(nu) > spec.jump_min_c and nu * nu > jump_var * s_innov
-                members.append((value, r, nu, big, k_off))
-            jump = any(big for _, _, _, big, _ in members) and not (
-                any(nu > spec.jump_min_c for _, _, nu, _, _ in members)
-                and any(nu < -spec.jump_min_c for _, _, nu, _, _ in members)
+                members.append((name, value, r, nu, big, k_off, idx))
+            jump = any(m[4] for m in members) and not (
+                any(m[3] > spec.jump_min_c for m in members)
+                and any(m[3] < -spec.jump_min_c for m in members)
             )
-            for value, r, nu, big, k_off in members:
+            if per_sensor and not jump and occ != EMPTY and bay.primary in temps:
+                # Only the two readings enter the row: both members see the same drive and
+                # the same air, so their difference identifies the placement without any
+                # SMART (item 101). Not on a jump tick, where the drive itself moved.
+                anchor_v = float(temps[bay.primary])
+                anchor_r = _sensor_var(cfg, bay.primary)
+                for name, value, _r, _nu, _big, _k, _idx in members:
+                    if name == bay.primary:
+                        continue
+                    _dmap_absorb(
+                        dmap_entry(bay, name),
+                        rise,
+                        value - anchor_v,
+                        anchor_r + _sensor_var(cfg, name) + CAL_ROW_VAR,
+                    )
+            for name, value, r, nu, big, k_off, idx in members:
                 if jump and big:
-                    # something moved: follow the sensor (the placement offset did not
-                    # move, so it keeps its own variance)
+                    # something moved: follow the sensor (the placement did not move, so
+                    # its offset state -- or its learned map -- keeps its own variance)
                     if occ != EMPTY:
-                        p[i_d + j, i_d + j] += (nu / s_map) ** 2
+                        s_i = member_map(bay, name, s_map, b_map)[0] if per_sensor else s_map
+                        p[i_d + j, i_d + j] += (nu / s_i) ** 2
                         jumped[b] = True
                     p[idx, idx] += nu * nu
                 if k_off is None:
@@ -1469,8 +1864,7 @@ def update(
         bay = st.bays[b]
         if bay.zone not in arrays or mem["bays"][b]["occ"] == EMPTY:
             return None
-        n = len(st.zones[bay.zone].bays)
-        return arrays[bay.zone], (2 + bay.index, 2 + n + bay.index)
+        return arrays[bay.zone], _slots(st.zones[bay.zone], bay)[:2]
 
     # -- SMART: reject, calibrate, measure ------------------------------------------
     for b, (serial, _source) in assoc.items():
@@ -1534,7 +1928,7 @@ def update(
     for b, bay in st.bays.items():
         bm = mem["bays"][b]
         if jumped.get(b):  # the fast-swap rule widened this bay on purpose
-            _mark_disturbed(bm, float(ts), spec.bay_settle_max_s)
+            _mark_disturbed(bm, float(ts), spec.bay_settle_max_s, SETTLE_JUMP)
         before = bm["occ"]
         declared_occ = topo.bays[b].occupied
         zone_ready = bay.zone in arrays
@@ -1568,8 +1962,7 @@ def update(
         else:
             bm["blind"] = 0.0
             x, _ = arrays[bay.zone]
-            n = len(st.zones[bay.zone].bays)
-            i_d, i_s, i_q = 2 + bay.index, 2 + n + bay.index, 2 + 2 * n + bay.index
+            i_d, i_s, i_q = _slots(st.zones[bay.zone], bay)
             s_map, b_map, _ = sensor_map(b)
             g = G0_W_PER_K + K_W_PER_K * geometry[bay.zone][1]
             d_t = float(x[i_s] - x[0])
@@ -1603,8 +1996,7 @@ def update(
             bm["since"] = float(ts)
             if bay.zone in arrays:
                 x, p = arrays[bay.zone]
-                n = len(st.zones[bay.zone].bays)
-                i_d, i_s, i_q = 2 + bay.index, 2 + n + bay.index, 2 + 2 * n + bay.index
+                i_d, i_s, i_q = _slots(st.zones[bay.zone], bay)
                 if before == EMPTY:  # a drive (possibly) arrived: start from the sensor, wide
                     x[i_d] = x[i_s]
                     p[i_d, :], p[:, i_d] = 0.0, 0.0
@@ -1614,7 +2006,7 @@ def update(
                     p[i_q, :], p[:, i_q] = 0.0, 0.0
                     p[i_q, i_q] = spec.p0_heat
                 if before == EMPTY or after == EMPTY:  # a deliberate widening, as a jump
-                    _mark_disturbed(bm, float(ts), spec.bay_settle_max_s)
+                    _mark_disturbed(bm, float(ts), spec.bay_settle_max_s, SETTLE_OCCUPANCY)
             if (before == EMPTY) != (after == EMPTY):
                 swapped[b] = True
                 _forget_pair(mem, b, bm["assoc"])
@@ -1665,7 +2057,7 @@ def update(
             if bay.zone in arrays:
                 x, _ = arrays[bay.zone]
                 n = len(st.zones[bay.zone].bays)
-                bay_y[b] = float(x[2 + n + bay.index] - x[0])
+                bay_y[b] = float(x[2 + len(st.zones[bay.zone].bays) + bay.node] - x[0])
             else:
                 bay_y[b] = None
         zone_air = {z: (float(arrays[z][0][0]) if z in arrays else None) for z in st.zones}
@@ -1727,7 +2119,7 @@ def update(
             if mem["bays"][b]["occ"] == EMPTY:
                 continue
             cd = drive_capacity(cfg, classes[b][0])
-            f = float(x[2 + 2 * n + j]) - g * float(x[2 + j] - x[0]) / cd
+            f = float(x[2 + n + zone.n_nodes + j]) - g * float(x[2 + j] - x[0]) / cd
             drift = max(drift, abs(f) * 60.0)
         zones_out[z] = {
             "initialised": True,
@@ -1766,13 +2158,15 @@ def update(
             "swapped": bool(swapped.get(b, False)),
             "observed": observed.get(b, False),
             "seeded": bool(bm["init"]),
-            "settling": _settling(bm, float(ts), spec.bay_settle_s),
-            "offsets_c": {
-                name: float(arrays[bay.zone][0][2 + 3 * len(st.zones[bay.zone].bays) + k])
-                for name, k in bay.offsets.items()
-            }
-            if bay.zone in arrays
-            else {},
+            "offsets_c": _offsets_view(st.zones[bay.zone], bay, arrays.get(bay.zone), per_sensor),
+            "proximal_map": {
+                name: {
+                    "slope_delta": entry["th"][0],
+                    "offset_delta_c": entry["th"][1],
+                    "samples": entry["n"],
+                }
+                for name, entry in bm["dmap"].items()
+            },
             "class": cls,
             "class_source": cls_source,
             "serial": serial,
@@ -1799,19 +2193,25 @@ def update(
         }
         if b in evidence:
             info["delta_t_c"], info["heat_w"] = evidence[b]
-        bays_out[b] = info
-        settling = bool(info["settling"])
+        settling = _settling(bm, float(ts), spec.bay_settle_s)
         budget = spec.bay_settle_max_s
-        if bay.zone not in arrays or bm["occ"] == EMPTY:
+        estimated = bay.zone in arrays and bm["occ"] != EMPTY
+        sigma: float | None = None
+        if estimated:
+            x, p = arrays[bay.zone]
+            i_d, i_s, i_q = _slots(st.zones[bay.zone], bay)
+            sigma = math.sqrt(max(float(p[i_d, i_d]), 0.0) + sigma_cal * sigma_cal)
+        # item 100: the estimator, not the solver, decides why a bay is not itself
+        _mark_model_reasons(bm, float(ts), spec, sigma, sigma_cal if estimated else None)
+        info.update(_settle_view(bm, float(ts), spec, settling))
+        bays_out[b] = info
+        if not estimated:
             # No sigma check to suspend: the trust rule skips such a bay outright.
             _account_settle(
                 bm, settling=settling, checked=False, over=False, h=h_pred, budget=budget
             )
             continue
-        x, p = arrays[bay.zone]
-        n = len(st.zones[bay.zone].bays)
-        i_d, i_s, i_q = 2 + bay.index, 2 + n + bay.index, 2 + 2 * n + bay.index
-        sigma = math.sqrt(max(float(p[i_d, i_d]), 0.0) + sigma_cal * sigma_cal)
+        assert sigma is not None
         _account_settle(
             bm,
             settling=settling,

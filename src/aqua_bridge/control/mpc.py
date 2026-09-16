@@ -1087,6 +1087,10 @@ def _plant_view(
             "occupancy": info["occupancy"],
             "class": info["class"],
             "since_ts": info["since_ts"],
+            # the estimator's own verdict on whether this bay may score the thermal model
+            # this tick, with its reason (section 8 item 100)
+            "model_exempt": info["model_exempt"],
+            "model_exempt_reason": info["model_exempt_reason"],
         }
         est = block.get(bay)
         if est is not None:
