@@ -438,7 +438,9 @@ def test_the_subscriptions_are_the_daemons_topics_only(cfg: MpcConfig, config_fi
     ]
 
 
-def test_the_tool_reads_the_broker_from_the_config_section(cfg: MpcConfig, config_file: Path) -> None:
+def test_the_tool_reads_the_broker_from_the_config_section(
+    cfg: MpcConfig, config_file: Path
+) -> None:
     broker = _Broker([])
     _run(config_file, broker, "--wait", "3")
     call = broker.collected[0]
