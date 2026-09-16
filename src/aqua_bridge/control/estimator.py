@@ -84,6 +84,20 @@ uncertain placement offset cannot look like a swap, while a swap -- which moves
 the drive and therefore every member together -- still does. The offset keeps its
 variance through the inflation: the drive moved, the placement did not.
 
+The innovations of a bay's proximal members are all taken against the node
+**before** any of them updates it, and the members have to agree: the rule
+fires only when at least one member passes the test and no other member of
+the bay has an innovation past ``jump_min_c`` of the opposite sign. One bay
+holds one drive, so a swap moves every proximal sensor of the bay the same
+way, while two redundant sensors at different placements disagree in opposite
+directions for as long as they sit there. Without the agreement test that
+standing disagreement re-armed the rule on every tick and latched the bay's
+SMART out of the calibration for good (section 8 item 17): on the ``rich``
+sim preset the two bays with a redundant pair never calibrated on 7 of 8
+seeds and their estimates were 4-8 degC off. A bay with a single proximal
+sensor, the only shape the goldens and the DAS example's other bays have, is
+unaffected.
+
 A drive pulled and another one pushed in within
 ``empty_confirm_s`` never passes through ``empty``; this rule makes sigma (hence
 the margin) grow at once and lets the filter follow the new drive instead of
@@ -1256,13 +1270,17 @@ def update(
                     p[i_s + j, i_s + j] + mean_r
                 ):
                     stepped[b] = True
+            # The fast-swap test runs on the node before any member of the bay has
+            # updated it, and the members have to agree (module docstring): one bay,
+            # one drive, so a swap moves every proximal sensor of the bay the same way.
+            idx = i_s + j
+            members: list[tuple[float, float, float, bool, int | None]] = []
             for name in present:
                 value = float(temps[name])
                 r = _sensor_var(cfg, name)
                 if occ == EMPTY:
                     r /= EMPTY_WEIGHT
                 k_off = bay.offsets.get(name)
-                idx = i_s + j
                 if k_off is None:
                     nu = value - x[idx]
                     s_innov = p[idx, idx] + r
@@ -1270,7 +1288,14 @@ def update(
                     off = i_off + k_off
                     nu = value - x[idx] - x[off]
                     s_innov = p[idx, idx] + 2.0 * p[idx, off] + p[off, off] + r
-                if abs(nu) > spec.jump_min_c and nu * nu > jump_var * s_innov:
+                big = abs(nu) > spec.jump_min_c and nu * nu > jump_var * s_innov
+                members.append((value, r, nu, big, k_off))
+            jump = any(big for _, _, _, big, _ in members) and not (
+                any(nu > spec.jump_min_c for _, _, nu, _, _ in members)
+                and any(nu < -spec.jump_min_c for _, _, nu, _, _ in members)
+            )
+            for value, r, nu, big, k_off in members:
+                if jump and big:
                     # something moved: follow the sensor (the placement offset did not
                     # move, so it keeps its own variance)
                     if occ != EMPTY:

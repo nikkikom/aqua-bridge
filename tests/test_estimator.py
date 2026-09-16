@@ -602,6 +602,59 @@ def test_a_redundant_air_sensor_keeps_the_zone_from_going_blind():
 
 
 # ---------------------------------------------------------------------------
+# fast-swap rule: the members of a bay have to agree (section 8 item 17)
+# ---------------------------------------------------------------------------
+
+
+def _disagreeing_run(ticks: int, gap_c: float):
+    """``a1``'s two proximal members ``gap_c`` apart for good, with SMART every tick."""
+    cfg = das_cfg(setpoints={}, topology=_serial_topology("a1", "A"))
+    mem, ups = None, []
+    for i in range(ticks):
+        ts = float(i) * cfg.dt
+        up = tick(
+            cfg,
+            mem,
+            ts,
+            prox_a1=PROX_C,
+            prox_a1b=PROX_C - gap_c,
+            smart={"A": {"temp_c": 44.0, "age_s": 0.0, "model": "M"}},
+        )
+        mem = up.memory
+        ups.append(up)
+    return cfg, ups
+
+
+def test_two_proximal_members_that_disagree_never_latch_the_bays_smart_out():
+    # Before the fix the standing disagreement re-armed the fast-swap rule on every
+    # tick and ``jumped`` gated SMART out of the calibration for the life of the run.
+    _, ups = _disagreeing_run(60, 4.0)
+    assert ups[-1].summary["smart_used"] >= 25
+    assert ups[-1].summary["smart_rejected"] == 0
+    assert ups[-1].bays["a1"]["calibration"]["samples"] >= 25
+    # (a constant stream does not identify the slope, so the entry is not accepted here;
+    # the accuracy this buys is measured on the truth simulator, see the rich sweep)
+    assert ups[-1].bays["a1"]["calibration"]["fresh_samples"] >= 25
+    # the other bays, one sensor each, are unaffected
+    assert ups[-1].bays["a2"]["occupancy"] == "occupied"
+
+
+def test_a_step_both_members_see_together_still_trips_the_fast_swap_rule():
+    cfg, ups = _disagreeing_run(30, 4.0)
+    before = ups[-1].estimates["a1"]["sigma"]
+    swap = tick(
+        cfg,
+        ups[-1].memory,
+        30.0 * cfg.dt,
+        prox_a1=PROX_C + 12.0,
+        prox_a1b=PROX_C - 4.0 + 12.0,
+        smart={"A": {"temp_c": 44.0, "age_s": 0.0, "model": "M"}},
+    )
+    assert swap.estimates["a1"]["sigma"] > before + 1.0  # the margin opens at once
+    assert swap.summary["smart_used"] == ups[-1].summary["smart_used"]  # that tick's SMART is held
+
+
+# ---------------------------------------------------------------------------
 # occupancy
 # ---------------------------------------------------------------------------
 
