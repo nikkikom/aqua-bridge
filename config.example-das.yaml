@@ -389,9 +389,14 @@ mpc:
   # Online PWM -> RPM curve per fan model (control/fancurve.py). With fan_curve_online the
   # daemon collects settled (pwm, rpm) pairs from every output that reports a speed, fits
   # rpm_max / deadband / exponent per fan model on the same grid tools/fit_fans.py uses, and
-  # -- once a fit passes -- the thermal model and the DAS MPC plan on the fitted deadband and
-  # exponent instead of the fan_models entry. The fitted rpm_max is reported only: model_use_rpm
-  # keeps normalising the tachometer by the commissioned fan_models.<m>.rpm_max, so a fan that
+  # -- once a fit passes -- the readers that plan on the air a fan moves use the fitted deadband
+  # and exponent instead of the fan_models entry: the thermal model, the DAS MPC's prediction,
+  # the estimator's airflow and the noise objective's u0 (diagnostics.fan_curves.readers lists
+  # every reader and which curve it follows). These keep reading fan_models whatever is fitted:
+  # the fan_health rpm and power rules (a curve fitted to the same tachometer readings would
+  # follow a fan that slows down, and the deviation would never show), the gate's Stuck airflow
+  # evidence, noise_db_at_max (a datasheet figure) and every rpm_max -- model_use_rpm keeps
+  # normalising the tachometer by the commissioned fan_models.<m>.rpm_max, so a fan that
   # loses speed still shows up as less air. The accepted curves live in the model store's fan_curves section,
   # so they survive a restart; the configured curve stays in force until a fit is accepted, and
   # a tach-less output is covered by the curve of its own fan model.
@@ -399,6 +404,9 @@ mpc:
   fan_curve_settle_s: 30.0     # a duty must hold this long before its (pwm, rpm) pair is sampled
   fan_curve_refit_s: 600.0     # shortest interval between two fits per fan model, seconds
   fan_curve_max_rmse_frac: 0.05  # a fit whose relative RMSE is worse than this is refused
+  fan_curve_max_age_s: 3600.0  # a fit nothing re-confirms for this long goes stale: it leaves
+                               # fan_curves and its readers fall back to the configured curve
+                               # (>= fan_curve_refit_s, or a fit could never be re-confirmed)
   # DAS MPC (solver: mpc; control/solver_das.py): least modelled fan noise with every drive
   # under its targets, planned over horizon steps of mpc_pred_dt_s. It acts only on a model
   # that passes its validity gate (a converged thermal model, finite bounded parameters,
