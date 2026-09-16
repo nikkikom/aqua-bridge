@@ -1,8 +1,10 @@
 """Tests for aqua_bridge.hostinfo against fake sysfs/procfs trees.
 
-Including the board's ``get_throttled`` word (PROJECT.md section 8 item 97): every
-bit of both halves, the sysfs attribute preferred over ``vcgencmd``, and every way
-neither source reads. No test here shells out to ``vcgencmd``.
+Including the board's throttling state (PROJECT.md section 8 item 97): every bit of
+both halves, each of the three sources on its own and in the order the chain tries
+them, the ``vcgencmd`` cadence that keeps that process off all but one tick a
+minute, and every way no source reads at all. No test here shells out to
+``vcgencmd``: the runner is always a callable the test owns.
 """
 
 from __future__ import annotations
@@ -17,12 +19,14 @@ from aqua_bridge.hostinfo import (
     THROTTLED_BITS,
     THROTTLED_SINCE_BOOT_SHIFT,
     CachedHostInfo,
+    ThrottledReader,
     collect_hostinfo,
     decode_throttled,
     read_cpu_temp_c,
     read_disk,
     read_loadavg,
     read_memory,
+    read_rpi_volt_hwmon,
     read_throttled,
     read_uptime_s,
     read_wifi_rssi,
@@ -218,38 +222,248 @@ def test_read_throttled_prefers_the_sysfs_attribute(tmp_path: Path) -> None:
     decoded = read_throttled(p, vcgencmd=never)
     assert decoded is not None
     assert decoded["soft_temp_limit_now"] is True and decoded["soft_temp_limit_since_boot"] is True
+    assert decoded["source"] == "sysfs" and decoded["partial"] is False
     assert calls["n"] == 0
 
 
 def test_read_throttled_falls_back_to_vcgencmd_output(tmp_path: Path) -> None:
-    decoded = read_throttled(tmp_path / "absent", vcgencmd=lambda: "throttled=0x4\n")
+    """The owner's board: no sysfs attribute on kernel 6.18, so vcgencmd is the word."""
+    decoded = read_throttled(
+        tmp_path / "absent", vcgencmd=lambda: "throttled=0x4\n", hwmon_root=tmp_path / "hwmon"
+    )
     assert decoded is not None and decoded["throttled_now"] is True
+    assert decoded["source"] == "vcgencmd" and decoded["partial"] is False
+    assert decoded["hex"] == "0x4" and decoded["unknown"] == []
 
 
 def test_read_throttled_without_the_binary_is_none(tmp_path: Path) -> None:
-    """No sysfs attribute and no vcgencmd (every machine that is not a Pi)."""
-    assert read_throttled(tmp_path / "absent", vcgencmd=lambda: None) is None
-    assert read_throttled(tmp_path / "absent", vcgencmd=None) is None
+    """No source at all (every machine that is not a Pi): unknown, and no warning."""
+    absent, hwmon = tmp_path / "absent", tmp_path / "hwmon"
+    assert read_throttled(absent, vcgencmd=lambda: None, hwmon_root=hwmon) is None
+    assert read_throttled(absent, vcgencmd=None, hwmon_root=hwmon) is None
+    hwmon.mkdir()  # a /sys/class/hwmon with no rpi_volt device in it
+    _write(hwmon / "hwmon0" / "name", "cpu_thermal\n")
+    assert read_throttled(absent, vcgencmd=None, hwmon_root=hwmon) is None
 
 
 def test_read_throttled_unreadable_source_is_none(tmp_path: Path) -> None:
     """A directory where the attribute should be: an OSError, not an exception out."""
     (tmp_path / "get_throttled").mkdir()
-    assert read_throttled(tmp_path / "get_throttled", vcgencmd=None) is None
+    assert (
+        read_throttled(tmp_path / "get_throttled", vcgencmd=None, hwmon_root=tmp_path / "hwmon")
+        is None
+    )
 
 
 @pytest.mark.parametrize("text", ["", "   ", "garbage\n", "throttled=\n", "throttled=oops\n"])
 def test_read_throttled_malformed_is_none(tmp_path: Path, text: str) -> None:
     p = tmp_path / "get_throttled"
     _write(p, text)
-    assert read_throttled(p, vcgencmd=None) is None
+    assert read_throttled(p, vcgencmd=None, hwmon_root=tmp_path / "hwmon") is None
 
 
 def test_read_throttled_a_raising_runner_is_none_not_an_exception(tmp_path: Path) -> None:
     def boom() -> str | None:
         raise RuntimeError("no")
 
-    assert read_throttled(tmp_path / "absent", vcgencmd=boom) is None
+    assert read_throttled(tmp_path / "absent", vcgencmd=boom, hwmon_root=tmp_path / "hw") is None
+
+
+# --- the rpi_volt hwmon alarm: the under-voltage condition on its own ----------
+
+
+def _hwmon_tree(root: Path, devices: dict[str, dict[str, str]]) -> Path:
+    """A fake /sys/class/hwmon: ``{"hwmon3": {"name": "rpi_volt", ...}}``."""
+    for entry, files in devices.items():
+        for name, text in files.items():
+            _write(root / entry / name, text)
+    return root
+
+
+def test_the_hwmon_alarm_is_found_by_name_and_not_by_index(tmp_path: Path) -> None:
+    """hwmon numbering is not stable across boots, so the device is matched by name.
+
+    Three devices, and the rpi_volt one deliberately not at index 1 -- where it
+    happens to sit on the owner's board today -- so a hardcoded index would fail here.
+    """
+    root = _hwmon_tree(
+        tmp_path / "hwmon",
+        {
+            "hwmon0": {"name": "cpu_thermal\n"},
+            "hwmon1": {"name": "scd30\n", "in0_lcrit_alarm": "1\n"},
+            "hwmon3": {"name": "rpi_volt\n", "in0_lcrit_alarm": "1\n"},
+        },
+    )
+    reading = read_rpi_volt_hwmon(root)
+    assert reading is not None
+    assert reading["source"] == "hwmon"
+    assert reading["under_voltage_now"] is True
+    assert reading["now"] is True, "one condition in force is enough to say 'throttling now'"
+
+
+def test_the_hwmon_reading_claims_nothing_it_did_not_read(tmp_path: Path) -> None:
+    """One bit, not the word: no fabricated zero for the conditions nobody read."""
+    root = _hwmon_tree(
+        tmp_path / "hwmon", {"hwmon1": {"name": "rpi_volt\n", "in0_lcrit_alarm": "0\n"}}
+    )
+    reading = read_rpi_volt_hwmon(root)
+    assert reading is not None
+    assert reading["under_voltage_now"] is False
+    for name in ("freq_capped", "throttled", "soft_temp_limit"):
+        assert reading[f"{name}_now"] is None, name
+        assert reading[f"{name}_since_boot"] is None, name
+    assert reading["under_voltage_since_boot"] is None, "the alarm says nothing about boot"
+    assert reading["raw"] is None and reading["hex"] is None, "no word was read"
+    assert reading["partial"] is True
+    assert reading["unknown"] == ["freq_capped", "throttled", "soft_temp_limit"]
+    # An unknown bit must not read as a false one: not "nothing is wrong", "not known".
+    assert reading["now"] is None and reading["since_boot"] is None
+
+
+def test_a_missing_or_malformed_hwmon_alarm_is_none(tmp_path: Path) -> None:
+    assert read_rpi_volt_hwmon(tmp_path / "absent") is None
+    assert read_rpi_volt_hwmon(_hwmon_tree(tmp_path / "a", {"hwmon0": {"name": "nvme\n"}})) is None
+    no_attr = _hwmon_tree(tmp_path / "b", {"hwmon0": {"name": "rpi_volt\n"}})
+    assert read_rpi_volt_hwmon(no_attr) is None
+    bad = _hwmon_tree(
+        tmp_path / "c", {"hwmon0": {"name": "rpi_volt\n", "in0_lcrit_alarm": "yes\n"}}
+    )
+    assert read_rpi_volt_hwmon(bad) is None
+
+
+def test_the_hwmon_bit_alone_is_the_whole_chain_on_a_board_without_vcgencmd(
+    tmp_path: Path,
+) -> None:
+    """No sysfs attribute, no vcgencmd binary: the alarm is what is left."""
+    root = _hwmon_tree(
+        tmp_path / "hwmon", {"hwmon2": {"name": "rpi_volt\n", "in0_lcrit_alarm": "1\n"}}
+    )
+    reading = read_throttled(tmp_path / "absent", vcgencmd=lambda: None, hwmon_root=root)
+    assert reading is not None and reading["source"] == "hwmon"
+    assert reading["under_voltage_now"] is True and reading["now"] is True
+
+
+# --- ThrottledReader: the chain with the process rate limited -------------------
+
+
+class _Clock:
+    """A clock the test moves by hand."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+class _Runner:
+    """A fake ``vcgencmd`` runner that counts its calls. No process is ever started."""
+
+    def __init__(self, *texts: str | None) -> None:
+        self.texts = list(texts) or ["throttled=0x0\n"]
+        self.calls = 0
+
+    def __call__(self) -> str | None:
+        self.calls += 1
+        return self.texts[min(self.calls - 1, len(self.texts) - 1)]
+
+
+def test_the_reader_runs_vcgencmd_at_most_once_per_interval(tmp_path: Path) -> None:
+    """The cadence key is what makes the process affordable on the loop thread."""
+    clock, runner = _Clock(), _Runner()
+    reader = ThrottledReader(
+        sysfs_path=tmp_path / "absent",
+        hwmon_root=tmp_path / "hwmon",
+        vcgencmd=runner,
+        poll_interval_s=60.0,
+        clock=clock,
+    )
+    for tick in range(0, 600, 5):  # ten minutes of dt = 5 s ticks
+        clock.t = float(tick)
+        assert reader() is not None
+    assert runner.calls == 10, "one fork a minute, not one per tick"
+
+
+def test_the_cached_word_is_served_between_polls_with_its_age(tmp_path: Path) -> None:
+    clock, runner = _Clock(), _Runner("throttled=0x50005\n", "throttled=0x0\n")
+    reader = ThrottledReader(
+        sysfs_path=tmp_path / "absent",
+        hwmon_root=tmp_path / "hwmon",
+        vcgencmd=runner,
+        poll_interval_s=60.0,
+        clock=clock,
+    )
+    fresh = reader()
+    assert fresh is not None and fresh["age_s"] == 0.0 and fresh["hex"] == "0x50005"
+
+    clock.t = 45.0
+    cached = reader()
+    assert runner.calls == 1, "no second process inside the interval"
+    assert cached is not None and cached["hex"] == "0x50005"
+    assert cached["age_s"] == pytest.approx(45.0), "a cached word is marked with its age"
+    assert cached["source"] == "vcgencmd" and cached["under_voltage_now"] is True
+
+    clock.t = 60.0
+    assert reader()["hex"] == "0x0"  # type: ignore[index]
+    assert runner.calls == 2
+
+
+def test_a_failed_poll_drops_the_word_and_waits_out_the_interval(tmp_path: Path) -> None:
+    """A failed poll is not a reading, and must not become a fork per tick either."""
+    root = _hwmon_tree(
+        tmp_path / "hwmon", {"hwmon1": {"name": "rpi_volt\n", "in0_lcrit_alarm": "1\n"}}
+    )
+    clock, runner = _Clock(), _Runner("throttled=0x4\n", None)
+    reader = ThrottledReader(
+        sysfs_path=tmp_path / "absent",
+        hwmon_root=root,
+        vcgencmd=runner,
+        poll_interval_s=60.0,
+        clock=clock,
+    )
+    assert reader()["hex"] == "0x4"  # type: ignore[index]
+
+    clock.t = 60.0
+    after = reader()  # the runner fails: the stale word is dropped, the chain goes on
+    assert runner.calls == 2
+    assert after is not None and after["source"] == "hwmon"
+    assert after["under_voltage_now"] is True and after["raw"] is None
+
+    for tick in (65.0, 70.0, 115.0):  # still no retry before the interval is out
+        clock.t = tick
+        assert reader()["source"] == "hwmon"  # type: ignore[index]
+    assert runner.calls == 2
+
+
+def test_a_raising_runner_is_a_failed_poll_not_an_exception(tmp_path: Path) -> None:
+    def boom() -> str | None:
+        raise RuntimeError("no")
+
+    reader = ThrottledReader(
+        sysfs_path=tmp_path / "absent", hwmon_root=tmp_path / "hwmon", vcgencmd=boom
+    )
+    assert reader() is None
+
+
+def test_the_reader_prefers_the_sysfs_attribute_and_starts_nothing(tmp_path: Path) -> None:
+    p = tmp_path / "get_throttled"
+    _write(p, "0x0\n")
+    runner = _Runner()
+    reader = ThrottledReader(sysfs_path=p, hwmon_root=tmp_path / "hwmon", vcgencmd=runner)
+    reading = reader()
+    assert reading is not None and reading["source"] == "sysfs"
+    assert runner.calls == 0
+
+
+def test_a_reader_without_a_runner_reads_files_only(tmp_path: Path) -> None:
+    """``subprocess_fallback=False``'s reader: the file sources, and nothing else."""
+    root = _hwmon_tree(
+        tmp_path / "hwmon", {"hwmon1": {"name": "rpi_volt\n", "in0_lcrit_alarm": "0\n"}}
+    )
+    reader = ThrottledReader(sysfs_path=tmp_path / "absent", hwmon_root=root)
+    reading = reader()
+    assert reading is not None and reading["source"] == "hwmon"
+    assert ThrottledReader(sysfs_path=tmp_path / "a", hwmon_root=tmp_path / "b")() is None
 
 
 def test_run_vcgencmd_starts_no_process_without_the_binary(monkeypatch: Any) -> None:
@@ -273,7 +487,7 @@ def test_collect_hostinfo_all_missing_is_all_none(tmp_path: Path) -> None:
         disk_path=tmp_path / "no" / "such" / "path",
         wireless_path=tmp_path / "wireless",
         throttled_path=tmp_path / "get_throttled",
-        vcgencmd=None,
+        hwmon_root=tmp_path / "hwmon",
     )
     assert info == {
         "cpu_temp_c": None,
@@ -310,7 +524,7 @@ def test_collect_hostinfo_all_present(tmp_path: Path) -> None:
         disk_path="/",
         wireless_path=tmp_path / "wireless",
         throttled_path=tmp_path / "get_throttled",
-        vcgencmd=None,
+        hwmon_root=tmp_path / "hwmon",
     )
     assert info["cpu_temp_c"] == pytest.approx(45.0)
     assert info["load1"] == pytest.approx(1.0)
