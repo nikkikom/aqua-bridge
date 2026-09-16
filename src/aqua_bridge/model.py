@@ -1650,7 +1650,7 @@ class MpcConfig:
     model_return_dwell_s: float = 300.0
     model_drift_rate_tau_s: float = 120.0
     model_drift_dwell_s: float = 120.0
-    model_max_air_dist_c_per_min: float = 5.0
+    model_max_air_dist_c_per_min: float = 8.0
     model_air_dist_tau_s: float = 900.0
     model_accept_prior: bool = False
     model_store_interval_s: float = 600.0
