@@ -131,6 +131,7 @@ mpc:
   ident_enabled: false   # true (needs topology): an explicit start intent may run an experiment
   ident_amplitude: 0.15  # PWM step of the two-level sequence, (0, 0.3]
   ident_levels: above    # above: base and base + amplitude | symmetric: base +- amplitude
+  ident_replan: true     # levels follow the live solver demand every tick (false: frozen at the start)
   ident_hold_s: [60, 120, 180]  # hold times the seeded sequence draws from (each >= 5 * dt when enabled)
   ident_max_duration_s: 1800    # whole experiment, seconds, (0, 7200]
   ident_settle_s: 600    # every zone served trusted this long before a start (>= confirm_s when enabled)
