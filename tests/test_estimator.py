@@ -57,9 +57,15 @@ def trusted(cfg: MpcConfig, **overrides: float | None) -> dict[str, float]:
     return {k: float(v) for k, v in values.items() if v is not None}
 
 
-def tick(cfg: MpcConfig, mem, ts: float, *, u: float = 0.5, smart=None, **temps):
+def tick(cfg: MpcConfig, mem, ts: float, *, u: float = 0.5, smart=None, calibration=None, **temps):
     return E.update(
-        mem, cfg, temps=trusted(cfg, **temps), u=dict.fromkeys(cfg.channels, u), ts=ts, smart=smart
+        mem,
+        cfg,
+        temps=trusted(cfg, **temps),
+        u=dict.fromkeys(cfg.channels, u),
+        ts=ts,
+        smart=smart,
+        calibration=calibration,
     )
 
 
@@ -827,6 +833,172 @@ def test_calibration_is_keyed_by_serial_within_the_bay():
     assert up_b.bays["a1"]["sigma_cal_c"] == cfg_b.estimator.sigma_uncalibrated_c
     up_a = tick(cfg_a, up_b.memory, 1.5)  # the first drive is back in the bay
     assert up_a.bays["a1"]["calibrated"]
+
+
+# ---------------------------------------------------------------------------
+# manual calibration (POST /api/calibrate, PROJECT.md section 8 item 23)
+# ---------------------------------------------------------------------------
+
+
+def _manual(bay: str, temp: float, ts: float) -> dict:
+    """``obs.inputs["calibration"]`` for one bay, the shape TickPlan.calibrations has."""
+    return {bay: {"temp_c": temp, "ts": ts}}
+
+
+def test_a_manual_calibration_is_the_same_sample_as_smart():
+    """Item 23's contract: the same values through either door leave the estimator in
+    the same state. The SMART run declares a serial on a1; the manual run declares
+    none (the case the endpoint exists for) and names the bay instead."""
+    readings = [(float(k) * 10.0, 44.0 + 0.4 * math.sin(k)) for k in range(1, 25)]
+
+    cfg_smart = das_cfg(setpoints={}, topology=_serial_topology("a1", "A"))
+    mem = None
+    for sample_ts, temp in readings:
+        up = tick(
+            cfg_smart, mem, sample_ts, smart={"A": {"temp_c": temp, "age_s": 0.0, "model": None}}
+        )
+        mem = up.memory
+    by_smart = up
+
+    cfg_manual = das_cfg(setpoints={})
+    mem = None
+    for sample_ts, temp in readings:
+        up = tick(cfg_manual, mem, sample_ts, calibration=_manual("a1", temp, sample_ts))
+        mem = up.memory
+    by_manual = up
+
+    smart_entry = by_smart.memory["cal"]["a1"]["A"]
+    manual_entry = by_manual.memory["manual"]["a1"]["cal"]
+    assert manual_entry == smart_entry
+    assert by_smart.summary["smart_used"] == by_manual.summary["smart_used"] == len(readings)
+    # ... and so is everything the views show, apart from the serial and the source.
+    shown = ("calibrated", "sigma_cal_c", "calibration", "occupancy")
+    manual_view = {k: by_manual.bays["a1"][k] for k in shown}
+    assert manual_view == {k: by_smart.bays["a1"][k] for k in shown}
+    assert by_manual.bays["a1"]["calibration_source"] == "manual"
+    assert by_smart.bays["a1"]["calibration_source"] == "smart"
+    assert by_manual.bays["a1"]["serial"] is None
+    assert by_manual.estimates["a1"] == by_smart.estimates["a1"]
+
+
+def _manual_run(cfg: MpcConfig, ticks: int = 60, *, calibrate: bool = True):
+    """``ticks`` ticks, each offering one handheld reading for bay a1 (or none)."""
+    mem, up = None, None
+    for k in range(1, ticks + 1):  # a moving reading identifies the slope
+        ts = float(k) * 10.0
+        temp = 44.0 + 3.0 * math.sin(0.7 * k)
+        up = tick(
+            cfg,
+            mem,
+            ts,
+            calibration=_manual("a1", temp, ts) if calibrate else None,
+            prox_a1=PROX_C,
+        )
+        mem = up.memory
+    return up
+
+
+def test_an_accepted_manual_calibration_is_the_map_the_filter_uses():
+    cfg = das_cfg(setpoints={})
+    up = _manual_run(cfg)
+    info = up.bays["a1"]
+    assert info["calibrated"] and info["calibration_source"] == "manual"
+    assert info["calibration"]["accepted_once"] is True
+    assert up.memory["manual"]["a1"]["cal"]["used"] is True
+    assert up.memory["bays"]["a1"]["map"] == E.MANUAL_MAP  # the map in force, not the prior
+    # sigma_cal is the calibration's own residual now, not the uncalibrated floor
+    assert info["sigma_cal_c"] == pytest.approx(math.sqrt(info["calibration"]["rms_c"] ** 2))
+    assert info["sigma_cal_c"] != est.SIGMA_UNCALIBRATED_C
+    # ... and the estimate is a different number from the one the prior map gives
+    bare = _manual_run(cfg, calibrate=False)
+    assert bare.bays["a1"]["calibrated"] is False
+    assert bare.bays["a1"]["sigma_cal_c"] == est.SIGMA_UNCALIBRATED_C
+    assert abs(up.estimates["a1"]["t"] - bare.estimates["a1"]["t"]) > 1.0
+    # the entry is the bay's own, never one of the model store's per-serial entries
+    assert up.memory["cal"] == {}
+
+
+def test_a_manual_calibration_far_from_the_estimate_is_rejected_and_counted():
+    cfg = das_cfg(setpoints={})
+    up = tick(cfg, None, 0.0)
+    up = tick(cfg, up.memory, 10.0, calibration=_manual("a1", 90.0, 10.0))
+    assert up.summary["smart_rejected"] == 1 and up.summary["smart_used"] == 0
+    assert up.bays["a1"]["calibration"] is None
+    assert up.bays["a1"]["calibration_source"] is None
+    up = tick(cfg, up.memory, 20.0, calibration=_manual("a1", 45.0, 20.0))
+    assert up.summary["smart_used"] == 1 and up.bays["a1"]["calibration"]["samples"] == 1
+    # the same reading offered again on later ticks is not a new sample
+    for ts in (30.0, 40.0):
+        up = tick(cfg, up.memory, ts, calibration=_manual("a1", 45.0, 20.0))
+    assert up.summary["smart_used"] == 1
+
+
+def test_a_stale_or_malformed_manual_calibration_is_ignored_and_never_raises():
+    cfg = das_cfg(setpoints={})
+    assert cfg.estimator is not None
+    up = tick(cfg, None, 0.0)
+    ts = cfg.estimator.smart_max_age_s + 100.0
+    for payload in (
+        "text",
+        [1, 2],
+        {"a1": 41.0},
+        {"nope": {"temp_c": 41.0, "ts": ts}},  # unknown bay
+        {"a1": {"temp_c": float("nan"), "ts": ts}},
+        {"a1": {"temp_c": 41.0}},  # no sample time
+        {"a1": {"temp_c": 41.0, "ts": ts + 1.0}},  # in the future
+        _manual("a1", 41.0, 0.0),  # older than smart_max_age_s
+    ):
+        out = tick(cfg, up.memory, ts, calibration=payload)
+        assert out.summary["manual_fresh"] == []
+        assert out.bays["a1"]["calibration"] is None
+
+
+def test_a_manual_calibration_is_presence_evidence_like_smart():
+    """An empty bay whose drive was measured by hand is occupied again at once."""
+    cfg = das_cfg(setpoints={})
+    mem = run_ticks(cfg, 3, prox_a1=None, prox_a1b=None)[-1].memory
+    mem = copy.deepcopy(mem)
+    mem["bays"]["a1"]["occ"] = E.EMPTY
+    up = tick(cfg, mem, 100.0, calibration=_manual("a1", 44.0, 100.0))
+    assert up.bays["a1"]["occupancy"] == E.OCCUPIED
+
+
+def test_a_manual_calibration_expires_like_a_smart_one():
+    cfg = das_cfg(setpoints={})
+    m = cfg.to_dict()
+    m["estimator"] = dict(m["estimator"], calibration_max_age_days=600.0 / 86400.0)
+    short = MpcConfig.from_mapping(m)
+    mem, up = None, None
+    for k in range(1, 61):
+        ts = float(k) * 10.0
+        up = tick(short, mem, ts, calibration=_manual("a1", 44.0 + 3.0 * math.sin(0.7 * k), ts))
+        mem = up.memory
+    assert up.bays["a1"]["calibrated"]
+    slope = up.bays["a1"]["calibration"]["slope"]
+    silent = tick(short, up.memory, 60.0 * 10.0 + 700.0)
+    assert not silent.bays["a1"]["calibrated"]
+    assert silent.bays["a1"]["sigma_cal_c"] == est.SIGMA_UNCALIBRATED_C
+    assert silent.bays["a1"]["calibration"]["slope"] == pytest.approx(slope)  # theta kept
+    assert silent.bays["a1"]["calibration"]["fresh_samples"] == 0
+
+
+def test_a_serials_calibration_wins_over_the_bays_manual_one():
+    cfg = das_cfg(setpoints={}, topology=_serial_topology("a1", "A"))
+    mem, up = None, None
+    for k in range(1, 41):
+        ts = float(k) * 10.0
+        temp = 44.0 + 3.0 * math.sin(0.7 * k)
+        up = tick(
+            cfg,
+            mem,
+            ts,
+            smart={"A": {"temp_c": temp, "age_s": 0.0, "model": None}},
+            calibration=_manual("a1", temp + 6.0, ts),
+        )
+        mem = up.memory
+    assert up.memory["manual"]["a1"]["cal"] is not None  # the manual entry is still kept
+    assert up.bays["a1"]["calibration_source"] == "smart"
+    assert up.bays["a1"]["calibration"]["slope"] == up.memory["cal"]["a1"]["A"]["th"][0]
 
 
 def test_smart_far_from_the_estimate_is_rejected_and_counted():

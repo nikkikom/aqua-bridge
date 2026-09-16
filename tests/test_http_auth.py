@@ -458,6 +458,7 @@ _POST_ROUTES = (
     "/api/limit",
     "/api/bay",
     "/api/ident",
+    "/api/calibrate",
     "/api/in/smart",
 )
 

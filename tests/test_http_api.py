@@ -778,3 +778,170 @@ def test_fuzz_ident_never_5xx(body: Any) -> None:
     sup = Supervisor(ident_cfg())
     ((status, _),) = _run(_post_real(sup, [("/api/ident", body)]))
     assert status in (200, 400, 409)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/calibrate (PROJECT.md sections 3, 6, item 23) against the real Supervisor
+# ---------------------------------------------------------------------------
+
+
+def _calibrate_rig(ticks: int = 8, **changes: Any):
+    """The DAS rig of the experiment suite, ticked until the estimator has a view."""
+    from test_ident_experiment import Rig, ident_cfg
+
+    rig = Rig(ident_cfg(**changes))
+    rig.ticks(ticks)
+    return rig
+
+
+def test_post_calibrate_happy_path_reaches_the_estimator_and_the_views() -> None:
+    rig = _calibrate_rig()
+    results = _run(
+        _post_real(
+            rig.sup,
+            [
+                ("/api/calibrate", {"bay": "a1", "drive_temp_c": 41.5}),
+                ("GET /api/model", None),
+            ],
+        )
+    )
+    assert [s for s, _ in results] == [200, 200]
+    assert results[0][1] == {"ok": True}
+    offered = results[1][1]["manual_calibrations"]
+    assert offered["a1"]["temp_c"] == 41.5
+    assert offered["a1"]["ts"] == rig.t  # the last tick's observation clock
+    assert results[1][1]["calibration"]["a1"]["calibration_source"] is None  # no tick yet
+
+    rig.ticks(1)
+    (_, model), (_, bays) = _run(
+        _post_real(rig.sup, [("GET /api/model", None), ("GET /api/bays", None)])
+    )
+    cal = model["calibration"]["a1"]
+    assert cal["calibration_source"] == "manual"
+    assert cal["calibration"]["samples"] == 1
+    assert cal["serial"] is None  # keyed by bay: a handheld reading has no serial
+    assert bays["bays"]["a1"]["estimator"]["calibration_source"] == "manual"
+    # a second reading replaces the first instead of queueing behind it
+    _run(_post_real(rig.sup, [("/api/calibrate", {"bay": "a1", "drive_temp_c": 42.5})]))
+    assert rig.sup.snapshot().extra["calibrations"]["a1"]["temp_c"] == 42.5
+
+
+def test_post_calibrate_invalid_requests_are_400() -> None:
+    rig = _calibrate_rig()
+    spec = rig.cfg.estimator
+    assert spec is not None
+    results = _run(
+        _post_real(
+            rig.sup,
+            [
+                ("/api/calibrate", {"bay": "nope", "drive_temp_c": 41.0}),
+                ("/api/calibrate", {"bay": "a1", "drive_temp_c": spec.calibrate_max_c + 1.0}),
+                ("/api/calibrate", {"bay": "a1", "drive_temp_c": spec.calibrate_min_c - 1.0}),
+                ("/api/calibrate", {"bay": "a1"}),
+                ("/api/calibrate", {"drive_temp_c": 41.0}),
+                ("/api/calibrate", {"bay": "a1", "drive_temp_c": 41.0, "extra": 1}),
+                ("/api/calibrate", {"bay": "a1", "drive_temp_c": "41"}),
+                ("/api/calibrate", ["a1", 41.0]),
+            ],
+        )
+    )
+    assert [s for s, _ in results] == [400] * 8
+    assert "unknown bay" in results[0][1]["error"]
+    for index in (1, 2):
+        assert "calibrate_min_c" in results[index][1]["error"]
+    assert rig.sup.snapshot().extra["calibrations"] == {}  # nothing leaked in
+
+
+def test_post_calibrate_on_a_legacy_config_is_400(cfg: MpcConfig) -> None:
+    from aqua_bridge.control.supervisor import Supervisor
+
+    ((status, body),) = _run(
+        _post_real(Supervisor(cfg), [("/api/calibrate", {"bay": "b03", "drive_temp_c": 41.0})])
+    )
+    assert status == 400 and "DAS" in body["error"]
+
+
+def test_post_calibrate_before_the_first_tick_is_409_no_tick() -> None:
+    from test_ident_experiment import Rig, ident_cfg
+
+    rig = Rig(ident_cfg())
+    ((status, body),) = _run(
+        _post_real(rig.sup, [("/api/calibrate", {"bay": "a1", "drive_temp_c": 41.0})])
+    )
+    assert status == 409 and body["error"].startswith("no_tick")
+
+
+def test_post_calibrate_on_an_empty_bay_is_409_and_names_it() -> None:
+    """c1 is ``occupied: false`` in the fixture: no drive, so nothing to calibrate."""
+    rig = _calibrate_rig()
+    ((status, body),) = _run(
+        _post_real(rig.sup, [("/api/calibrate", {"bay": "c1", "drive_temp_c": 41.0})])
+    )
+    assert status == 409 and body["error"].startswith("empty:c1")
+
+
+def test_post_calibrate_on_an_untrusted_zone_is_409_and_names_the_zone() -> None:
+    rig = _calibrate_rig()
+    rig.drop = ("air_b", "prox_b1")  # zone zb loses every sensor of bay b1
+    rig.ticks(6)
+    zones = rig.sup.snapshot().last_cmd.diagnostics["zones"]
+    assert zones["zb"]["trusted"] is False
+    ((status, body),) = _run(
+        _post_real(rig.sup, [("/api/calibrate", {"bay": "b1", "drive_temp_c": 41.0})])
+    )
+    assert status == 409 and body["error"].startswith("untrusted:zb")
+    assert "b1" in body["error"]
+    # a trusted zone of the same config still accepts one
+    ((status, _),) = _run(
+        _post_real(rig.sup, [("/api/calibrate", {"bay": "a1", "drive_temp_c": 41.0})])
+    )
+    assert status == 200
+
+
+def test_post_calibrate_needs_credentials_and_obeys_the_verify_limit() -> None:
+    """Item 23: the same door as every other command -- 401 without credentials,
+    429 once the global limit on uncached password checks refuses."""
+    rig = _calibrate_rig()
+    body = {"bay": "a1", "drive_temp_c": 41.0}
+
+    async def scenario() -> tuple[int, int, int, str | None]:
+        auth = make_authenticator(auth_cache_s=0, auth_verify_max=1, auth_verify_window_s=600)
+        client = TestClient(TestServer(create_app(rig.sup, cfg=None, auth=auth)))
+        await client.start_server()
+        try:
+            anon = await client.post("/api/calibrate", json=body)
+            headers = client_auth()["headers"]
+            first = await client.post("/api/calibrate", json=body, headers=headers)
+            second = await client.post("/api/calibrate", json=body, headers=headers)
+            return anon.status, first.status, second.status, second.headers.get("Retry-After")
+        finally:
+            await client.close()
+
+    anon, first, second, retry_after = _run(scenario())
+    assert anon == 401 and first == 200 and second == 429
+    assert retry_after is not None and int(retry_after) >= 1
+
+
+@pytest.mark.fuzzy
+@given(
+    body=st.one_of(
+        _json_value,
+        st.dictionaries(st.sampled_from(["bay", "drive_temp_c", "extra"]), _json_value),
+        st.fixed_dictionaries(
+            {"bay": st.sampled_from(["a1", "a2", "b1", "c1", "nope", ""])},
+            optional={"drive_temp_c": st.floats(allow_nan=True, allow_infinity=True)},
+        ),
+    )
+)
+def test_fuzz_calibrate_never_5xx_and_never_leaks_a_bad_reading(body: Any) -> None:
+    from test_ident_experiment import Rig, ident_cfg
+
+    rig = Rig(ident_cfg())
+    rig.ticks(8)
+    ((status, _),) = _run(_post_real(rig.sup, [("/api/calibrate", body)]))
+    assert status in (200, 400, 409)
+    spec, topo = rig.cfg.estimator, rig.cfg.topology
+    assert spec is not None and topo is not None
+    for bay, entry in rig.sup.snapshot().extra["calibrations"].items():
+        assert bay in topo.bays
+        assert spec.calibrate_min_c <= entry["temp_c"] <= spec.calibrate_max_c
