@@ -1644,7 +1644,16 @@ with each candidate bay's `T̂_s − T̂_a` series, both detrended; a pair needs
 `associate_min_corr` that beats the runner-up of both the serial and the
 bay by `associate_margin`, and on 3 consecutive evaluations (every
 60 s). (4) Dropped on a change into or out of `empty`, a proximal jump,
-or a serial silent for `smart_max_age_s`. Until associated, a serial's
+or a serial silent for `smart_max_age_s`; a drop forgets the serial's history,
+so the pair must win (3) again over a full window. (5) **Re-checked**: an
+accepted pair keeps recording its series and is re-scored against its own bay at
+every evaluation; `associate_drop_checks` consecutive scores below
+`associate_drop_corr` drop it. Keeping a pair asks less than choosing one (on the
+truth simulator a correct pair scores 0.71–0.97 and dips to 0.37 through a quiet
+window, a wrong one has a median of −0.27 to +0.24). Until a correlated pair has
+passed one re-check its calibration is **not used**, however many samples it has:
+the first window is the one the re-check cannot judge yet. A declared serial
+takes part in none of this. Until associated, a serial's
 samples calibrate nothing. `GET /api/bays` shows the candidates with
 scores.
 
@@ -4186,9 +4195,42 @@ Owner decision (2026-09-16):
     only a fresh store file loads zones `frozen`).
 17. Estimator accuracy on the `rich` sim preset: calibrated estimates up to
     2 °C off make the MPC up to 1.30× the uniform-curve noise.
-18. Serial → bay association: a wrong correlation pair can still feed
-    another drive's SMART into a bay's calibration (bounded by
-    `smart_reject_c`); tighten acceptance.
+18. **Done** (2026-09-16): a correlation pair now has to keep proving itself.
+    An association is a claim about correlation, so the claim is re-tested with
+    the statistic that made it: the bay series and the serial's SMART history go
+    on being recorded after the pair is accepted, every evaluation (60 s)
+    re-scores the pair against its own bay, and `associate_drop_checks` (3, new
+    key) consecutive scores below `associate_drop_corr` (0.3, new key) end it.
+    Keeping a pair deliberately asks less than choosing one: measured on the
+    truth simulator a correct pair scores 0.71–0.97 over the window and dips to
+    0.37 through a quiet one, while a wrong pair's median is −0.27 to +0.24.
+    Every drop — re-check, hot swap, jump, silence — now also forgets the
+    serial's SMART history, so the pair has to win the acceptance rule again
+    over a fresh window. And until a correlated pair has passed one re-check its
+    calibration is **not used** (`calibrated` stays false, `σ_cal` stays at
+    `sigma_uncalibrated_c`): the first window is exactly the one the re-check
+    cannot judge yet. A declared serial takes part in none of this — it is the
+    owner's statement, and its band stays `smart_reject_c`.
+
+    A tighter absolute band for a correlated serial was tried first and dropped:
+    it cannot tell the two apart, because an uncalibrated bay's estimate carries
+    the prior map's own offset, so a *correct* pair's SMART is several °C away
+    too (`smart_reject_corr_c: 3` cost 11 of 12 correct associations on the
+    example config).
+
+    Measured on `sim/das.py` (example config, `basic` physics with sensor noise,
+    SMART with activity bursts, three bays given a neighbouring drive's serial
+    as if the correlator had guessed wrong, two correct pairs as a control,
+    2000 ticks, seeds 9 and 11): without the re-check 5 of 6 wrong pairs were
+    held for the whole run, fed 121–205 rows into the bay's RLS and **every one
+    of them reached an accepted calibration on the wrong drive**. With it all
+    six were dropped at 3425–3725 s (the first evaluation with a full window)
+    after 53–60 rows, and only one of the six ever had its calibration used —
+    which it lost at the drop, the bay's map reverting to the prior in the same
+    tick. Neither control pair was dropped in any run, and the declared-serial
+    calibration run of `tests/test_estimator.py` is unchanged (12+ of 15 bays
+    accepted, estimates within 1 °C).
+
 19. **Done** (2026-09-16): occupancy debounce. A bay whose proximal members
     all go untrusted keeps its occupancy state, its `pending_empty_s` and its
     `pending_occupied_ticks` until the blindness has lasted

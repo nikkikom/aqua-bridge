@@ -237,11 +237,29 @@ A new sample is one whose ``ts - age_s`` lies more than :data:`NEW_SAMPLE_EPS_S`
 after the previous one of that serial. Serial -> bay association:
 :mod:`aqua_bridge.control.associate`.
 
+**Correlation pairs are re-checked** (item 18). A declared serial is the owner's
+statement; a correlated one is a guess, and a wrong guess feeds another drive's
+SMART into this bay's calibration. The absolute band cannot tell the two apart
+(an uncalibrated bay's estimate carries the prior map's own offset, so a *correct*
+pair is several degC away too), so the pair is re-tested with the statistic that
+accepted it: its SMART history and the bay series keep being recorded, every
+evaluation re-scores the pair against its own bay, and ``associate_drop_checks``
+consecutive scores below ``associate_drop_corr`` end the
+association (``assoc_check_fails`` in the per-bay output counts them). A dropped
+pair's history starts over: it has to win the full acceptance rule again, over a
+fresh window, before it may calibrate that bay. Until a correlation pair has
+passed one re-check its calibration is **not used**, however many samples it has
+(``calibrated`` stays false and ``sigma_cal`` stays at the uncalibrated floor):
+the first window of a guessed pair is exactly the window the re-check cannot
+judge yet, and a wrong map there would bias the drive estimate that sets the fan
+speed. A declared serial is used as before.
+
 Memory (plain JSON)::
 
     {"v": 1, "fp": <structure fingerprint>, "ts": last ts,
      "zones": {zone: {"x": [...], "P": [[...]], "t_in": float | None, "blind": s}},
-     "bays": {bay: {"occ", "low", "rise", "blind", "since", "assoc", "map", "init",
+     "bays": {bay: {"occ", "low", "rise", "blind", "rej" (failed re-checks),
+                    "ver" (a re-check passed), "since", "assoc", "map", "init",
                     "disturb", "spent", "clean"}},
      "cal": {bay: {serial: {"th", "P", "n", "fresh", "rms2", "ts", "used"
                             [, "inflate", "confirm"]}}},
@@ -611,6 +629,8 @@ def _fresh_bay() -> dict[str, Any]:
         "low": 0.0,
         "rise": 0,
         "blind": 0.0,
+        "rej": 0,
+        "ver": False,
         "since": None,
         "assoc": None,
         "map": None,
@@ -685,11 +705,16 @@ def _parse(memory: object, st: _Structure) -> dict[str, Any]:
         blind = _num(raw.get("blind", 0.0))
         if blind < 0:
             raise ValueError("blind")
+        rej = raw.get("rej", 0)
+        if isinstance(rej, bool) or not isinstance(rej, int) or rej < 0:
+            raise ValueError("rej")
         out["bays"][b] = {
             "occ": occ,
             "low": _num(raw.get("low", 0.0)),
             "rise": rise,
             "blind": blind,
+            "rej": rej,
+            "ver": bool(raw.get("ver", False)),
             "since": _opt_num(raw.get("since")),
             "assoc": assoc,
             "map": mapping,
@@ -946,6 +971,21 @@ def _seed_sensor(bay: _Bay, temps: Mapping[str, float]) -> float:
     return max(float(temps[name]) for name in bay.sensors if name in temps)
 
 
+def _forget_pair(mem: dict[str, Any], bay: str, serial: str | None) -> None:
+    """End a correlation association and forget the evidence that made it.
+
+    The serial's SMART history starts over, so the pair has to win the acceptance
+    rule again over a full window before it may calibrate that bay -- whether it
+    ended on a hot swap, a jump, silence or a failed re-check (item 18).
+    """
+    bm = mem["bays"][bay]
+    bm["assoc"], bm["rej"], bm["ver"] = None, 0, False
+    mem["pending"].pop(bay, None)
+    known = mem["smart"].get(serial) if serial is not None else None
+    if known is not None:
+        known["hist"] = []
+
+
 def update(
     memory: object,
     cfg: MpcConfig,
@@ -998,11 +1038,11 @@ def update(
         bm = mem["bays"][b]
         if b in declared:
             assoc[b] = (declared[b], "declared")
-            bm["assoc"] = None
+            bm["assoc"], bm["rej"] = None, 0
             continue
         serial = bm["assoc"]
         if serial is not None and (serial not in fresh_smart or serial in declared_serials):
-            bm["assoc"] = None
+            _forget_pair(mem, b, serial)
             serial = None
         if serial is not None:
             assoc[b] = (serial, "correlation")
@@ -1028,10 +1068,14 @@ def update(
             return None
         return mem["cal"].get(b, {}).get(assoc[b][0])
 
+    def verified(b: str) -> bool:
+        """Whether the bay's association may calibrate it: declared, or re-checked once."""
+        return b in assoc and (assoc[b][1] == "declared" or bool(mem["bays"][b]["ver"]))
+
     def sensor_map(b: str) -> tuple[float, float, str | None]:
         """``(s, b, source)`` the filter uses for bay ``b``."""
         entry = cal_entry(b)
-        if entry is not None and entry["used"]:
+        if entry is not None and entry["used"] and verified(b):
             return entry["th"][0], entry["th"][1], assoc[b][0]
         return CAL_PRIOR[0], CAL_PRIOR[1], None
 
@@ -1216,7 +1260,8 @@ def update(
             continue  # a jump this tick: the sample may describe the drive that just left
         smart_arrived[b] = True
         bay = st.bays[b]
-        if bay.zone not in arrays or mem["bays"][b]["occ"] == EMPTY:
+        bm = mem["bays"][b]
+        if bay.zone not in arrays or bm["occ"] == EMPTY:
             continue
         x, p = arrays[bay.zone]
         n = len(st.zones[bay.zone].bays)
@@ -1229,7 +1274,7 @@ def update(
         per_bay = mem["cal"].setdefault(b, {})
         entry = per_bay.get(serial) or _fresh_calibration(spec.sigma_uncalibrated_c)
         entry, _ = calibration_update(entry, temp - x[0], x[i_s] - x[0], sample_ts)
-        if _calibrated(entry, float(ts), max_age_cal):
+        if _calibrated(entry, float(ts), max_age_cal) and verified(b):
             entry["used"] = True
             _scalar_update(x, p, i_d, temp, SMART_R)
         per_bay[serial] = entry
@@ -1321,13 +1366,14 @@ def update(
                 if before == EMPTY or after == EMPTY:  # a deliberate widening, as a jump
                     _mark_disturbed(bm, float(ts), spec.bay_settle_max_s)
             if (before == EMPTY) != (after == EMPTY):
-                bm["assoc"] = None
+                _forget_pair(mem, b, bm["assoc"])
                 if b in assoc and assoc[b][1] == "correlation":
+                    _forget_pair(mem, b, assoc[b][0])
                     del assoc[b]
             bm["low"], bm["rise"], bm["blind"] = 0.0, 0, 0.0
             bm["occ"] = after
         if jumped.get(b) and b in assoc and assoc[b][1] == "correlation":
-            bm["assoc"] = None
+            _forget_pair(mem, b, assoc[b][0])
             del assoc[b]
 
     # -- store the filter ----------------------------------------------------------------
@@ -1342,12 +1388,17 @@ def update(
     # -- association: series, SMART histories, scoring -----------------------------------
     taken = {serial for serial, _ in assoc.values()}
     unassigned = [s for s in fresh_smart if s not in taken and s not in declared_serials]
+    # Correlation pairs are re-checked against the same statistic that accepted them
+    # (item 18), so their histories keep being recorded instead of being cleared.
+    held = {b: serial for b, (serial, source) in assoc.items() if source == "correlation"}
+    tracked = set(unassigned) | set(held.values())
     window = spec.associate_window_s
+    min_span = associate.MIN_SPAN_FRACTION * window
     for serial, entry in list(mem["smart"].items()):
-        if serial in unassigned and serial in new_samples:
+        if serial in tracked and serial in new_samples:
             sample_ts, temp = new_samples[serial]
             entry["hist"] = associate.record_smart(entry["hist"], sample_ts, temp, ts, window)
-        elif serial not in unassigned:
+        elif serial not in tracked:
             entry["hist"] = []
         if serial not in fresh_smart and float(ts) - entry["ts"] > window:
             del mem["smart"][serial]
@@ -1356,7 +1407,8 @@ def update(
         for b, bay in st.bays.items()
         if b not in assoc and mem["bays"][b]["occ"] != EMPTY and b not in declared
     ]
-    if unassigned and candidates:
+    scoring = bool(unassigned and candidates)
+    if scoring or held:
         bay_y: dict[str, float | None] = {}
         for b, bay in st.bays.items():
             if bay.zone in arrays:
@@ -1374,22 +1426,26 @@ def update(
         )
         if due:
             mem["next_assoc"] = float(ts) + associate.EVERY_S
-            scores = associate.score_matrix(
-                mem["series"],
-                {s: mem["smart"][s]["hist"] for s in unassigned},
-                unassigned,
-                candidates,
-                {b: st.bays[b].zone for b in candidates},
-                min_span_s=associate.MIN_SPAN_FRACTION * window,
-            )
+            scores: dict[str, dict[str, float]] = {}
+            if scoring:
+                scores = associate.score_matrix(
+                    mem["series"],
+                    {s: mem["smart"][s]["hist"] for s in unassigned},
+                    unassigned,
+                    candidates,
+                    {b: st.bays[b].zone for b in candidates},
+                    min_span_s=min_span,
+                )
+                mem["pending"], confirmed = associate.confirm(
+                    mem["pending"],
+                    associate.assign(scores, spec.associate_min_corr, spec.associate_margin),
+                )
+                for b, serial in confirmed.items():
+                    mem["bays"][b]["assoc"], mem["bays"][b]["rej"] = serial, 0
+            else:
+                mem["pending"] = {}
             mem["scores"] = scores
-            mem["pending"], confirmed = associate.confirm(
-                mem["pending"],
-                associate.assign(scores, spec.associate_min_corr, spec.associate_margin),
-            )
-            for b, serial in confirmed.items():
-                mem["bays"][b]["assoc"] = serial
-                mem["smart"][serial]["hist"] = []
+            _recheck_associations(mem, st, held, spec, min_span, assoc)
     else:
         mem["series"] = None
         mem["scores"] = {}
@@ -1431,7 +1487,7 @@ def update(
         cls, cls_source = classes[b]
         serial, assoc_source = assoc.get(b, (None, None))
         entry = cal_entry(b)
-        calibrated = _calibrated(entry, float(ts), max_age_cal)
+        calibrated = _calibrated(entry, float(ts), max_age_cal) and verified(b)
         sigma_cal = (
             max(SIGMA_CAL_FLOOR_C, math.sqrt(float(entry["rms2"])))  # type: ignore[index]
             * float(entry.get("inflate", 1.0))  # type: ignore[union-attr]
@@ -1446,6 +1502,7 @@ def update(
             "pending_empty_s": float(bm["low"]),
             "pending_occupied_ticks": int(bm["rise"]),
             "pending_unknown_s": float(bm["blind"]),
+            "assoc_check_fails": int(bm["rej"]),
             "observed": observed.get(b, False),
             "seeded": bool(bm["init"]),
             "settling": _settling(bm, float(ts), spec.bay_settle_s),
@@ -1651,6 +1708,54 @@ def restore_calibration(
         if not per_bay:
             del mem["cal"][bay]
     return mem, warnings
+
+
+def _recheck_associations(
+    mem: dict[str, Any],
+    st: _Structure,
+    held: Mapping[str, str],
+    spec: Any,
+    min_span_s: float,
+    assoc: dict[str, tuple[str, str]] | None = None,
+) -> None:
+    """Re-score every correlation pair against its own bay and drop the ones that stopped
+    correlating (module docstring, *Association*; item 18). In place, pure.
+
+    A pair whose history is too short for a score yet (a fresh association, a serial that
+    was briefly silent) is left alone. ``associate_drop_checks`` consecutive scores below
+    ``associate_drop_corr`` end the association through :func:`_forget_pair`. Keeping a
+    pair deliberately asks less than choosing one (``associate_min_corr``): on the truth
+    simulator a correct pair scores 0.71-0.97 over the window and dips to 0.37 through a
+    quiet one, while a wrong pair sits at a median of -0.27 to +0.24.
+    """
+    if not held:
+        return
+    floor = spec.associate_drop_corr
+    scores = associate.score_matrix(
+        mem["series"],
+        {
+            serial: mem["smart"][serial]["hist"]
+            for serial in held.values()
+            if serial in mem["smart"]
+        },
+        sorted(set(held.values())),
+        sorted(held),
+        {b: st.bays[b].zone for b in held},
+        min_span_s=min_span_s,
+    )
+    for b, serial in held.items():
+        score = scores.get(serial, {}).get(b)
+        if score is None:
+            continue
+        bm = mem["bays"][b]
+        if score >= floor:
+            bm["rej"], bm["ver"] = 0, True
+            continue
+        bm["rej"] += 1
+        if bm["rej"] >= spec.associate_drop_checks:
+            _forget_pair(mem, b, serial)
+            if assoc is not None:
+                assoc.pop(b, None)  # this tick's output already shows the bay unpaired
 
 
 def _declared_state(declared: bool | str, current: str) -> str:

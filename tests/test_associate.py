@@ -184,6 +184,85 @@ def test_association_drops_when_the_bay_becomes_empty():
     assert up.bays["b1"]["serial"] is None
 
 
+def _series_of(cfg: MpcConfig, bay: str, ts: float, *, matching: bool):
+    """A recorded series over every bay and zone, plus a SMART history that does (or does
+    not) correlate with ``bay``'s own trace."""
+    window_s = cfg.estimator.associate_window_s
+    step = A.SAMPLE_S
+    n = int(window_s / step) + 1
+    t_rec = [ts - window_s + step * k for k in range(n)]
+    wave = [math.sin(t / 400.0) for t in t_rec]
+    series = {
+        "t": t_rec,
+        "y": {b: (wave if b == bay else [0.0] * n) for b in cfg.topology.bays},
+        "a": {z: [30.0] * n for z in cfg.topology.zones},
+    }
+    hist = [
+        [t, 30.0 + 5.0 * (math.sin(t / 400.0) if matching else math.sin(t / 97.0))] for t in t_rec
+    ]
+    return series, hist
+
+
+def _held(cfg: MpcConfig, bay: str, serial: str, ts: float, *, matching: bool):
+    """A memory whose ``bay`` holds ``serial`` by correlation, with a full window of
+    evidence that either keeps correlating or does not (item 18)."""
+    mem = _with_association(cfg, bay, serial)
+    series, hist = _series_of(cfg, bay, ts, matching=matching)
+    mem["series"] = series
+    mem["smart"][serial] = {"ts": ts, "t": 40.0, "model": "M", "hist": hist}
+    mem["next_assoc"] = None  # the next tick is an evaluation
+    return mem
+
+
+def test_a_correlation_pair_that_stops_correlating_is_dropped():
+    """Item 18: the statistic that accepted a pair has to keep holding."""
+    cfg = das_cfg(setpoints={})
+    ts = 4000.0
+    smart = {"S1": {"temp_c": 40.0, "age_s": 1.0, "model": "M"}}
+    mem = _held(cfg, "a1", "S1", ts, matching=False)
+    fails = []
+    for i in range(int(cfg.estimator.associate_drop_checks)):
+        up = _tick(cfg, mem, ts + A.EVERY_S * (i + 1), smart)
+        mem = json.loads(json.dumps(up.memory))
+        fails.append(up.bays["a1"]["assoc_check_fails"])
+    assert fails[:-1] == list(range(1, len(fails)))  # counted up ...
+    assert fails[-1] == 0 and up.bays["a1"]["serial"] is None  # ... and then dropped
+    assert mem["smart"]["S1"]["hist"] == []  # the evidence is forgotten: earn it again
+
+
+def test_a_correlation_pair_that_keeps_correlating_is_kept_and_may_calibrate():
+    cfg = das_cfg(setpoints={})
+    ts = 4000.0
+    smart = {"S1": {"temp_c": 40.0, "age_s": 1.0, "model": "M"}}
+    mem = _held(cfg, "a1", "S1", ts, matching=True)
+    for i in range(4):
+        up = _tick(cfg, mem, ts + A.EVERY_S * (i + 1), smart)
+        mem = json.loads(json.dumps(up.memory))
+        assert up.bays["a1"]["serial"] == "S1", i
+        assert up.bays["a1"]["assoc_check_fails"] == 0
+    assert mem["bays"]["a1"]["ver"] is True
+
+
+def test_a_guessed_pair_does_not_calibrate_before_its_first_re_check():
+    """Until a correlation pair has passed one re-check its map is not used, however
+    many samples it has; a declared serial is used as before (item 18)."""
+    cfg = das_cfg(setpoints={})
+    mem = _with_association(cfg, "a1", "S1")
+    entry = E._fresh_calibration(cfg.estimator.sigma_uncalibrated_c)
+    for k in range(40):  # a converged calibration of the wrong drive
+        x = 4.0 + 3.0 * math.sin(k)
+        entry, _ = E.calibration_update(entry, x, 0.7 * x - 2.1, 0.0)
+    entry["used"] = True
+    mem["cal"]["a1"] = {"S1": entry}
+    up = _tick(cfg, mem, 1.0, {"S1": {"temp_c": 40.0, "age_s": 1.0, "model": "M"}})
+    assert up.bays["a1"]["association"] == "correlation"
+    assert up.bays["a1"]["calibrated"] is False
+    assert up.bays["a1"]["sigma_cal_c"] == cfg.estimator.sigma_uncalibrated_c
+    mem["bays"]["a1"]["ver"] = True  # one re-check passed
+    ok = _tick(cfg, mem, 1.0, {"S1": {"temp_c": 40.0, "age_s": 1.0, "model": "M"}})
+    assert ok.bays["a1"]["calibrated"] is True
+
+
 def test_a_declared_serial_wins_and_is_never_correlated():
     m = das_cfg(setpoints={}).to_dict()
     m["topology"]["bays"]["a2"]["serial"] = "S1"

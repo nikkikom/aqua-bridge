@@ -169,6 +169,10 @@ def test_estimator_section_parses_and_round_trips():
         {"reset_drive_var": 0.0},
         {"jump_min_c": 0.0},
         {"jump_sigmas": -1.0},
+        {"occupancy_hold_s": -1.0},
+        {"associate_drop_checks": 0.0},
+        {"associate_drop_corr": 0.0},
+        {"associate_drop_corr": 0.8},  # not below associate_min_corr
         {"k_sigma": "wide"},
         {"window": 1},
         [],
@@ -693,6 +697,12 @@ def test_a_correlation_association_never_relaxes_the_drive_class():
     assert up.bays["a2"]["class"] == "hdd" and up.estimates["a2"]["limit"] == 50.0
 
 
+def _serial_topology(bay: str, serial: str) -> dict:
+    topo = das_mapping()["topology"]
+    topo["bays"][bay]["serial"] = serial
+    return topo
+
+
 def test_fresh_smart_of_an_associated_serial_keeps_a_bay_occupied():
     m = das_mapping()
     m["setpoints"] = {}
@@ -756,12 +766,6 @@ def test_calibration_is_keyed_by_serial_within_the_bay():
     assert up_b.bays["a1"]["sigma_cal_c"] == cfg_b.estimator.sigma_uncalibrated_c
     up_a = tick(cfg_a, up_b.memory, 1.5)  # the first drive is back in the bay
     assert up_a.bays["a1"]["calibrated"]
-
-
-def _serial_topology(bay: str, serial: str) -> dict:
-    topo = das_mapping()["topology"]
-    topo["bays"][bay]["serial"] = serial
-    return topo
 
 
 def test_smart_far_from_the_estimate_is_rejected_and_counted():
