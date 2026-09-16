@@ -4155,8 +4155,12 @@ Owner decision (2026-09-16):
     11-minute guideline; `tools/ci_pytest_shards.py` now runs several
     pytest processes concurrently, each on a disjoint deterministic slice
     of `tests/test_*.py`, inside both `test` matrix jobs (§12).
-27. Test gap: the DS18B20 plateau test uses an 1800 s sine, so no plateau
-    is longer than `stuck_s`; add one.
+27. **Done** (2026-09-16): the sine's turning points never held a
+    plateau close to `stuck_s`; `test_a_truly_idle_drive_frozen_longer_
+    than_the_window_never_flags_stuck` (`tests/test_gate.py`) holds
+    `prox_a2` at one exact value for the whole 1100-tick run (several
+    times `stuck_s`) while a faster, independent fan cycle keeps every
+    window supplied with airflow evidence; never flags.
 28. **Done** (2026-09-16): `tools/bench_step.py --sim-plant das` takes
     `--sim-preset` (`basic`, default, or `rich`, item 17) and reports the
     preset it actually ran in `plant.preset`, instead of the literal
