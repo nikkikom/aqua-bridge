@@ -670,17 +670,23 @@ ones get their defaults):
 | `zones.sigma_floor_hold_s` / `sigma_floor_growth_c` / `sigma_floor_release_per_min` | 1800 / 1.0 / 0.0025 | ≥ 0 s / > 0 °C / > 0 PWM per minute; `trust_rule: sigma` only: the soft sigma floor holds at most this long, or until the σ of every lost group has grown this much, then falls at this rate (§3 per-zone trust) |
 | `noise.exponent` / `weight_noise` / `band_hysteresis` | 5 / 1.0 / 0.02 | `[3, 7]` / ≥ 0 / ≥ 0 |
 | `estimator.k_sigma` | 2.0 | `[0, 4]`; margin `= k_sigma * sigma` |
-| `estimator.sigma_fault_c` / `sigma_air_fault_c` | 4.0 / 2.0 | > 0, °C; with `trust_rule: sigma` a zone is untrusted while a constrained bay's drive σ or its air σ is above them; `sigma_fault_c` must then exceed the uncalibrated floor 1.5 |
+| `estimator.sigma_fault_c` / `sigma_air_fault_c` | 4.0 / 2.0 | > 0, °C; with `trust_rule: sigma` a zone is untrusted while a constrained bay's drive σ or its air σ is above them; `sigma_fault_c` must then exceed `sigma_uncalibrated_c` |
+| `estimator.sigma_uncalibrated_c` | 1.5 | > 0, °C; the σ floor of a bay without an accepted SMART calibration |
 | `estimator.air_blind_fault_s` | 900 | ≥ 0 s; with `trust_rule: sigma` a zone is untrusted once its air node has had no trusted `zone_air` reading for this long (the air σ barely grows, §3 per-zone trust and §8 item 70) |
 | `estimator.q_t_air` / `q_d_air` / `q_t_drive` / `q_t_sensor` / `q_heat` / `q_offset` | 1e-4 / 4e-7 / 1e-5 / 1e-4 / 4e-7 / 1e-4 | > 0; process noise per tick (the last one a proximal placement offset's) |
+| `estimator.p0_t_air` / `p0_d_air` / `p0_t_drive` / `p0_t_sensor` / `p0_heat` | 0.25 / 2.5e-3 / 0.1 / 0.1 / 2.5e-5 | > 0; the initial variance of those same states |
 | `estimator.sensor_noise_c` | 0.03 | ≥ 0 |
 | `estimator.proximal_offset_c` | 3.0 | ≥ 0, °C; prior σ of the placement offset the filter carries for every proximal sensor of a bay beyond the first (§3 estimator, §8 item 67); 0 fuses them all on one node |
 | `estimator.smart_max_age_s` / `smart_reject_c` | 300 / 8.0 | ≥ `dt` / > 0 |
 | `estimator.occupied_dT_c` / `empty_dT_c` / `empty_confirm_s` | 2.0 / 0.7 / 300 | `occupied_dT_c > empty_dT_c > 0`; `empty_confirm_s ≥ 2 * dt` |
+| `estimator.occupancy_hold_s` | 30 | ≥ 0, s; a blind bay keeps its occupancy this long (0: no debounce) |
+| `estimator.reset_drive_var` | 25 | > 0, °C²; the drive variance a bay restarts from when a drive (possibly) arrived |
+| `estimator.jump_min_c` / `jump_sigmas` | 0.5 / 6.0 | > 0 / > 0; the fast-swap rule's thresholds on a proximal innovation |
 | `estimator.bay_settle_s` | 600 | ≥ 0 |
 | `estimator.bay_settle_max_s` | 1800 | ≥ `bay_settle_s`, s; the most settling exemption one bay may draw from `trust_rule: sigma` before it has to run this long with neither a window nor a σ over `sigma_fault_c` (§3 per-zone trust, §8 item 69); 0 grants none at all |
 | `estimator.calibration_max_age_days` | 30 | > 0 |
 | `estimator.associate_window_s` / `associate_min_corr` / `associate_margin` | 3600 / 0.8 / 0.15 | ≥ 600 / `(0, 1)` / `(0, 1)` |
+| `estimator.associate_drop_corr` / `associate_drop_checks` | 0.3 / 3 | `0 < associate_drop_corr < associate_min_corr` / ≥ 1; a correlation pair re-scored below that on this many consecutive evaluations is dropped |
 
 **Flat DAS keys of `mpc`** (validated always, inert in legacy mode; the
 booleans need `topology`; the rules that depend on `dt` are checked only
@@ -696,6 +702,7 @@ long `dt`):
 | `model_converged_rel_se` | 0.25 | `(0, 1)` |
 | `model_max_pred_err_c` | 1.0 | > 0 |
 | `model_use_rpm` | `false` | airflow from the tach for identification (needs `topology`) |
+| `model_reset_on_swap` | `true` | a hot-swapped bay's identified `g0`, `k`, `q_s` start over from the prior (§8 item 12; inert in legacy mode and in a `frozen` zone) |
 | `mpc_pred_dt_s` | 30 | > 0; ≥ `dt` with `topology` |
 | `mpc_blocks` | `[]` | ints ≥ 1 summing to `horizon`; `[]` = `[1, 1, 2, 4, 6, 6]` cut to `horizon` |
 | `mpc_every_ticks` | 1 | int ≥ 1 (DAS example 2) |
