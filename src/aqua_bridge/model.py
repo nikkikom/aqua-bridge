@@ -1389,7 +1389,9 @@ class StuckParams:
       channel's own net PWM move above ``stuck_pwm_net``
     * ``air``      -- zone-air sensors whose plausible net move *against* that
       airflow move (warmer air after more airflow, cooler after less) by more
-      than ``stuck_air_oppose_c`` voids it as evidence
+      than ``stuck_air_oppose_c`` and at most ``stuck_air_oppose_max_c`` voids
+      it as evidence, and whose plausible net move above ``stuck_zone_air_dT_c``
+      is evidence on its own while the airflow stays inside ``stuck_airflow_net``
 
     Legacy mode: the global ``stuck_s`` / ``stuck_eps_c``, every channel (each on
     its own), every other temperature, no ``airflow`` and no ``air``. With
@@ -1518,11 +1520,15 @@ class MpcConfig:
       each rate limited to at most one line per ``budget_log_interval_s`` carrying
       the count of exceedances since the last line. Both modes; both apply
       regardless of ``dt``.
-    * ``stuck_airflow_net`` / ``stuck_air_oppose_c`` -- DAS Stuck evidence (gate rule 3,
+    * ``stuck_airflow_net`` / ``stuck_air_oppose_c`` / ``stuck_air_oppose_max_c`` /
+      ``stuck_zone_air_dT_c`` -- DAS Stuck evidence (gate rule 3,
       ``aqua_bridge.control.gate``): the net move of a zone's relative airflow that
-      counts for its sensors instead of ``stuck_pwm_net``, and the zone-air move against
-      it (degrees C) that voids it for the zone's ``drive_proximal`` sensors. Validated
-      always, inert in legacy mode.
+      counts for its sensors instead of ``stuck_pwm_net``; the zone-air move against
+      it (degrees C) that voids it for the zone's ``drive_proximal`` sensors, and the
+      move above which that excuse no longer holds (a zone-air swing that large must
+      show in a healthy proximal reading whatever the airflow did); and the zone-air
+      move that is evidence on its own while the airflow stays inside
+      ``stuck_airflow_net``. Validated always, inert in legacy mode.
     * ``model_shadow`` / ``model_window_s`` / ``model_lambda`` / ``model_p_trace_max`` /
       ``model_converged_rel_se`` / ``model_max_pred_err_c`` / ``model_use_rpm`` -- the
       zoned thermal model's online identification (``control/thermal.py``): shadow
@@ -1597,6 +1603,8 @@ class MpcConfig:
     budget_log_interval_s: float = 60.0
     stuck_airflow_net: float = 0.15
     stuck_air_oppose_c: float = 0.3
+    stuck_air_oppose_max_c: float = 3.0
+    stuck_zone_air_dT_c: float = 1.5  # noqa: N815 - reads like stuck_sibling_dT_c
     topology: Topology | None = None
     sensors: dict[str, SensorSpec] = field(default_factory=dict)
     drive_classes: dict[str, DriveClass] = field(default_factory=dict)
@@ -1702,6 +1710,12 @@ class MpcConfig:
         )
         s(self, "stuck_airflow_net", _cfg_num("stuck_airflow_net", self.stuck_airflow_net))
         s(self, "stuck_air_oppose_c", _cfg_num("stuck_air_oppose_c", self.stuck_air_oppose_c))
+        s(
+            self,
+            "stuck_air_oppose_max_c",
+            _cfg_num("stuck_air_oppose_max_c", self.stuck_air_oppose_max_c),
+        )
+        s(self, "stuck_zone_air_dT_c", _cfg_num("stuck_zone_air_dT_c", self.stuck_zone_air_dT_c))
         for name in ("model_shadow", "model_use_rpm", "model_accept_prior"):
             _cfg_bool(name, getattr(self, name))
         for name in (
@@ -1939,6 +1953,15 @@ class MpcConfig:
             )
         if self.stuck_air_oppose_c <= 0:
             raise ConfigError(f"mpc.stuck_air_oppose_c must be > 0, got {self.stuck_air_oppose_c}")
+        if self.stuck_air_oppose_max_c <= self.stuck_air_oppose_c:
+            raise ConfigError(
+                f"mpc.stuck_air_oppose_max_c ({self.stuck_air_oppose_max_c}) must be > "
+                f"mpc.stuck_air_oppose_c ({self.stuck_air_oppose_c})"
+            )
+        if self.stuck_zone_air_dT_c <= 0:
+            raise ConfigError(
+                f"mpc.stuck_zone_air_dT_c must be > 0, got {self.stuck_zone_air_dT_c}"
+            )
         if self.solver is SolverKind.MPC and self.regulates_drive_limits:
             # The DAS MPC (control/solver_das.py) tracks no setpoint: its QP is strictly
             # convex through the noise surrogate or the move penalty.
