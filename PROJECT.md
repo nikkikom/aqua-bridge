@@ -54,7 +54,7 @@ always reads "for the one implicit zone" in legacy mode.
 | 3 | Digole + touch: pages, override, diagnostics |
 | 4 | MQTT + HA discovery: drive estimates and margins, air temperatures, fan speeds, noise index, model status, Pi health (not raw PWM in Auto) |
 | 5 | HTTP: view state, estimates, bays and model; control (drive limits, bays, mode, manual PWM, preset, identification experiments) |
-| upgrade | same codebase on Zero 2 W |
+| upgrade | same codebase, same config, on a Raspberry Pi Zero 2 W (**done**, 2026-09-16, §8 items 50, 51) |
 
 The plant:
 
@@ -202,8 +202,15 @@ measure it.
 - Digole: UART `/dev/serial0` (= `ttyAMA0`), plus I2C/SPI if wired that
   way. Bluetooth is off (`dtoverlay=disable-bt`); serial console is
   removed from UART.
-- Zero 2 W upgrade: same 32-bit userland or 64-bit Lite, no `armv6` in
-  the code. USB OTG is unchanged.
+- **Board (2026-09-16, §8 items 50, 51):** the controller is a Raspberry
+  Pi **Zero 2 W** (4 cores at 1.0 GHz, 64-bit Raspberry Pi OS Lite,
+  trixie, kernel 6.18, aarch64), running the same code and the same DAS
+  config as the single-core, 32-bit Zero W it replaced; no `armv6`-only
+  code existed to remove and nothing in the API changed. USB OTG is
+  unchanged. The Zero W stays the reference for the older board's
+  numbers where those are still cited (the step-budget fallback of §8
+  item 73, and measurements taken before the move) — it is not what the
+  code now runs on.
 
 **Status:** only the Pi is up. The aquaero 6 XT, Quadro, Digole, the
 DS18B20 buses and the DAS itself are not connected yet; the spike
@@ -6163,6 +6170,38 @@ Owner decision (2026-09-16):
     reworked to leave the example alone (which would mean shipping
     `proximal_offset_c: 0` in `config.example-das.yaml`, i.e. not fixing
     item 67 for the example's own redundant pairs).
+
+    **Where that commit is:** `522a39d0de08ef3c4ce985f10d18c1a17086de54`,
+    "goldens: regenerate the four DAS trajectories (drop this commit to
+    keep the old ones)", 2026-09-16, directly after item 67's estimator
+    commit on `main`. `git show --stat` on it touches exactly the four
+    files above and nothing else — no code, no other golden, no other doc
+    — so `git revert` of that one commit is the whole "drop" side of the
+    owner decision above; it has not been reverted, so the four DAS
+    goldens the tree ships today are the regenerated ones and
+    `test_das_core.py::test_golden_trajectory` passes against them. That
+    is this document recording where the commit sits, not the owner
+    decision above being resolved — nothing here answers it.
+
+    **Before ever regenerating `tests/golden/das_*.json` again**, a reader
+    should: confirm the change is isolated to `tests/golden/*` in its own
+    commit exactly the way this one is, never folded into the code change
+    that moved the goldens, so either can be dropped without the other;
+    confirm the two legacy goldens (`regulation_noise_disturbance.*`,
+    `setpoint_steps.*`) are still untouched and bit-identical — if a
+    change moves those too it reached the legacy, no-`topology` path and
+    breaks the safety contract's bit-identity requirement (§2) regardless
+    of how reasonable the DAS numbers look; and read the move itself —
+    `max |Δpwm|`, `max |Δtemp|`, and every tick where `mode` or
+    `zones_in_fault` differs (`GOLDEN_PWM_ATOL` 1e-6, `GOLDEN_TEMP_ATOL`
+    1e-4, `AQUA_BRIDGE_REGEN_GOLDEN=1` to produce the new file,
+    `tests/test_das_core.py`) — against the specific code change that
+    caused it, the way this item's own numbers above are read against
+    item 67's added offset states. A move that cannot be explained that
+    way by the change that supposedly caused it is a bug to fix, not a
+    golden to accept. **The rule stays what item 73's brief already
+    set: goldens are regenerated only on an owner decision, in an
+    isolated commit of their own, never to make a failing test pass.**
 100. **Done** (2026-09-17): the two notions are untangled, and they were not one
     rule wearing two hats — they were two questions. The estimator is the owner
     of both: it marks every reason a bay is not itself (`jump`, `occupancy`,
@@ -6748,8 +6787,32 @@ Owner decision (2026-09-16):
 
 ### 8.4 Open — Zero 2 W upgrade
 
-50. Run on a Zero 2 W with the same config.
-51. 64-bit Lite if needed, with no API change.
+50. **Done** (2026-09-16): the owner moved the controller itself from the
+    Zero W to a Raspberry Pi Zero 2 W and installed the daemon there from
+    this repository (`deploy/install-pi.sh --user <user> --das`) with the
+    same DAS config the Zero W ran, `config.example-das.yaml` — no key
+    added, removed or renamed for the move. What the new board changes is
+    the step-budget gate, re-measured and re-derived on it (`budget_ms`
+    600 → 250, `budget_alarm_ms` 750 → 350; §8 items 73, 95, 2026-09-17);
+    every other config key, the HTTP/MQTT surface and the safety contract
+    (§2) are exactly what they were on the Zero W. Run on a Zero 2 W with
+    the same config.
+51. **Done** (2026-09-16): the Zero 2 W runs 64-bit Raspberry Pi OS —
+    trixie, kernel 6.18, aarch64, 4 cores at 1.0 GHz — in place of the Zero
+    W's 32-bit `armv6l` userland on a single 1.0 GHz core; nothing in
+    `src/aqua_bridge` is conditioned on word size, endianness or core count,
+    and no request, response or config-schema shape in `model.py`, the HTTP
+    API (§6) or MQTT/HA (§7) changed for the move — item 50's re-derived
+    step budget is a config value, not an API change. `deploy/install-pi.sh`
+    ran unmodified against this board: it still installs
+    `deploy/packages-rpi.txt`'s package *names* through `apt-get`, Debian's
+    own package resolution picked the `arm64` build of each one, and the
+    script's own guard against `pip` fetching or building numpy from PyPI
+    (§9) did not fire — so the apt-package venv strategy §9 documents for
+    the Zero W needed no change either. §9's "Versions on Trixie" note
+    still names only what was verified on the Zero W; it has not been
+    re-run with `apt-cache policy` on the Zero 2 W to confirm the same
+    package versions there. 64-bit Lite if needed, with no API change.
 52. **Done** (2026-09-16; corrected the same day after review): the levels
     are re-planned from the live solver demand every tick
     (`mpc.ident_replan`, default `true`; §3 "Active identification
@@ -7786,4 +7849,4 @@ blob in the log.
    `fallback_pwm` stop write (about ten seconds of loud fans, accepted,
    §9).
 8. Digole + touch.
-9. Zero 2 W with no API change.
+9. **Done** (2026-09-16, §8 items 50, 51): Zero 2 W with no API change.

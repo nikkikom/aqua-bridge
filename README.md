@@ -28,10 +28,12 @@ Project language is English only (docs, comments, commit messages, issues).
 ## Bring up on a fresh Raspberry Pi
 
 Condensed from PROJECT.md §10, which has the full rationale for each
-step. There is no project-specific image. Steps 1–6 below have been run
-on a Zero W; step 7 onward (USB spike, sensor commissioning, enabling
-the service) needs the aquaero and is not yet confirmed on real
-hardware.
+step. There is no project-specific image. Steps 1–6 below were first run
+on a Zero W; the controller has since moved to a Raspberry Pi **Zero 2
+W** (64-bit Lite, trixie) with the same steps and the same config, no
+code change needed (PROJECT.md §8 items 50, 51). Step 7 onward (USB
+spike, sensor commissioning, enabling the service) needs the aquaero and
+is not yet confirmed on real hardware, on either board.
 
 1. **Flash.** Raspberry Pi Imager → Raspberry Pi OS Lite (32-bit for a
    Zero W; 32- or 64-bit for a Zero 2 W), Trixie. In the imager's
