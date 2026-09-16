@@ -39,8 +39,11 @@ when ``z`` is declared ``coupled_to`` a zone that lists it (the weak cross-zone
 prior), else not at all. Channels of one ``fans.<ch>.group`` (default: the
 channel itself) share one coefficient per zone, ``E_zG`` (prior
 ``sum_{i in G} w_zi``), with ``phi_zG = sum_i w_zi phi_i / sum_i w_zi``: one
-multiplier on the group's prior effectiveness until experiments split it
-(later milestone).
+multiplier on the group's prior effectiveness, shared by every channel of the
+group. Active identification experiments (:mod:`aqua_bridge.control.ident`)
+already run each channel of a group alone in turn so the *data* to split it
+exists; the split itself -- turning that into one ``E`` per channel instead
+of per group -- is still open (PROJECT.md section 8 item 13).
 
 Parameter table (:data:`PARAMETERS`; keys as in :func:`parameter_keys`)
 ------------------------------------------------------------------------

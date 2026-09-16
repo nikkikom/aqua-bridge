@@ -1030,8 +1030,10 @@ class FanSpec:
     """``fans.<channel>``: what hangs on one PWM output (1-2 fans on one tach is typical).
 
     ``group`` names the air path the channel shares with other channels
-    (``None``: its own). ``forbidden_pwm`` is parsed and validated only; the
-    solver that honours it is a later milestone.
+    (``None``: its own). ``forbidden_pwm`` (a resonance band to skip) is
+    honoured by the DAS solver (:func:`~aqua_bridge.control.solver_das.snap_bands`,
+    both the PI-like form and the MPC), not by the legacy solvers -- there is
+    no ``fans:`` section, hence no ``forbidden_pwm``, without ``topology``.
     """
 
     model: str
