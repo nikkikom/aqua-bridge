@@ -685,7 +685,7 @@ ones get their defaults):
 | `estimator.bay_settle_s` | 600 | ≥ 0 |
 | `estimator.bay_settle_max_s` | 1800 | ≥ `bay_settle_s`, s; the most settling exemption one bay may draw from `trust_rule: sigma` before it has to run this long with neither a window nor a σ over `sigma_fault_c` (§3 per-zone trust, §8 item 69); 0 grants none at all |
 | `estimator.calibration_max_age_days` | 30 | > 0 |
-| `estimator.calibrate_min_c` / `calibrate_max_c` | 5.0 / 80.0 | °C; `calibrate_min_c < calibrate_max_c`, both inside `(temp_min_c, temp_max_c)`; the range `POST /api/calibrate` accepts for a handheld drive reading (item 23) |
+| `estimator.calibrate_min_c` / `calibrate_max_c` | 5.0 / 80.0 | °C; `calibrate_min_c < calibrate_max_c`; the range `POST /api/calibrate` accepts for a handheld drive reading (item 23), narrowed at submit time to the gate's `[temp_min_c, temp_max_c]` — a config that narrows the gate below these defaults is valid and never blocks the daemon's start |
 | `estimator.associate_window_s` / `associate_min_corr` / `associate_margin` | 3600 / 0.8 / 0.15 | ≥ 600 / `(0, 1)` / `(0, 1)` |
 | `estimator.associate_drop_corr` / `associate_drop_checks` | 0.3 / 3 | `0 < associate_drop_corr < associate_min_corr` / a whole number ≥ 1; a correlation pair re-scored below that on this many consecutive evaluations is dropped |
 
@@ -1517,7 +1517,8 @@ DAS mode adds: `zones` (per zone: trusted, reasons, fault timer,
 `class`, `zone`, `zone_trusted`, `calibrated`, `source`, `q_w`); `bays`
 (every bay: occupancy, class and its source, serial, association,
 calibration, candidates, pending occupancy evidence); `estimator`
-(status, error, per zone air estimate, SMART counters); `noise`
+(status, error, per zone air estimate, SMART counters and the separate
+manual-calibration counters of item 23); `noise`
 (`db_index` from the fans' speed, `db_index_cmd` at the new command, per
 channel rpm and its source); `thermal` (with `model_shadow`: status,
 `pred_err_c`, per zone and bay the coefficients with relative standard
@@ -1670,16 +1671,25 @@ confirm it again. SMART is never a gate input and cannot fault a zone.
 thermometer. It is **keyed by the bay**, not by a serial — the operator names
 the bay, so there is nothing to associate — and is otherwise the same sample as
 a SMART one: the same `smart_reject_c` rejection, the same RLS row, the same
-acceptance rule, the same measurement of `T_d` at `R = 1 °C²` once accepted, the
+acceptance rule (**20 fresh samples** with slope variance < 0.01 — so a single
+handheld reading changes no estimate; the bay stays uncalibrated at
+`σ_cal` 1.5 °C until twenty are in, and `POST /api/calibrate` answers with the
+count so far), the same measurement of `T_d` at `R = 1 °C²` once accepted, the
 same presence evidence for the occupancy machine, and the same expiry after
-`calibration_max_age_days`. The reading reaches `step` as
+`calibration_max_age_days`. It is counted in its own `manual_used` /
+`manual_rejected` totals, never in the SMART pair, so those stay a diagnostic of
+the SMART path alone (an enclosure whose SMART agent has died shows no SMART
+traffic, whatever the operator measures by hand). The reading reaches `step` as
 `obs.inputs["calibration"]` (`{bay: {temp_c, ts}}`, the supervisor's
 `TickPlan.calibrations`), so `step` stays a pure function of `(obs, cfg,
 state)`. Its entry lives in the estimator's `manual` memory, never in `cal`
 (which the model store owns per serial), so a swapped drive's SMART calibration
 and the bay's manual one can never be confused; a bay's associated serial's
-calibration wins while it exists. Manual calibrations do not survive a restart
-(item 104). The refusals are in §6 *Control*.
+calibration wins once it is one the filter would use (accepted at least once, or
+accepted now) — a SMART entry still collecting its first twenty samples leaves
+the manual map in force instead of dropping the bay back to the prior. Manual
+calibrations do not survive a restart (item 104). The refusals are in §6
+*Control*.
 
 **Association without SES** (`control/associate.py`). The PC reports
 serials, not bays. (1) A declared `bays.<b>.serial` (config or `POST
@@ -4276,22 +4286,32 @@ Rules (`control/supervisor.py`):
   handheld thermometer, for an enclosure whose drives no SMART agent can read.
   Same authentication, same rate limit and same intent path as every other
   command. `400` for a malformed body, an unknown bay, a `drive_temp_c` outside
-  `[estimator.calibrate_min_c, estimator.calibrate_max_c]` or a legacy config;
+  `[estimator.calibrate_min_c, estimator.calibrate_max_c]` narrowed to the gate's
+  `[temp_min_c, temp_max_c]`, or a legacy config;
   `409` when the reading would be meaningless or unsafe, the error naming which
   bay and why: `no_tick` (no estimate yet — the estimator has to have run once),
   `empty:<bay>` (the estimator calls the bay empty, so there is no drive a
   temperature could describe), `untrusted:<zone>` (the bay's zone is untrusted
   or in fault, and a map fitted to a reading the gate does not believe would
   bias every later estimate of that bay, which is what decides how hard the fans
-  run). An accepted reading is offered to the estimator for
-  `estimator.smart_max_age_s` and reaches it exactly like a SMART sample of that
-  bay (§3) — folded in once, by sample time, exactly as a repeated SMART reading
-  is. It is visible in `GET /api/model` under `manual_calibrations` while it is
-  offered, and as the bay's `calibration` with `calibration_source: "manual"` in
-  `/api/bays` and `/api/model`, and on the page in Drives (`cal manual`) and
-  Model. A second reading for the same bay replaces the first. Like every other intent it
-  aborts a running identification experiment. There is no MQTT counterpart
-  (item 105).
+  run). The three are read against the last completed tick, and re-read on every
+  tick that offers the reading: one taken while the zone was trusted is held back,
+  never absorbed, if the gate has stopped trusting the zone (or the bay has gone
+  empty) by the time a tick would fold it in. An accepted reading is offered to
+  the estimator for `estimator.smart_max_age_s` and reaches it exactly like a
+  SMART sample of that bay (§3) — folded in once, by sample time, exactly as a
+  repeated SMART reading is. **One reading is not a calibration:** the map is
+  accepted at 20 fresh samples (§3), so the 200 body carries
+  `{"ok": true, "calibration": {bay, calibrated, calibration_source,
+  fresh_samples, samples_required}}` — the counts as of the last tick, this
+  reading landing on the next one. It is visible in `GET /api/model` under
+  `manual_calibrations` while it is offered, and as the bay's `calibration` with
+  `calibration_source: "manual"` in `/api/bays` and `/api/model`, and on the page
+  in Drives (`cal manual`) and Model. A second reading for the same bay replaces
+  the first. Like every other accepted intent it aborts a running identification
+  experiment — but a *refused* one does not: the bay, the range and the three
+  refusals are checked before the experiment is touched. There is no MQTT
+  counterpart (item 105).
 - **`/api/ident`** (DAS): `start` needs exactly one of `group` / `channel`
   (unknown → 400); `409` when `ident_enabled` is false, an experiment is
   already running, or a precondition fails — the error names every failed
@@ -4939,17 +4959,23 @@ Owner decision (2026-09-16):
 23. **Done** (2026-09-16): `POST /api/calibrate {bay, drive_temp_c}` —
     calibration with a handheld thermometer when SMART is absent. Same
     authentication, rate limit and intent path as every other command
-    (`Calibrate` in `control/intents.py`, `Supervisor._calibrate`); the bay
-    and the range `estimator.calibrate_min_c` / `calibrate_max_c` are
-    validated, and the reading is refused with the reason named when it
-    would be meaningless or unsafe (`no_tick`, `empty:<bay>`,
-    `untrusted:<zone>`, §6 *Control*). An accepted reading rides to `step`
-    as `obs.inputs["calibration"]` and reaches the estimator exactly like a
+    (`Calibrate` in `control/intents.py`, `Supervisor._check_calibrate`); the
+    bay and the range `estimator.calibrate_min_c` / `calibrate_max_c`
+    (narrowed to the gate's absolute range) are validated, and the reading is
+    refused with the reason named when it would be meaningless or unsafe
+    (`no_tick`, `empty:<bay>`, `untrusted:<zone>`, §6 *Control*) — all of it
+    before a running identification experiment is touched, so a refused
+    reading costs no experiment, and re-checked on every tick that offers the
+    reading. An accepted reading rides to `step` as
+    `obs.inputs["calibration"]` and reaches the estimator exactly like a
     SMART sample of that bay, keyed by bay instead of by serial (§3
-    *Manual calibration*). Visible in `GET /api/model`
-    (`manual_calibrations`, `calibration_source`), in `GET /api/bays` and on
-    the page (Drives `cal manual`, Model). Left open: persistence (item 104)
-    and an MQTT counterpart (item 105).
+    *Manual calibration*): one of the 20 fresh samples an accepted map needs,
+    counted in its own `manual_used` / `manual_rejected` totals, and it does
+    not displace a bay's SMART calibration until that one is accepted.
+    Visible in `GET /api/model` (`manual_calibrations`,
+    `calibration_source`), in `GET /api/bays`, in the 200 body's
+    `calibration` progress and on the page (Drives `cal manual`, Model).
+    Left open: persistence (item 104) and an MQTT counterpart (item 105).
 24. **Done:** the HTML page shows drive estimates, bays, zone and model
     status (§6 View, `publishers/static/index.html`), reusing the existing
     `/api/estimate`, `/api/bays`, `/api/model` views plus the new
