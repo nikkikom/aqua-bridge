@@ -1687,7 +1687,7 @@ the model checks 0.17 ms, the solver's
 own bookkeeping 0.28 ms, the sensor gate 0.10 ms, the `json.dumps` guard
 on the solver memory and the diagnostics 0.10 ms, the rest of `step`
 0.20 ms. Cutting the first two means changing the arithmetic, which would
-move the goldens.
+move the goldens; whether that regeneration is worth it is §8 item 95.
 
 CI checks the ratio (DAS MPC p99 ≤ 12× legacy MPC p99 in the same
 process, `tests/test_bench_budget.py`); the absolute `mpc.budget_ms` gate
@@ -4072,20 +4072,30 @@ Owner decision (2026-09-16):
     be measured, not assumed. Where the remaining time goes is in §4
     "Budget at `dt = 5 s`": the SQP, its box QPs and the estimator's Kalman
     update are most of it, and cutting those means changing the arithmetic,
-    which would move the goldens.
+    which would move the goldens — item 95 carries that decision, so closing
+    this item does not lose it.
 
     The owner's fallback is documented config, not a new default:
     `mpc.budget_ms: 1000.0` **with** `mpc.budget_alarm_ms: 1250.0` (the
     config model rejects a `budget_ms` that is not strictly below the
     alarm, so raising one alone fails to load) and `mpc_every_ticks: 3`.
-    Both example configs carry the three lines commented out next to the
-    live keys, and both budget log lines now name the key that was
-    exceeded and the keys to change (`mpc.mpc_every_ticks` only where the
-    DAS MPC is the solver). `tests/test_bench_budget.py` checks that the
-    three values load, that `budget_ms: 1000` alone is rejected, that
-    `mpc_every_ticks: 3` really solves on a third of the ticks against the
-    truth plant, and that a solve tick is the expensive one;
-    `tests/test_loop.py` checks the raised thresholds and the two log lines.
+    `config.example-das.yaml` names each of the three values in the comment
+    on the live key it replaces: the edit is *changing a value*, not
+    uncommenting a line. A second copy of a key is not an override — YAML
+    keeps only the last one — so since this item `load_config` refuses a key
+    written twice instead of silently dropping one
+    (`config._UniqueKeyLoader`); `config.example.yaml` is the legacy layout
+    with no DAS MPC and points at the DAS file. Both budget log lines now
+    name the key that was exceeded and the keys to change
+    (`mpc.mpc_every_ticks` only where the DAS MPC is the solver).
+    `tests/test_bench_budget.py` reads the three numbers out of
+    `config.example-das.yaml`'s own comments, writes each over its live
+    value and loads the file — so a fallback documented in a form that does
+    not take effect fails there and not on the Pi — and checks that
+    `budget_ms: 1000` alone is rejected, that `mpc_every_ticks: 3` really
+    solves on a third of the ticks against the truth plant and that a solve
+    tick is the one that runs the SQP; `tests/test_loop.py` checks the
+    raised thresholds and the two log lines.
 
     **On the Pi (main session).** Re-measure the DAS MPC p99 with
     `tools/bench_step.py --sim-plant das` and run `pytest
@@ -4334,6 +4344,21 @@ Owner decision (2026-09-16):
       large a value only makes them blunt, never false;
     - confirm no rule fires over a quiet day before narrowing
       `rpm_tolerance_frac` or the `*_fault_s` windows.
+95. Numerics of the DAS MPC solve tick (from item 73; the breakdown is in
+    §4 "Budget at `dt = 5 s`"). On the development machine the SQP with its
+    box QPs (0.73 ms) and the estimator's Kalman update (0.64 ms) are about
+    half of a 2.9 ms solve tick, and they are what is left after item 73's
+    bit-identical optimisations. Every way found to make them cheaper —
+    reordering the accumulations, other dtypes, vectorising the Joseph
+    update across bays — changes the floating-point arithmetic and moves
+    `tests/golden/*`, which item 73's brief forbids without asking, so it
+    stopped there. **Owner decision:** is the remaining time worth
+    regenerating the goldens? If yes, the work is the numerics change, the
+    regenerated goldens, and a re-run of item 73's bit-identity harness
+    against the *new* baseline (it can then only prove that the two
+    revisions agree, not that the controller is unchanged, so the golden
+    diff has to be read). If no, close this item and leave both phases as
+    they are.
 
 ### 8.3 Open — needs the DAS hardware
 
