@@ -120,7 +120,12 @@ hardware.
    physical sensors, `busN` the aquaero's aquabus slots, `softN` software
    and `virtN` virtual sensors); the optional timing keys and the
    software-sensor heartbeat (`heartbeat_sensor`, `heartbeat_value_c`,
-   off by default) are shown at their defaults, PROJECT.md §3 Track B),
+   off by default — 0 is right only while no software sensor is enabled
+   on the controller, §8 item 84) are shown at their defaults,
+   PROJECT.md §3 Track B; do **not** bind a `busN` input of a device that
+   can leave the aquaero's aquabus yet: that slot keeps the last value it
+   read instead of reading as missing, so the solver would follow a
+   frozen temperature (§8 item 92)),
    `onewire.sensors`
    (bound in step 8), the MQTT host and credentials, `http.enabled` /
    `mqtt.enabled`. Every declared name must be bound exactly once — the
@@ -167,9 +172,14 @@ hardware.
    controller (enabled, a timeout of a few tens of seconds, a fallback
    temperature above every alarm threshold) with an alarm that selects a
    safe profile, save that configuration once, then set
-   `heartbeat_sensor` to that sensor: the daemon writes it every tick, and
-   a daemon or Pi that stops leaves the controller to run the safe profile
-   (PROJECT.md §2 "Software-sensor heartbeat and profiles", §8 item 84). As the
+   `heartbeat_sensor` to that sensor: the daemon writes it on every tick
+   whose duties reached the controller (and on no other), so a daemon or
+   Pi that stops — or one that runs but can no longer write — leaves the
+   controller to run the safe profile
+   (PROJECT.md §2 "Software-sensor heartbeat and profiles", §8 item 84).
+   Set the key in the same step as the sensor: a sensor enabled on the
+   device with `heartbeat_sensor: 0` falls back and fires the alarm one
+   timeout after boot, for good. As the
    service user:
    `HYPOTHESIS_PROFILE=pi .venv/bin/python -m pytest -m hardware`. Warm
    each mapped thermistor and confirm the right `obs.temps` key moves (a
