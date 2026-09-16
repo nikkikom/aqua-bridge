@@ -244,10 +244,10 @@ def advance_confirmation(
     value on a time-valid tick adds one, and the sensor leaves the map on reaching
     ``cfg.confirm_ticks``; any other tick of a confirming sensor (a dropout, a time
     fault) restarts its count. A name gate-trusted only because it had no reference to
-    check against (``gate.no_reference``, item 61 -- a sensor missing since boot, while
-    the rest of the system is past its own cold start) starts confirming too, on this
-    same tick, exactly like a fresh rejection: it has no more evidence behind it than a
-    Jump does. Legacy mode: always empty.
+    check against (``gate.no_reference``, item 61 -- a sensor missing since boot, on any
+    tick but the run's genuine first) starts confirming too, on this same tick and
+    whatever the time status, exactly like a fresh rejection: it has no more evidence
+    behind it than a Jump does. Legacy mode: always empty.
     """
     if cfg.zone_layout.implicit:
         return {}
@@ -259,8 +259,13 @@ def advance_confirmation(
             out[name] = 0
             continue
         if name not in old:
-            if time_ok and gate.per_temp.get(name, False) and name in gate.no_reference:
-                out[name] = 0  # a never-referenced first reading confirms like any return
+            if gate.per_temp.get(name, False) and name in gate.no_reference:
+                # A never-referenced first reading confirms like any return -- and like
+                # the rejection branch above, whatever the time status: a time-faulted
+                # tick must not be the one tick on which a sensor slips in unvetted (the
+                # window is pushed either way, so the next tick has a reference). The
+                # increment path below still requires a time-valid tick to advance.
+                out[name] = 0
             continue
         raw = old[name]
         valid = isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0

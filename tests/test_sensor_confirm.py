@@ -29,7 +29,7 @@ from aqua_bridge.control import estimator, zones
 from aqua_bridge.control.gate import evaluate_gate
 from aqua_bridge.control.mpc import solver_for
 from aqua_bridge.model import Mode, MpcConfig, MpcState, PlantObservation
-from das_fixtures import PROX_C, das_cfg, das_obs, default_temps
+from das_fixtures import PROX_C, SP, das_cfg, das_obs, default_temps
 from invariants import checked_step
 
 #: Confirmation long enough to see the intermediate ticks (``confirm_s <= fallback_hold_s``).
@@ -201,6 +201,64 @@ def test_a_sensor_missing_since_boot_confirms_on_its_first_reading(ccfg):
         assert cmd.mode is Mode.AUTO, k  # bay a1's other member (prox_a1) covers the zone
     fused_tick = missing_ticks + ccfg.confirm_ticks
     assert rec[fused_tick][1].last_good_obs.temps["prox_a1b"] == PROX_C  # type: ignore[union-attr]
+
+
+def test_a_sensor_missing_since_boot_confirms_while_every_zone_is_blind(ccfg):
+    """Item 61, the case ``last_good_obs is not None`` alone would miss: while every zone
+    is in fault nothing is fused, so ``state.last_good_obs`` stays ``None`` for the whole
+    outage and not just on tick 0. A zone-air sensor that comes back then -- a 1-Wire bus
+    that was not up at boot, a DS18B20 whose first post-reset read is the 85 degC
+    power-on value, which passes the range check and, with no reference, the slew check
+    too -- must still confirm. This is the blindest the system ever is; it is not the
+    moment to fuse a first reading on trust alone."""
+    missing_ticks = 3
+
+    def temps(i: int) -> dict[str, float | None]:
+        out = patched(ccfg, air_a=None, air_b=None, air_c=None)
+        if i >= missing_ticks:
+            out["air_a"] = SP
+        return out
+
+    rec = run(ccfg, temps, missing_ticks + ccfg.confirm_ticks + 2)
+    for k, (cmd, state) in enumerate(rec):
+        confirming = cmd.diagnostics["sensor_confirm"]
+        if k < missing_ticks:
+            assert state.last_good_obs is None, k  # nothing trusted yet, every zone blind
+            assert confirming == {}, k
+        elif k < missing_ticks + ccfg.confirm_ticks:
+            assert state.last_good_obs is None, k  # still blind: the reading is not fused
+            assert confirming == {"air_a": k - missing_ticks}, k
+        else:
+            assert "air_a" not in confirming, k
+    fused = rec[missing_ticks + ccfg.confirm_ticks][1].last_good_obs
+    assert fused is not None and fused.temps["air_a"] == SP
+    assert rec[0][0].diagnostics["zones_in_fault"] == ["za", "zb", "zc"]
+
+
+def test_a_never_referenced_first_reading_confirms_on_a_time_faulted_tick(ccfg):
+    """Item 61: a gate rejection starts a confirmation whatever the time status, and a
+    first reading with no reference must not differ -- otherwise one badly timed tick
+    (the observation repeats its timestamp) is enough for the sensor to be referenced
+    from the next tick on and never confirm at all. The count still cannot *advance* on a
+    time-faulted tick; it only starts there."""
+    missing_ticks = 3
+
+    def temps(i: int) -> dict[str, float | None]:
+        return patched(ccfg, prox_a1b=None if i < missing_ticks else PROX_C)
+
+    def make_obs(
+        cfg: MpcConfig, ts: float, temps: dict[str, float | None], pwm: Any
+    ) -> PlantObservation:
+        if round(ts / cfg.dt) == missing_ticks:  # the returning tick repeats its timestamp
+            ts = float(missing_ticks - 1) * cfg.dt
+        return das_obs(cfg, ts, temps=temps, pwm=pwm)
+
+    rec = run(ccfg, temps, missing_ticks + ccfg.confirm_ticks + 2, make_obs=make_obs)
+    assert rec[missing_ticks][0].diagnostics["time"]["status"] == "not_advancing"
+    counts = [cmd.diagnostics["sensor_confirm"].get("prox_a1b") for cmd, _ in rec]
+    assert counts == [None, None, None, 0, 1, 2, 3, None, None]
+    good = rec[missing_ticks + ccfg.confirm_ticks - 1][1].last_good_obs
+    assert good is None or good.temps.get("prox_a1b") is None  # not fused while confirming
 
 
 def test_a_dropout_while_confirming_restarts_the_count(ccfg):
