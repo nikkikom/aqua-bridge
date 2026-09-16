@@ -3382,7 +3382,7 @@ tests carry the `nightly` marker.
 |------|--------|-------|
 | `tests/test_zones.py` | DAS config parsing, defaults and rejections; `strict` trust per group (`sigma` without an estimator update); closure `F*` with `declared` / `none`; per-zone timers and confirmation; `degraded` vs `fallback`; legacy = one implicit zone; per-channel `compose`; per-role Stuck sizing; the DEGRADED banner and health field | PR |
 | `tests/test_mpc_zone_fallback.py` | a fault in zone A never lowers any channel of its reach below `prev` (hold, then `max(prev, fallback_pwm)`); channels outside keep regulating; the solver request never carries faulted-zone sensors and healthy commands do not depend on their values; per-zone recovery is bumpless; Flicker in one zone never resets another; a dropout in a redundant group is no fault; solver faults; legacy `mpc` turns a zone fault into whole fallback | PR (one sweep nightly) |
-| `tests/test_sensor_confirm.py` | sensor confirmation (§3): a jumping redundant member (proximal, zone air, inlet) is not fused until it confirms and the zone does not fault, the estimates of the DAS example config match a run without the member until then; a real level change is fused after `confirm_ticks`; restart on a new jump or a dropout; a sole member costs `confirm_ticks` once; a sensor missing since boot confirms its first reading too (item 61); a zone in fault waits for a confirmed member in every group; `diagnostics["gate"]["per_temp"]` reads `false` for a confirming sensor even on a tick its raw reading passes cleanly (item 63); a property over random jumps, dropouts and time faults (median3 on and off) that the counts follow the gate's raw verdict and no confirming sensor reaches the estimator, the solver or `last_good_obs`; malformed memory; JSON and determinism; legacy keeps no state | PR |
+| `tests/test_sensor_confirm.py` | sensor confirmation (§3): a jumping redundant member (proximal, zone air, inlet) is not fused until it confirms and the zone does not fault, the estimates of the DAS example config match a run without the member until then; a real level change is fused after `confirm_ticks`; restart on a new jump or a dropout; a sole member costs `confirm_ticks` once; a sensor missing since boot confirms its first reading too, including while every zone is blind and on a time-faulted tick (item 61); a zone in fault waits for a confirmed member in every group; `diagnostics["gate"]["per_temp"]` reads `false` for a confirming sensor even on a tick its raw reading passes cleanly (item 63); a property over random jumps, dropouts and time faults (median3 on and off) that the counts follow the gate's raw verdict and no confirming sensor reaches the estimator, the solver or `last_good_obs`; malformed memory; JSON and determinism; legacy keeps no state | PR |
 | `tests/test_sigma_trust.py` | `trust_rule: sigma` (§3, §8 item 8): thresholds inclusive, empty and undeclared bays, an uninitialised zone, a sigma that is not a number, time faults, unknown keys and setpoint groups still fault, `strict` ignores the estimator; the `sigma_fault_c` floor; switching rules by config only; the verdict reads this tick's σ across a crossing; an estimator fault applies `strict`; a zone in fault returns without its lost sensor only under `sigma`; on the truth sim 2 % DS18B20 dropouts fault far fewer zones than `strict` with no violation (both DAS solvers), a replay without a bay's only proximal sensor never lowers its zone's airflow beyond 2 % and raises it within ten minutes (PI-like DAS), a lost redundant member changes nothing, a bay's or a zone's sensors lost for good fault the zone once σ passes and it holds, then ramps high; a hot swap holds its zone for a few ticks; the soft sigma floor (§8 item 68): it holds the command before the loss, ends on the σ growth or the hold time, falls at its rate, reopens on a further lost group, keeps its episode on an estimator fault, starts over from malformed memory, its config keys; on the DAS MPC without a bay's only sensor the no-floor run reproduces the drop (−0.04, about 21 % less airflow) and the soft floor holds, then releases | PR: `basic`; nightly: dropout sweep on `basic` and `rich` (redundant pairs masked), a sensor lost for good on both presets and solvers, the soft floor's margin, noise and no-ratchet bounds on `basic` seeds 1–5 and `rich` 0–2, both solvers, two sensors, and its margin bounds on the DAS MPC until the floor has released (`basic` b02 and b13, `rich` b02) |
 | `tests/test_das_core.py` | the core invariants, closed loops and DAS goldens for `pi_das` and `mpc_das` (§4.2) | PR |
 | `tests/test_pi_das.py`, `tests/test_estimates.py`, `tests/test_das_config.py` | the margin-deficit PI (served zones, unconstrained channels, fixed channels, occupancy), the estimates block and prior map, `noise` / `limit_c` / served-zone config | PR |
@@ -4269,13 +4269,19 @@ Owner decision (2026-09-16):
     fraction the config accepts.
 61. **Done** (2026-09-16): a name whose slew check (gate rule 2) passed
     with neither a `last_good_obs` value nor a previous raw one to
-    compare against, while the run is past its own cold start
-    (`last_good_obs` already exists for some other sensor), is now
+    compare against, on any tick but the run's genuine first, is now
     `GateResult.no_reference`; `zones.advance_confirmation` starts such
     a name confirming on the same tick, exactly like a fresh rejection,
     instead of fusing it on trust alone (`tests/test_sensor_confirm.py`).
-    The whole run's genuine first tick (`last_good_obs is None`) is
-    unaffected and stays bumpless.
+    "Past its own cold start" is a window, previous raw temps or a
+    `last_good_obs` — not `last_good_obs` alone: while every zone is in
+    fault nothing is fused, so it stays `None` for the whole outage, and
+    a sensor returning then (a 1-Wire bus that was not up at boot, a
+    DS18B20 reading its 85 °C power-on value) is exactly the one that
+    needs vetting. Like the rejection branch it does not depend on the
+    time status either, so one badly timed tick cannot be the tick a
+    sensor slips in on. The genuine first tick — no window, no last raw
+    temps, nothing trusted — is unaffected and stays bumpless.
 62. **Done** (2026-09-16): `record_from_tick` now skips the names of
     `diagnostics["sensor_confirm"]` when building `trusted_temps`, the
     same exclusion `mpc.step` itself applies before fusing a sensor
