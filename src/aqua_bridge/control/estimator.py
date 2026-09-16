@@ -260,9 +260,12 @@ evaluation re-scores the pair against its own bay, and ``associate_drop_checks``
 consecutive scores below ``associate_drop_corr`` end the
 association (``assoc_check_fails`` in the per-bay output counts them). A dropped
 pair's history starts over: it has to win the full acceptance rule again, over a
-fresh window, before it may calibrate that bay. Until a correlation pair has
-passed one re-check its calibration is **not used**, however many samples it has
-(``calibrated`` stays false and ``sigma_cal`` stays at the uncalibrated floor):
+fresh window, before it may calibrate that bay. So does an *accepted* one, so the
+window that made the pair cannot sit as the pair's own first re-check. Until a
+correlation pair has passed one re-check its calibration is **not used**, however
+many samples it has (``calibrated`` stays false, ``sigma_cal`` stays at the
+uncalibrated floor and ``calibration.accepted_once`` reads false, so the thermal
+identification does not convert a row with that map either):
 the first window of a guessed pair is exactly the window the re-check cannot
 judge yet, and a wrong map there would bias the drive estimate that sets the fan
 speed. A declared serial is used as before.
@@ -1051,7 +1054,9 @@ def update(
         bm = mem["bays"][b]
         if b in declared:
             assoc[b] = (declared[b], "declared")
-            bm["assoc"], bm["rej"] = None, 0
+            # The declaration replaces any correlation pair, verification included: an
+            # undeclared bay must earn ``ver`` again from its next pair (item 18).
+            bm["assoc"], bm["rej"], bm["ver"] = None, 0, False
             continue
         serial = bm["assoc"]
         if serial is not None and (serial not in fresh_smart or serial in declared_serials):
@@ -1342,11 +1347,17 @@ def update(
         elif not sensor_ok and not smart_arrived.get(b):
             # Item 19: a dropout is not evidence. The bay keeps its state (and its
             # pending counts, which this tick neither confirms nor contradicts) until
-            # the blindness has lasted occupancy_hold_s.
-            bm["blind"] += h_occ
-            if bm["blind"] >= spec.occupancy_hold_s:
-                after = UNKNOWN
-                bm["low"], bm["rise"] = 0.0, 0
+            # the blindness has lasted occupancy_hold_s. ``blind`` is a *pending*
+            # transition, so a bay that is already unknown counts nothing: there is no
+            # transition left to hold and pending_unknown_s stays 0 however long the
+            # blindness lasts.
+            if before == UNKNOWN:
+                bm["blind"] = 0.0
+            else:
+                bm["blind"] += h_occ
+                if bm["blind"] >= spec.occupancy_hold_s:
+                    after = UNKNOWN
+                    bm["low"], bm["rise"] = 0.0, 0
         else:
             bm["blind"] = 0.0
             x, _ = arrays[bay.zone]
@@ -1474,7 +1485,13 @@ def update(
                     associate.assign(scores, spec.associate_min_corr, spec.associate_margin),
                 )
                 for b, serial in confirmed.items():
-                    mem["bays"][b]["assoc"], mem["bays"][b]["rej"] = serial, 0
+                    # A pair starts unverified and with no evidence behind it (item 18):
+                    # the window that accepted it must not count again as its own first
+                    # re-check, so the serial's SMART history starts over and the pair
+                    # has to rebuild a full window before its map may calibrate the bay.
+                    bm = mem["bays"][b]
+                    bm["assoc"], bm["rej"], bm["ver"] = serial, 0, False
+                    mem["smart"][serial]["hist"] = []
             else:
                 mem["pending"] = {}
             mem["scores"] = scores
@@ -1562,7 +1579,10 @@ def update(
                 "fresh_samples": entry["fresh"],
                 "rms_c": math.sqrt(float(entry["rms2"])),
                 "age_s": None if entry["ts"] is None else float(ts) - entry["ts"],
-                "accepted_once": entry["used"],
+                # The thermal identification anchors on this flag (``mpc._thermal_shadow``),
+                # so it says what the filter itself does: a pair the estimator refuses to
+                # use is not a map the RLS may convert a row with either (item 18).
+                "accepted_once": bool(entry["used"]) and verified(b),
             },
             "candidates": associate.top_candidates(mem["scores"], b) if b not in assoc else [],
         }

@@ -171,7 +171,9 @@ def test_estimator_section_parses_and_round_trips():
         {"jump_min_c": 0.0},
         {"jump_sigmas": -1.0},
         {"occupancy_hold_s": -1.0},
-        {"associate_drop_checks": 0.0},
+        {"occupancy_hold_s": 301.0},  # above smart_max_age_s
+        {"associate_drop_checks": 0},
+        {"associate_drop_checks": 2.5},  # a count of evaluations, not a fraction
         {"associate_drop_corr": 0.0},
         {"associate_drop_corr": 0.8},  # not below associate_min_corr
         {"k_sigma": "wide"},
@@ -364,7 +366,8 @@ def test_occupancy_debounce_rides_out_a_short_proximal_dropout(as_empty):
 
 
 def test_occupancy_debounce_gives_up_after_the_hold(as_empty):
-    """A dropout that lasts is still a loss of observability."""
+    """A dropout that lasts is still a loss of observability, and once the verdict is in
+    nothing is pending any more, however long the blindness goes on."""
     cfg, mem = as_empty(occupancy_hold_s=6.0)
     blind = run_ticks(cfg, 8, mem=mem, t0=100.0, prox_b1=None)
     seq = [up.bays["b1"]["occupancy"] for up in blind]
@@ -372,6 +375,10 @@ def test_occupancy_debounce_gives_up_after_the_hold(as_empty):
     entry = blind[5].estimates["b1"]  # the insert reset, one hold later than before
     assert entry["sigma"] > 4.0
     assert blind[5].bays["b1"]["pending_unknown_s"] == 0.0
+    # blind for three more holds: pending_unknown_s is a pending transition, not an uptime
+    more = run_ticks(cfg, 20, mem=blind[-1].memory, t0=108.0, prox_b1=None)
+    assert all(up.bays["b1"]["occupancy"] == "unknown" for up in more)
+    assert [up.bays["b1"]["pending_unknown_s"] for up in more] == [0.0] * 20
 
 
 def test_occupancy_debounce_zero_is_the_old_rule(as_empty):

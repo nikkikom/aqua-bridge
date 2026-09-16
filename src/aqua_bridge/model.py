@@ -1277,8 +1277,11 @@ ESTIMATOR_DEFAULTS: dict[str, float] = {
     "jump_sigmas": 6.0,
     "occupancy_hold_s": 30.0,
     "associate_drop_corr": 0.3,
-    "associate_drop_checks": 3.0,
+    "associate_drop_checks": 3,
 }
+
+#: ``estimator`` keys that count evaluations: an integer, not a continuous quantity.
+_ESTIMATOR_INT_KEYS: frozenset[str] = frozenset({"associate_drop_checks"})
 
 #: ``estimator`` keys that are a variance of a filter state (all ``> 0``).
 _ESTIMATOR_VARIANCE_KEYS: tuple[str, ...] = (
@@ -1332,8 +1335,9 @@ class EstimatorSpec:
     * ``smart_reject_c``           -- a SMART value this far from the estimate is dropped
     * ``associate_drop_corr`` / ``associate_drop_checks`` -- a correlation pair is
       re-scored against its own bay at every evaluation; this many consecutive scores
-      below that correlation drop it (``0 < associate_drop_corr < associate_min_corr``,
-      ``associate_drop_checks >= 1``), and it must then be earned again. Keeping a pair
+      below that correlation drop it (``0 < associate_drop_corr < associate_min_corr``;
+      ``associate_drop_checks`` is a whole number of evaluations, ``>= 1``), and it must
+      then be earned again. Keeping a pair
       asks less than choosing one: a correct pair scores near ``associate_min_corr`` but
       dips through a quiet window, a wrong one sits near zero
     * ``occupied_dT_c`` / ``empty_dT_c`` -- occupancy evidence thresholds on
@@ -1342,7 +1346,12 @@ class EstimatorSpec:
       empty (``>= 2 dt``)
     * ``occupancy_hold_s``         -- occupancy debounce: a bay keeps its state this long
       while no trusted proximal member of it reports, before it falls back to ``unknown``
-      (``>= 0``; 0 is the undebounced rule)
+      (``0 <= occupancy_hold_s <= smart_max_age_s``; 0 is the undebounced rule). It is
+      also the window in which a blind ``empty`` bay is unconstrained: an ``empty`` bay
+      carries no estimate, so a drive inserted into it while it is blind is invisible to
+      the solver until the hold expires. The bound is ``smart_max_age_s``, the estimator's
+      other tolerance for absent per-bay evidence -- a dead proximal sensor may not be
+      ignored for longer than a silent SMART feed
     * ``bay_settle_s``             -- settling time after an occupancy change (``>= 0``)
     * ``bay_settle_max_s``         -- the most settling exemption one bay may draw from
       the ``sigma`` trust rule before it has to run this long without one, seconds
@@ -1352,10 +1361,6 @@ class EstimatorSpec:
       this long is no longer trusted (> 0)
     * ``associate_window_s`` / ``associate_min_corr`` / ``associate_margin`` -- serial
       -> bay association by correlation (``>= 600``, ``(0, 1)``, ``(0, 1)``)
-    * ``associate_drop_corr`` / ``associate_drop_checks`` -- a correlated pair is
-      re-scored against its own bay on every association evaluation; this many
-      consecutive scores (``>= 1``) below this correlation (``0 < associate_drop_corr
-      < associate_min_corr``) end the pair
     """
 
     k_sigma: float = ESTIMATOR_DEFAULTS["k_sigma"]
@@ -1392,7 +1397,7 @@ class EstimatorSpec:
     jump_sigmas: float = ESTIMATOR_DEFAULTS["jump_sigmas"]
     occupancy_hold_s: float = ESTIMATOR_DEFAULTS["occupancy_hold_s"]
     associate_drop_corr: float = ESTIMATOR_DEFAULTS["associate_drop_corr"]
-    associate_drop_checks: float = ESTIMATOR_DEFAULTS["associate_drop_checks"]
+    associate_drop_checks: int = int(ESTIMATOR_DEFAULTS["associate_drop_checks"])
 
     @classmethod
     def coerce(cls, data: object) -> EstimatorSpec:
@@ -1401,7 +1406,11 @@ class EstimatorSpec:
         raw = _section_keys("estimator", data, optional=tuple(ESTIMATOR_DEFAULTS))
         return cls(
             **{
-                key: _cfg_num(f"estimator.{key}", raw.get(key, default))
+                key: (
+                    _cfg_int(f"estimator.{key}", raw.get(key, default))
+                    if key in _ESTIMATOR_INT_KEYS
+                    else _cfg_num(f"estimator.{key}", raw.get(key, default))
+                )
                 for key, default in ESTIMATOR_DEFAULTS.items()
             }
         )
@@ -1431,10 +1440,14 @@ class EstimatorSpec:
             "sensor_noise_c",
             "proximal_offset_c",
             "air_blind_fault_s",
-            "occupancy_hold_s",
         ):
             if getattr(self, key) < 0:
                 raise ConfigError(f"{where}.{key} must be >= 0, got {getattr(self, key)}")
+        if not 0.0 <= self.occupancy_hold_s <= self.smart_max_age_s:
+            raise ConfigError(
+                f"{where}: 0 <= occupancy_hold_s <= smart_max_age_s is required, got "
+                f"{self.occupancy_hold_s} and {self.smart_max_age_s}"
+            )
         if not 0.0 < self.associate_drop_corr < self.associate_min_corr:
             raise ConfigError(
                 f"{where}: 0 < associate_drop_corr < associate_min_corr is required, got "

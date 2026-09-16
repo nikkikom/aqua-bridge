@@ -275,7 +275,7 @@ mpc:
     occupied_dT_c: 2.0   # proximal minus zone air above this: a drive is there
     empty_dT_c: 0.7      # below this (and < 1 W) for empty_confirm_s: the bay is empty
     empty_confirm_s: 300
-    occupancy_hold_s: 30 # a bay keeps its occupancy while blind this long (0: no debounce)
+    occupancy_hold_s: 30 # a bay keeps its occupancy while blind this long (0: no debounce; <= smart_max_age_s)
     bay_settle_s: 600   # zones.trust_rule: sigma suspends a bay's sigma check for this long
                          # after the filter widens it on purpose (a swap, an occupancy change)
                          # while the bay is still read by a proximal sensor
@@ -288,7 +288,7 @@ mpc:
     associate_min_corr: 0.8
     associate_margin: 0.15
     associate_drop_corr: 0.3      # a correlated pair is re-scored against its bay every
-    associate_drop_checks: 3      # evaluation; this many scores below it in a row drop it
+    associate_drop_checks: 3      # evaluation; this many (a whole number) in a row drop it
     sigma_uncalibrated_c: 1.5     # sigma floor of a bay without an accepted SMART calibration
     p0_t_air: 0.25       # initial variance per state kind: air, air disturbance, drive,
     p0_d_air: 2.5e-3     # sensor node, heat (the same order as the q_* above)

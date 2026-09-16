@@ -263,6 +263,84 @@ def test_a_guessed_pair_does_not_calibrate_before_its_first_re_check():
     assert ok.bays["a1"]["calibrated"] is True
 
 
+def _smart_on_the_wave(ts: float):
+    """The SMART reading of the serial whose history :func:`_series_of` built."""
+    return {"S1": {"temp_c": 30.0 + 5.0 * math.sin(ts / 400.0), "age_s": 1.0, "model": "M"}}
+
+
+def _correlating(mem, cfg: MpcConfig, bay: str, serial: str, ts: float):
+    """Give ``mem`` a window in which ``serial``'s SMART history correlates with
+    ``bay``'s own series, so the next tick's evaluation scores the pair at 1.0."""
+    series, hist = _series_of(cfg, bay, ts, matching=True)
+    mem["series"] = series
+    mem["smart"][serial] = {"ts": ts, "t": 40.0, "model": "M", "hist": hist}
+    mem["next_assoc"] = None  # the next tick is an evaluation
+    return mem
+
+
+def test_a_confirmed_pair_starts_unverified_with_no_evidence_behind_it():
+    """Item 18: the window that accepts a pair may not sit as the pair's own first
+    re-check, so a correlator-confirmed pair rebuilds a full window before it may
+    calibrate its bay -- exactly what a pair dropped and re-earned has to do."""
+    cfg = das_cfg(setpoints={})
+    ts = 4000.0
+    mem = json.loads(json.dumps(_tick(cfg, None, ts, _smart_on_the_wave(ts)).memory))
+    for i in range(A.CONFIRM_EVALUATIONS):
+        t = ts + A.EVERY_S * (i + 1)
+        up = _tick(cfg, _correlating(mem, cfg, "a1", "S1", t), t, _smart_on_the_wave(t))
+        mem = json.loads(json.dumps(up.memory))
+    assert mem["bays"]["a1"]["assoc"] == "S1"  # the correlator confirmed it ...
+    assert mem["bays"]["a1"]["ver"] is False  # ... unverified, with its evidence gone
+    assert mem["smart"]["S1"]["hist"] == []
+    # an evaluation later there is still nothing to score, so the pair stays unverified
+    t = ts + A.EVERY_S * (A.CONFIRM_EVALUATIONS + 1)
+    up = _tick(cfg, mem, t, _smart_on_the_wave(t))
+    assert up.bays["a1"]["serial"] == "S1" and up.bays["a1"]["association"] == "correlation"
+    assert up.memory["bays"]["a1"]["ver"] is False
+    assert up.bays["a1"]["calibrated"] is False
+
+
+def test_a_declaration_clears_the_bay_s_verification():
+    """``ver`` belongs to a pair, not to a bay: declaring a serial (and undeclaring it
+    again) must not leave the next correlation pair verified from its first tick."""
+    cfg = das_cfg(setpoints={})
+    mem = _with_association(cfg, "a1", "S1")
+    mem["bays"]["a1"]["ver"] = True
+    m = cfg.to_dict()
+    m["topology"]["bays"]["a1"]["serial"] = "S1"
+    declared = MpcConfig.from_mapping(m)
+    smart = {"S1": {"temp_c": 40.0, "age_s": 1.0, "model": "M"}}
+    up = _tick(declared, mem, 1.0, smart)
+    assert up.bays["a1"]["association"] == "declared"
+    assert up.memory["bays"]["a1"]["ver"] is False
+    mem = json.loads(json.dumps(up.memory))  # the declaration is removed again
+    mem["bays"]["a1"]["assoc"] = "S2"  # and the correlator confirms a different serial
+    up = _tick(cfg, mem, 2.0, {"S2": {"temp_c": 40.0, "age_s": 1.0, "model": "M"}})
+    assert up.bays["a1"]["serial"] == "S2" and up.bays["a1"]["calibrated"] is False
+    assert up.memory["bays"]["a1"]["ver"] is False
+
+
+def test_an_unverified_pair_is_not_an_anchor_for_the_thermal_identification():
+    """``calibration.accepted_once`` is what ``mpc._thermal_shadow`` builds its maps
+    from, so it says what the filter itself does with the map (item 18)."""
+    cfg = das_cfg(setpoints={})
+    mem = _with_association(cfg, "a1", "S1")
+    entry = E._fresh_calibration(cfg.estimator.sigma_uncalibrated_c)
+    for k in range(40):
+        x = 4.0 + 3.0 * math.sin(k)
+        entry, _ = E.calibration_update(entry, x, 0.7 * x - 2.1, 0.0)
+    entry["used"] = True  # a map accepted while the pair was verified
+    mem["cal"]["a1"] = {"S1": entry}
+    smart = {"S1": {"temp_c": 40.0, "age_s": 1.0, "model": "M"}}
+    up = _tick(cfg, mem, 1.0, smart)
+    assert up.bays["a1"]["calibrated"] is False
+    assert up.bays["a1"]["calibration"]["accepted_once"] is False
+    mem["bays"]["a1"]["ver"] = True  # one re-check passed: both agree again
+    ok = _tick(cfg, mem, 1.0, smart)
+    assert ok.bays["a1"]["calibrated"] is True
+    assert ok.bays["a1"]["calibration"]["accepted_once"] is True
+
+
 def test_a_declared_serial_wins_and_is_never_correlated():
     m = das_cfg(setpoints={}).to_dict()
     m["topology"]["bays"]["a2"]["serial"] = "S1"
