@@ -37,8 +37,11 @@ mpc:
   mpc_tau_s: 120.0       # MPC model: time constant of the controlled temperatures, seconds (> 0)
   mpc_gain_c_per_pwm: 8.0  # MPC model: steady-state °C drop of a temperature per +1.0 PWM on one of its channels
   mpc_estimator_gain: 0.1  # MPC offset-free disturbance estimator, per-tick gain in (0, 1]
-  budget_ms: 600.0        # runtime alarm: log a warning when step() takes longer than this, ms (> 0)
-  budget_alarm_ms: 750.0  # runtime alarm: log an error instead past this, ms (> budget_ms; raising
+  budget_ms: 250.0        # runtime alarm: log a warning when step() takes longer than this, ms (> 0);
+                          # re-derived on the Zero 2 W (item 73): 2.9x the measured DAS MPC step
+                          # p99 of 85.96 ms -- the legacy MPC here is far cheaper (p99 7.14 ms at
+                          # dt = 2 s measured on the same board).
+  budget_alarm_ms: 350.0  # runtime alarm: log an error instead past this, ms (> budget_ms; raising
                           # budget_ms means changing this value too, or the config does not load).
                           # The Zero W fallback of §8 item 73 -- budget_ms 1000.0 with
                           # budget_alarm_ms 1250.0 and mpc_every_ticks 3 -- is for the DAS MPC and
