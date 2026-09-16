@@ -73,6 +73,22 @@ only ``model_reconfirm_s`` of convergence with the prediction error in bounds re
 the PI-like DAS form acts meanwhile, and the calibrations load with ``sigma_cal`` x 2
 until SMART confirms them.
 
+A fitted model (:func:`document_from_fit`, plan section 8 item 15)
+------------------------------------------------------------------
+``tools/fit_model.py`` writes a *report* (``kind: aqua_bridge.thermal_model``) whose
+``memory`` is already the thermal memory in the shape above, but whose envelope is not a
+store document. :func:`document_from_fit` converts one: the fitted memory becomes
+``thermal``, the other sections are empty (a fit of a recording knows nothing about the
+SMART calibrations or the bay view of the machine that loads it) and ``saved_wall`` is
+the report's ``generated_at``, so a fit from last year loads ``stale`` exactly like a
+store file from last year. ``tools/fit_model.py --store-out PATH`` writes the converted
+document next to the report, and :func:`load` also accepts a *report* in the store's own
+place, so copying the tool's ``model.json`` to ``$STATE_DIRECTORY`` works. Two
+differences from a file the daemon wrote, both warned about on load: the report carries
+no store fingerprint, so its structure is checked only by the thermal model's own
+fingerprint (:func:`aqua_bridge.control.thermal.restore`), and the persister replaces
+the file with a store document at its first save -- keep the tool's output elsewhere.
+
 Save (:class:`ModelPersister`)
 ------------------------------
 Each tick the persister keeps a reference to the new state's ``solver_memory`` (plain
@@ -108,12 +124,15 @@ from aqua_bridge.model import STORE_KEY, STORE_SEED_KEY, ConfigError, MpcConfig,
 
 __all__ = [
     "FILENAME",
+    "FIT_KIND",
+    "FIT_VERSION",
     "MAX_FILE_BYTES",
     "SCHEMA",
     "SCHEMA_VERSION",
     "LoadResult",
     "ModelPersister",
     "build_document",
+    "document_from_fit",
     "fingerprint",
     "initial_state",
     "load",
@@ -126,6 +145,9 @@ _LOG = logging.getLogger("aqua_bridge.modelstore")
 SCHEMA = "aqua-bridge-model-store"
 SCHEMA_VERSION = 1
 FILENAME = "model.json"
+#: ``kind`` and ``v`` of a ``tools/fit_model.py`` report (:func:`document_from_fit`).
+FIT_KIND = "aqua_bridge.thermal_model"
+FIT_VERSION = 1
 #: A larger file is not read (corrupt or not ours).
 MAX_FILE_BYTES = 16_000_000
 
@@ -262,6 +284,17 @@ def load(path: str | os.PathLike[str], cfg: MpcConfig, *, now_wall: float) -> Lo
             return _prior(result, f"store: {p} is unreadable or corrupt ({exc})"[:300])
         if not isinstance(doc, dict):
             return _prior(result, "store: the file is not a JSON object")
+        if doc.get("kind") == FIT_KIND:  # a tools/fit_model.py report (module docstring)
+            try:
+                doc = document_from_fit(cfg, doc)
+            except ValueError as exc:
+                return _prior(result, f"store: {p} is a fit report but {exc}")
+            result.warnings.append(
+                f"store: {p} is a tools/fit_model.py report; its fitted model is loaded "
+                "and the other sections start at their prior. Its structure is checked "
+                "against the thermal model's own fingerprint, not the store's, and the "
+                "daemon replaces the file with a store document at its first save."
+            )
         if doc.get("schema") != SCHEMA or doc.get("v") != SCHEMA_VERSION:
             return _prior(result, f"store: unknown schema {doc.get('schema')!r} v{doc.get('v')!r}")
         if doc.get("fingerprint") != fingerprint(cfg):
@@ -373,6 +406,45 @@ def build_document(
         "fan_curves": dict(curves) if isinstance(curves, Mapping) else {},
         "calibration": calibration,
         "bays": bays_out,
+    }
+
+
+def document_from_fit(
+    cfg: MpcConfig, payload: Mapping[str, Any], *, wall: float | None = None
+) -> dict[str, Any]:
+    """A store document from a ``tools/fit_model.py`` report (module docstring, *A fitted
+    model*).
+
+    ``payload`` is the report as the tool writes it (``kind``/``v`` and ``memory``, which
+    is already in exactly the shape ``solver_memory["thermal"]`` uses). The thermal
+    section is that memory; ``fan_curves``, ``calibration`` and ``bays`` are empty,
+    because a fit of a recording knows nothing about the SMART calibrations or the bay
+    view of the machine that will load it. ``wall`` defaults to the report's
+    ``generated_at``, so the file's age -- and with it the ``fresh`` / ``stale`` rule --
+    is the age of the *fit*, not of the conversion. Raises ``ValueError`` for anything
+    that is not such a report.
+    """
+    if not isinstance(payload, Mapping) or payload.get("kind") != FIT_KIND:
+        raise ValueError(f"not an {FIT_KIND} report")
+    if payload.get("v") != FIT_VERSION:
+        raise ValueError(f"its version is {payload.get('v')!r}, not {FIT_VERSION}")
+    memory = payload.get("memory")
+    if not isinstance(memory, Mapping):
+        raise ValueError("it carries no thermal memory")
+    if wall is None:
+        generated = payload.get("generated_at")
+        if not _finite(generated):
+            raise ValueError("it has no finite generated_at")
+        wall = float(generated)  # type: ignore[arg-type]
+    return {
+        "schema": SCHEMA,
+        "v": SCHEMA_VERSION,
+        "fingerprint": fingerprint(cfg),
+        "saved_wall": float(wall),
+        "thermal": dict(memory),
+        "fan_curves": {},
+        "calibration": {},
+        "bays": {},
     }
 
 

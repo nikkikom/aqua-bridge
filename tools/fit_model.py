@@ -44,9 +44,17 @@ their prior.
 
 Output ``model.json`` carries the thermal memory in exactly the shape
 ``solver_memory["thermal"]``/``GET /api/model`` use (:mod:`aqua_bridge.control.
-thermal` module docstring) under ``"memory"``, so a future model-store loader can
-seed the live daemon from it directly -- see :func:`aqua_bridge.control.thermal.
-theta_from_memory`.
+thermal` module docstring) under ``"memory"`` -- see :func:`aqua_bridge.control.
+thermal.theta_from_memory`.
+
+``--store-out PATH`` additionally writes that fit as a **model store** document
+(:func:`aqua_bridge.modelstore.document_from_fit`), which the daemon loads from
+``--model-store PATH`` or ``$STATE_DIRECTORY/model.json``: the fitted memory becomes
+the store's ``thermal`` section and its ``saved_wall`` is this run's clock, so the
+usual ``fresh`` / ``stale`` rule applies to the age of the fit. The daemon also
+accepts the *report* itself in the store's place, but it replaces that file with a
+store document at its first save, so write the store copy separately and keep the
+report.
 """
 
 from __future__ import annotations
@@ -61,6 +69,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from aqua_bridge import modelstore
 from aqua_bridge.config import AppConfig, ConfigError, load_config
 from aqua_bridge.control import estimator, thermal
 from aqua_bridge.model import MpcConfig
@@ -491,6 +500,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="fit the zoned thermal model (required: the only mode this tool supports)",
     )
     p.add_argument("--out", default="model.json", metavar="PATH")
+    p.add_argument(
+        "--store-out",
+        metavar="PATH",
+        help="also write the fit as a model store document the daemon can load "
+        "(--model-store PATH or $STATE_DIRECTORY/model.json); keep it separate from --out, "
+        "the daemon overwrites the store file",
+    )
     p.add_argument("--holdout-frac", type=float, default=DEFAULT_HOLDOUT_FRAC)
     p.add_argument("--horizon-ticks", type=int, default=DEFAULT_HORIZON_TICKS)
     p.add_argument("--max-refine-step", type=float, default=DEFAULT_MAX_REFINE_STEP)
@@ -563,6 +579,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     _print_report(cfg, payload)
     print(f"wrote {out_path}")
+
+    if args.store_out:
+        store_out = Path(args.store_out)
+        if store_out.resolve() == out_path.resolve():
+            print("--store-out must differ from --out", file=sys.stderr)
+            return 2
+        if store_out.parent != Path(""):
+            store_out.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            document = modelstore.document_from_fit(cfg, payload)
+        except ValueError as exc:  # unreachable for a payload this run built; never silent
+            print(f"model store: {exc}", file=sys.stderr)
+            return 2
+        modelstore.write_atomic(
+            store_out, json.dumps(document, allow_nan=False, separators=(",", ":")).encode()
+        )
+        print(f"wrote {store_out} (model store, {modelstore.SCHEMA} v{modelstore.SCHEMA_VERSION})")
     return 0
 
 

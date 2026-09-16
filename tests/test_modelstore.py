@@ -254,6 +254,90 @@ def test_a_truncated_file_loads_the_prior(tmp_path):
         assert result.source == "prior" and "corrupt" in result.warnings[0]
 
 
+# ---------------------------------------------------------------------------
+# a tools/fit_model.py report in the store's place (PROJECT.md section 8 item 15)
+# ---------------------------------------------------------------------------
+
+
+def fit_report(cfg: MpcConfig, *, generated_at: float, **changes: Any) -> dict[str, Any]:
+    """A ``tools/fit_model.py`` report, cut down to what the loader reads."""
+    doc = {
+        "v": modelstore.FIT_VERSION,
+        "kind": modelstore.FIT_KIND,
+        "fingerprint": thermal.cached_structure(cfg).fingerprint,
+        "memory": thermal.fresh_memory(cfg, status="converged"),
+        "generated_at": generated_at,
+    }
+    doc.update(changes)
+    return doc
+
+
+def test_a_fit_report_loads_as_a_model_with_a_warning(tmp_path):
+    cfg = shadow_cfg()
+    path = write_doc(tmp_path / "model.json", fit_report(cfg, generated_at=NOW - 60))
+    result, state = load_state(path, cfg)
+    assert result.source == "fresh" and result.age_s == pytest.approx(60.0)
+    assert len(result.warnings) == 1 and "fit_model.py report" in result.warnings[0]
+    cmd, _, _ = run(cfg, state, 1)
+    store = cmd.diagnostics["store"]
+    assert store["source"] == "fresh" and store["sections"]["thermal"] == "loaded"
+    # the other sections are empty: a fit knows nothing about this machine's calibrations
+    assert store["sections"]["calibration"] == 0 and store["sections"]["bays"] == 0
+    assert cmd.diagnostics["thermal"]["status"] == "frozen"
+
+
+def test_an_old_fit_report_loads_stale_like_an_old_store_file(tmp_path):
+    cfg = shadow_cfg()
+    doc = fit_report(cfg, generated_at=NOW - 40 * DAY)
+    result, state = load_state(write_doc(tmp_path / "model.json", doc), cfg)
+    assert result.source == "stale"
+    cmd, _, _ = run(cfg, state, 1)
+    assert cmd.diagnostics["thermal"]["status"] == "stale"
+
+
+def test_a_fit_report_for_another_structure_drops_its_model(tmp_path):
+    cfg = shadow_cfg()
+    other = shadow_cfg(dt=4.0)
+    doc = fit_report(cfg, generated_at=NOW - 60, memory=thermal.fresh_memory(other))
+    doc["memory"]["fp"] = "not this structure"
+    result, state = load_state(write_doc(tmp_path / "model.json", doc), cfg)
+    assert result.source == "fresh"
+    cmd, _, _ = run(cfg, state, 1)
+    store = cmd.diagnostics["store"]
+    assert store["sections"]["thermal"] == "dropped"
+    assert any("structure differs" in w for w in store["warnings"]), store["warnings"]
+    assert cmd.diagnostics["thermal"]["status"] == "prior"
+
+
+@pytest.mark.parametrize(
+    ("change", "needle"),
+    [
+        ({"v": 2}, "its version is 2"),
+        ({"memory": "not a mapping"}, "no thermal memory"),
+        ({"generated_at": None}, "no finite generated_at"),
+    ],
+    ids=["version", "memory", "generated_at"],
+)
+def test_a_malformed_fit_report_loads_the_prior(tmp_path, change, needle):
+    cfg = shadow_cfg()
+    doc = {**fit_report(cfg, generated_at=NOW - 60), **change}
+    result = modelstore.load(write_doc(tmp_path / "model.json", doc), cfg, now_wall=NOW)
+    assert result.source == "prior" and len(result.warnings) == 1
+    assert needle in result.warnings[0], result.warnings
+
+
+def test_document_from_fit_keeps_the_fit_time_unless_told_otherwise():
+    cfg = shadow_cfg()
+    report = fit_report(cfg, generated_at=NOW - 3600.0)
+    doc = modelstore.document_from_fit(cfg, report)
+    assert doc["saved_wall"] == NOW - 3600.0
+    assert doc["fingerprint"] == modelstore.fingerprint(cfg)
+    assert doc["fan_curves"] == {} and doc["calibration"] == {} and doc["bays"] == {}
+    assert modelstore.document_from_fit(cfg, report, wall=NOW)["saved_wall"] == NOW
+    with pytest.raises(ValueError, match="not an aqua_bridge.thermal_model report"):
+        modelstore.document_from_fit(cfg, {"kind": "something else"})
+
+
 def test_wrong_schema_version_or_fingerprint_loads_the_prior(tmp_path):
     cfg = shadow_cfg()
     for change, needle in (
