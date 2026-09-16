@@ -152,15 +152,20 @@ On every solve tick the model must pass (:func:`check_model`):
   ``model_return_factor`` does not scale: it is a move, not a level, and asking the
   enclosure to be twice as steady to come back only delays the return.
 
-Bays within ``estimator.bay_settle_s`` of an occupancy change are left out of the last
-three checks (a hot swap's transient is real, not a model error), and so are bays within
-``bay_settle_s`` of a tick on which the estimator's own drive variance exceeded
-:data:`SETTLE_DRIVE_VAR_C2` or its calibration floor ``sigma_cal`` changed (additions: a
-drive pulled and another pushed in within ``empty_confirm_s`` never passes through
-``empty``, the estimator's fast-swap rule follows it as a jump with a wide variance, and
-an accepted or expired SMART calibration re-maps the drive estimate by up to the prior's
-3 degC; on the truth simulator both tripped the prediction-error check and held the
-fallback for 20 minutes). A failure switches to
+Bays the **estimator** reports ``model_exempt`` are left out of the last three checks, and
+the estimator says which of its three reasons it is (``model_exempt_reason``) and how much
+of the ``estimator.bay_settle_s`` window is left (``model_exempt_until_s``): an
+``occupancy`` change (a hot swap's transient is real, not a model error); a bay that is
+``uncertain``, its drive variance ``sigma ** 2 - sigma_cal ** 2`` over
+``estimator.bay_uncertain_var_c2`` (a drive pulled and another pushed in within
+``empty_confirm_s`` never passes through ``empty``, so the fast-swap rule follows it as a
+jump with a wide variance instead -- and equally a bay nobody is watching, whose
+prediction error is not evidence about a model); or a ``calibration`` step over
+``estimator.bay_cal_step_c`` (an accepted or expired map re-maps the drive estimate by up
+to the prior's 3 degC). On the truth simulator the last two each tripped the
+prediction-error check and held the fallback for 20 minutes. The rule itself lives in the
+estimator, which is the only place that knows why it widened a bay (section 8 item 100);
+this module reads its answer. A failure switches to
 the **PI-like DAS solver on the same estimates** (``solver_pi``, margin-deficit form):
 ``mode`` stays ``auto``, ``diagnostics["solver_diag"]["model"]`` says ``active: pi_das``
 and why. The MPC comes back only after the checks have passed with the numeric limits
@@ -294,9 +299,7 @@ __all__ = [
     "QUANT_U",
     "REL_DECREASE_TOL",
     "RIDGE",
-    "SETTLE_CAL_STEP_C",
     "SQP_STEP_TOL",
-    "SETTLE_DRIVE_VAR_C2",
     "DasMpcSolver",
     "ModelCheck",
     "PenaltyQp",
@@ -344,11 +347,6 @@ QP_FAST_ITER = 8
 REL_DECREASE_TOL = 1e-8
 SQP_STEP_TOL = 1e-4
 _HALVINGS = 30
-#: A bay whose estimator drive variance (``sigma^2 - sigma_cal^2``) exceeds this, degC^2, is
-#: settling (module docstring, validity gate).
-SETTLE_DRIVE_VAR_C2 = 1.0
-#: A change of a bay's ``sigma_cal`` above this, degC, is a calibration event (settling).
-SETTLE_CAL_STEP_C = 0.05
 #: Low-pass of the estimator's disturbances for the prediction, seconds (module docstring).
 DIST_TAU_S = 120.0
 #: Bumpless offset decay, seconds (module docstring).
@@ -1031,8 +1029,6 @@ def _fresh_memory() -> dict[str, Any]:
         "status": None,
         "fresh": None,
         "dist": {"q": {}, "d": {}, "since": {}},
-        "settle": {},
-        "cal": {},
         "lin_u": {},
     }
 
@@ -1118,8 +1114,6 @@ def _parse(raw: object, cfg: MpcConfig) -> dict[str, Any]:
     mem["checks"] = dict(checks) if isinstance(checks, Mapping) else {}
     status = raw.get("status")
     mem["status"] = status if isinstance(status, str) else None
-    mem["settle"] = _num_map(raw.get("settle", {}))
-    mem["cal"] = _num_map(raw.get("cal", {}))
     mem["lin_u"] = _num_map(raw.get("lin_u", {}), channels)
     dist = raw.get("dist")
     if dist is not None:
@@ -1264,7 +1258,7 @@ class DasMpcSolver:
         fixed = {ch: float(v) for ch, v in req.fixed_channels.items()}
         free = [ch for ch in cfg.channels if ch not in fixed]
         self._decay_bias(mem, ts, free)
-        settling = self._settling_bays(cfg, req, mem, ts)
+        settling = self._settling_bays(req)
         rows = self._rows(cfg, req)
         self._score_prediction(cfg, req, mem, ts, settling, rows)
         self._filter_disturbances(req, mem, ts)
@@ -1614,39 +1608,24 @@ class DasMpcSolver:
         mem["pred"] = {"ts": ts + pred.h, "t": pending}
 
     @staticmethod
-    def _settling_bays(
-        cfg: MpcConfig, req: SolverRequest, mem: dict[str, Any], ts: float
-    ) -> set[str]:
-        """Bays left out of the prediction-error and drift checks (module docstring): within
-        ``estimator.bay_settle_s`` of an occupancy change, or of the last tick on which the
-        estimator's own drive uncertainty exceeded :data:`SETTLE_DRIVE_VAR_C2` (a swap it
-        followed as a jump without passing through ``empty``) or its calibration floor
-        ``sigma_cal`` changed (a SMART calibration accepted or expired re-maps the drive
-        estimate). Updates ``mem["settle"]`` and ``mem["cal"]``."""
-        assert cfg.estimator is not None
-        window = cfg.estimator.bay_settle_s
+    def _settling_bays(req: SolverRequest) -> set[str]:
+        """Bays left out of the prediction-error, drift and air-disturbance checks
+        (module docstring): the ones the **estimator** reports ``model_exempt``.
+
+        The solver used to infer this from the published sigmas -- a bay within
+        ``estimator.bay_settle_s`` of an occupancy change, of a tick whose drive variance
+        was over a threshold, or of a step in its ``sigma_cal``. Every one of those facts
+        belongs to the estimator, which is also the only place that knows *why* a bay was
+        widened, so the rule lives there now and this reads its answer (section 8 item
+        100). ``model_exempt_reason`` and ``model_exempt_until_s`` beside it say which
+        reason and for how long; ``diagnostics["bays"]`` carries both to ``/api/state``.
+        """
         bays = req.plant.get("bays", {}) if isinstance(req.plant, Mapping) else {}
-        marks = {b: t for b, t in mem["settle"].items() if b in bays and 0.0 <= ts - t < window}
-        cal_seen: dict[str, float] = {}
-        out: set[str] = set()
-        for bay, info in bays.items():
-            if not isinstance(info, Mapping):
-                continue
-            sigma, cal = info.get("sigma"), info.get("sigma_cal")
-            if _finite(sigma) and _finite(cal):
-                cal_f = float(cal)
-                if float(sigma) ** 2 - cal_f**2 > SETTLE_DRIVE_VAR_C2:
-                    marks[bay] = ts
-                last_cal = mem["cal"].get(bay)
-                if last_cal is not None and abs(cal_f - last_cal) > SETTLE_CAL_STEP_C:
-                    marks[bay] = ts
-                cal_seen[bay] = cal_f
-            since = info.get("since_ts")
-            if (_finite(since) and 0.0 <= ts - float(since) < window) or bay in marks:
-                out.add(bay)
-        mem["settle"] = marks
-        mem["cal"] = cal_seen
-        return out
+        return {
+            bay
+            for bay, info in bays.items()
+            if isinstance(info, Mapping) and info.get("model_exempt") is True
+        }
 
     def _model(
         self,
