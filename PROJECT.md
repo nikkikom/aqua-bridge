@@ -679,14 +679,14 @@ ones get their defaults):
 | `estimator.proximal_offset_c` | 3.0 | ≥ 0, °C; prior σ of the placement offset the filter carries for every proximal sensor of a bay beyond the first (§3 estimator, §8 item 67); 0 fuses them all on one node |
 | `estimator.smart_max_age_s` / `smart_reject_c` | 300 / 8.0 | ≥ `dt` / > 0 |
 | `estimator.occupied_dT_c` / `empty_dT_c` / `empty_confirm_s` | 2.0 / 0.7 / 300 | `occupied_dT_c > empty_dT_c > 0`; `empty_confirm_s ≥ 2 * dt` |
-| `estimator.occupancy_hold_s` | 30 | ≥ 0, s; a blind bay keeps its occupancy this long (0: no debounce) |
+| `estimator.occupancy_hold_s` | 30 | `0 ≤ occupancy_hold_s ≤ smart_max_age_s`, s; a blind bay keeps its occupancy this long (0: no debounce). It is also the window in which a blind `empty` bay is unconstrained, so it is bounded by the estimator's other tolerance for absent per-bay evidence |
 | `estimator.reset_drive_var` | 25 | > 0, °C²; the drive variance a bay restarts from when a drive (possibly) arrived |
 | `estimator.jump_min_c` / `jump_sigmas` | 0.5 / 6.0 | > 0 / > 0; the fast-swap rule's thresholds on a proximal innovation |
 | `estimator.bay_settle_s` | 600 | ≥ 0 |
 | `estimator.bay_settle_max_s` | 1800 | ≥ `bay_settle_s`, s; the most settling exemption one bay may draw from `trust_rule: sigma` before it has to run this long with neither a window nor a σ over `sigma_fault_c` (§3 per-zone trust, §8 item 69); 0 grants none at all |
 | `estimator.calibration_max_age_days` | 30 | > 0 |
 | `estimator.associate_window_s` / `associate_min_corr` / `associate_margin` | 3600 / 0.8 / 0.15 | ≥ 600 / `(0, 1)` / `(0, 1)` |
-| `estimator.associate_drop_corr` / `associate_drop_checks` | 0.3 / 3 | `0 < associate_drop_corr < associate_min_corr` / ≥ 1; a correlation pair re-scored below that on this many consecutive evaluations is dropped |
+| `estimator.associate_drop_corr` / `associate_drop_checks` | 0.3 / 3 | `0 < associate_drop_corr < associate_min_corr` / a whole number ≥ 1; a correlation pair re-scored below that on this many consecutive evaluations is dropped |
 
 **Flat DAS keys of `mpc`** (validated always, inert in legacy mode; the
 booleans need `topology`; the rules that depend on `dt` are checked only
@@ -1661,9 +1661,12 @@ accepted pair keeps recording its series and is re-scored against its own bay at
 every evaluation; `associate_drop_checks` consecutive scores below
 `associate_drop_corr` drop it. Keeping a pair asks less than choosing one (on the
 truth simulator a correct pair scores 0.71–0.97 and dips to 0.37 through a quiet
-window, a wrong one has a median of −0.27 to +0.24). Until a correlated pair has
-passed one re-check its calibration is **not used**, however many samples it has:
-the first window is the one the re-check cannot judge yet. A declared serial
+window, a wrong one has a median of −0.27 to +0.24). Acceptance itself forgets the
+serial's history too, so the first re-check scores a *fresh* window rather than the
+one that accepted the pair. Until a correlated pair has passed one re-check its
+calibration is **not used**, however many samples it has: the first window is the
+one the re-check cannot judge yet, which costs an undeclared serial about two
+windows before its map is used. A declared serial
 takes part in none of this. Until associated, a serial's
 samples calibrate nothing. `GET /api/bays` shows the candidates with
 scores.
@@ -4206,8 +4209,16 @@ Owner decision (2026-09-16):
     DAS MPC in its PI-like fallback until the next experiment, while the bay
     simply relearns like a new one. A `frozen` zone is skipped — it never moves
     its coefficients, so a reset there would strand the bay at the prior.
+    The consequence of leaving the status alone, for the record: the zone keeps
+    its `converged` badge, its `conv` level and its exponentially-weighted
+    `pred_err` from before the swap, so the validity gate (§3, `check_model`)
+    accepts the zone while that one bay's block is back at the generic prior,
+    for the few windows it takes the prediction error to climb. Cooling is not
+    reduced by it — the estimator's own `reset_drive_var` and jump inflation
+    make the swapped bay's margin dominate — but the diagnostics claim more
+    confidence than the model has until the bay is re-identified.
 
-The **mean** is the point, not any one sensor. The per-sensor fast-swap test
+    The **mean** is the point, not any one sensor. The per-sensor fast-swap test
     is sequential, so with a redundant pair — two sensors at different placements,
     disagreeing with the bay's one sensor node — one of them jumps on almost every
     tick under fan excitation (measured: 5689 of 5760 ticks on b10, 5759 on b03,
@@ -4248,10 +4259,16 @@ The **mean** is the point, not any one sensor. The per-sensor fast-swap test
     0.37 through a quiet one, while a wrong pair's median is −0.27 to +0.24.
     Every drop — re-check, hot swap, jump, silence — now also forgets the
     serial's SMART history, so the pair has to win the acceptance rule again
-    over a fresh window. And until a correlated pair has passed one re-check its
+    over a fresh window, and so does *acceptance itself*: the window that made
+    the pair does not get to sit its own first re-check, which therefore scores
+    a fresh window. And until a correlated pair has passed one re-check its
     calibration is **not used** (`calibrated` stays false, `σ_cal` stays at
-    `sigma_uncalibrated_c`): the first window is exactly the one the re-check
-    cannot judge yet. A declared serial takes part in none of this — it is the
+    `sigma_uncalibrated_c`, and `calibration.accepted_once` reads false, so the
+    thermal identification will not convert a row with that map either): the
+    first window is exactly the one the re-check cannot judge yet. The cost is
+    that an undeclared serial takes about two windows, not one, before its
+    calibration is used. A `ver` flag is per pair, not per bay: a declaration,
+    and every drop, clears it. A declared serial takes part in none of this — it is the
     owner's statement, and its band stays `smart_reject_c`.
 
     A tighter absolute band for a correlated serial was tried first and dropped:
@@ -4281,6 +4298,8 @@ The **mean** is the point, not any one sensor. The per-sensor fast-swap test
     variance, exactly as before. The count runs on every blind tick and
     restarts when any member reports again, so `occupancy_hold_s: 0` is the
     old rule bit-for-bit. The per-bay diagnostics show `pending_unknown_s`,
+    which is a *pending* transition: a bay that has already reached `unknown`
+    counts nothing and reports 0 however long the blindness lasts.
     and `control/ident.py` counts it as a pending transition, so an
     experiment does not start into a dropout. A zone with no filter state at
     all is still `unknown` at once. Measured on `sim/das.py` (example config,

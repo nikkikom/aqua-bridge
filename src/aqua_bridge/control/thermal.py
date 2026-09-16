@@ -1796,7 +1796,13 @@ def _reset_swapped_bays(
     has its own. The window in progress goes with them, and so does the zone air block's
     window, which anchors on this bay's heat through those very coefficients. The zone's
     status is left alone: the bay relearns like a new one, and demoting the zone would
-    park the DAS MPC in its fallback until the next identification experiment.
+    park the DAS MPC in its fallback until the next identification experiment. The
+    consequence is deliberate and worth knowing: the zone keeps its ``converged``
+    status, its ``conv`` level and its exponentially-weighted ``err2`` from before the
+    swap, so ``solver_das.check_model`` accepts the zone while this bay's block is back
+    at the generic prior, until the prediction error has climbed over the next few
+    windows. Cooling is not reduced by it -- the estimator inflates the swapped bay's
+    variance in the same tick, so its margin dominates the plan.
 
     A ``frozen`` zone never moves its coefficients (a model loaded converged from a fresh
     store file), so resetting one of its bays would strand it at the prior: it is skipped.
