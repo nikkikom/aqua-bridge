@@ -234,6 +234,17 @@ hardware.
     permissions are missing. Then check MQTT entities in Home Assistant
     if `mqtt.enabled`.
 
+    `/api/health`'s `device_health` should be `{"ok": true, "problems":
+    []}`; the page's **Controllers** section (and `/api/state`'s
+    `device_health`) shows the same thing per controller and per fan —
+    stuck or absent outputs, outputs not in PWM mode, the rail voltage,
+    current and power, and rpm against the fitted fan curve. In Home
+    Assistant it is the `Controller problem` binary sensor. The drift
+    thresholds are the `fan_health:` section of `config.yaml`; the rpm rule
+    needs an `mpc.fan_models` curve (fit one with `tools/fit_fans.py` from a
+    recording) and the power rule needs `fan_models.<m>.power_w_at_max`,
+    without which it stays off.
+
 12. **Optional SMART agent**, on the PC with the drives attached (not
     the Pi): `python tools/smart_agent.py --mqtt <broker-host>
     --node-id aqua-bridge --interval 60`, or install
