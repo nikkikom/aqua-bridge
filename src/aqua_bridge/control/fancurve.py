@@ -16,7 +16,11 @@ fitted offline by ``tools/fit_fans.py`` and copied in by hand). With the switch 
 thermal model's identification and the DAS MPC's prediction read the fitted curve
 instead (:func:`aqua_bridge.control.thermal.model_params`), per **fan model**, so a
 tach-less output is covered by the curve fitted from the outputs of the same model that
-do report a speed.
+do report a speed. Only ``deadband`` and ``exponent`` reach the model; the fitted
+``rpm_max`` is reported (``GET /api/state``) but never normalises a tachometer reading
+(``model_use_rpm`` keeps the commissioned ``fan_models.<m>.rpm_max``, the only fixed
+reference against which an absolute loss of speed shows up --
+:func:`aqua_bridge.control.thermal._channel_phi`).
 
 What is sampled
 ---------------

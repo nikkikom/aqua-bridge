@@ -1776,8 +1776,13 @@ fit only with enough bins over enough PWM span and a relative RMSE at
 most `fan_curve_max_rmse_frac`. Until then the configured curve stays.
 Accepted curves live in the store's `fan_curves` section, so they survive
 a restart, and the identification above and the MPC's prediction both use
-them. One fit per fan model, not per channel: a tach-less output is
-covered by the curve of its own model. The estimator's airflow and the
+them — the fitted `deadband` and `exponent` only. The fitted `rpm_max` is
+reported but never divides a tachometer reading: `model_use_rpm`
+normalises by the commissioned `fan_models.<m>.rpm_max`, because a
+`rpm_max` fitted to the same readings would make `phi` self-normalising
+and hide the very loss of speed the tach branch exists to see. One fit
+per fan model, not per channel: a tach-less output is covered by the
+curve of its own model. The estimator's airflow and the
 noise model's `u0` still read the config (§8 item 96).
 
 **Objective and constraints** (`control/solver_das.py`, `control/noise.py`).
@@ -3608,7 +3613,7 @@ tests carry the `nightly` marker.
 | `tests/test_noise_regression.py` | calibrated DAS MPC noise ≤ 0.8× the quietest uniform curve at equal or better worst true margin (measured 0.31–0.48×); uncalibrated bound 2.0 (0.30–0.69×); rich preset bound 1.35 (up to 1.30×); MPC vs PI-DAS reported, not asserted (PI-DAS has not settled within the window on several seeds) | PR: 2 seeds; nightly: 8-seed sweeps |
 | `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× (named constant) the legacy MPC p99, the 75th percentile of several interleaved, warm-up-discarded repeats (§8 item 6); `bench_step.py` runs both DAS solvers; absolute p99 ≤ `mpc.budget_ms` only on `armv6l`; the Zero W fallback of §8 item 73 (`budget_ms` 1000 with `budget_alarm_ms` 1250 loads, `budget_ms` 1000 alone is rejected, `mpc_every_ticks: 3` solves a third of the ticks and a solve tick is the expensive one) | PR / Pi |
 | `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise; a `tools/fit_model.py` report in the store's place loads as a model, ages like a store file and drops a model of another structure (item 15) | PR |
-| `tests/test_fancurve.py` | the online PWM → RPM fit (item 14): a swept fan is identified per fan model, one duty or a ramping command is never enough, a noisy tachometer is refused by the residual, the bins stay bounded and follow a fan that changes, a malformed memory or a changed channel → fan-model map starts over, `curve_pair` falls back to the config for anything unusable, `step` publishes the fit into the store's `fan_curves` and reports it, and the curve round-trips through `model.json` | PR |
+| `tests/test_fancurve.py` | the online PWM → RPM fit (item 14): a swept fan is identified per fan model, one duty or a ramping command is never enough, a noisy tachometer is refused by the residual, the bins stay bounded and follow a fan that changes, a malformed memory or a changed channel → fan-model map starts over, `curve_pair` falls back to the config for anything unusable, `step` publishes the fit into the store's `fan_curves` and reports it, the curve round-trips through `model.json`, and `model_use_rpm` keeps the configured `rpm_max` as its reference so a worn fan still reads as less air | PR |
 | `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes; legacy refuses | PR |
 | `tests/test_sim_das.py` | the truth plant: energy balance through transients and hot swap, steady state, more airflow never warms anything, dead band and exponent, quantisation per sensor type, lags, SMART cadence, determinism per seed | PR |
 
@@ -4332,7 +4337,11 @@ Owner decision (2026-09-16):
     curves go into `solver_memory["fan_curves"]`, the store section that
     was written and validated but never produced or read, and from there
     the thermal model's identification and the DAS MPC's prediction plan on
-    them (`u0.<m>`, `n.<m>` in §3's table) and they survive a restart.
+    them (`u0.<m>`, `n.<m>` in §3's table) and they survive a restart. The
+    fitted `rpm_max` is reported only: `model_use_rpm` keeps normalising the
+    tachometer by the commissioned `fan_models.<m>.rpm_max`, because a
+    `rpm_max` fitted to those same readings would make `φ` self-normalising
+    and hide a fan that has lost speed.
     `GET /api/state`'s `fan_curves` diagnostics name the curve in force per
     model and where it came from (`fit` | `store` | `config`). Still on the
     configured curve, deliberately: the estimator's own airflow and the

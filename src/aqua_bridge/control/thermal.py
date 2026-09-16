@@ -32,7 +32,11 @@ as affine inputs.
 Airflow. Channel ``i`` with fan model ``m`` moves air in proportion to
 ``phi_i(u) = clip((u - u0_m) / (1 - u0_m), 0, 1) ** n_m`` (``deadband``,
 ``exponent``), or ``clip(rpm / rpm_max, 0, 1) ** n_m`` for identification when
-``model_use_rpm`` is on and the channel reports a finite rpm. ``E`` is sparse by
+``model_use_rpm`` is on and the channel reports a finite rpm. ``rpm_max`` there is
+always ``fan_models.<m>.rpm_max``, the commissioned reference, never a fitted one:
+that fixed divisor is what lets the tach branch see a fan that has lost speed
+(``fan_curve_online`` gives the rpm branch its ``exponent`` and nothing else).
+``E`` is sparse by
 declaration: channel ``i`` reaches zone ``z`` with the prior weight
 ``w_zi = 33 W/K * count_i / (zones listing i)`` when ``z`` lists it, ``0.1 w``
 when ``z`` is declared ``coupled_to`` a zone that lists it (the weak cross-zone
@@ -1692,14 +1696,16 @@ def _channel_phi(
     for ch in st.channels:
         name = cfg.fans[ch].model
         model = cfg.fan_models[name]
-        deadband, exponent, rpm_max = float(model.deadband), float(model.exponent), model.rpm_max
+        deadband, exponent = float(model.deadband), float(model.exponent)
         if curves is not None:
-            deadband, exponent, rpm_max = fancurve.curve_pair(
-                curves.get(name), deadband, exponent, rpm_max
+            # the fitted curve supplies the shape only: normalising the tachometer by a
+            # rpm_max fitted to those same readings would hide an absolute loss of speed
+            deadband, exponent, _ = fancurve.curve_pair(
+                curves.get(name), deadband, exponent, model.rpm_max
             )
         reading = None if rpm is None else rpm.get(ch)
         if cfg.model_use_rpm and _finite(reading):
-            frac = min(1.0, max(0.0, float(reading) / rpm_max))  # type: ignore[arg-type]
+            frac = min(1.0, max(0.0, float(reading) / model.rpm_max))  # type: ignore[arg-type]
             out[ch] = frac**exponent if frac > 0 else 0.0
         else:
             value = u.get(ch)
