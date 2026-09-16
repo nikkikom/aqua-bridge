@@ -141,6 +141,23 @@ measure it.
   Quadro on its own USB port, with a warning). How many Quadro
   temperature inputs are usable is known only once it is connected;
   `config.example-das.yaml` binds none of them.
+- **Supported topology (owner decision 2026-09-16, §8.1):** exactly one
+  controlling controller — the aquaero — with slave devices, the Quadro
+  among them, hanging off it over aquabus. Two independent controllers are
+  not supported yet, though they might be later. Reaching one controller
+  over two access paths at once — aquabus and its own USB, both live —
+  is out of design and must not be relied on: with the aquabus-attached
+  Quadro also reachable on its own USB, the first control-report write
+  over that USB link failed (`SET feature report 0x03: [Errno 110]
+  Connection timed out`), after which its control endpoint stalled for
+  good (`GET ...: [Errno 32] Broken pipe`); a USB-level reset went through
+  but the kernel still could not configure the device (`usb 1-1.2: can't
+  set config #1, error -32`), and only a physical replug recovered it. Its
+  status reports kept working throughout, and the fan it drove kept
+  running, because control went through the aquaero the whole time.
+  Hidraw support for the Quadro's own USB port stays in the code
+  (`hw/aquacomputer.py`, `hw/sources.py`) and is simply unused in this
+  installation.
 - The daemon reads and writes both controllers through **hidraw**
   (`/dev/hidrawN`, `hw/hidraw.py`), not the Linux `aquacomputer_d5next`
   hwmon driver (owner decision 2026-09-15, §8.1). It reads the status
@@ -4588,6 +4605,16 @@ Owner decision (2026-09-16):
   1–2 on its aquabus), not the flow sensors the driver called by those
   names. If a coolant layout ever comes back, it gets its own decision;
   `inputs` is the place it would go, not `temps`/`rpm`.
+- **One controlling controller, slaves behind it.** The daemon supports
+  exactly one controlling controller — today the aquaero — with slave
+  devices, the Quadro among them, attached to it over aquabus. Two
+  independent controllers are not supported yet, though they might be
+  later. A controller reachable over two access paths at once (aquabus
+  and its own USB, both live) is an out-of-design mode: reaching an
+  aquabus-attached Quadro over its own USB too proved unstable (§2
+  "Supported topology"), and the daemon does not need it in that form.
+  Hidraw support for the Quadro's own USB port stays in the code and is
+  simply unused in this installation (item 106).
 
 - **The Pi's own board is a health signal, never a model input**
   (item 103). On the owner's Zero 2 W (64-bit trixie, kernel 6.18.50-v8)
@@ -5880,6 +5907,18 @@ Owner decision (2026-09-16):
     topic shape (`cmd/calibrate/<bay>` with a raw number) plus a Home
     Assistant `number` entity per bay. Decide whether the owner wants it
     before adding fifteen more entities.
+106. Nothing at startup checks a config against the one-controlling-
+    controller shape (owner decision 2026-09-16, §8.1, §2 "Supported
+    topology"). `hw/sources.py::_check_quadro_commanded_once` refuses a
+    commanding quadro entry without a `serial:` when the aquaero already
+    commands aquabus outputs 5–8 (both would reach the same Quadro), but a
+    commanding quadro entry *with* a `serial:` — a second, physically
+    distinct Quadro on its own USB port, i.e. a second controlling
+    controller — is only logged as a warning. Add a startup check that
+    refuses such a config outright, with a message naming the one
+    supported shape: exactly one controlling device, with any slave
+    devices (a Quadro on its aquaero's aquabus, for instance) hanging off
+    it. Not implemented here — docs only.
 
 ### 8.3 Open — needs the DAS hardware
 
@@ -5907,13 +5946,16 @@ Owner decision (2026-09-16):
     reading the sensor back is the check item 93 adds. What is left of this
     item is the owner's decision whether `release()` runs at exit, and
     running the daemon's own heartbeat on the hardware (item 93).
-34. Spike: which Quadro temperature inputs carry a reading in its status
-    report (`tools/aquacomputer_probe.py`); bind them in its `temp_map`.
-    Over aquabus the Quadro's sensors 1–4 appear in the aquaero's aquabus
-    temperature slots `bus1..bus4` (§2 "Quadro on aquabus"); with one
-    thermistor on sensor 2 only `bus2` read. Which inputs will be used is
-    decided when the sensors are wired; the config binds them as `busN`
-    (item 85). Also open: whether the Quadro's 16 slots at `0x3C`, named
+34. **Done** (2026-09-16): a Quadro temperature input carries a reading in
+    the *aquaero's* status report — the Quadro's sensors 1–4 appear in the
+    aquaero's aquabus temperature slots `bus1..bus4` (§2 "Quadro on
+    aquabus"); with one thermistor on sensor 2, only `bus2` read, 23.28 °C
+    on the run behind the 2026-09-16 topology decision (§2 "Supported
+    topology", §8.1), matching the earlier 24.04 °C capture. They reach the
+    daemon through the aquaero, not a second hidraw path to the Quadro
+    itself, and the config binds them as `busN` (item 85). Which of the
+    remaining three inputs will be used is decided when the sensors are
+    wired. Still open: whether the Quadro's 16 slots at `0x3C`, named
     software sensors `soft1..16` after the aquaero's, are software sensors.
 35. Confirm the HID report layout of `hw/aquacomputer.py` on the real
     devices in their final wiring (the Quadro on aquabus or on its own
@@ -6113,12 +6155,18 @@ Owner decision (2026-09-16):
     `pwm5..pwm8` absent, one error line instead of a read failure per tick,
     and the channels back when the Quadro returns.
 
-96. Item 88's hardware half: confirm that the Quadro's save report
-    (identical to the Farbwerk 360's) persists a configuration over a power
-    cycle, the way report 6 does on the aquaero (verified 2026-09-15, item
-    86). Run `tools/aquacomputer_commission.py --device quadro --save`
-    against the real Quadro, power-cycle it, and confirm the duties and
-    limits it read back before the save are still there after.
+96. **Not applicable in the supported topology** (owner decision
+    2026-09-16, §8.1, §2 "Supported topology"). Item 88's hardware half was
+    going to confirm that the Quadro's own save report (identical to the
+    Farbwerk 360's) persists a configuration over a power cycle, the way
+    report 6 does on the aquaero (verified 2026-09-15, item 86), by running
+    `tools/aquacomputer_commission.py --device quadro --save` against the
+    real Quadro. That needs the Quadro reachable on its own USB while it
+    stays wired to the aquaero's aquabus too — the exact two-access-path
+    setup that proved unstable (§2) — so it does not run against the
+    supported topology, and this item is not carried out. It would apply
+    again only if a Quadro on its own USB port, independent of the
+    aquaero, became a supported second controller.
 
 97. Tune `mpc.stuck_zone_air_dT_c` on the real enclosure (item 58). Its
     default, 1.5 °C, is the simulator's number: it clears the largest
