@@ -26,6 +26,7 @@
 <section id="overview"><h2>Overview</h2><table></table></section>
 <section id="temps"><h2>Temps</h2><table></table></section>
 <section id="fans"><h2>Fans</h2><table></table></section>
+<section id="devices"><h2>Controllers</h2><table></table></section>
 <section id="drives" hidden><h2>Drives</h2><table></table></section>
 <section id="zones" hidden><h2>Zones</h2><table></table></section>
 <section id="model" hidden><h2>Model</h2><table></table></section>
@@ -96,6 +97,46 @@ function renderModel(model, diag) {
   ]);
 }
 
+// Controllers: /api/state's "device_health" -- per controller what the adapter
+// found (stuck outputs, absent aquabus slots, outputs not in PWM mode, the flow
+// sensors, the active profile when one is published) and per channel the fan
+// health: rpm and power against the fitted curve, and the 12 V rail.
+function renderDevices(health) {
+  const h = health || {};
+  const rows = [];
+  for (const d of (h.devices || [])) {
+    const flags = [];
+    for (const [key, label] of [["stuck_channels", "stuck"], ["absent_channels", "absent"],
+                                ["not_pwm_channels", "not PWM"],
+                                ["unconfigured_channels", "unconfigured"]]) {
+      const list = d[key] || [];
+      if (list.length) flags.push(label + " " + list.join(", "));
+    }
+    if (d.active_profile !== undefined && d.active_profile !== null) {
+      flags.push("profile " + fmt(d.active_profile, 0));
+    }
+    const flows = Object.keys(d.flows || {}).filter(f => d.flows[f] !== null)
+      .map(f => f + " " + fmt(d.flows[f], 0));
+    if (flows.length) flags.push(flows.join(", "));
+    const age = d.status_age_s === null || d.status_age_s === undefined
+      ? "no status report" : "status " + fmt(d.status_age_s, 1) + " s ago";
+    rows.push(row(d.label || d.device, age + (flags.length ? " | " + flags.join(" | ") : " | ok")));
+  }
+  const fans = h.fans || {};
+  for (const ch of Object.keys(fans).sort()) {
+    const f = fans[ch];
+    const parts = [fmt(f.rpm, 0) + " rpm"];
+    if (f.expected_rpm !== null && f.expected_rpm !== undefined) {
+      parts.push("curve " + fmt(f.expected_rpm, 0));
+    }
+    parts.push(fmt(f.voltage_v) + " V", fmt(f.current_ma, 0) + " mA", fmt(f.power_w) + " W");
+    rows.push(row(ch + ((f.problems || []).length ? " DRIFT" : ""), parts.join(", ")));
+  }
+  for (const p of (h.problems || [])) rows.push(row("problem", p));
+  if (!rows.length) rows.push(row("Controllers", "no device health yet"));
+  table("devices", rows);
+}
+
 async function poll() {
   try {
     const [stateRes, healthRes] = await Promise.all([
@@ -141,6 +182,8 @@ async function poll() {
       fanRows.push(row(ch + " RPM", fmt((obs.rpm || {})[ch], 0)));
     }
     table("fans", fanRows);
+
+    renderDevices(state.device_health);
 
     // DAS mode only: /api/state carries "bays" (the declarations in force)
     // exactly when the config has a topology (section 6); legacy configs

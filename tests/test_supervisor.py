@@ -460,6 +460,28 @@ def test_mqtt_and_usb_flags(sup):
     assert s.mqtt_connected is True and s.usb_present is True
 
 
+def test_device_health_is_a_view_only_snapshot_field(sup):
+    """Items 79 and 83: the health monitor publishes here; nothing in the control path
+    reads it back, and both payloads carry it."""
+    assert sup.snapshot().device_health == {}
+    assert sup.snapshot().health_payload()["device_health"] == {"ok": True, "problems": []}
+
+    health = {"devices": [{"label": "aquaero"}], "fans": {}, "problems": ["boom"], "ok": False}
+    sup.set_device_health(health)
+    s = sup.snapshot()
+    assert s.device_health == health
+    assert s.state_payload()["device_health"] == health
+    assert s.health_payload()["device_health"] == {"ok": False, "problems": ["boom"]}
+    json.loads(s.to_json())
+
+    # the snapshot hands out its own top-level dict, so a reader cannot add keys to it
+    s.device_health["extra"] = 1
+    assert "extra" not in sup.snapshot().device_health
+
+    sup.set_device_health(None)
+    assert sup.snapshot().device_health == {}
+
+
 def test_uptime_uses_injected_clock(cfg):
     now = [10.0]
     sup = Supervisor(cfg, clock=lambda: now[0])

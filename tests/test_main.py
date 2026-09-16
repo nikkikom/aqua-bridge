@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -13,9 +14,11 @@ import time
 from pathlib import Path
 
 import pytest
+import yaml
 
 from aqua_bridge import __main__ as main_mod
 from aqua_bridge.config import ConfigError, load_config
+from aqua_bridge.health import FanHealthConfig
 from aqua_bridge.model import Mode, MpcCommand
 
 REPO = Path(__file__).resolve().parent.parent
@@ -250,6 +253,46 @@ def test_main_without_record_path_or_flag_writes_nothing(
     )
     assert rc == 0
     assert not any(tmp_path.iterdir())  # nothing written anywhere under our scratch dir
+
+
+def test_build_health_monitor_wires_the_source_and_the_supervisor(example_config_path):
+    """Items 79 and 83: the monitor is an on_tick observer that reads the source's own
+    device health and publishes everything through Supervisor.set_device_health."""
+    from aqua_bridge.control.supervisor import Supervisor
+
+    app = load_config(example_config_path)
+    sup = Supervisor(app.mpc)
+    src, _sink, _release = main_mod.build_io(app, "composite")
+    monitor = main_mod.build_health_monitor(app, sup, src)
+    assert monitor is not None and monitor.source is src
+    assert monitor.settings == FanHealthConfig()
+    monitor.on_tick(None)  # never raises, and publishes even with no observation
+    assert sup.snapshot().device_health["ok"] is True
+
+
+def test_build_health_monitor_is_none_when_disabled_with_a_source_that_has_none(
+    example_config_path, tmp_path
+):
+    from aqua_bridge.control.supervisor import Supervisor
+
+    app = load_config(example_config_path)
+    app = dataclasses.replace(app, fan_health={"enabled": False})
+    sup = Supervisor(app.mpc)
+    sim_src, _sink, _release = main_mod.build_io(app, "sim")
+    assert main_mod.build_health_monitor(app, sup, sim_src) is None
+    # ... but a composite still gets one: its device health is published either way
+    composite, _s, _r = main_mod.build_io(app, "composite")
+    assert main_mod.build_health_monitor(app, sup, composite) is not None
+
+
+def test_a_bad_fan_health_key_exits_2_before_anything_opens(tmp_path, example_config_path, caplog):
+    raw = yaml.safe_load(example_config_path.read_text())
+    raw["fan_health"]["rpm_fault_s"] = -1
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    with caplog.at_level(logging.ERROR):
+        assert main_mod.main(["--config", str(path), "--source", "sim", "--once"]) == 2
+    assert "fan_health.rpm_fault_s" in caplog.text
 
 
 def test_build_io_sim_and_unknown(example_config_path):

@@ -32,6 +32,14 @@ CI; ``--sim-plant`` picks it:
   legacy config without ``sim.das``, or missing names: :class:`ConfigError`,
   exit code 2.
 
+Fan and device health (:mod:`aqua_bridge.health`, PROJECT.md section 8 items 79
+and 83) is one more ``on_tick`` observer: it reads the tick's per-output
+readings from ``PlantObservation.inputs["fans"]`` and the source's own
+``device_health()``, applies the ``fan_health:`` drift rules and hands the result
+to ``Supervisor.set_device_health``, whence ``/api/state``, ``/api/health``, the
+MQTT state blob and the page show it. A bad ``fan_health:`` key is a
+:class:`ConfigError` (exit 2).
+
 HTTP (``http.enabled``) and MQTT (``mqtt.enabled``) run next to the loop via
 :mod:`aqua_bridge.publishers.runtime`; both attach to the supervisor's
 ``ControlSurface``. A publisher that fails to start (port in use, broker
@@ -69,6 +77,7 @@ from typing import Any
 from aqua_bridge.config import AppConfig, ConfigError, load_config
 from aqua_bridge.control.loop import Loop, Sink, Source
 from aqua_bridge.control.supervisor import Supervisor
+from aqua_bridge.health import FanHealthConfig, HealthMonitor
 from aqua_bridge.model import MpcCommand, MpcConfig, MpcState, PlantObservation
 from aqua_bridge.modelstore import ModelPersister, initial_state, store_path
 from aqua_bridge.modelstore import load as load_model_store
@@ -80,6 +89,7 @@ from aqua_bridge.sdnotify import SdNotifier, watchdog_seconds
 
 __all__ = [
     "PlantIO",
+    "build_health_monitor",
     "build_io",
     "build_model_store",
     "build_parser",
@@ -322,6 +332,22 @@ def build_recorder(app: AppConfig, cfg: MpcConfig, cli_path: str | None) -> Reco
         raise ConfigError(f"record_max_bytes/record_backup_count must be integers: {exc}") from exc
 
 
+def build_health_monitor(
+    app: AppConfig, supervisor: Supervisor, source: Any
+) -> HealthMonitor | None:
+    """The fan-health / device-health observer for ``on_tick``, or ``None`` when
+    ``fan_health.enabled`` is false and the source has no device health of its own
+    to publish either (PROJECT.md section 8 items 79 and 83).
+
+    ``fan_health:`` is validated here, so a bad threshold is a startup
+    :class:`ConfigError` (exit 2) rather than a rule that silently never fires.
+    """
+    settings = FanHealthConfig.from_section(app.section("fan_health"))
+    if not settings.enabled and not hasattr(source, "device_health"):
+        return None
+    return HealthMonitor(app.mpc, settings, source=source, publish=supervisor.set_device_health)
+
+
 def build_model_store(
     cfg: MpcConfig,
     cli_path: str | None,
@@ -418,6 +444,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         app = load_config(args.config)
         cfg = app.mpc
         recorder = build_recorder(app, cfg, args.record)
+        FanHealthConfig.from_section(app.section("fan_health"))  # fail before anything opens
         initial, persister = build_model_store(cfg, args.model_store)
     except ConfigError as exc:
         _LOG.error("config: %s", exc)
@@ -458,8 +485,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         state=initial,
     )
 
+    health = build_health_monitor(app, supervisor, source)
     http_service, mqtt_service = start_publishers(app, supervisor, smart_inbox=smart_inbox)
-    hooks = [h.on_tick if h is not None else None for h in (mqtt_service, recorder, persister)]
+    # The health monitor runs before the MQTT publisher, so the tick it evaluated is
+    # the tick the state blob carries.
+    hooks = [
+        h.on_tick if h is not None else None for h in (health, mqtt_service, recorder, persister)
+    ]
     if any(h is not None for h in hooks):
         loop.on_tick = chain_on_tick(*hooks)
 

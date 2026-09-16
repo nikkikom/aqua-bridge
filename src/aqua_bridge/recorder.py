@@ -42,11 +42,21 @@ interval already does.
 
 Fields: ``v`` (schema version), ``i`` (tick index), ``ts``, ``das`` (whether
 ``cfg.is_das``), ``mode``, ``applied``, ``temps``/``rpm``/``pwm`` (raw, as read),
-``prev`` (the command in effect this tick), ``cmd`` (the command computed this
-tick, which becomes next tick's ``prev``), ``trusted_temps``, ``zones_ok``,
-``bays``, ``read_error``, ``controller_error``. Legacy-mode recordings (``das:
-false``) still carry ``temps``/``rpm``/``pwm``/``prev``/``cmd`` -- enough for
-``tools/fit_fans.py``, which needs no topology.
+``fans`` (the per-output electrical readings, below), ``prev`` (the command in
+effect this tick), ``cmd`` (the command computed this tick, which becomes next
+tick's ``prev``), ``trusted_temps``, ``zones_ok``, ``bays``, ``read_error``,
+``controller_error``. Legacy-mode recordings (``das: false``) still carry
+``temps``/``rpm``/``pwm``/``prev``/``cmd`` -- enough for ``tools/fit_fans.py``,
+which needs no topology.
+
+``fans`` (PROJECT.md section 8 item 79) is ``{channel: {duty, rpm, voltage_v,
+current_ma, power_w, power_reported}}``, straight from ``PlantObservation.inputs
+["fans"]`` -- what the aquaero or Quadro reported for that output this tick. It
+is a new key of the same schema version, not a new version: every reader here and
+in ``tools/`` takes fields by name with a default, a recording made before it
+existed simply has ``{}``, and a source that reports no such readings (the
+simulator) writes ``{}`` too. ``power_reported`` is false for an aquaero's own
+outputs, which report 0 mA and 0 W in PWM mode whatever the fan does.
 """
 
 from __future__ import annotations
@@ -64,6 +74,7 @@ from aqua_bridge.model import MpcConfig
 __all__ = [
     "DEFAULT_BACKUP_COUNT",
     "DEFAULT_MAX_BYTES",
+    "FAN_READING_FIELDS",
     "RECORD_VERSION",
     "Recorder",
     "chain_on_tick",
@@ -94,6 +105,33 @@ def _sanitize_map(values: Mapping[str, Any] | None) -> dict[str, float | None]:
 
 def _mapping(value: object) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+#: The numeric fields of one channel's fan readings that a record keeps
+#: (``PlantObservation.inputs["fans"]``, PROJECT.md section 8 item 79). The
+#: descriptive ones (device, output, aquabus) repeat the config every tick and
+#: are left out; ``power_reported`` stays, since without it a recorded 0 W cannot
+#: be told from a fault.
+FAN_READING_FIELDS: tuple[str, ...] = ("duty", "rpm", "voltage_v", "current_ma", "power_w")
+
+
+def _fan_readings(obs: Any) -> dict[str, dict[str, Any]]:
+    """``{channel: {duty, rpm, voltage_v, current_ma, power_w, power_reported}}`` from
+    the observation's ``inputs["fans"]``; ``{}`` for a source that reports none (the
+    simulator, a legacy recording), so the record shape only ever grows a key."""
+    inputs = getattr(obs, "inputs", None)
+    readings = _mapping(inputs).get("fans")
+    out: dict[str, dict[str, Any]] = {}
+    for channel, reading in _mapping(readings).items():
+        if not isinstance(reading, Mapping):
+            continue
+        entry: dict[str, Any] = {
+            field: (float(reading[field]) if _finite(reading.get(field)) else None)
+            for field in FAN_READING_FIELDS
+        }
+        entry["power_reported"] = bool(reading.get("power_reported"))
+        out[str(channel)] = entry
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +176,7 @@ def record_from_tick(result: TickResult, cfg: MpcConfig) -> dict[str, Any]:
         "temps": _sanitize_map(result.obs.temps),
         "rpm": _sanitize_map(result.obs.rpm),
         "pwm": _sanitize_map(result.obs.pwm),
+        "fans": _fan_readings(result.obs),
         "prev": _sanitize_map(prev),
         "cmd": _sanitize_map(result.cmd.pwm),
         "trusted_temps": {k: float(v) for k, v in trusted_temps.items()},

@@ -45,6 +45,7 @@ _INDEX_HTML = (
 _JS_BUILTINS = {
     "all",
     "className",
+    "filter",
     "getElementById",
     "hidden",
     "innerHTML",
@@ -60,6 +61,45 @@ _JS_BUILTINS = {
     "stringify",
     "textContent",
     "toFixed",
+}
+
+#: What a live `HealthMonitor` publishes (PROJECT.md section 8 items 79, 83). The
+#: supervisor holds it verbatim, so the page's Controllers section reads exactly these
+#: keys; built here rather than run through the hardware adapter, which the HTTP tests
+#: do not have.
+_DEVICE_HEALTH: dict[str, Any] = {
+    "devices": [
+        {
+            "label": "aquaero",
+            "device": "aquaero",
+            "serial": "12345-54321",
+            "firmware": 2104,
+            "power_cycles": None,
+            "open": True,
+            "status_age_s": 0.4,
+            "stuck_channels": [],
+            "absent_channels": ["qd1"],
+            "not_pwm_channels": [],
+            "unconfigured_channels": [],
+            "flows": {"flow1": 0, "flow2": 0, "flow3": None},
+            "active_profile": 1,
+            "problems": ["aquaero: no device on aquabus behind qd1"],
+        }
+    ],
+    "fans": {
+        "xt1": {
+            "duty": 0.5,
+            "rpm": 700.0,
+            "voltage_v": 12.1,
+            "current_ma": 0.0,
+            "power_w": 0.0,
+            "expected_rpm": 750.0,
+            "expected_power_w": None,
+            "problems": [],
+        }
+    },
+    "problems": ["aquaero: no device on aquabus behind qd1"],
+    "ok": False,
 }
 
 
@@ -84,6 +124,7 @@ def _collect_keys(value: Any, out: set[str]) -> None:
 def _das_payload_keys() -> set[str]:
     cfg = dataclasses.replace(load_config(EXAMPLE_DAS_CONFIG).mpc, model_shadow=True)
     sup = Supervisor(cfg)
+    sup.set_device_health(_DEVICE_HEALTH)
     state = MpcState.cold()
     obs = das_obs(cfg, 0.0, pwm=0.5)
     cmd, state = step(obs, sup.effective_config(), state)
