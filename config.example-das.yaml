@@ -378,7 +378,7 @@ mpc:
   # default is set above what the truth simulator's drawn physics produce on a healthy
   # enclosure, but not far above it: the healthy ceiling measured there is 7.44 degC/min
   # against this 8.0, so on a fitted model of the real enclosure this should come down --
-  # section 8 items 66 and 96 have the measurements and the tuning.
+  # section 8 items 66 and 98 have the measurements and the tuning.
   model_max_air_dist_c_per_min: 8.0
   model_air_dist_tau_s: 900.0
   # Back from the model fallback (PI-like DAS) to the MPC: the gate's numeric limits scaled

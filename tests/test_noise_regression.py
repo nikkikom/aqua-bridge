@@ -66,7 +66,7 @@ UNCALIBRATED_BOUND = 2.0
 #: is on the physical node, so the MPC cools the bays it believes hottest and a uniform
 #: curve sized on the truth can be quieter. Measured 0.29-1.18 over the six of seeds 1-8
 #: this bound is asserted on (seed 7: 1.18); seeds 2 and 5 skip it, because b10's
-#: remaining over-estimate (section 8 items 17 and 96) drives their hot zone to full
+#: remaining over-estimate (section 8 items 17 and 101) drives their hot zone to full
 #: speed, u* reaches 1.0 and the comparison has nothing left to say -- those two seeds
 #: are covered instead by
 #: ``test_rich_preset_estimates_follow_the_drive_reported_temperature`` below, and their
@@ -78,7 +78,7 @@ RICH_BOUND = 1.25
 #: Section 8 item 17: with every bay calibrated the estimate follows the drive-reported
 #: temperature (true drive temperature + the drawn SMART offset) to this, degC, over the
 #: window. Measured 0.12-1.97 rms over seeds 1-8; the outlier is a bay with a redundant
-#: proximal pair, which one sensor node per bay cannot represent (section 8 item 96).
+#: proximal pair, which one sensor node per bay cannot represent (section 8 item 101).
 RICH_ESTIMATE_RMS_C = 2.5
 #: The same accuracy, signed and per bay: the rms above is symmetric and averages over
 #: 15 bays, so one bay 7.6 degC out still passes it. The two directions are not equally
