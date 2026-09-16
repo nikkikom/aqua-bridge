@@ -16,6 +16,17 @@ testable without files:
 * ``calibration`` -- :func:`aqua_bridge.control.estimator.restore_calibration` (per bay
   and serial; each bad entry is dropped with a warning; the time of each entry is
   re-based on ``ts``; a stale file inflates ``sigma_cal``).
+* ``manual_calibration`` --
+  :func:`aqua_bridge.control.estimator.restore_manual_calibration` (per bay, section 8
+  item 104: the hand-measured maps of ``POST /api/calibrate``). Applied after
+  ``calibration`` and into the same estimator memory. Its rule is stricter than the
+  SMART one and lives there in full: an entry older than
+  ``estimator.manual_calibration_max_age_days``, one whose age is unknown, and one whose
+  bay is now declared with another ``occupied`` / ``class`` / ``serial`` are **dropped**
+  rather than restored at a reduced weight; what survives comes back provisional
+  (``sigma_cal`` doubled until twenty fresh hand readings confirm it) from a ``fresh``
+  file as much as from a ``stale`` one, because a bay-keyed map has no feed that could
+  re-associate it after a swap the daemon slept through.
 * ``fan_curves`` -- per fan model ``{rpm_max, deadband, exponent}`` inside the bounds of
   ``fan_models`` validation, kept in ``solver_memory["fan_curves"]``. With
   ``mpc.fan_curve_online`` the online fit (:mod:`aqua_bridge.control.fancurve`) keeps
@@ -39,7 +50,8 @@ The result, ``solver_memory[STORE_KEY]`` and ``diagnostics["store"]``::
 
     {"source": "fresh" | "stale" | "prior", "path": str | None, "age_s": float | None,
      "loaded_ts": ts, "sections": {"thermal": "loaded" | "dropped" | "ignored" | "absent",
-     "calibration": int entries, "fan_curves": int, "bays": int, "ident_settle": int},
+     "calibration": int entries, "manual_calibration": int entries, "fan_curves": int,
+     "bays": int, "ident_settle": int},
      "warnings": [str, ...], "bays": {bay: {...}},
      ["ident_settle": {"ts": ts, "credit_s": {zone: seconds}}]}
 
@@ -169,6 +181,7 @@ def apply_seed(mem: dict[str, Any], cfg: MpcConfig, seed: object, ts: float) -> 
     sections: dict[str, Any] = {
         "thermal": "absent",
         "calibration": 0,
+        "manual_calibration": 0,
         "fan_curves": 0,
         "bays": 0,
         "ident_settle": 0,
@@ -224,6 +237,19 @@ def apply_seed(mem: dict[str, Any], cfg: MpcConfig, seed: object, ts: float) -> 
             warnings.extend(cal_warnings)
             sections["calibration"] = sum(len(v) for v in est_mem["cal"].values())
 
+        manual = seed.get("manual_calibration")
+        if manual is not None:
+            # Applied on top of whatever ``calibration`` staged, so the two sections land
+            # in one estimator memory instead of the second discarding the first.
+            est_mem, manual_warnings = estimator.restore_manual_calibration(
+                staged.get("estimator", mem.get("estimator")), manual, cfg, ts=ts
+            )
+            staged["estimator"] = est_mem
+            warnings.extend(manual_warnings)
+            sections["manual_calibration"] = sum(
+                1 for known in est_mem["manual"].values() if known["cal"] is not None
+            )
+
         curves = seed.get("fan_curves")
         if curves is not None:
             staged["fan_curves"] = _fan_curves(curves, cfg, warnings)
@@ -245,7 +271,14 @@ def apply_seed(mem: dict[str, Any], cfg: MpcConfig, seed: object, ts: float) -> 
         summary["source"] = "prior"
         summary["bays"] = {}
         summary.pop("ident_settle", None)
-        sections.update(thermal="absent", calibration=0, fan_curves=0, bays=0, ident_settle=0)
+        sections.update(
+            thermal="absent",
+            calibration=0,
+            manual_calibration=0,
+            fan_curves=0,
+            bays=0,
+            ident_settle=0,
+        )
         warnings.append(f"store: not applied ({type(exc).__name__}: {exc})"[:300])
     if len(warnings) > MAX_WARNINGS:
         extra = len(warnings) - MAX_WARNINGS

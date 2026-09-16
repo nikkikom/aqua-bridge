@@ -242,6 +242,7 @@ class MqttService:
             port=mqtt_cfg["port"],
             username=mqtt_cfg["username"],
             password=mqtt_cfg["password"],
+            allow_calibrate=mqtt_cfg["allow_calibrate"],
             on_intent=supervisor.submit,
             on_connection_change=on_connection_change,
         )
