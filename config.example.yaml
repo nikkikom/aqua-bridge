@@ -201,6 +201,35 @@ fan_health:
   power_fault_s: 120.0       # a power deviation held this long is reported, seconds (> 0)
   log_interval_s: 300.0      # one log line per channel at most this often, seconds (> 0)
 
+# The Raspberry Pi's own temperature and throttling as a health signal (PROJECT.md
+# section 3 "Fan and device health", section 8 item 97 and the owner decision of
+# 2026-09-16 in section 8.1). The board is NOT part of the thermal model: about a watt
+# against the drives' tens of watts, and its reading is dominated by its own
+# self-heating. It is never a solver input, never a zone air sensor, never a model node
+# -- these rules only produce a published field and a log line. Defaults shown.
+host_health:
+  enabled: true              # false: the board's temperature and throttling are still
+                             # read, published and shown; no rule runs
+  temp_limit_c: 75.0         # the board above this is a deviation, degC: the Pi caps its
+                             # ARM clock around 80 and hard-throttles around 85, so this
+                             # warns before the board starts defending itself
+  temp_fault_s: 120.0        # held this long it is reported, seconds (> 0): a build or an
+                             # update heats the SoC for tens of seconds; two minutes is
+                             # placement or airflow
+  divergence_c: 25.0         # the board further than this from the enclosure air is a
+                             # deviation while the CPU is idle, degC (> 0): at idle a
+                             # Zero 2 W sits 10-20 degC above the air around it. Judged on
+                             # the absolute difference, either way round
+  divergence_fault_s: 900.0  # a divergence held this long, idle throughout, is reported,
+                             # seconds (> 0); the enclosure's air moves in minutes
+  idle_load1_max: 0.5        # the CPU counts as idle at or below this load1 (>= 0): above
+                             # it the board's reading says more about the CPU than the air,
+                             # so the divergence rule is not evidence of anything
+  air_temps: []              # the temperatures averaged as the enclosure-air reference;
+                             # empty means every zone_air sensor, else every inlet sensor,
+                             # else every configured temperature
+  log_interval_s: 300.0      # one log line for the board at most this often, seconds (> 0)
+
 http:
   # HTTPS with basic auth only; there is no plain-HTTP listener (PROJECT.md section 6).
   # With enabled: true but a missing or invalid certificate, key or credentials

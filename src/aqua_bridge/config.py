@@ -3,8 +3,8 @@
 ``load_config(path)`` returns an :class:`AppConfig`. Only the ``mpc``
 section is typed and validated (:class:`aqua_bridge.model.MpcConfig`);
 the other sections (``mqtt``, ``host``, ``xt6``, ``http``, ``digole``,
-``onewire``, ``fan_health``) are handed to their owners as plain dicts. Unknown keys
-*inside* ``mpc`` are an error; unknown top-level sections are kept in
+``onewire``, ``fan_health``, ``host_health``) are handed to their owners as plain
+dicts. Unknown keys *inside* ``mpc`` are an error; unknown top-level sections are kept in
 ``AppConfig.extra`` so a typo there is visible without being fatal.
 
 Each owner validates its own scalars against a *bad type*, not only a
@@ -17,8 +17,9 @@ each raises naming the key, at the point that section is actually used (config
 load for ``onewire`` since a DAS temperature source cannot start without it;
 service start for ``http``/``mqtt`` so a typo in one optional publisher's
 section never stops the daemon from controlling the fans), and ``fan_health:``
-in :meth:`~aqua_bridge.health.FanHealthConfig.from_section` at startup (a bad
-drift threshold is a configuration error, exit 2, like a bad ``mpc`` key: the
+in :meth:`~aqua_bridge.health.FanHealthConfig.from_section` and ``host_health:``
+in :meth:`~aqua_bridge.health.HostHealthConfig.from_section`, both at startup (a
+bad drift threshold is a configuration error, exit 2, like a bad ``mpc`` key: the
 operator asked for a rule the daemon cannot run). ``digole:`` has no
 owner yet (section 5, "after Command is stable"), so ``_warn_bad_digole_enabled``
 below only logs a warning at config load -- nothing reads the section, so there
@@ -67,6 +68,7 @@ KNOWN_SECTIONS: tuple[str, ...] = (
     "digole",
     "onewire",
     "fan_health",
+    "host_health",
 )
 
 
@@ -133,6 +135,7 @@ class AppConfig:
     digole: dict[str, Any] = field(default_factory=dict)
     onewire: dict[str, Any] = field(default_factory=dict)
     fan_health: dict[str, Any] = field(default_factory=dict)
+    host_health: dict[str, Any] = field(default_factory=dict)
     aquacomputer: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     extra: dict[str, Any] = field(default_factory=dict)
     source: str | None = None
