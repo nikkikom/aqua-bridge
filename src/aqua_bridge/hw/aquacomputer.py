@@ -119,6 +119,8 @@ __all__ = [
     "crc16_usb",
     "decode_status",
     "finalize_control_report",
+    "format_channel_state",
+    "format_percent",
     "is_status_report",
     "kind_by_name",
     "output_mode",
@@ -688,6 +690,39 @@ def channel_state(kind: DeviceKind, data: bytes | bytearray, k: int) -> ChannelS
         mode=output_mode(kind, data, k),
         aquabus=channel.aquabus,
     )
+
+
+def format_percent(centi: int) -> str:
+    """Centi-percent as a printable percentage: ``4250`` -> ``"42.50 %"``."""
+    return f"{centi / 100:.2f} %"
+
+
+def format_channel_state(state: ChannelState, k: int, *, name: str = "") -> str:
+    """One output's line for a tool's control-report listing, without indent or
+    newline: ``pwm3<name>  duty 42.50 %`` plus whichever fields the kind has --
+    control source, power limits and whether the duty is in effect, then the
+    output mode (or "unconfigured").
+
+    Shared by ``tools/aquacomputer_probe.py`` and
+    ``tools/aquacomputer_commission.py`` so that what is learned about the
+    control report is printed the same way by both. ``name`` is appended to the
+    channel number (the commissioning tool names the config's channel there).
+    """
+    line = f"pwm{k + 1}{name}  duty {format_percent(state.duty):>8}"
+    if state.source is not None:
+        line += f"  source 0x{state.source:04X}"
+        if state.min_power is not None and state.max_power is not None:
+            line += (
+                f"  min {format_percent(state.min_power)}  max {format_percent(state.max_power)}"
+            )
+        line += "  (follows its preset)" if state.on_duty else "  (does not follow its preset)"
+    if state.unconfigured:
+        line += "  (unconfigured)"
+    elif state.aquabus and state.mode is not None:
+        line += f"  mode 0x{state.mode.raw:04X} (aquabus, not interpreted)"
+    elif state.mode is not None:
+        line += f"  mode {state.mode.name} (0x{state.mode.raw:04X})"
+    return line
 
 
 def active_profile(kind: DeviceKind, data: bytes | bytearray) -> int | None:

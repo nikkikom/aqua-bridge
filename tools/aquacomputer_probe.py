@@ -47,6 +47,8 @@ from aqua_bridge.hw.aquacomputer import (
     channel_state,
     check_control_report,
     decode_status,
+    format_channel_state,
+    format_percent,
     is_status_report,
 )
 from aqua_bridge.hw.aquacomputer_adapter import AquacomputerTiming
@@ -65,10 +67,6 @@ from aqua_bridge.hw.hidraw import (
 __all__ = ["build_parser", "main", "probe"]
 
 Opener = Callable[[HidrawInfo], HidTransport]
-
-
-def _percent(centi: int) -> str:
-    return f"{centi / 100:.2f} %"
 
 
 def _wait_status(
@@ -110,7 +108,7 @@ def _print_status(kind: DeviceKind, status: StatusReport, out: TextIO) -> None:
             print(f"    pwm{n}/fan{n}  no device (rpm 0xFFFF){where}", file=out)
             continue
         print(
-            f"    pwm{n}/fan{n}  {fan.rpm:5d} rpm  duty {_percent(fan.duty):>8}  "
+            f"    pwm{n}/fan{n}  {fan.rpm:5d} rpm  duty {format_percent(fan.duty):>8}  "
             f"{fan.voltage_v:5.2f} V  {fan.current_ma:5d} mA  {fan.power_w:6.2f} W{where}",
             file=out,
         )
@@ -125,22 +123,7 @@ def _print_control(kind: DeviceKind, data: bytes, out: TextIO) -> None:
         print(f"  active profile: {profile}", file=out)
     print("  outputs (control report):", file=out)
     for k in range(kind.pwm_count):
-        state = channel_state(kind, data, k)
-        line = f"    pwm{k + 1}  duty {_percent(state.duty):>8}"
-        if state.source is not None:
-            assert state.min_power is not None and state.max_power is not None
-            follows = "follows its preset" if state.on_duty else "does not follow its preset"
-            line += (
-                f"  source 0x{state.source:02X}  min {_percent(state.min_power)}"
-                f"  max {_percent(state.max_power)}  ({follows})"
-            )
-        if state.unconfigured:
-            line += "  (unconfigured)"
-        elif state.aquabus and state.mode is not None:
-            line += f"  mode 0x{state.mode.raw:04X} (aquabus, not interpreted)"
-        elif state.mode is not None:
-            line += f"  mode {state.mode.name} (0x{state.mode.raw:04X})"
-        print(line, file=out)
+        print(f"    {format_channel_state(channel_state(kind, data, k), k)}", file=out)
 
 
 def _probe_device(
