@@ -112,8 +112,10 @@ hardware.
 
 6. **Config.** Edit `/etc/aqua-bridge/config.yaml`: `mpc.channels` /
    `mpc.temps` / `mpc.sensors` / `mpc.topology` for the enclosure, the
-   `aquacomputer:` list (one entry per controller: `device: aquaero` or
-   `quadro`, `serial:` when several of one kind are attached, `fans`
+   `aquacomputer:` list (one entry per controller — the supported topology
+   is exactly one controlling controller, the aquaero, with any slave
+   devices hanging off it over aquabus, PROJECT.md §2: `device: aquaero`
+   or `quadro`, `serial:` when several of one kind are attached, `fans`
    with `{pwm: pwmN, rpm: fanN}` per output (with the Quadro on the
    aquaero's aquabus, its outputs are the aquaero's `pwm5..pwm8` and
    `fan5..fan8`), `temp_map` per input actually present (`tempN`
@@ -157,8 +159,12 @@ hardware.
    controlled.
 
 7. **USB hardware.** dwc2 host + powered hub, XT6 on USB; the Quadro on
-   aquabus (its PWM is writable through the XT6, §2), or on its own USB
-   port. `lsusb`, then, as the service user,
+   aquabus (its PWM is writable through the XT6, §2) — the supported
+   topology, exactly one controlling controller with any slaves hanging
+   off it. A Quadro on its own USB port instead, as a second controller,
+   is not supported yet; reaching an aquabus-attached Quadro on its own
+   USB port too, at the same time, is out of design and proved unstable
+   (PROJECT.md §2). `lsusb`, then, as the service user,
    `.venv/bin/python tools/aquacomputer_probe.py` — read-only: lists
    each aquaero / Quadro (serial, USB interface, `/dev/hidrawN`) with
    its temperatures by group, outputs (rpm, duty, voltage, current,
@@ -198,10 +204,13 @@ hardware.
    shows every output's duty, source and limits and the active profile
    without writing anything; add `--save` to store it, after a typed
    confirmation and a re-read that aborts when the controller changed
-   while you were reading (PROJECT.md §8 item 88; run once per
-   controller, so `--device quadro` too when one is configured — its save
-   report is not verified to persist, unlike the aquaero's, §8 item 96).
-   As the
+   while you were reading (PROJECT.md §8 item 88). In the supported
+   topology this is the only controller to commission: a Quadro on the
+   aquaero's aquabus has no `aquacomputer:` entry of its own, and its
+   outputs live in the aquaero's own control report blocks (§2), saved
+   with it. `--device quadro` only applies to a Quadro configured on its
+   own USB port, which is not the supported topology (PROJECT.md §2) and
+   whose own save report is unverified to persist, §8 item 96. As the
    service user:
    `HYPOTHESIS_PROFILE=pi .venv/bin/python -m pytest -m hardware`. Warm
    each mapped thermistor and confirm the right `obs.temps` key moves (a
