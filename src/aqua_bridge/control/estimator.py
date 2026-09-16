@@ -113,7 +113,11 @@ reading of a sensor that was missing on the zone's first tick met a node sitting
 at the zone air and tripped the fast-swap rule. A bay is seeded once: a sensor
 that returns after a *later* loss is an innovation like any other, and the
 fast-swap rule is right to widen the bay, since the drive may have been changed
-while nothing was watching.
+while nothing was watching. A bay seeded from a member that is *not* its anchor
+(the anchor was missing too) holds a node placed where that member sits, so the
+anchor's own first reading is a step the fast-swap rule fires on -- the
+conservative direction, and the trust rule's settling exemption covers it while
+the bay stays observed.
 
 Output
 ------
