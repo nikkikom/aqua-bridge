@@ -1078,16 +1078,24 @@ class FanSpec:
 
 @dataclass(frozen=True)
 class FanModel:
-    """``fan_models.<model>``: RPM curve and noise at full speed of one fan type.
+    """``fan_models.<model>``: RPM curve, noise and electrical draw at full speed of
+    one fan type.
 
     ``noise_db_at_max`` defaults to 0 dB: the noise figure is an index, and
     equal defaults weigh every model the same.
+
+    ``power_w_at_max`` is the electrical power *one* fan of this model draws at
+    full speed, watts. It has no default: the figure depends on the fan and
+    nothing may invent one, so left out (``None``) it turns off the fan-health
+    power rule for this model (:mod:`aqua_bridge.health`, PROJECT.md section 8
+    item 79) while the rpm and rail rules keep working.
     """
 
     rpm_max: float
     deadband: float = 0.1
     exponent: float = 1.0
     noise_db_at_max: float = 0.0
+    power_w_at_max: float | None = None
 
     @classmethod
     def coerce(cls, path: str, data: object) -> FanModel:
@@ -1097,13 +1105,15 @@ class FanModel:
             path,
             data,
             required=("rpm_max",),
-            optional=("deadband", "exponent", "noise_db_at_max"),
+            optional=("deadband", "exponent", "noise_db_at_max", "power_w_at_max"),
         )
+        power = raw.get("power_w_at_max")
         return cls(
             rpm_max=_cfg_num(f"{path}.rpm_max", raw["rpm_max"]),
             deadband=_cfg_num(f"{path}.deadband", raw.get("deadband", 0.1)),
             exponent=_cfg_num(f"{path}.exponent", raw.get("exponent", 1.0)),
             noise_db_at_max=_cfg_num(f"{path}.noise_db_at_max", raw.get("noise_db_at_max", 0.0)),
+            power_w_at_max=(None if power is None else _cfg_num(f"{path}.power_w_at_max", power)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -1112,6 +1122,7 @@ class FanModel:
             "deadband": self.deadband,
             "exponent": self.exponent,
             "noise_db_at_max": self.noise_db_at_max,
+            "power_w_at_max": self.power_w_at_max,
         }
 
 
@@ -2257,6 +2268,14 @@ class MpcConfig:
                 raise ConfigError(f"{where}.exponent must be in [0.5, 1.5], got {fm.exponent}")
             if not math.isfinite(fm.noise_db_at_max):
                 raise ConfigError(f"{where}.noise_db_at_max must be finite")
+            if fm.power_w_at_max is not None and not (
+                math.isfinite(fm.power_w_at_max) and fm.power_w_at_max > 0
+            ):
+                raise ConfigError(
+                    f"{where}.power_w_at_max must be a finite number > 0 (watts of one fan at "
+                    f"full speed), or absent to turn the fan-health power rule off for this "
+                    f"model; got {fm.power_w_at_max}"
+                )
         for ch, fan in self.fans.items():
             where = f"mpc.fans.{ch}"
             if fan.model not in self.fan_models:
