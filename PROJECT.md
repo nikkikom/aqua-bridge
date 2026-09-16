@@ -2931,9 +2931,9 @@ a model converges only with them.
   aquabus, which ignores writes over its USB (a quadro entry with
   `fans: {}` that only reads sensors is allowed). Which Quadro sits on
   aquabus cannot be read before the devices are opened, so a commanding
-  quadro entry with a serial is accepted as a second Quadro on its own USB
-  port and logged as a warning; if it is the one on aquabus after all, its
-  channels are found stuck with the explanation below. At runtime a Quadro
+  quadro entry with a serial is refused too, as a second, physically
+  distinct Quadro on its own USB port, i.e. a second, independent
+  controller (item 106). At runtime a Quadro
   channel found stuck, next to an aquaero whose status report shows a device
   on its aquabus, is logged with that explanation: the Quadro is probably
   on aquabus and must be commanded through the aquaero. A config that
@@ -3903,8 +3903,8 @@ the board.
   written, naming all failed devices, `xt6:` plus an `aquacomputer:` list, timing keys per
   device, distinct serials for one kind, every name bound exactly once
   (exit 2 otherwise), aquaero `pwm5..pwm8` together with a commanding Quadro
-  entry without a serial refused (a sensors-only Quadro entry allowed, one
-  with a serial accepted with a warning), the stuck Quadro hint only next to
+  entry refused either way, with or without a serial (a sensors-only Quadro
+  entry allowed, item 106), the stuck Quadro hint only next to
   an aquaero reporting an aquabus device, the loop over an aquaero whose
   aquabus slot empties (the loop keeps controlling the healthy half with no
   read error, that channel's `rpm` / `pwm` `None`, one error line, and the
@@ -5922,9 +5922,10 @@ Owner decision (2026-09-16):
     on aquabus) fails `read()` naming the channel and is listed in
     `absent_channels`; `apply()` writes it and does not raise, so the
     fallback ramp is not held back (item 90). A config that commands
-    `pwm5..pwm8` and the outputs of a quadro entry without `serial:` is
-    refused at startup (one with a serial is accepted with a warning, as a
-    second Quadro on its own USB port); a stuck Quadro channel next to an
+    `pwm5..pwm8` and the outputs of a commanding quadro entry is refused at
+    startup either way, with or without `serial:` (item 106: one with a
+    serial is a second, physically distinct Quadro on its own USB port, i.e.
+    a second, independent controller); a stuck Quadro channel next to an
     aquaero that reports an aquabus device is logged as probably on aquabus,
     to be commanded through the aquaero. Aquabus blocks (mode word `0x0500`)
     get no "not PWM" warning; the unconfigured block 8 (source `0xFFFF`,
@@ -6339,18 +6340,33 @@ Owner decision (2026-09-16):
     and publishes **no** Discovery entity: fifteen more `number` entities whose
     state Home Assistant republishes on its own restart is the retained-message
     problem in another costume. §7 *Manual calibration over MQTT*.
-106. Nothing at startup checks a config against the one-controlling-
-    controller shape (owner decision 2026-09-16, §8.1, §2 "Supported
-    topology"). `hw/sources.py::_check_quadro_commanded_once` refuses a
-    commanding quadro entry without a `serial:` when the aquaero already
-    commands aquabus outputs 5–8 (both would reach the same Quadro), but a
-    commanding quadro entry *with* a `serial:` — a second, physically
-    distinct Quadro on its own USB port, i.e. a second controlling
-    controller — is only logged as a warning. Add a startup check that
-    refuses such a config outright, with a message naming the one
-    supported shape: exactly one controlling device, with any slave
-    devices (a Quadro on its aquaero's aquabus, for instance) hanging off
-    it. Not implemented here — docs only.
+106. **Done** (2026-09-17): nothing at startup checked a config against the
+    one-controlling-controller shape (owner decision 2026-09-16, §8.1, §2
+    "Supported topology"). `hw/sources.py::_check_quadro_commanded_once`
+    refused a commanding quadro entry without a `serial:` when the
+    aquaero already commanded aquabus outputs 5–8 (both would reach the
+    same Quadro), but a commanding quadro entry *with* a `serial:` — a
+    second, physically distinct Quadro on its own USB port, i.e. a second
+    controlling controller — was only logged as a warning. That warning
+    is now the same `ConfigError` as the unidentified case, naming both
+    clashing entries and the one supported shape: exactly one controlling
+    device, with any slave devices (a Quadro on its aquaero's aquabus,
+    for instance) hanging off it. Raised in the same early,
+    before-any-device-is-opened block as the composite source's other
+    config errors (`build_composite_from_config`, ahead of
+    `check_watchdog`), so it fails clean at startup. A single controller
+    alone (aquaero or Quadro) and an aquaero with a Quadro genuinely
+    slaved to it over aquabus (no separate commanding `quadro:` entry)
+    both still build, as do `config.example.yaml` and
+    `config.example-das.yaml` unchanged; so does an aquaero and a Quadro
+    that command their own, non-aquabus outputs independently — two
+    physically distinct devices with no ambiguity between them, which
+    this item's narrower scope (the aquabus-Quadro ambiguity that can
+    silently write nothing, and its identified twin that is a second
+    controller either way) does not reach. Whether that last shape should
+    also be refused, to fully match "two independent controllers are not
+    supported yet" in the general case, is the owner's call — see
+    PROPOSED ITEMS.
 
 ### 8.3 Open — needs the DAS hardware
 
