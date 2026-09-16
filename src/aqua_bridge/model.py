@@ -83,6 +83,7 @@ choice for cooling:
 * The DAS MPC keys (``mpc_pred_dt_s``, ``mpc_blocks``, ``mpc_every_ticks``,
   ``rho_soft``, ``rho_hard``, ``solver_outer_max``, ``model_max_drift_c_per_min``,
   ``model_return_factor``, ``model_return_dwell_s``, ``model_drift_rate_tau_s``,
+  ``model_drift_dwell_s``, ``model_max_air_dist_c_per_min``, ``model_air_dist_tau_s``,
   ``model_accept_prior``; ``aqua_bridge.control.solver_das``) are flat keys too,
   validated always and inert in legacy mode. ``mpc_pred_dt_s >= dt`` is checked
   only with ``topology``; ``mpc_blocks`` empty (the default) means the plan's
@@ -1551,16 +1552,19 @@ class MpcConfig:
       airflow from the tachometer instead of the PWM curve.
     * ``mpc_pred_dt_s`` / ``mpc_blocks`` / ``mpc_every_ticks`` / ``rho_soft`` / ``rho_hard``
       / ``solver_outer_max`` / ``model_max_drift_c_per_min`` / ``model_return_factor`` /
-      ``model_return_dwell_s`` / ``model_drift_rate_tau_s`` / ``model_accept_prior`` --
-      the DAS MPC (``control/solver_das.py``, ``solver: mpc`` with ``topology`` and no
+      ``model_return_dwell_s`` / ``model_drift_rate_tau_s`` / ``model_drift_dwell_s`` /
+      ``model_max_air_dist_c_per_min`` / ``model_air_dist_tau_s`` / ``model_accept_prior``
+      -- the DAS MPC (``control/solver_das.py``, ``solver: mpc`` with ``topology`` and no
       ``setpoints``): prediction step (``horizon`` counts these steps), move blocks
       (:meth:`blocks`), solve every n-th tick, soft / hard penalty weights, cap on the
-      active-piece iterations, the validity gate's equilibrium drift limit, the factor
-      on the gate's numeric limits and the time they must hold for the MPC to return
-      from the model fallback, the low-pass time constant of the drives' observed rate
-      that the return's relative drift check subtracts, and whether a thermal model
-      that has not converged (its prior or what it learnt so far) may drive the fans.
-      Inert in legacy mode.
+      active-piece iterations, the validity gate's drift limit (on the rate the drives'
+      own movement does not explain), the factor on the gate's numeric limits and the
+      time they must hold for the MPC to return from the model fallback, the low-pass
+      time constant both the drives' observed rate and the model's own rate go through,
+      how long a drift or air-disturbance check must fail before it faults the model,
+      the limit on the zone-air disturbance's move away from its slow level and that
+      level's time constant, and whether a thermal model that has not converged (its
+      prior or what it learnt so far) may drive the fans. Inert in legacy mode.
     * ``model_store_interval_s`` / ``model_store_max_age_days`` / ``model_reconfirm_s`` --
       the model store (``modelstore.py``, ``control/persist.py``): the shortest interval
       between two writes of ``model.json``, the age above which a stored model loads
@@ -1645,6 +1649,9 @@ class MpcConfig:
     model_return_factor: float = 0.5
     model_return_dwell_s: float = 300.0
     model_drift_rate_tau_s: float = 120.0
+    model_drift_dwell_s: float = 120.0
+    model_max_air_dist_c_per_min: float = 5.0
+    model_air_dist_tau_s: float = 900.0
     model_accept_prior: bool = False
     model_store_interval_s: float = 600.0
     model_store_max_age_days: float = 30.0
@@ -1751,6 +1758,9 @@ class MpcConfig:
             "model_return_factor",
             "model_return_dwell_s",
             "model_drift_rate_tau_s",
+            "model_drift_dwell_s",
+            "model_max_air_dist_c_per_min",
+            "model_air_dist_tau_s",
             "model_store_interval_s",
             "model_store_max_age_days",
             "model_reconfirm_s",
@@ -2149,6 +2159,19 @@ class MpcConfig:
         if self.model_drift_rate_tau_s <= 0:
             raise ConfigError(
                 f"mpc.model_drift_rate_tau_s must be > 0, got {self.model_drift_rate_tau_s}"
+            )
+        if self.model_drift_dwell_s < 0:
+            raise ConfigError(
+                f"mpc.model_drift_dwell_s must be >= 0, got {self.model_drift_dwell_s}"
+            )
+        if self.model_max_air_dist_c_per_min <= 0:
+            raise ConfigError(
+                "mpc.model_max_air_dist_c_per_min must be > 0, got "
+                f"{self.model_max_air_dist_c_per_min}"
+            )
+        if self.model_air_dist_tau_s <= 0:
+            raise ConfigError(
+                f"mpc.model_air_dist_tau_s must be > 0, got {self.model_air_dist_tau_s}"
             )
 
     def _validate_das(self) -> None:
