@@ -21,6 +21,7 @@ from aqua_bridge.hw.aquacomputer_adapter import (
     TIMING_KEYS,
     AquacomputerAdapter,
     AquacomputerTiming,
+    DeviceBinding,
     build_adapter_from_config,
     check_watchdog,
     parse_device_section,
@@ -525,3 +526,73 @@ def test_the_unit_watchdog_fits_the_das_example_with_two_controllers_at_their_de
             dt=app.mpc.dt,
             step_bound_s=app.mpc.budget_alarm_ms / 1000.0,
         )
+
+
+# --- the software-sensor heartbeat (item 84) -----------------------------------------------
+
+
+def test_the_heartbeat_is_off_by_default_and_configured_per_device() -> None:
+    default = _parse(_SECTION).timing
+    assert (default.heartbeat_sensor, default.heartbeat_value_c) == (0, 20.0)
+    assert not default.heartbeat_on
+    on = _parse(dict(_SECTION, heartbeat_sensor=1, heartbeat_value_c=25.5)).timing
+    assert (on.heartbeat_sensor, on.heartbeat_value_c) == (1, 25.5)
+    assert on.heartbeat_on
+    assert _parse(dict(_SECTION, heartbeat_sensor=8)).timing.heartbeat_sensor == 8
+    assert {"heartbeat_sensor", "heartbeat_value_c"} <= set(TIMING_KEYS) <= set(ENTRY_KEYS)
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        (9, "one of the aquaero's software sensors 1..8"),
+        (-1, "heartbeat_sensor must be an integer >= 0"),
+        (1.0, "heartbeat_sensor must be an integer >= 0"),
+        ("1", "heartbeat_sensor must be an integer >= 0"),
+        (True, "heartbeat_sensor must be an integer >= 0"),
+    ],
+)
+def test_bad_heartbeat_sensor_is_config_error(value, match: str) -> None:
+    with pytest.raises(ConfigError, match=re.escape(match)):
+        _parse(dict(_SECTION, heartbeat_sensor=value))
+
+
+@pytest.mark.parametrize("value", [400.0, -400.0, float("nan"), float("inf"), "20", None, True])
+def test_a_heartbeat_value_the_report_cannot_carry_is_config_error(value) -> None:
+    with pytest.raises(ConfigError, match="heartbeat_value_c must be a finite number in"):
+        _parse(dict(_SECTION, heartbeat_sensor=1, heartbeat_value_c=value))
+
+
+def test_the_quadro_has_no_known_software_sensor_report() -> None:
+    """Only the aquaero's output report 0x07 is verified, so a heartbeat on a Quadro
+    entry is refused at startup instead of writing bytes nobody has seen work."""
+    quadro = dict(
+        _SECTION, device="quadro", fans={"radiator": {"pwm": "pwm1"}, "intake": {"pwm": "pwm2"}}
+    )
+    assert _parse(quadro).timing.heartbeat_sensor == 0  # off is fine
+    with pytest.raises(ConfigError, match="not supported on the quadro"):
+        _parse(dict(quadro, heartbeat_sensor=1))
+    with pytest.raises(ConfigError, match="not supported on the quadro"):
+        AquacomputerTiming.for_kind(QUADRO, heartbeat_sensor=1)
+
+
+def test_a_binding_built_in_code_validates_the_heartbeat_against_its_kind() -> None:
+    with pytest.raises(ConfigError, match="software sensors 1..8"):
+        DeviceBinding(
+            kind=AQUAERO,
+            pwm_map={"radiator": 1},
+            timing=dataclasses.replace(AquacomputerTiming.for_kind(AQUAERO), heartbeat_sensor=99),
+        )
+
+
+def test_both_example_configs_show_the_heartbeat_keys() -> None:
+    """Every operator-tunable key is in both example files with its default
+    (PROJECT.md section 3, Track B)."""
+    from aqua_bridge.config import load_config
+
+    root = Path(__file__).resolve().parent.parent
+    legacy = load_config(root / "config.example.yaml").xt6
+    (aquaero,) = load_config(root / "config.example-das.yaml").aquacomputer
+    for entry in (legacy, aquaero):
+        assert entry["heartbeat_sensor"] == 0
+        assert entry["heartbeat_value_c"] == AquacomputerTiming.for_kind(AQUAERO).heartbeat_value_c

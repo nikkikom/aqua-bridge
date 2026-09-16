@@ -135,6 +135,10 @@ xt6:
   duty_mismatch_s: 5.0          # a mismatch lasting longer re-reads and rewrites every channel (> 0)
   write_min_interval_s: 0.0     # a falling duty is written at most this often (>= 0; 0 writes every change; rises go out at once)
   write_deadband: 0             # a falling duty is written only this far below the written one, 1/100 % (0..10000; 0 writes every change)
+  heartbeat_sensor: 0           # software sensor softN (aquaero 1..8) the daemon writes every tick as a
+                                # hardware watchdog; 0 is off (the controller's own timeout, fallback
+                                # temperature and alarm action are set on the device itself)
+  heartbeat_value_c: 20.0       # the temperature the heartbeat writes, degC: below the sensor's alarm
 
 http:
   # HTTPS with basic auth only; there is no plain-HTTP listener (PROJECT.md section 6).

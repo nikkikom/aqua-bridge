@@ -61,6 +61,44 @@ Writing
     operation starts once ``ctrl_budget_s`` of this call is spent. Either way
     ``DeviceUnavailable`` is raised.
 
+The software-sensor heartbeat (hardware watchdog)
+    With ``heartbeat_sensor`` set (0, the default, is off), every ``apply()``
+    first writes ``heartbeat_value_c`` into that aquaero software sensor with
+    the HID output report ``0x07`` -- once per tick, before the duties, sent
+    once per ``apply()`` however often the control write is retried. Only the
+    configured sensor is written; the other seven slots carry ``0x7FFF`` ("no
+    data"), so the device keeps its own values for them. The point is the
+    controller's own watchdog: with that sensor enabled on the device, given a
+    timeout and a high fallback temperature, and an alarm on it that selects a
+    safe profile, a daemon (or Pi) that stops writing lets the sensor fall back
+    and the controller take over -- verified on the owner's aquaero, which goes
+    to 100 % on every output about 30 s after the last heartbeat and back on
+    the next one (PROJECT.md section 8 items 33, 84). The heartbeat is one
+    device operation like any other: it waits ``ctrl_gap_ms`` and is inside
+    ``ctrl_budget_s``, so the worst case per tick stays what
+    ``worst_case_tick_s`` states. It never fails the tick -- a failed write is
+    logged once per state change (error when it starts failing, info when it
+    goes out again), and the cost of it not arriving is exactly the fallback
+    the device is configured for, which is the safe direction. ``heartbeat_on``
+    and ``heartbeat_ok`` expose it.
+
+The active profile
+    Byte ``0x06`` of the aquaero's control report is the profile it runs
+    (``active_profile``, 1-based). A profile switch -- the alarm above, or a
+    press on the controller's own panel -- reloads the **saved** profile, so
+    every duty the daemon wrote live is gone. Every fresh control report is
+    therefore checked: a changed byte logs one line naming both profiles and
+    makes the next write send every configured channel. No control read is
+    added for it; the report is the one the periodic ``ctrl_refresh_s`` read
+    (60 s by default) or an invalidation already fetches. So a switch is
+    noticed within ``duty_mismatch_s`` plus a tick whenever the reloaded
+    profile drives the outputs differently than the daemon last wrote (the duty
+    verification sees the changed output duty and re-reads the report), and
+    otherwise at the latest after ``ctrl_refresh_s``. Waiting is safe: the
+    profile an alarm selects is the safe one (on the owner's controller every
+    output at 100 %), so the delay only postpones the daemon taking the fans
+    back down.
+
 Keeping the cache honest
     Speed, duty, voltage, current and power arrive in every status report, so
     drift of the fans themselves is visible without a control read. What a
@@ -115,10 +153,13 @@ from typing import Any, TypeVar
 from aqua_bridge.hw.aquacomputer import (
     DUTY_MAX,
     KINDS,
+    TEMP_MAX_C,
+    TEMP_MIN_C,
     ChannelSnapshot,
     DeviceKind,
     ReportError,
     StatusReport,
+    active_profile,
     capture_channel,
     channel_holds,
     channel_state,
@@ -128,6 +169,7 @@ from aqua_bridge.hw.aquacomputer import (
     is_status_report,
     patch_duties,
     restore_channel,
+    software_sensor_report,
 )
 from aqua_bridge.hw.hidraw import (
     HIDRAW_QUEUE_FULL,
@@ -186,9 +228,11 @@ KIND_TIMING_DEFAULTS: Mapping[str, Mapping[str, Any]] = MappingProxyType(
 
 @dataclass(frozen=True, kw_only=True)
 class AquacomputerTiming:
-    """Operator-tunable timing of one device. Every default is declared here once,
-    ``ctrl_gap_ms`` per kind in :data:`KIND_TIMING_DEFAULTS`; build one with
-    :meth:`for_kind` (documented in both example configs and PROJECT.md section 3)."""
+    """The operator-tunable keys of one device: the control-report timing and the
+    software-sensor heartbeat. Every default is declared here once, ``ctrl_gap_ms``
+    per kind in :data:`KIND_TIMING_DEFAULTS`; build one with :meth:`for_kind`
+    (documented in both example configs and PROJECT.md section 3). The keys whose
+    bounds depend on the device kind are checked by :meth:`check_kind`."""
 
     #: Wait after a control operation before the next GET or SET, ms (>= 0); per kind.
     ctrl_gap_ms: float
@@ -210,6 +254,16 @@ class AquacomputerTiming:
     #: A falling duty is written only this far below the written one, centi-percent
     #: (0 writes every fall).
     write_deadband: int = 0
+    #: Software sensor (``softN``) that gets the heartbeat every ``apply()``;
+    #: 0 is off. Only the aquaero has a known software-sensor report.
+    heartbeat_sensor: int = 0
+    #: The temperature the heartbeat writes, degC. It must stay below whatever
+    #: alarm the controller has on that sensor (the device's own configuration).
+    heartbeat_value_c: float = 20.0
+
+    @property
+    def heartbeat_on(self) -> bool:
+        return self.heartbeat_sensor > 0
 
     def __post_init__(self) -> None:
         _number("ctrl_gap_ms", self.ctrl_gap_ms, positive=False)
@@ -221,12 +275,33 @@ class AquacomputerTiming:
         _number("duty_mismatch_s", self.duty_mismatch_s, positive=True)
         _number("write_min_interval_s", self.write_min_interval_s, positive=False)
         _integer("write_deadband", self.write_deadband, 0, DUTY_MAX)
+        _integer("heartbeat_sensor", self.heartbeat_sensor, 0, None)
+        _in_range("heartbeat_value_c", self.heartbeat_value_c, TEMP_MIN_C, TEMP_MAX_C)
+
+    def check_kind(self, kind: DeviceKind) -> None:
+        """Validates what only the device kind can bound: which software sensors
+        exist, and whether the kind has a software-sensor report at all."""
+        if not self.heartbeat_on:
+            return
+        count = kind.soft_sensor_count if kind.soft_sensor_report_id is not None else None
+        if count is None:
+            raise ConfigError(
+                f"heartbeat_sensor is not supported on the {kind.name}: its software-sensor "
+                "report is not known (only the aquaero's is); use 0 to switch the heartbeat off"
+            )
+        if not 1 <= self.heartbeat_sensor <= count:
+            raise ConfigError(
+                f"heartbeat_sensor must be 0 (off) or one of the {kind.name}'s software "
+                f"sensors 1..{count}, got {self.heartbeat_sensor}"
+            )
 
     @classmethod
     def for_kind(cls, kind: DeviceKind | str, **overrides: Any) -> AquacomputerTiming:
         """The defaults for ``kind`` with ``overrides`` applied."""
         name = kind if isinstance(kind, str) else kind.name
-        return cls(**{**KIND_TIMING_DEFAULTS[name], **overrides})
+        timing = cls(**{**KIND_TIMING_DEFAULTS[name], **overrides})
+        timing.check_kind(KINDS[name])
+        return timing
 
     @classmethod
     def from_section(
@@ -264,6 +339,13 @@ def _number(name: str, value: Any, *, positive: bool) -> None:
         return
     bound = "> 0" if positive else ">= 0"
     raise ConfigError(f"{name} must be a finite number {bound}, got {value!r}")
+
+
+def _in_range(name: str, value: Any, minimum: float, maximum: float) -> None:
+    ok = isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+    if ok and minimum <= value <= maximum:
+        return
+    raise ConfigError(f"{name} must be a finite number in {minimum:g}..{maximum:g}, got {value!r}")
 
 
 def _integer(name: str, value: Any, minimum: int, maximum: int | None) -> None:
@@ -332,6 +414,7 @@ class DeviceBinding:
     def __post_init__(self) -> None:
         if self.timing is None:
             object.__setattr__(self, "timing", AquacomputerTiming.for_kind(self.kind))
+        self.timing.check_kind(self.kind)
         kind = self.kind
         for what, mapping, count in (
             ("pwm", self.pwm_map, kind.pwm_count),
@@ -448,6 +531,10 @@ class AquacomputerAdapter:
         #: The absent inputs read() found last ("pwm5 (qd1)", ...), logged when it changes.
         self._absent_inputs: tuple[str, ...] = ()
         self._absent_channels: tuple[str, ...] = ()
+        #: The profile the last control report said the controller runs (1-based).
+        self._profile: int | None = None
+        #: Whether the last heartbeat write succeeded; ``None`` before the first one.
+        self._heartbeat_ok: bool | None = None
         #: Why the last opened node was rejected for its serial; apply() refuses to
         #: write until a status report carries the configured serial.
         self._serial_rejected: str | None = None
@@ -477,8 +564,29 @@ class AquacomputerAdapter:
     @property
     def absent_channels(self) -> tuple[str, ...]:
         """Channels whose aquabus output or bound aquabus tachometer had no device
-        behind it (rpm ``0xFFFF``) in the status report the last ``read()`` used."""
+        behind it (rpm ``0xFFFF``) in the status report the last ``read()`` used.
+        Their ``rpm`` / ``pwm`` are ``None`` in the observation; every other channel
+        and every temperature still comes through (PROJECT.md section 8 item 90)."""
         return self._absent_channels
+
+    @property
+    def active_profile(self) -> int | None:
+        """The profile the controller ran when its control report was last read
+        (1-based; ``None`` on a kind without a profile byte, or before the first
+        read). It is only as fresh as the cache: ``ctrl_refresh_s`` and the duty
+        verification decide how soon a switch is noticed (module docstring)."""
+        return self._profile
+
+    @property
+    def heartbeat_on(self) -> bool:
+        """The software-sensor heartbeat is configured (``heartbeat_sensor``)."""
+        return self.timing.heartbeat_on
+
+    @property
+    def heartbeat_ok(self) -> bool | None:
+        """Whether the last heartbeat write succeeded; ``None`` before the first
+        one (and while the heartbeat is off)."""
+        return self._heartbeat_ok
 
     def close(self) -> None:
         """Closes the device node (the next call opens it again)."""
@@ -741,9 +849,33 @@ class AquacomputerAdapter:
             self._originals = {k: capture_channel(self.kind, data, k) for k in self._names}
         return data
 
+    def _check_profile(self, data: bytes) -> None:
+        """Byte ``0x06`` of a fresh aquaero control report is the profile it runs.
+
+        A profile switch reloads the *saved* profile, so every duty written live is
+        gone; the next write therefore sends every configured channel. One line per
+        change (PROJECT.md section 8 item 84).
+        """
+        profile = active_profile(self.kind, data)
+        if profile is None:
+            return
+        previous, self._profile = self._profile, profile
+        if previous is None or previous == profile:
+            return
+        _LOG.warning(
+            "%s: the active profile changed from profile %d to profile %d; the switch "
+            "reloads the saved profile, so every duty written live is gone: writing every "
+            "configured channel again (PROJECT.md section 8 item 84)",
+            self.binding.label,
+            previous,
+            profile,
+        )
+        self._rewrite = True
+
     def _adopt(self, data: bytes) -> list[int]:
         """Takes a fresh control report as the cache. Returns the channels whose held
         duty is no longer the one this adapter knew (external changes)."""
+        self._check_profile(data)
         now = self._clock()
         drifted: list[int] = []
         for k in sorted(self._names):
@@ -823,6 +955,54 @@ class AquacomputerAdapter:
                 raise
         raise AssertionError("unreachable")  # pragma: no cover
 
+    # -- software-sensor heartbeat ------------------------------------------
+
+    def _send_heartbeat(self, transport: HidTransport, deadline: float) -> None:
+        """One heartbeat into the configured software sensor (module docstring).
+
+        Never raises: a heartbeat that does not go out costs the controller's own
+        timeout, and the profile its alarm then selects is the safe one, so it must
+        not turn a tick into a failed write. It is sequenced like every other device
+        operation (``ctrl_gap_ms`` before it, ``ctrl_budget_s`` over it), which keeps
+        the worst case per tick exactly the one ``worst_case_tick_s`` states.
+        """
+        number = self.timing.heartbeat_sensor
+        try:
+            report = software_sensor_report(self.kind, {number: self.timing.heartbeat_value_c})
+            self._control(
+                deadline,
+                f"software-sensor heartbeat to soft{number}",
+                lambda: transport.write_report(report),
+            )
+        except Exception as exc:  # a failed heartbeat never fails the tick
+            self._note_heartbeat(False, exc)
+        else:
+            self._note_heartbeat(True, None)
+
+    def _note_heartbeat(self, ok: bool, error: BaseException | None) -> None:
+        """Logs a heartbeat state change, once (not once per tick)."""
+        if ok == self._heartbeat_ok:
+            return
+        first, self._heartbeat_ok = self._heartbeat_ok is None, ok
+        number = self.timing.heartbeat_sensor
+        if ok:
+            _LOG.info(
+                "%s: writing the software-sensor heartbeat of %.2f degC to soft%d %s",
+                self.binding.label,
+                self.timing.heartbeat_value_c,
+                number,
+                "every write" if first else "again",
+            )
+            return
+        _LOG.error(
+            "%s: the software-sensor heartbeat to soft%d failed: %s; the controller falls "
+            "back to its own configured temperature for that sensor after its timeout, and "
+            "whatever alarm it has on it takes over (PROJECT.md section 8 item 84)",
+            self.binding.label,
+            number,
+            error,
+        )
+
     def _refresh_due(self) -> bool:
         period = self.timing.ctrl_refresh_s
         return (
@@ -863,15 +1043,23 @@ class AquacomputerAdapter:
         recorded a deferred fall as applied, and a fault must never slow a fan.
 
         An aquabus output with no device behind it is written with the others and
-        is no error here: ``read()`` raises for it, which runs the loop's
-        fallback, and ``absent_channels`` lists it (module docstring, Reading).
+        is no error here: ``read()`` reports it as ``None`` and lists it in
+        ``absent_channels`` (module docstring, Reading).
+
+        With ``heartbeat_sensor`` configured, the software-sensor heartbeat goes
+        out first, once per call and whatever the duties do (module docstring).
         """
         duties = self._duties(cmd)
         never_lower = getattr(cmd, "mode", None) in _NEVER_LOWER_MODES
-        self._with_retries(
-            "control report write",
-            lambda transport, deadline: self._apply_once(transport, duties, deadline, never_lower),
-        )
+        pending_heartbeat = [self.timing.heartbeat_on]
+
+        def once(transport: HidTransport, deadline: float) -> None:
+            if pending_heartbeat[0]:  # once per apply(), not once per retry
+                pending_heartbeat[0] = False
+                self._send_heartbeat(transport, deadline)
+            self._apply_once(transport, duties, deadline, never_lower)
+
+        self._with_retries("control report write", once)
 
     def _warn_about_modes(self, ctrl: bytes) -> None:
         """One warning per open for every commanded output of the aquaero's own not in
