@@ -194,10 +194,10 @@ class _FakeSmart:
         return self._data
 
 
-def test_read_has_no_inputs_key_when_smart_is_not_configured() -> None:
+def test_read_has_no_smart_key_when_smart_is_not_configured() -> None:
     a, _q, _aquaero, _quadro, clock = _fleet()
     composite = CompositeSource([a], clock=clock)
-    assert composite.read().inputs == {}
+    assert "smart" not in composite.read().inputs
     assert composite.smart is None
 
 
@@ -205,15 +205,15 @@ def test_read_puts_smart_snapshot_into_inputs() -> None:
     a, _q, _aquaero, _quadro, clock = _fleet()
     smart = _FakeSmart({"WD-ABC123": {"temp_c": 34.0, "age_s": 5.0, "model": "WDC WD40"}})
     composite = CompositeSource([a], smart=smart, clock=clock)
-    assert composite.read().inputs == {
-        "smart": {"WD-ABC123": {"temp_c": 34.0, "age_s": 5.0, "model": "WDC WD40"}}
+    assert composite.read().inputs["smart"] == {
+        "WD-ABC123": {"temp_c": 34.0, "age_s": 5.0, "model": "WDC WD40"}
     }
 
 
 def test_read_reflects_an_empty_smart_snapshot() -> None:
     a, _q, _aquaero, _quadro, clock = _fleet()
     composite = CompositeSource([a], smart=_FakeSmart({}), clock=clock)
-    assert composite.read().inputs == {"smart": {}}
+    assert composite.read().inputs["smart"] == {}
 
 
 # --- build_composite_from_config: binding checks -----------------------------------------
@@ -348,7 +348,7 @@ def test_build_composite_from_config_passes_smart_clock_sleep_and_opener_through
     composite, _release = _build(xt6_section=_XT6_SECTION, smart=smart, clock=clock, opener=bus)
     assert composite.smart is smart
     obs = composite.read()
-    assert obs.inputs == {"smart": {"S1": {"temp_c": 30.0, "age_s": 1.0, "model": None}}}
+    assert obs.inputs["smart"] == {"S1": {"temp_c": 30.0, "age_s": 1.0, "model": None}}
     assert obs.ts == 7.0 and bus.opened == [device.node]
 
 
@@ -663,3 +663,130 @@ def test_a_daemon_started_with_an_empty_aquabus_slot_becomes_ready(fast_cfg) -> 
     assert first.read_error is None and first.applied
     assert first.obs.pwm == {"radiator": pytest.approx(1.0), "intake": None}
     assert notifier.ready_n == 1
+
+
+# --- device health and fan readings (items 79, 83) --------------------------------------
+
+
+def test_read_merges_the_fan_readings_of_every_controller() -> None:
+    """The per-output electrical readings ride obs.inputs["fans"], not temps/rpm/pwm,
+    so nothing the solver sees changes (PROJECT.md section 8 item 79)."""
+    a, q, _aquaero, _quadro, clock = _fleet(FakeClock(50.0))
+    obs = CompositeSource([a, q], clock=clock).read()
+
+    assert set(obs.inputs["fans"]) == {"radiator", "exhaust"}
+    radiator = obs.inputs["fans"]["radiator"]
+    assert radiator["device"] == "aquaero" and radiator["output"] == "pwm2"
+    assert radiator["rpm"] == 120.0 and radiator["duty"] == pytest.approx(0.1412)
+    assert radiator["voltage_v"] == pytest.approx(12.09)
+    # the aquaero reports 0 mA / 0 W for its own outputs in PWM mode: not a fault
+    assert radiator["current_ma"] == 0.0 and radiator["power_reported"] is False
+    assert obs.inputs["fans"]["exhaust"]["power_reported"] is True
+    # and none of it reached the observation the gate and the solver read
+    assert set(obs.temps) == {"air_z0", "air_z1"} and set(obs.rpm) == {"radiator"}
+
+
+def test_an_aquabus_output_reports_its_real_current_and_power() -> None:
+    clock = FakeClock()
+    device = aquabus_aquaero(clock)
+    adapter = AquacomputerAdapter(
+        DeviceBinding(kind=AQUAERO, pwm_map={"qd3": 7}, fan_map={"qd3": 7}),
+        clock=clock,
+        sleep=FakeSleep(clock),
+        opener=FakeBus(device),
+    )
+    reading = adapter.read().inputs["fans"]["qd3"]
+    assert reading["aquabus"] is True and reading["power_reported"] is True
+    assert (reading["rpm"], reading["current_ma"]) == (1105.0, 27.0)
+    assert reading["power_w"] == pytest.approx(0.32)
+
+
+def test_an_absent_aquabus_slot_contributes_no_fan_reading() -> None:
+    """A slot with rpm 0xFFFF reads 0 V and 0 W: the whole block is meaningless, so it
+    is left out rather than published as a dead fan on a dead rail."""
+    clock = FakeClock()
+    adapter = AquacomputerAdapter(
+        DeviceBinding(kind=AQUAERO, pwm_map={"qd3": 7, "radiator": 2}),
+        clock=clock,
+        sleep=FakeSleep(clock),
+        opener=FakeBus(FakeController(AQUAERO, clock)),  # nothing on aquabus
+    )
+    with pytest.raises(DeviceUnavailable, match="no device behind pwm7"):
+        adapter.read()
+    assert set(adapter.fan_readings()) == {"radiator"}
+
+
+def test_device_health_lists_the_absent_channels_after_a_failed_read() -> None:
+    """The tick that most needs the diagnosis is the one whose read() raised, so the
+    device health does not ride the observation (PROJECT.md section 8 item 83)."""
+    clock = FakeClock()
+    adapter = AquacomputerAdapter(
+        DeviceBinding(kind=AQUAERO, pwm_map={"qd3": 7}, serial="12345-54321"),
+        clock=clock,
+        sleep=FakeSleep(clock),
+        opener=FakeBus(FakeController(AQUAERO, clock)),
+    )
+    with pytest.raises(DeviceUnavailable):
+        adapter.read()
+    health = adapter.device_health()
+    assert health["absent_channels"] == ["qd3"] and health["stuck_channels"] == []
+    assert health["device"] == "aquaero" and health["open"] is True
+    assert health["status_age_s"] == 0.0 and health["firmware"] == 2104
+    assert health["problems"] == ["aquaero 12345-54321: no device on aquabus behind qd3"]
+
+
+def test_device_health_reports_the_flow_sensors_and_no_active_profile_yet() -> None:
+    """Flow is published here, never in the observation (owner decision 2026-09-16,
+    PROJECT.md section 8.1, item 91); 0x7FFF reads as null."""
+    a, _q, _aquaero, _quadro, _clock = _fleet()
+    a.read()
+    health = a.device_health()
+    assert health["flows"] == {"flow1": 0, "flow2": 0, "flow3": None}
+    assert "active_profile" not in health  # another change adds it
+
+
+def test_device_health_reports_an_active_profile_once_one_exists() -> None:
+    """Read defensively: this change does not depend on the one that publishes it."""
+    a, _q, _aquaero, _quadro, _clock = _fleet()
+    a.read()
+    a.active_profile = 2
+    assert a.device_health()["active_profile"] == 2
+
+
+def test_device_health_lists_an_own_output_not_in_pwm_mode() -> None:
+    """The aquaero's own outputs 1-4 have a mode word; an aquabus output's is not
+    interpreted, so only the former can be listed (items 83, 85)."""
+    clock = FakeClock()
+    device = FakeController(AQUAERO, clock)
+    mode = 0x20C + 20 * 1 + 0x0E  # controller block 2 (output 2)
+    device.ctrl[mode : mode + 2] = (0x0001).to_bytes(2, "big")  # low byte 1 = DC voltage
+    adapter = AquacomputerAdapter(
+        DeviceBinding(kind=AQUAERO, pwm_map={"radiator": 2}),
+        clock=clock,
+        sleep=FakeSleep(clock),
+        opener=FakeBus(device),
+    )
+    adapter.apply(MpcCommand(pwm={"radiator": 0.4}, mode=Mode.AUTO))
+    health = adapter.device_health()
+    assert health["not_pwm_channels"] == ["radiator"]
+    assert health["problems"] == ["aquaero: radiator are not in PWM mode"]
+
+
+def test_composite_device_health_merges_every_controller_and_its_problems() -> None:
+    a, q, _aquaero, _quadro, clock = _fleet()
+    composite = CompositeSource([a, q], clock=clock)
+    composite.read()
+    health = composite.device_health()
+    assert [d["device"] for d in health["devices"]] == ["aquaero", "quadro"]
+    assert health["ok"] is True and health["problems"] == []
+
+
+def test_composite_device_health_survives_a_controller_that_raises() -> None:
+    a, q, _aquaero, _quadro, clock = _fleet()
+
+    def boom() -> dict[str, object]:
+        raise RuntimeError("no")
+
+    a.device_health = boom  # type: ignore[method-assign]
+    health = CompositeSource([a, q], clock=clock).device_health()
+    assert [d["device"] for d in health["devices"]] == ["quadro"]

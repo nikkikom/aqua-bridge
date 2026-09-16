@@ -251,6 +251,11 @@ class DeviceKind:
     #: Offset of the active-profile byte in the control report (``None`` where
     #: the kind has no profiles or the byte is not known).
     profile_offset: int | None = None
+    #: The status report carries real current and power for the kind's *own* outputs.
+    #: False on the aquaero: its own outputs 1-4 report 0 mA and 0 W in PWM mode
+    #: (verified on the Pi, PROJECT.md section 2), while its aquabus blocks 5-8 carry
+    #: what the device on the bus measures. A hardware fact, not a tunable.
+    own_outputs_report_power: bool = True
 
     @property
     def temp_names(self) -> tuple[str, ...]:
@@ -278,6 +283,17 @@ class DeviceKind:
     def aquabus_outputs(self) -> tuple[int, ...]:
         """Output numbers (1-based) that belong to a device on the aquaero's aquabus."""
         return tuple(k + 1 for k, channel in enumerate(self.ctrl_channels) if channel.aquabus)
+
+    def reports_power(self, number: int) -> bool:
+        """Output ``number`` (1-based) reports a meaningful current and power.
+
+        Absence of current is only evidence of a fault where the answer is True:
+        an aquaero drives its own outputs 1-4 as PWM and reports 0 mA / 0 W for
+        them however fast the fan turns (PROJECT.md section 8 item 79).
+        """
+        if not 1 <= number <= self.pwm_count:
+            raise IndexError(f"{self.name} has pwm1..pwm{self.pwm_count}, not pwm{number}")
+        return self.own_outputs_report_power or self.ctrl_channels[number - 1].aquabus
 
     def describe_temps(self) -> str:
         """``temp1..temp8, bus1..bus8, ...``, for messages."""
@@ -336,6 +352,7 @@ AQUAERO = DeviceKind(
     soft_sensor_report_id=SOFT_SENSOR_REPORT_ID,
     soft_sensor_count=8,
     profile_offset=0x06,
+    own_outputs_report_power=False,
 )
 
 QUADRO = DeviceKind(
