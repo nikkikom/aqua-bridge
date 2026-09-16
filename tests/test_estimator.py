@@ -335,13 +335,44 @@ def test_sigma_grows_while_a_bay_has_no_trusted_sensor_and_shrinks_back():
 
 
 def test_a_redundant_member_keeps_the_bay_observed():
-    cfg = lcfg()
+    cfg = lcfg(occupancy_hold_s=0.0)  # no debounce: the old rule
     mem = run_ticks(cfg, 30)[-1].memory
     ups = run_ticks(cfg, 30, mem=mem, t0=30.0, prox_a1=None)
     assert all(up.bays["a1"]["occupancy"] == "occupied" for up in ups)
     ups = run_ticks(cfg, 5, mem=ups[-1].memory, t0=60.0, prox_a1=None, prox_a1b=None)
     assert all(up.bays["a1"]["occupancy"] == "unknown" for up in ups)  # observability lost
     assert "a1" in ups[-1].estimates  # still constrained
+
+
+def test_occupancy_debounce_rides_out_a_short_proximal_dropout(as_empty):
+    """Item 19: an empty bay stays empty through a dropout shorter than the hold."""
+    cfg, mem = as_empty(occupancy_hold_s=6.0)  # 6 ticks at dt = 1
+    blind = run_ticks(cfg, 5, mem=mem, t0=100.0, prox_b1=None)
+    assert [up.bays["b1"]["occupancy"] for up in blind] == ["empty"] * 5
+    assert [up.bays["b1"]["pending_unknown_s"] for up in blind] == [1.0, 2.0, 3.0, 4.0, 5.0]
+    assert "b1" not in blind[-1].estimates  # still unconstrained: no 25 degC^2 margin
+    # the sensor comes back: the count restarts, a second dropout gets the full hold again
+    back = run_ticks(cfg, 1, mem=blind[-1].memory, t0=105.0, prox_b1=SP + 0.1)
+    assert back[-1].bays["b1"]["pending_unknown_s"] == 0.0
+    again = run_ticks(cfg, 5, mem=back[-1].memory, t0=106.0, prox_b1=None)
+    assert [up.bays["b1"]["occupancy"] for up in again] == ["empty"] * 5
+
+
+def test_occupancy_debounce_gives_up_after_the_hold(as_empty):
+    """A dropout that lasts is still a loss of observability."""
+    cfg, mem = as_empty(occupancy_hold_s=6.0)
+    blind = run_ticks(cfg, 8, mem=mem, t0=100.0, prox_b1=None)
+    seq = [up.bays["b1"]["occupancy"] for up in blind]
+    assert seq == ["empty"] * 5 + ["unknown"] * 3
+    entry = blind[5].estimates["b1"]  # the insert reset, one hold later than before
+    assert entry["sigma"] > 4.0
+    assert blind[5].bays["b1"]["pending_unknown_s"] == 0.0
+
+
+def test_occupancy_debounce_zero_is_the_old_rule(as_empty):
+    cfg, mem = as_empty(occupancy_hold_s=0.0)
+    blind = run_ticks(cfg, 3, mem=mem, t0=100.0, prox_b1=None)
+    assert [up.bays["b1"]["occupancy"] for up in blind] == ["unknown"] * 3
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +592,19 @@ def test_a_redundant_air_sensor_keeps_the_zone_from_going_blind():
 # ---------------------------------------------------------------------------
 # occupancy
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def as_empty():
+    """``(cfg, memory)`` with bay ``b1`` settled ``empty`` (its sensor reads the air)."""
+
+    def build(**estimator: Any):
+        cfg = lcfg(empty_confirm_s=10.0, **estimator)
+        ups = run_ticks(cfg, 100, prox_b1=SP + 0.1)
+        assert ups[-1].bays["b1"]["occupancy"] == "empty"
+        return cfg, ups[-1].memory
+
+    return build
 
 
 def test_occupancy_unknown_to_occupied_at_once_on_a_warm_sensor():

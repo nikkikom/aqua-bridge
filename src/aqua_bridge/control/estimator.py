@@ -123,7 +123,8 @@ the bay stays observed.
 Every number of this module that an operator could tune is a key of the config's
 ``estimator`` section with one documented default there (plan section 8 item 71):
 the process noise ``q_*``, the initial covariance ``p0_*``, the fast-swap
-``jump_min_c`` and ``jump_sigmas``, the occupancy thresholds,
+``jump_min_c`` and ``jump_sigmas``, the occupancy thresholds and
+``occupancy_hold_s``,
 ``reset_drive_var``, ``sigma_uncalibrated_c`` and the SMART and association keys.
 The priors of the physical model (``C_a``, ``leak``, ``kappa``, ``E``, ``g0``, ``k``)
 stay module constants: they are the thermal model's, not the operator's.
@@ -159,9 +160,13 @@ filter attributes to the drive beyond what the sensor offset alone explains:
 an empty bay has no case-to-drive offset, so with the prior ``b`` its plain
 ``q C_d`` would never fall below 1 W):
 
-* ``unknown`` at start (and whenever the zone has no estimate yet), and after a
-  tick without any trusted proximal member of the bay (loss of observability;
-  a redundant member standing in keeps the state);
+* ``unknown`` at start (and whenever the zone has no estimate yet), and after
+  ``occupancy_hold_s`` seconds without any trusted proximal member of the bay
+  (loss of observability; a redundant member standing in keeps the state). A
+  shorter dropout -- one tick of CRC failures, a clock glitch -- is not evidence
+  of anything: the bay keeps its state and its pending counts (item 19). The
+  count runs on every blind tick and restarts as soon as a member reports again,
+  so ``occupancy_hold_s: 0`` is exactly the undebounced rule;
 * ``unknown -> occupied`` at once when ``dT > occupied_dT_c`` or a SMART sample
   of the bay's associated serial arrives;
 * ``occupied | unknown -> empty`` after ``empty_confirm_s`` seconds with
@@ -181,8 +186,10 @@ an empty bay has no case-to-drive offset, so with the prior ``b`` its plain
 a zone over a removed drive; the zone trust groups stay those of the declared config.
 
 The per-bay output shows a change in progress: ``pending_empty_s`` (seconds of
-evidence toward ``empty`` counted so far) and ``pending_occupied_ticks`` (ticks of
-evidence toward ``occupied`` on an empty bay); both are 0 when nothing is pending.
+evidence toward ``empty`` counted so far), ``pending_occupied_ticks`` (ticks of
+evidence toward ``occupied`` on an empty bay) and ``pending_unknown_s`` (seconds
+of the debounce toward ``unknown`` a blind bay has counted); all three are 0 when
+nothing is pending.
 The identification experiments (:mod:`aqua_bridge.control.ident`) refuse to start
 while either is non-zero in a zone they serve.
 
@@ -234,7 +241,7 @@ Memory (plain JSON)::
 
     {"v": 1, "fp": <structure fingerprint>, "ts": last ts,
      "zones": {zone: {"x": [...], "P": [[...]], "t_in": float | None, "blind": s}},
-     "bays": {bay: {"occ", "low", "rise", "since", "assoc", "map", "init",
+     "bays": {bay: {"occ", "low", "rise", "blind", "since", "assoc", "map", "init",
                     "disturb", "spent", "clean"}},
      "cal": {bay: {serial: {"th", "P", "n", "fresh", "rms2", "ts", "used"
                             [, "inflate", "confirm"]}}},
@@ -603,6 +610,7 @@ def _fresh_bay() -> dict[str, Any]:
         "occ": UNKNOWN,
         "low": 0.0,
         "rise": 0,
+        "blind": 0.0,
         "since": None,
         "assoc": None,
         "map": None,
@@ -674,10 +682,14 @@ def _parse(memory: object, st: _Structure) -> dict[str, Any]:
         spent, clean = _num(raw.get("spent", 0.0)), _num(raw.get("clean", 0.0))
         if spent < 0 or clean < 0:
             raise ValueError("settling budget")
+        blind = _num(raw.get("blind", 0.0))
+        if blind < 0:
+            raise ValueError("blind")
         out["bays"][b] = {
             "occ": occ,
             "low": _num(raw.get("low", 0.0)),
             "rise": rise,
+            "blind": blind,
             "since": _opt_num(raw.get("since")),
             "assoc": assoc,
             "map": mapping,
@@ -1243,12 +1255,23 @@ def update(
         after = before
         if declared_occ is True:
             after = OCCUPIED
+            bm["blind"] = 0.0
         elif declared_occ is False:
             after = EMPTY
-        elif not zone_ready or (not sensor_ok and not smart_arrived.get(b)):
+            bm["blind"] = 0.0
+        elif not zone_ready:  # no filter state at all: nothing is known about the bay
             after = UNKNOWN
-            bm["low"], bm["rise"] = 0.0, 0
+            bm["low"], bm["rise"], bm["blind"] = 0.0, 0, 0.0
+        elif not sensor_ok and not smart_arrived.get(b):
+            # Item 19: a dropout is not evidence. The bay keeps its state (and its
+            # pending counts, which this tick neither confirms nor contradicts) until
+            # the blindness has lasted occupancy_hold_s.
+            bm["blind"] += h_occ
+            if bm["blind"] >= spec.occupancy_hold_s:
+                after = UNKNOWN
+                bm["low"], bm["rise"] = 0.0, 0
         else:
+            bm["blind"] = 0.0
             x, _ = arrays[bay.zone]
             n = len(st.zones[bay.zone].bays)
             i_d, i_s, i_q = 2 + bay.index, 2 + n + bay.index, 2 + 2 * n + bay.index
@@ -1301,7 +1324,7 @@ def update(
                 bm["assoc"] = None
                 if b in assoc and assoc[b][1] == "correlation":
                     del assoc[b]
-            bm["low"], bm["rise"] = 0.0, 0
+            bm["low"], bm["rise"], bm["blind"] = 0.0, 0, 0.0
             bm["occ"] = after
         if jumped.get(b) and b in assoc and assoc[b][1] == "correlation":
             bm["assoc"] = None
@@ -1422,6 +1445,7 @@ def update(
             "since_ts": bm["since"],
             "pending_empty_s": float(bm["low"]),
             "pending_occupied_ticks": int(bm["rise"]),
+            "pending_unknown_s": float(bm["blind"]),
             "observed": observed.get(b, False),
             "seeded": bool(bm["init"]),
             "settling": _settling(bm, float(ts), spec.bay_settle_s),

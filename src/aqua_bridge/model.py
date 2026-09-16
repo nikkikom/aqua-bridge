@@ -1275,6 +1275,7 @@ ESTIMATOR_DEFAULTS: dict[str, float] = {
     "reset_drive_var": 25.0,
     "jump_min_c": 0.5,
     "jump_sigmas": 6.0,
+    "occupancy_hold_s": 30.0,
 }
 
 #: ``estimator`` keys that are a variance of a filter state (all ``> 0``).
@@ -1331,6 +1332,9 @@ class EstimatorSpec:
       ``T_s - T_a`` (``occupied_dT_c > empty_dT_c > 0``)
     * ``empty_confirm_s``          -- low evidence must last this long before a bay is
       empty (``>= 2 dt``)
+    * ``occupancy_hold_s``         -- occupancy debounce: a bay keeps its state this long
+      while no trusted proximal member of it reports, before it falls back to ``unknown``
+      (``>= 0``; 0 is the undebounced rule)
     * ``bay_settle_s``             -- settling time after an occupancy change (``>= 0``)
     * ``bay_settle_max_s``         -- the most settling exemption one bay may draw from
       the ``sigma`` trust rule before it has to run this long without one, seconds
@@ -1374,6 +1378,7 @@ class EstimatorSpec:
     reset_drive_var: float = ESTIMATOR_DEFAULTS["reset_drive_var"]
     jump_min_c: float = ESTIMATOR_DEFAULTS["jump_min_c"]
     jump_sigmas: float = ESTIMATOR_DEFAULTS["jump_sigmas"]
+    occupancy_hold_s: float = ESTIMATOR_DEFAULTS["occupancy_hold_s"]
 
     @classmethod
     def coerce(cls, data: object) -> EstimatorSpec:
@@ -1408,7 +1413,12 @@ class EstimatorSpec:
         for key in _ESTIMATOR_VARIANCE_KEYS:
             if getattr(self, key) <= 0:
                 raise ConfigError(f"{where}.{key} must be > 0, got {getattr(self, key)}")
-        for key in ("sensor_noise_c", "proximal_offset_c", "air_blind_fault_s"):
+        for key in (
+            "sensor_noise_c",
+            "proximal_offset_c",
+            "air_blind_fault_s",
+            "occupancy_hold_s",
+        ):
             if getattr(self, key) < 0:
                 raise ConfigError(f"{where}.{key} must be >= 0, got {getattr(self, key)}")
         if self.smart_max_age_s < dt:
