@@ -1865,7 +1865,7 @@ class DasMpcSolver:
         hard = np.tile(hard1, horizon + 1)
 
         # noise surrogate and moves over every variable
-        sur = noise_model.surrogate(cfg, prev)
+        sur = noise_model.surrogate(cfg, prev, req.fan_curves)
         assert cfg.noise is not None
         coef = cfg.noise.weight_noise * np.repeat(np.array(blocks, dtype=float), m)
         g_n = np.tile(np.array([sur.g[ch] for ch in channels]), n_b)
