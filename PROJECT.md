@@ -728,6 +728,7 @@ long `dt`):
 | `ident_enabled` | `false` | an explicit start may run an experiment (needs `topology`) |
 | `ident_amplitude` | 0.15 | `(0, 0.3]` |
 | `ident_levels` | `above` | `above` \| `symmetric` |
+| `ident_replan` | `true` | the levels follow the live solver demand every tick (§3, §8.4 item 52); `false` freezes them at the base of the start (the Zero W behaviour) |
 | `ident_hold_s` | `[60, 120, 180]` | non-empty, positive; each ≥ `5 * dt` when enabled |
 | `ident_max_duration_s` | 1800 | `(0, 7200]` |
 | `ident_settle_s` | 600 | ≥ 0; ≥ `confirm_s` when enabled |
@@ -2050,13 +2051,39 @@ by the supervisor). Explicit start only (`POST /api/ident`, MQTT
 `cmd/ident`), with `ident_enabled: true`. The unit of excitation is a
 **fan group** (`fans.<ch>.group`; a channel without one is its own
 group): the whole group first, then each of its channels alone while its
-siblings hold their frozen base. The sequence is a two-level random
+siblings hold the group's base. The sequence is a two-level random
 telegraph: levels `u_base` and `u_base + ident_amplitude` (`above`,
-never less cooling than the solver's level at start) or `u_base ±
+never less cooling than the solver asks for) or `u_base ±
 ident_amplitude` (`symmetric`), holds drawn from `ident_hold_s` by a
 seeded LFSR, `ident_max_duration_s` split over the phases. The levels are
 ordinary supervisor overrides, so `compose` rate-limits and clamps them
-and fallback beats them. **Start preconditions**, each refused with a
+and fallback beats them.
+
+**A rise in the solver's demand wins over the experiment's plan, always**
+(`ident_replan: true`, item 52). Every tick each channel's base is raised
+to the solver's honest demand for it (`diagnostics["target_pwm"]`, before
+the rate limit and the clamp) and its two levels are re-derived around the
+new base and clamped into `[pwm_min, pwm_max]`; the base never falls, so
+the experiment never reduces cooling below a level it has established, and
+a channel whose demand is missing this tick keeps its base. The schedule
+(phases and switch times) still comes from the seed once, at the start.
+Because a re-planned level can only reach the fans on the next tick,
+`compose` also floors an experiment channel's own override with the
+solver's command for the tick (`max(override, mpc_cmd.pwm[ch] - dip)`,
+`dip` 0 under `above` and `ident_amplitude` under `symmetric`), so no tick
+of an experiment puts less on a fan than the controller would have. The
+aborts of a tick are decided on that tick's estimates, with the same
+thresholds in the same order, *before* the next tick's levels are
+re-planned: no re-planned level can make an abort later or weaker, and a
+re-planned level is never below the frozen plan's. What it costs the
+identification: the levels move with the demand, so the step sizes change
+(a rise of `d` inside a hold makes the next switch `A ∓ d` instead of `A`,
+and a level clamped at `pwm_max` squeezes the step — under `above` with the
+demand at `pwm_max` the excitation stops until the demand falls back). The
+base drift is slow next to the 60–180 s holds, so the regressors keep the
+content the fit lives on (§8.4 item 52 has the sim numbers and the measured
+per-tick cost). `ident_replan: false` keeps the levels frozen at the base
+of the start, which is what ran on the Zero W. **Start preconditions**, each refused with a
 named reason: control mode `auto` without human overrides
 (`control_mode`), last command `auto` (`mode:<m>`), no saturation, band
 or stall on the target (`saturated:`, `band:`, `no_command:`,
@@ -3669,7 +3696,7 @@ tests carry the `nightly` marker.
 | `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× (named constant) the legacy MPC p99, the 75th percentile of several interleaved, warm-up-discarded repeats (§8 item 6); `bench_step.py` runs both DAS solvers; absolute p99 ≤ `mpc.budget_ms` only on `armv6l`; the Zero W fallback of §8 item 73 (`budget_ms` 1000 with `budget_alarm_ms` 1250 loads, `budget_ms` 1000 alone is rejected, `mpc_every_ticks: 3` solves a third of the ticks and a solve tick is the expensive one) | PR / Pi |
 | `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise; a `tools/fit_model.py` report in the store's place loads as a model, ages like a store file, drops a model of another structure and is refused outright when its `store_fingerprint` is another config's or missing (item 15); the settle timers round-trip through the file as seconds already settled minus the daemon's outage, drop on a long outage, a stale file or an unknown age, a malformed section is dropped with a warning, and the persister asks the supervisor for them before a save (item 20) | PR |
 | `tests/test_fancurve.py` | the online PWM → RPM fit (item 14): a swept fan is identified per fan model, one duty or a ramping command is never enough, a noisy tachometer is refused by the residual, the bins stay bounded and follow a fan that changes, a malformed memory or a changed channel → fan-model map starts over, `curve_pair` falls back to the config for anything unusable, `step` publishes the fit into the store's `fan_curves` and reports it, the curve round-trips through `model.json`, and `model_use_rpm` keeps the configured `rpm_max` as its reference so a worn fan still reads as less air | PR |
-| `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes a run but the settle timers come back from the store and a start between `plan_tick` and `record_tick` keeps its tick (§8 item 20); `k·σ` counted once and the absolute abort from `ident_abort_below_limit_c` (items 53, 54); a lost sensor group blocks a start and aborts a run (item 72); legacy refuses | PR |
+| `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); the re-planned levels of item 52 (the anchor follows a rise and only a rise, a held sibling with it, the band, `symmetric` dipping at most the amplitude below the live demand, the same aborts on the same tick with and without re-planning, a re-planned level never below the frozen one, and through the loop a warming zone followed instead of held back — against `ident_replan: false`, which still holds it back); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes a run but the settle timers come back from the store and a start between `plan_tick` and `record_tick` keeps its tick (§8 item 20); `k·σ` counted once and the absolute abort from `ident_abort_below_limit_c` (items 53, 54); a lost sensor group blocks a start and aborts a run (item 72); legacy refuses | PR |
 | `tests/test_ident_sim.py` | an experiment on the truth plant never takes a drive over a limit and never leaves the enclosure hotter than the same seed without one, with the excitation visible on the fans; a drawn enclosure that is already saturated refuses the start; and, with the room warming 20 °C/h so the envelope actually binds, the run aborts on `envelope:<bay>` with `T̂_d + k·σ` still below the absolute abort and no drive over its limit from the abort on, on `ident_levels: above` and `symmetric` (§8 item 53) | PR: `basic` seed 1, both `ident_levels`; nightly: `basic` and `rich` seeds 1–5, envelope sweep `basic` seeds 1–5 × both `ident_levels` |
 | `tests/test_sim_das.py` | the truth plant: energy balance through transients and hot swap, steady state, more airflow never warms anything, dead band and exponent, quantisation per sensor type, lags, SMART cadence, determinism per seed | PR |
 
@@ -3934,8 +3961,9 @@ coefficients with relative standard errors; `{"status": "off"}` without
 prior, identified from), `calibration` per bay (serial, calibrated,
 `sigma_cal_c`, calibration details), `store` what the model store loaded
 (`{"source": "off"}` without a store), `experiment` the identification
-experiment's status (running, target, phase, level, elapsed and remaining
-seconds, the last result and abort reason).
+experiment's status (running, target, phase, level, the base at the start,
+the anchor the levels are drawn around now (`plan_base`) with `levels` and
+`replan`, elapsed and remaining seconds, the last result and abort reason).
 
 `/api/health` keys:
 
@@ -4242,8 +4270,10 @@ them as "§8 item N".
   after items 3, 8, 9 and 10, which is item 73).
 - Live MQTT and Home Assistant checks use the owner's Home Assistant
   broker; its host name is in `private.md` (item 21).
-- An experiment holding back a cooling increase is deferred to the
-  Zero 2 W upgrade (item 52).
+- An experiment holding back a cooling increase was deferred to the
+  Zero 2 W upgrade (item 52); done 2026-09-16, the levels are re-planned
+  from the live solver demand every tick (`ident_replan`, §3), and the
+  measured cost says it would have fitted the Zero W as well.
 
 Owner decisions (2026-09-14, later the same day):
 
@@ -5717,11 +5747,67 @@ Owner decision (2026-09-16):
 
 50. Run on a Zero 2 W with the same config.
 51. 64-bit Lite if needed, with no API change.
-52. Experiments: with `above` levels the low level is the solver's base
-    frozen at start, so a solver that later wants more cooling on that
-    channel is held back until the +3 °C envelope trips. Deferred to the
-    Zero 2 W (owner, 2026-09-14): re-plan the levels from the live solver
-    demand, which the Zero 2 W's compute allows every tick.
+52. **Done** (2026-09-16): the levels are re-planned from the live solver
+    demand every tick (`mpc.ident_replan`, default `true`; §3
+    "Active identification experiments"). Each tick every channel's base is
+    raised to the solver's honest demand (`diagnostics["target_pwm"]`) and
+    its levels are re-derived around it and clamped into the band; the base
+    never falls; and because a re-planned level can only reach the fans on
+    the next tick, `compose` floors an experiment channel's override with
+    the solver's command for the tick. The rule: **a rise in demand wins
+    over the experiment's plan, always** — no tick of an experiment puts
+    less on a fan than the controller would have (`symmetric`: at most the
+    owner-accepted `ident_amplitude` below it). The aborts of a tick are
+    decided before the next tick's levels are re-planned, on the same
+    estimates with the same thresholds in the same order, so nothing aborts
+    later or weaker.
+
+    *What it was:* with `above` levels the low level was the solver's base
+    frozen at start, so a solver that later wanted more cooling on that
+    channel was held back until the +3 °C envelope tripped. Deferred to the
+    Zero 2 W (owner, 2026-09-14) for the per-tick compute.
+
+    *Cost per tick* (dev machine, arm64, Python 3.14, DAS example: 8
+    channels, 15 bays, 4 zones; 6 interleaved repeats × 2000 calls, median):
+    the experiment bookkeeping of one tick is 32.9 µs before this item,
+    35.7 µs with `ident_replan: false` and 37.4 µs with `true` — **+4.5 µs
+    per tick**, of which 1.7 µs is the re-plan itself and 2.8 µs the demand
+    copied into `TickFacts` on every tick. The DAS MPC step measures 3.25 ms
+    p99 on the same machine against 609–615 ms on the Zero W (item 73), a
+    factor of ~190; carried over, the re-plan is ≈ 0.9 ms per tick on a Zero
+    W and less on a Zero 2 W, against `budget_ms` 600. Only the levels are
+    re-derived, never the schedule, which is why it is this cheap: the
+    deferral was the right call for an unmeasured feature, but the measured
+    one would have fitted the Zero W too. Hence the default `true` on every
+    board; `false` is there to get the frozen plan back, not to save time.
+
+    *Identification* (`sim/das.py`, `rich` preset, `k_sigma: 1`, one
+    experiment at a time as the supervisor runs them, 24 h, seeds 1–4,
+    scratch harness): the two modes start the same experiments (21 / 22 / 47
+    / 38 starts per seed) and abort on the same bays, except seed 3 where
+    the frozen plan aborted four times on the envelope and the re-planned
+    one three (a rising demand that the frozen plan could not follow). The
+    fit is the same within the seed spread — worst in-zone `E` error median
+    0.51 (frozen) against 0.51 (re-planned), rms 0.356 against 0.356; worst
+    per-bay `k` median 0.53 against 0.53, its worst seed 0.58 against 0.81 —
+    while the cooling the experiment withheld goes away: **1991 channel-ticks
+    below the solver's own command (worst 0.10 PWM, a full `d_pwm_max`) →
+    0**. With every channel excited at once (8 h, seeds 1–4) the enclosure
+    runs cold, the demand never rises above the anchors and the two modes
+    are identical to the digit. Neither mode reaches `converged` in this
+    closed-loop scenario (`pe_min` stays near zero: with the solver moving
+    the other channels of a zone, one experiment at a time does not excite
+    the zoned regressors) — that is the scenario, not this item; the
+    convergence evidence stays `tests/test_thermal_ident.py`, whose
+    open-loop excitation this item does not touch and which still passes.
+
+    *Main session, on the Zero 2 W:* run one experiment on the real
+    enclosure with `ident_replan: true` and confirm (a) an experiment on a
+    warming bay follows the solver up instead of aborting on the envelope,
+    (b) `GET /api/model`'s `experiment.plan_base` rises with the demand and
+    never falls, and (c) the per-tick cost stays inside the step budget
+    (`tools/bench_step.py`, `step_ms_max` and the budget counters in
+    `/api/health`, with an experiment running).
 
 ### 8.5 Done
 
@@ -5848,7 +5934,7 @@ Owner decision (2026-09-16):
 - [x] Tick recorder and offline tools: `--record`, `tools/fit_model.py --topology`, `tools/fit_fans.py`, `tools/replay.py`
 - [x] DAS MPC: noise surrogate, soft / hard and terminal rows, move blocks, active-piece SQP, forbidden bands, validity gate with PI-DAS model fallback, bumpless, `mpc_every_ticks`, `noise_db` (`control/solver_das.py`, `control/noise.py`)
 - [x] Model store with calibration and bays sections, fresh → `frozen`, stale → shadow hold re-confirmed for `model_reconfirm_s`, `StateDirectory=` (`modelstore.py`, `control/persist.py`)
-- [x] Active identification experiments per fan group with the +3 °C envelope on estimates, `POST /api/ident`, MQTT `cmd/ident`, HA `ident_running` (`control/ident.py`)
+- [x] Active identification experiments per fan group with the +3 °C envelope on estimates, `POST /api/ident`, MQTT `cmd/ident`, HA `ident_running` (`control/ident.py`); levels re-planned from the live solver demand every tick, a rise in demand always winning over the plan (`ident_replan`, §8.4 item 52)
 - [x] Runtime drive limits: `POST /api/limit`, MQTT `cmd/limit/...`, HA `limit_<class>`; DAS presets (comfort band, noise weight)
 
 #### Track B — hardware (Pi USB; fake sysfs anywhere)
