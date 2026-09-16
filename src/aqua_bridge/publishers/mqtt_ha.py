@@ -55,9 +55,13 @@ Its guards, when it *is* on:
   :func:`validate_mqtt_section` like every other scalar of the section
 * ``mqtt.username`` must be set with it, or the section is a named
   :class:`MqttSetupError` at startup. An anonymous connection cannot be given an ACL of
-  its own, so "the broker's ACL" would be no guard at all -- the refusal is the
-  "rejection when the broker connection is not authenticated" the item asks for, made
-  at configuration time where the owner can see it rather than per message
+  its own, so "the broker's ACL" would be no guard at all. Read it for exactly what it
+  is: a *configured username is required*, checked once when the config is parsed. It is
+  not a check that the connection is authenticated -- nothing here inspects the CONNACK
+  or the broker's ACL, and a broker running ``allow_anonymous true``, or one that takes
+  the username without checking the password, would accept the same calibration. The
+  deliberate ``true`` plus a named account is a speed bump the owner sees at startup;
+  the authentication itself is the broker's job to enforce
 * a **retained** calibration is ignored and logged, exactly as a retained experiment
   ``start`` is: a retained number would be redelivered on every reconnect and refitted
   into the bay's map on every restart, which is the failure item 104 is about

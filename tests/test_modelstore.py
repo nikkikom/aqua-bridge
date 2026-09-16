@@ -1249,6 +1249,26 @@ def test_the_staleness_window_of_a_stored_manual_calibration(tmp_path, age_s, ke
         assert any("b01" in w for w in store["warnings"]), store["warnings"]
 
 
+def test_an_unknown_age_names_which_of_the_two_causes_it_was(tmp_path):
+    """A file that never carried a sample time and a wall clock behind the file both
+    leave the age unknown, and both are dropped -- but the warning must not send the
+    owner hunting for an NTP problem that is not there."""
+    cfg = load_config(EXAMPLE_DAS_CONFIG).mpc
+
+    doc = stored_doc(cfg, saved_wall=NOW - 60, manual_calibration=manual_section(cfg, age_s=None))
+    _, state = load_state(write_doc(tmp_path / "none.json", doc), cfg)
+    cmd, _, _ = run(cfg, state, 1)
+    missing = [w for w in cmd.diagnostics["store"]["warnings"] if "b01" in w]
+    assert missing and "carries no saved sample time" in missing[0], missing
+    assert "wall clock" not in missing[0]
+
+    doc = stored_doc(cfg, saved_wall=NOW - 60, manual_calibration=manual_section(cfg, age_s=-60.0))
+    _, state = load_state(write_doc(tmp_path / "behind.json", doc), cfg)
+    cmd, _, _ = run(cfg, state, 1)
+    behind = [w for w in cmd.diagnostics["store"]["warnings"] if "b01" in w]
+    assert behind and "the wall clock is behind the file" in behind[0], behind
+
+
 def test_a_longer_window_keeps_what_the_default_drops(tmp_path):
     """The window is a config key, not a number in the source."""
     cfg = dataclasses.replace(

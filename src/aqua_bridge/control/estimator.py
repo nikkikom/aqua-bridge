@@ -370,9 +370,13 @@ at the uncalibrated sigma (more margin, more cooling, never less):
 * **swapped** -- the entry records the bay's declaration as it stood when the file was
   written (``occupied``, ``class``, ``serial``). Any of the three different in the
   running config drops it: the owner has said this bay holds a different drive. While
-  the daemon runs, the estimator's own swap rule (item 12 -- occupancy crossing
-  ``empty`` in either direction, or the fast-swap proximal jump) drops the bay's manual
-  entry on the tick it fires, restored or not.
+  the daemon runs, the evidenced half of the estimator's own swap rule (item 12 -- the
+  bay's occupancy crossing ``empty`` in either direction) drops the bay's manual entry
+  on the tick it fires, restored or not. The other half -- a bare proximal step with no
+  occupancy crossing -- only *inflates* it (``"inflate": 2.0`` / ``"confirm": 20``): one
+  tick's innovation is raised by a spin-up or a fan step as readily as by a swap, and
+  the same event leaves a SMART entry alone, so twenty hand readings are not thrown away
+  on evidence that thin.
 * **reconfigured** -- the store's fingerprint already refuses a file written for
   another structure; the per-entry declaration above covers the policy the fingerprint
   deliberately leaves out.
@@ -2160,21 +2164,33 @@ def update(
                 if b in assoc and assoc[b][1] == "correlation":
                     _forget_pair(mem, b, assoc[b][0])
                     del assoc[b]
+                # The bay's manual calibration described the drive that was there (items
+                # 12, 104). It is keyed by bay, not by serial, so unlike a SMART entry it
+                # would follow the slot rather than the drive and nothing later would
+                # notice. Only this half of the swap rule drops it -- an occupancy
+                # crossing of ``empty``, where a drive demonstrably left or arrived --
+                # and the bay returns to the prior map at the uncalibrated sigma: more
+                # margin, never less cooling.
+                mem["manual"].pop(b, None)
             bm["low"], bm["rise"], bm["blind"] = 0.0, 0, 0.0
             bm["occ"] = after
         if jumped.get(b) and b in assoc and assoc[b][1] == "correlation":
             _forget_pair(mem, b, assoc[b][0])
             del assoc[b]
 
-    # A swapped bay's manual calibration described the drive that was there (items 12,
-    # 104). It is keyed by bay, not by serial, so unlike a SMART entry it would follow
-    # the slot rather than the drive and nothing later would notice. Dropped on the tick
-    # the swap rule fires, restored from the store or measured in this run alike, which
-    # returns the bay to the prior map at the uncalibrated sigma -- more margin, never
-    # less cooling.
-    for b, was_swapped in swapped.items():
-        if was_swapped:
-            mem["manual"].pop(b, None)
+    # The other half of the swap rule -- a bare proximal step, with no occupancy crossing
+    # (items 12, 104) -- *inflates* the bay's manual calibration instead of dropping it.
+    # ``stepped`` is one tick's innovation against the predicted node, and a spin-up, an
+    # I/O burst or a fan step raises it as readily as a swap does; deleting on that would
+    # throw away twenty readings the owner took by hand on evidence that thin, and it
+    # would be asymmetric anyway, since the same event leaves a SMART entry alone.
+    # Inflation is the conservative direction: ``sigma_cal`` doubles until ``confirm``
+    # further accepted hand readings of that bay clear it, indefinitely without them.
+    for b, was_stepped in stepped.items():
+        known = mem["manual"].get(b)
+        if was_stepped and known is not None and known["cal"] is not None:
+            known["cal"]["inflate"] = STALE_SIGMA_CAL_FACTOR
+            known["cal"]["confirm"] = CAL_MIN_SAMPLES
 
     # -- store the filter ----------------------------------------------------------------
     for z, (x, p) in arrays.items():
@@ -2549,13 +2565,16 @@ def restore_manual_calibration(
     """``(estimator memory, warnings)`` with the model store's manual calibrations
     installed (module docstring, *Manual calibration*; PROJECT.md section 8 item 104).
 
-    ``manual`` is ``{bay: {"th", "P", "n", "fresh", "rms2", "used", "age_s",
-    "declared": {"occupied", "class", "serial"}}}`` -- ``age_s`` the seconds since the
-    entry's last accepted hand reading at load time, ``None`` when unknown -- and ``ts``
-    the clock of the tick it is applied on. Every doubtful entry is **dropped** with a
-    named warning: an unknown bay, an entry that is malformed or out of bounds, an age
-    that is unknown, negative or past ``estimator.manual_calibration_max_age_days``, or a
-    bay whose declaration has changed since the file was written. What survives is
+    ``manual`` is ``{bay: {"th", "P", "n", "fresh", "rms2", "used", "age_s"[,
+    "age_reason"], "declared": {"occupied", "class", "serial"}}}`` -- ``age_s`` the
+    seconds since the entry's last accepted hand reading at load time, ``None`` when
+    unknown, with the optional ``age_reason`` naming *why* it is unknown (no saved sample
+    time, against a wall clock behind the file) so the warning does not point at one
+    wrong cause -- and ``ts`` the clock of the tick it is applied on. Every doubtful entry
+    is **dropped** with a named warning: an unknown bay, an entry that is malformed or out
+    of bounds, an age that is unknown, negative or past
+    ``estimator.manual_calibration_max_age_days``, or a bay whose declaration has changed
+    since the file was written. What survives is
     re-based on ``ts`` and always inflated (``inflate`` / ``confirm``), a fresh file
     included. A bay already in ``memory`` is left alone. Pure; never raises for a bad
     ``manual`` (only for a legacy ``cfg``).
@@ -2584,9 +2603,15 @@ def restore_manual_calibration(
             continue
         age = raw.get("age_s")
         if not _finite(age) or float(age) < 0.0:  # type: ignore[arg-type]
+            reason = raw.get("age_reason")
+            why = (
+                reason
+                if isinstance(reason, str) and reason
+                else "it carries no saved sample time, or the wall clock is behind the file"
+            )
             warnings.append(
-                f"{where}: the age of its last hand reading is unknown (the wall clock is "
-                "behind the file); dropped rather than trusted"
+                f"{where}: the age of its last hand reading is unknown ({why}); "
+                "dropped rather than trusted"
             )
             continue
         if float(age) > window:  # type: ignore[arg-type]

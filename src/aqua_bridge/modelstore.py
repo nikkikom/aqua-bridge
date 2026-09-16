@@ -301,6 +301,13 @@ def _manual_calibration_seed(
     :func:`aqua_bridge.control.estimator.restore_manual_calibration` wants it: the entry's
     fields, its ``age_s`` at load time and the bay declaration it was saved under.
 
+    An entry whose age cannot be computed carries ``age_s: None`` *and* an ``age_reason``
+    naming which of the two cases it is, so the warning the estimator prints does not
+    blame the clock for a file that simply never carried a sample time: a missing or
+    unusable ``last_sample_wall`` (``build_document`` writes ``null`` whenever the entry's
+    controller ``ts`` is unusable) against a ``last_sample_wall`` in the future of
+    ``now_wall``, which really is a wall clock behind the file.
+
     No ``expired`` flag: the window of a manual calibration is the *loading* config's
     ``estimator.manual_calibration_max_age_days``, applied in the estimator where that
     config is at hand, so the rule has exactly one home (module docstring).
@@ -315,8 +322,14 @@ def _manual_calibration_seed(
             continue
         seeded = {k: entry[k] for k in _CAL_FIELDS if k in entry}
         last = entry.get("last_sample_wall")
-        age = now_wall - float(last) if _finite(last) else None
-        seeded["age_s"] = age if age is not None and age >= 0 else None
+        if not _finite(last):
+            seeded["age_s"] = None
+            seeded["age_reason"] = "it carries no saved sample time"
+        elif now_wall < float(last):  # type: ignore[arg-type]
+            seeded["age_s"] = None
+            seeded["age_reason"] = "the wall clock is behind the file"
+        else:
+            seeded["age_s"] = now_wall - float(last)  # type: ignore[arg-type]
         declared = entry.get("declared")
         seeded["declared"] = dict(declared) if isinstance(declared, Mapping) else None
         out[str(bay)] = seeded
