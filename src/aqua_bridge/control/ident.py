@@ -106,13 +106,34 @@ tick (``diagnostics["estimates"]``: ``t_c``, ``margin_c = k sigma``, ``soft_c``,
 ``k sigma`` is counted **once** (section 8 item 53). ``soft`` and ``hard`` already
 subtract it, so the soft and hard rules read ``T_hat``, and only the absolute rule,
 which is measured against the raw limit, reads ``upper``. ``T_hat <= hard`` therefore
-means ``T_hat + k sigma <= limit``, the 2-sigma statement the plan intends, and
-``abort_temp`` is stricter than it by ``ident_abort_below_limit_c``: the absolute
-abort is the rule that binds and it is unchanged from before item 53. What changed is
-that a settled enclosure is no longer refused at start and no longer sits on the abort
-edge: PI-like DAS regulates ``T_hat`` to ``soft`` (section 8.5 item 1) and the DAS MPC
-rides ``T_hat = soft`` too, so both now start with the whole
-``ident_start_band_c`` / ``ident_max_over_c`` band in hand.
+means ``T_hat + k sigma <= limit``, the 2-sigma statement the plan intends.
+
+Which rule binds, and what item 53 moved. Put every rule on ``upper``, so they compare:
+
+* ``envelope`` fires at ``upper > limit - comfort_c + ident_max_over_c``;
+* ``abort_temp`` at ``upper >= limit - ident_abort_below_limit_c``;
+* ``hard`` at ``upper > limit``.
+
+``abort_temp`` is therefore always stricter than ``hard``, but the **soft envelope is
+the rule that binds first** whenever ``ident_max_over_c < comfort_c -
+ident_abort_below_limit_c``, which is the case for every class of
+``config.example-das.yaml`` (``ident_max_over_c`` 3.0, ``ident_abort_below_limit_c``
+1.0): the envelope fires at ``upper`` 48.0 / 58.0 / 63.0 degC for hdd / ssd_sata /
+nvme, the absolute abort only at 49.0 / 64.0 / 69.0. The absolute abort binds instead
+when ``ident_max_over_c >= comfort_c - ident_abort_below_limit_c`` -- for instance the
+``quiet`` preset on hdd, which narrows ``comfort_c`` to 3.0.
+
+So item 53 did move the operational abort point, by exactly ``k sigma``, on the rule
+that usually binds: the envelope. That is the whole point of the item -- the ``k sigma``
+it dropped was being counted a second time inside a reference that had already
+subtracted it. What did **not** move is the backstop: ``abort_temp`` is bit-identical to
+before item 53, so an experiment still cannot take a drive's ``upper`` to within
+``ident_abort_below_limit_c`` of its limit whatever the envelope allows, and
+``ident_levels: above`` never commands less cooling than the solver asked for at the
+start in the first place. What the item bought is that a settled enclosure is no longer
+refused at start and no longer sits on the abort edge: PI-like DAS regulates ``T_hat``
+to ``soft`` (section 8.5 item 1) and the DAS MPC rides ``T_hat = soft`` too, so both now
+start with the whole ``ident_start_band_c`` / ``ident_max_over_c`` band in hand.
 
 Abort list (:func:`advance`; abort = release the override)
 ----------------------------------------------------------
@@ -267,8 +288,20 @@ class TickFacts:
     ``mode`` is the solver command's mode (``None``: no solver command, e.g. a
     controller error); ``pwm`` the solver's command per channel; ``zones``,
     ``estimates``, ``bays``, ``saturated``, ``fan_stall``, ``sigma_floor`` and
-    ``store`` the matching entries of its diagnostics (empty when absent or
-    malformed, which every check reads as unsafe).
+    ``store`` the matching entries of its diagnostics, empty when absent or malformed.
+
+    An empty ``zones``, ``estimates``, ``bays``, ``saturated`` or ``fan_stall`` reads as
+    **unsafe**: no zone is settled, no bay has an estimate, every channel counts as
+    saturated. The two remaining fields are not that shape, deliberately:
+
+    * ``sigma_floor`` is written only under ``zones.trust_rule: sigma``, so an empty one
+      means *no lost sensor group*, not *unknown*: :func:`lost_sensor_zones` returns no
+      reason. Under ``strict`` a lost group faults its zone, which ``settle:`` and
+      ``degraded`` catch instead, so the only way to lose the check is a ``sigma`` tick
+      whose diagnostics are malformed -- ``mpc.step`` always writes the key there, and a
+      missing solver command is already caught by ``mode is None``;
+    * ``store`` is the model store's summary; an empty one restores no settle credit,
+      which only makes a start wait longer.
     """
 
     ts: float | None
