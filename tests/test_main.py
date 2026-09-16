@@ -270,6 +270,23 @@ def test_build_health_monitor_wires_the_source_and_the_supervisor(example_config
     assert sup.snapshot().device_health["ok"] is True
 
 
+def test_build_health_monitor_publishes_the_single_xt6_controller(example_config_path):
+    """--source xt6 is the argparse default and what deploy/install-pi.sh installs: its
+    bare adapter answers for itself, not with a {devices, problems} dict, and the whole
+    controller must still reach /api/state (PROJECT.md section 8 items 83, 91)."""
+    from aqua_bridge.control.supervisor import Supervisor
+
+    app = load_config(example_config_path)
+    sup = Supervisor(app.mpc)
+    src, _sink, _release = main_mod.build_io(app, "xt6")
+    monitor = main_mod.build_health_monitor(app, sup, src)
+    assert monitor is not None
+    monitor.on_tick(None)
+    (device,) = sup.snapshot().device_health["devices"]
+    assert device["label"] == src.binding.label and device["device"] == "aquaero"
+    assert "flows" in device and "not_pwm_channels" in device and "stuck_channels" in device
+
+
 def test_build_health_monitor_is_none_when_disabled_with_a_source_that_has_none(
     example_config_path, tmp_path
 ):

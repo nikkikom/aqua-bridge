@@ -7,7 +7,10 @@ fan draws. The hardware adapter hands those out per commanded channel
 puts them in ``PlantObservation.inputs["fans"]``; the controller's own state
 (stuck outputs, absent aquabus slots, outputs not in PWM mode, flow sensors)
 arrives separately through
-:meth:`~aqua_bridge.hw.sources.CompositeSource.device_health`.
+:meth:`~aqua_bridge.hw.sources.CompositeSource.device_health` -- or, for a single
+``xt6`` adapter, that controller's own
+:meth:`~aqua_bridge.hw.aquacomputer_adapter.AquacomputerAdapter.device_health`,
+which :meth:`HealthMonitor.device_health` publishes in the same shape.
 
 Where this sits
 ---------------
@@ -27,35 +30,50 @@ reads. Nothing here changes a duty; a drift is a log line and a published field.
 The rules
 ---------
 All three are sustained rules -- a deviation must hold for its own ``*_fault_s``
-before it is reported -- and all three ignore a channel for ``settle_s`` after its
-output duty moved, because an aquabus fan's rpm in the aquaero's status report
-lags the Quadro's own report by several seconds (PROJECT.md section 2) and a step
-would otherwise read as drift.
+of *live, uninterrupted* readings before it is reported. A channel that misses a
+tick (the read failed, its aquabus slot went away) starts every window again: wall
+time passing while nothing was measured is not evidence of anything.
+
+The duty window
+    An aquabus fan's rpm in the aquaero's status report lags the Quadro's own
+    report by several seconds (PROJECT.md section 2), so the two duty-dependent
+    rules never judge a reading against the duty of that same tick alone: they
+    judge it against the *band* the output duty spanned over the last ``settle_s``
+    -- ``[min duty, max duty]`` of that window, mapped through the fan curve. A
+    step from 20 % to 100 % widens the band to cover both while the tachometer
+    catches up and narrows back to a point once ``settle_s`` of steady duty has
+    passed, and a duty that keeps moving is judged against a wider band rather
+    than never judged at all. Nothing is judged until ``settle_s`` of readings has
+    accumulated (at startup, and again after a gap).
 
 rpm against the fitted curve
     Expected speed is ``rpm_max * phi(duty, deadband, exponent)`` from the
     channel's ``mpc.fan_models`` entry -- the same curve shape
     ``tools/fit_fans.py`` fits from a recording, so the fitted numbers go straight
-    into ``fan_models``. A deviation is ``|rpm - expected| > rpm_tolerance_frac *
-    rpm_max``. Below ``min_duty`` nothing is judged: inside and just above the
-    deadband the curve says little and a stopped fan is normal. A channel whose
-    model is not configured (a legacy config with no ``mpc.fans``/``fan_models``)
-    is skipped.
+    into ``fan_models``. A deviation is a speed further than
+    ``rpm_tolerance_frac * rpm_max`` below the band's low edge or above its high
+    edge. Below ``min_duty`` nothing is judged: inside and just above the deadband
+    the curve says little and a stopped fan is normal. A channel whose model is
+    not configured (a legacy config with no ``mpc.fans``/``fan_models``) is
+    skipped.
 
 the 12 V rail
-    The block's voltage outside ``[rail_min_v, rail_max_v]``. A block reporting
-    0.0 V is not judged: that is what an aquaero's empty aquabus slot reads, not a
-    dead rail.
+    The block's voltage outside ``[rail_min_v, rail_max_v]``. This one does not
+    depend on the duty at all, so it is judged at every duty and a duty move never
+    restarts it -- a rail that sags while the solver is modulating is exactly when
+    it matters. A block reporting 0.0 V is not judged: that is what an aquaero's
+    empty aquabus slot reads, not a dead rail.
 
 power against the duty
     Only where the device reports power at all: an aquaero reports 0 mA and 0 W
     for its *own* outputs in PWM mode however fast the fan turns, so absence of
     current is no fault there and ``power_reported`` says so per output. Expected
     power is ``count * power_w_at_max * phi(duty) ** power_exponent`` (the fan law,
-    with the exponent a config key), and the rule fires when the measured power
-    leaves ``+- power_tolerance_frac`` of it. ``fan_models.<m>.power_w_at_max`` has
-    no default -- without it the rule is simply off for that model, since the
-    figure depends on the fan and nothing may invent one.
+    with the exponent a config key), taken over the same duty band, and the rule
+    fires when the measured power leaves it by more than
+    ``power_tolerance_frac``. ``fan_models.<m>.power_w_at_max`` has no default --
+    without it the rule is simply off for that model, since the figure depends on
+    the fan and nothing may invent one.
 
 Every threshold above is a ``fan_health:`` key with one default declared once in
 :class:`FanHealthConfig`, validated there, shown in both example configs and
@@ -67,6 +85,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -110,13 +129,12 @@ class FanHealthConfig:
     #: Below this output duty no rpm or power rule fires (0..1): inside and just
     #: above a fan's deadband the curve says little.
     min_duty: float = 0.25
-    #: After the output duty of a channel moves by more than ``settle_duty``, that
-    #: channel is not judged for this long, seconds (>= 0). An aquabus fan's rpm in
-    #: the aquaero's status report lags by several seconds (PROJECT.md section 2).
+    #: The rpm and power rules judge a reading against the band the output duty
+    #: spanned over the last this many seconds, and judge nothing until that much
+    #: has accumulated (>= 0). An aquabus fan's rpm in the aquaero's status report
+    #: lags by several seconds (PROJECT.md section 2).
     settle_s: float = 15.0
-    #: How far the output duty must move to restart ``settle_s`` (0..1).
-    settle_duty: float = 0.02
-    #: |rpm - expected| above this fraction of the model's ``rpm_max`` is a deviation.
+    #: A speed this fraction of the model's ``rpm_max`` outside the band is a deviation.
     rpm_tolerance_frac: float = 0.25
     #: An rpm deviation held this long is reported, seconds (> 0).
     rpm_fault_s: float = 120.0
@@ -144,7 +162,6 @@ class FanHealthConfig:
             raise ConfigError(f"fan_health.enabled must be true or false, got {self.enabled!r}")
         _number("fan_health.min_duty", self.min_duty, minimum=0.0, maximum=1.0)
         _number("fan_health.settle_s", self.settle_s, minimum=0.0, maximum=None)
-        _number("fan_health.settle_duty", self.settle_duty, minimum=0.0, maximum=1.0)
         _number("fan_health.rpm_tolerance_frac", self.rpm_tolerance_frac, minimum=0.0, maximum=None)
         rail_min = _number("fan_health.rail_min_v", self.rail_min_v, minimum=0.0, maximum=None)
         rail_max = _number("fan_health.rail_max_v", self.rail_max_v, minimum=0.0, maximum=None)
@@ -199,10 +216,26 @@ def _finite(value: Any) -> bool:
 class _ChannelState:
     """What one channel's rules need to remember between ticks."""
 
-    duty: float | None = None
-    settled_at: float | None = None
+    #: ``(t, duty)`` back to ``settle_s`` before the newest reading, oldest first.
+    duty_window: deque[tuple[float, float]] = dataclasses.field(default_factory=deque)
+    #: The update counter of the tick this channel was last read on; a channel that
+    #: misses one has no live evidence across the gap (see :meth:`forget`).
+    tick: int | None = None
     since: dict[str, float] = dataclasses.field(default_factory=dict)
     logged_at: dict[str, float] = dataclasses.field(default_factory=dict)
+
+    def forget(self) -> None:
+        """A gap in the readings: nothing held here was established by live data, so
+        every window starts again (the rail included -- a deviation that straddles a
+        ten-minute outage is not a deviation held for ten minutes)."""
+        self.duty_window.clear()
+        self.since.clear()
+
+    def forget_duty(self) -> None:
+        """This tick carried no output duty: only the rules that need one start again."""
+        self.duty_window.clear()
+        self.since.pop("rpm", None)
+        self.since.pop("power", None)
 
 
 class HealthMonitor:
@@ -211,10 +244,11 @@ class HealthMonitor:
     Build one per run and give :meth:`on_tick` to the loop (chained with the
     recorder and the MQTT publisher by
     :func:`aqua_bridge.recorder.chain_on_tick`). ``source`` is the object the loop
-    reads from; a source without ``device_health`` (the simulator, a single
-    ``xt6`` adapter before it is opened) simply contributes none. ``publish`` is
-    called with the merged payload every tick -- ``Supervisor.set_device_health``
-    in the daemon.
+    reads from -- a composite, a single ``xt6`` adapter (its one controller is
+    published as a one-element ``devices`` list, see :meth:`device_health`) or a
+    source with no ``device_health`` at all, such as the simulator, which simply
+    contributes none. ``publish`` is called with the merged payload every tick --
+    ``Supervisor.set_device_health`` in the daemon.
 
     :meth:`on_tick` never raises: the loop isolates it anyway, and a diagnostics
     bug must not cost a tick.
@@ -235,6 +269,7 @@ class HealthMonitor:
         self.publish = publish
         self._clock = clock
         self._channels: dict[str, _ChannelState] = {}
+        self._tick = 0
         self.last: dict[str, Any] = {"devices": [], "fans": {}, "problems": [], "ok": True}
 
     # -- the rules ---------------------------------------------------------
@@ -245,17 +280,29 @@ class HealthMonitor:
             state = self._channels[channel] = _ChannelState()
         return state
 
-    def _settled(self, channel: str, duty: float, now: float) -> bool:
-        """False while this channel is inside ``settle_s`` of a duty move."""
-        s = self.settings
-        state = self._state(channel)
-        if state.duty is None or abs(duty - state.duty) > s.settle_duty:
-            state.duty = duty
-            state.settled_at = now + s.settle_s
-            state.since.clear()
-            return False
-        state.duty = duty
-        return state.settled_at is None or now >= state.settled_at
+    def _duty_band(
+        self, state: _ChannelState, duty: float, now: float
+    ) -> tuple[float, float] | None:
+        """The lowest and the highest output duty over the last ``settle_s``, or
+        ``None`` while fewer than ``settle_s`` of live readings back it.
+
+        This is what the aquabus lag costs: a reading taken now describes some duty
+        of the last few seconds, so it may only be judged against all of them. A
+        steady duty collapses the band to a point; a duty that keeps moving widens it
+        instead of postponing the judgement for ever.
+        """
+        window = state.duty_window
+        if window and window[-1][0] == now:
+            window[-1] = (now, duty)  # one entry per instant, whatever the clock does
+        else:
+            window.append((now, duty))
+        cutoff = now - self.settings.settle_s
+        while len(window) >= 2 and window[1][0] <= cutoff:
+            window.popleft()
+        if window[0][0] > cutoff:
+            return None
+        duties = [d for _, d in window]
+        return min(duties), max(duties)
 
     def _sustained(self, channel: str, rule: str, deviating: bool, now: float) -> float | None:
         """Seconds this rule has been deviating once past its window, else ``None``."""
@@ -289,13 +336,12 @@ class HealthMonitor:
             "expected_power_w": None,
             "problems": [],
         }
-        if not _finite(duty):
-            return out
-        duty = float(duty)
-        settled = self._settled(channel, duty, now)
+        state = self._state(channel)
         problems: list[str] = []
 
-        # the 12 V rail: judged at any duty, since it does not depend on one
+        # the 12 V rail: judged at any duty and never restarted by a duty move, since
+        # it does not depend on one (a rail that sags while the solver modulates is
+        # exactly the case worth catching)
         if _finite(volts) and float(volts) > 0.0:
             volts = float(volts)
             low, high = s.rail_min_v, s.rail_max_v
@@ -308,17 +354,32 @@ class HealthMonitor:
         else:
             self._sustained(channel, "rail", False, now)
 
+        if not _finite(duty):
+            state.forget_duty()
+            self._sustained(channel, "rpm", False, now)
+            self._sustained(channel, "power", False, now)
+            out["problems"] = problems
+            return out
+        duty = float(duty)
+        band = self._duty_band(state, duty, now)
+
         target = expected_rpm(self.cfg, channel, duty)
         out["expected_rpm"] = target
-        judge = settled and duty >= s.min_duty
+        judge = band is not None and duty >= s.min_duty
         if judge and target is not None and _finite(rpm):
+            assert band is not None
             spec = self.cfg.fans[channel]
-            rpm_max = self.cfg.fan_models[spec.model].rpm_max
-            off = abs(float(rpm) - target)
-            held = self._sustained(channel, "rpm", off > s.rpm_tolerance_frac * rpm_max, now)
+            model = self.cfg.fan_models[spec.model]
+            rpm_max = model.rpm_max
+            floor = rpm_max * phi(band[0], model.deadband, model.exponent)
+            ceiling = rpm_max * phi(band[1], model.deadband, model.exponent)
+            slack = s.rpm_tolerance_frac * rpm_max
+            speed = float(rpm)
+            off = speed < floor - slack or speed > ceiling + slack
+            held = self._sustained(channel, "rpm", off, now)
             if held is not None:
                 problems.append(
-                    f"{channel}: {float(rpm):.0f} rpm at {duty * 100:.0f} % duty, "
+                    f"{channel}: {speed:.0f} rpm at {duty * 100:.0f} % duty, "
                     f"{target:.0f} rpm expected from the fitted curve, for {held:.0f} s"
                 )
         else:
@@ -333,9 +394,14 @@ class HealthMonitor:
             and expected_w >= s.power_min_w
             and _finite(power)
         ):
+            assert band is not None
+            floor = self._expected_power(channel, band[0]) or 0.0
+            ceiling = self._expected_power(channel, band[1]) or 0.0
             power = float(power)
-            off = abs(power - expected_w)
-            held = self._sustained(channel, "power", off > s.power_tolerance_frac * expected_w, now)
+            off = power < floor * (1.0 - s.power_tolerance_frac) or power > ceiling * (
+                1.0 + s.power_tolerance_frac
+            )
+            held = self._sustained(channel, "power", off, now)
             if held is not None:
                 problems.append(
                     f"{channel}: {power:.2f} W at {duty * 100:.0f} % duty, "
@@ -360,7 +426,15 @@ class HealthMonitor:
     # -- the tick ----------------------------------------------------------
 
     def update(self, readings: Mapping[str, Any], now: float) -> dict[str, Any]:
-        """Run the rules over one tick's readings and merge in the device health."""
+        """Run the rules over one tick's readings and merge in the device health.
+
+        One call is one tick, whatever it carries: a tick a channel is missing from
+        (the read raised and the loop fed a blank observation, or the channel's
+        aquabus slot went away) is a gap in that channel's evidence, and every window
+        of it starts again on the next live reading. Without that, an outage's wall
+        time would count towards a ``*_fault_s`` nothing measured during it.
+        """
+        self._tick += 1
         fans: dict[str, Any] = {}
         problems: list[str] = []
         if self.settings.enabled:
@@ -368,30 +442,53 @@ class HealthMonitor:
                 reading = readings[channel]
                 if not isinstance(reading, Mapping):
                     continue
+                state = self._state(channel)
+                if state.tick is not None and state.tick != self._tick - 1:
+                    state.forget()
+                state.tick = self._tick
                 verdict = self.check_channel(channel, reading, now)
                 fans[channel] = verdict
                 problems.extend(verdict["problems"])
                 self._log(channel, verdict["problems"], now)
         devices = self.device_health()
         payload = {
-            "devices": devices.get("devices") or [],
+            "devices": devices["devices"],
             "fans": fans,
-            "problems": [*(devices.get("problems") or []), *problems],
+            "problems": [*devices["problems"], *problems],
         }
         payload["ok"] = not payload["problems"]
         self.last = payload
         return payload
 
     def device_health(self) -> dict[str, Any]:
-        """The source's own device health, or an empty one without such a source."""
+        """``{devices, problems}`` from the source, or empty lists without such a source.
+
+        Both shapes a source may answer with are accepted: a
+        :class:`~aqua_bridge.hw.sources.CompositeSource` returns ``{devices,
+        problems, ok}`` already, while a single
+        :class:`~aqua_bridge.hw.aquacomputer_adapter.AquacomputerAdapter` -- what
+        ``--source xt6``, the default and what ``deploy/install-pi.sh`` installs,
+        hands the loop -- returns that one controller's own dict. It is wrapped into
+        a one-element ``devices`` list here, so the same payload reaches
+        ``/api/state``, the page and Home Assistant either way.
+        """
         getter = getattr(self.source, "device_health", None)
+        empty: dict[str, Any] = {"devices": [], "problems": []}
         if not callable(getter):
-            return {}
+            return empty
         try:
-            return dict(getter())
+            health = dict(getter())
         except Exception:  # a diagnostics path must never break a tick
             _LOG.exception("device_health failed")
-            return {}
+            return empty
+        problems = [str(p) for p in health.get("problems") or ()]
+        if "devices" in health:
+            devices = [d for d in (health.get("devices") or []) if isinstance(d, Mapping)]
+        elif "label" in health or "device" in health:
+            devices = [health]  # one controller, answering for itself
+        else:
+            devices = []
+        return {"devices": devices, "problems": problems}
 
     def _log(self, channel: str, problems: list[str], now: float) -> None:
         """One warning per channel, rate limited to ``log_interval_s``."""

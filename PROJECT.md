@@ -2269,8 +2269,12 @@ converges only with them.
 
   - the measurements ride the observation.
     `AquacomputerAdapter.fan_readings()` returns
-    `{channel: {device, output, rpm, duty, voltage_v, current_ma, power_w,
-    power_reported, aquabus}}` and `read()` puts it in
+    `{channel: {device, output, tach, rpm, duty, voltage_v, current_ma,
+    power_w, power_reported, aquabus}}` — `rpm` from the channel's *bound*
+    tachometer (`fans.<ch>.rpm`, named in `tach`), the one `obs.rpm` and a
+    `tools/fit_fans.py` fit describe, which the config may deliberately put
+    on another block than the output; the electrical fields from the
+    output's own block — and `read()` puts it in
     `PlantObservation.inputs["fans"]`, which `CompositeSource` merges
     across controllers. `inputs` is exogenous non-gated data: it never
     enters the sensor gate, never faults anything and never reaches
@@ -2299,24 +2303,41 @@ converges only with them.
   - **rpm against the fitted curve.** Expected speed is
     `rpm_max * phi(duty, deadband, exponent)` from the channel's
     `mpc.fan_models` entry — the curve `tools/fit_fans.py` fits from a
-    recording, so a fit goes straight into `fan_models`. A deviation is
-    `|rpm − expected| > rpm_tolerance_frac * rpm_max` held `rpm_fault_s`.
+    recording, so a fit goes straight into `fan_models`. The speed judged
+    is the channel's *bound* tachometer (`fans.<ch>.rpm`), which the config
+    may deliberately put on another block than the output, and which is the
+    one the curve was fitted from. A deviation is a speed further than
+    `rpm_tolerance_frac * rpm_max` outside the duty band below, held
+    `rpm_fault_s`.
   - **the 12 V rail.** Outside `[rail_min_v, rail_max_v]` for
     `rail_fault_s`. A block reading 0.0 V is not judged: that is an
-    aquaero's empty aquabus slot, not a dead rail.
+    aquaero's empty aquabus slot, not a dead rail. This rule does not
+    depend on the duty, so it is judged at every duty and a duty move never
+    restarts it: a rail that sags while the solver modulates is exactly the
+    case worth catching.
   - **power against the duty.** Only where the device reports power at
     all: an aquaero reports 0 mA and 0 W for its *own* outputs 1–4 in PWM
     mode however fast the fan turns, so absence of current is no fault
     there and `power_reported` says so per output. Expected power is
-    `count * power_w_at_max * phi(duty) ** power_exponent`;
-    `fan_models.<m>.power_w_at_max` has no default (the figure depends on
-    the fan), so without it this rule is simply off for that model.
+    `count * power_w_at_max * phi(duty) ** power_exponent` over the same
+    band; `fan_models.<m>.power_w_at_max` has no default (the figure
+    depends on the fan), so without it this rule is simply off for that
+    model.
 
   Nothing is judged below `min_duty` (inside and just above the deadband
-  the curve says little), nor for `settle_s` after a channel's output duty
-  moved by more than `settle_duty` — an aquabus fan's rpm in the aquaero's
-  status report lags the Quadro's own report by several seconds, and a step
-  would otherwise read as drift. Repeated problems are logged at most once
+  the curve says little). An aquabus fan's rpm in the aquaero's status
+  report lags the Quadro's own report by several seconds, so the two
+  duty-dependent rules judge a reading not against the duty of its own tick
+  but against the **band** the output duty spanned over the last
+  `settle_s` — `[min duty, max duty]` of that window mapped through the fan
+  curve. A step widens the band while the tachometer catches up and it
+  narrows back to a point after `settle_s` of steady duty; a duty that
+  keeps moving is judged against a wider band rather than never judged at
+  all. Nothing is judged before `settle_s` of live readings has
+  accumulated, and every window of a channel starts again whenever it
+  misses a tick (the read raised, the aquabus slot went away): wall time
+  that passed while nothing was measured is not evidence of a deviation.
+  Repeated problems are logged at most once
   per channel per `log_interval_s`. Every threshold is a `fan_health:` key
   with one default declared once in `health.FanHealthConfig`, validated
   there (an unknown key or a bad value is a `ConfigError`, exit 2, checked
@@ -3037,7 +3058,10 @@ the board.
 - `tests/test_health.py` — the `fan_health:` keys and their one default,
   every rejection; the fitted curve's expected rpm (`None` for a legacy
   config); each rule firing only after its own window and clearing again; a
-  duty step never firing during `settle_s` (the aquabus lag); nothing judged
+  duty step never firing while the band still covers it (the aquabus lag)
+  and a duty that moves every tick still judged, for the rail at once and
+  for rpm against the widened band; a gap in the readings restarting every
+  window; nothing judged
   below `min_duty` (the captured 9.02 % duty / 128 rpm aquabus report);
   0 V never a rail fault; 0 W never a fault on an aquaero's own output but a
   fault on one that reports power; the power rule off without
@@ -3987,10 +4011,13 @@ Owner decision (2026-09-16):
     blob and the page; `health.HealthMonitor` warns on rpm away from the
     fitted `fan_models` curve, a rail outside its window and power out of
     line with the duty, each sustained and each with its own `fan_health:`
-    key (§3 "Fan and device health"). Not judged below `min_duty` nor for
-    `settle_s` after a duty move, so the aquabus rpm lag never fires; the
-    power rule only runs where the device reports power, so the aquaero's
-    own 0 mA / 0 W is not a fault. Left for the hardware (item 94):
+    key (§3 "Fan and device health"). Nothing is judged below `min_duty`,
+    and the rpm and power rules judge a reading against the band the duty
+    spanned over the last `settle_s` (never against one tick's duty alone),
+    so the aquabus rpm lag never fires while a duty that keeps moving is
+    still judged; the rail rule needs no duty and runs at any. The power
+    rule only runs where the device reports power, so the aquaero's own
+    0 mA / 0 W is not a fault. Left for the hardware (item 94):
     `power_w_at_max` is unmeasured, so the power rule is off by default,
     and the default thresholds are wide guesses until a recording of the
     real enclosure exists.
@@ -4291,7 +4318,9 @@ Owner decision (2026-09-16):
       quantisation makes the rule usable at all on these fans or whether it
       should key on current instead;
     - watch how long the aquabus rpm actually lags after a duty step and set
-      `settle_s` from that (15 s is a guess from "several seconds");
+      `settle_s` from that (15 s is a guess from "several seconds"). It is now
+      the width of the duty band the rpm and power rules judge against, so too
+      large a value only makes them blunt, never false;
     - confirm no rule fires over a quiet day before narrowing
       `rpm_tolerance_frac` or the `*_fault_s` windows.
 
