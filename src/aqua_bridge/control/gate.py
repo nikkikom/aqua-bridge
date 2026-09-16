@@ -246,10 +246,13 @@ def _window_series(window: Sequence[WindowSample], name: str) -> list[float | No
 
 
 def _filtered_stream(raw: Iterable[float | None], median3: bool) -> Iterator[float | None]:
-    """:func:`_filtered_series` one value at a time, so a caller can stop early (item 73).
+    """The filtered value at every index of ``raw``, streamed (item 73).
 
-    ``median3_of(raw[: i + 1])`` reads only the last three entries of that
-    prefix and its length, so carrying the last three raw values is enough.
+    Yields ``median3_of(raw[: i + 1])`` for each ``i`` -- the value a check at
+    that index runs on, each using only its own past -- one at a time, so a
+    caller can stop as soon as it has seen enough. ``median3_of`` reads only the
+    last three entries of the prefix and its length, so carrying the last three
+    raw values is enough; ``median3`` false yields ``raw`` unchanged.
     """
     if not median3:
         yield from raw
@@ -260,13 +263,6 @@ def _filtered_stream(raw: Iterable[float | None], median3: bool) -> Iterator[flo
         if len(tail) > 3:
             del tail[0]
         yield median3_of(tail)
-
-
-def _filtered_series(raw: Sequence[float | None], median3: bool) -> list[float | None]:
-    """Filtered value at every index of ``raw`` (each uses only its own past)."""
-    if not median3:
-        return list(raw)
-    return list(_filtered_stream(raw, True))
 
 
 def push_window(
