@@ -1848,6 +1848,28 @@ def test_a_swap_drops_the_bays_manual_calibration():
     assert set(out2.memory["manual"]) == {"a1"}
 
 
+def test_a_bare_proximal_step_inflates_the_manual_map_instead_of_dropping_it():
+    """The riskier half of the swap rule (items 12 and 104). ``stepped`` is one tick's
+    innovation against the predicted node -- a spin-up, an I/O burst or a fan step raises
+    it as readily as a swap does -- so it must not delete twenty readings the owner took
+    by hand. It inflates them instead: ``sigma_cal`` doubled until ``confirm`` further
+    accepted hand readings clear it, which is still the conservative direction."""
+    cfg = das_cfg(setpoints={})
+    up = _manual_run(cfg)
+    before = up.bays["a1"]["sigma_cal_c"]
+    assert up.bays["a1"]["calibration_source"] == "manual"
+    assert "inflate" not in up.memory["manual"]["a1"]["cal"]
+
+    out = tick(cfg, up.memory, 610.0, prox_a1=PROX_C + 6.0)
+    assert out.bays["a1"]["swapped"] is True  # the fast-swap step fired ...
+    assert out.bays["a1"]["occupancy"] == "occupied"  # ... with no crossing of ``empty``
+    entry = out.memory["manual"]["a1"]["cal"]  # the map is still there
+    assert entry["inflate"] == E.STALE_SIGMA_CAL_FACTOR
+    assert entry["confirm"] == E.CAL_MIN_SAMPLES
+    assert out.bays["a1"]["calibration_source"] == "manual"
+    assert out.bays["a1"]["sigma_cal_c"] == pytest.approx(before * E.STALE_SIGMA_CAL_FACTOR)
+
+
 def test_restore_manual_calibration_is_pure_and_never_raises_on_rubbish(cfg: MpcConfig):
     """The estimator half of item 104: a legacy config is the only thing that raises."""
     das = das_cfg(setpoints={})
