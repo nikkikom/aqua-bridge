@@ -21,6 +21,7 @@ models.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -55,6 +56,23 @@ DETECT_BOUND_S = 300.0
 SLOW_GAINS = (0.5,)
 DETECT_SLOW_BOUND_S = 1200.0
 
+#: Fouling scenario (section 8 item 66): the enclosure keeps a steady load, then every
+#: fan's ``e`` drops to :data:`FOUL_FACTOR` of it -- a blocked filter or a dust mat, not a
+#: fan fault: the tachometers read the same. At ``model_max_air_dist_c_per_min`` 8.0 the
+#: gate catches a drop to 0.15x or below on every seed and load of both presets (and
+#: nothing healthy); 0.25x on about half the runs, 0.3-0.5x on ``rich`` only.
+T_FOUL = 1800.0
+FOUL_END = 4800.0
+FOUL_FACTOR = 0.15
+FOUL_BOUND_S = 900.0
+FOUL_HEAT = {
+    "b01": [(0.0, 0.6)],
+    "b02": [(0.0, 1.0)],
+    "b06": [(0.0, 0.8)],
+    "b10": [(0.0, 1.0)],
+    "b13": [(0.0, 0.7)],
+}
+
 
 def scenario_cfg(**changes: Any) -> MpcConfig:
     data = load_config(EXAMPLE_DAS_CONFIG).mpc.to_dict()
@@ -68,6 +86,23 @@ def return_bound_s(cfg: MpcConfig) -> float:
     return cfg.model_return_dwell_s + 2 * cfg.mpc_every_ticks * cfg.dt
 
 
+def build_plant(cfg: MpcConfig, *, preset: str, seed: int, heat_schedule: Any = None):
+    """The truth plant of every scenario here: the config's topology, sensor noise of the
+    real types, a 25 degC inlet."""
+    topology = topology_from_config(cfg)
+    for entry in topology["sensors"].values():
+        entry["noise_sigma_c"] = SENSOR_TYPES[entry["type"]].noise_sigma_c
+    topology["inlet"] = {"base_c": 25.0}
+    return build_das_plant(
+        topology,
+        preset=preset,
+        dt=cfg.dt,
+        initial_pwm=0.5,
+        seed=seed,
+        heat_schedule=heat_schedule,
+    )
+
+
 def load_step_run(
     cfg: MpcConfig,
     monkeypatch: pytest.MonkeyPatch,
@@ -79,17 +114,9 @@ def load_step_run(
 ) -> DasRun:
     """The scenario of the module docstring; ``gain`` scales the model's bay gains from
     :data:`T_STEP` on (a broken model), ``None`` kicks a sound model into the fallback."""
-    topology = topology_from_config(cfg)
-    for entry in topology["sensors"].values():
-        entry["noise_sigma_c"] = SENSOR_TYPES[entry["type"]].noise_sigma_c
-    topology["inlet"] = {"base_c": 25.0}
-    schedule = {
-        bay: [(0.0, 0.0), (T_STEP, 1.0 if entry["zone"] == zone else 0.0)]
-        for bay, entry in topology["bays"].items()
-    }
-    plant = build_das_plant(
-        topology, preset=preset, dt=cfg.dt, initial_pwm=0.5, seed=seed, heat_schedule=schedule
-    )
+    zones = {bay: spec.zone for bay, spec in cfg.topology.bays.items()}
+    schedule = {bay: [(0.0, 0.0), (T_STEP, 1.0 if z == zone else 0.0)] for bay, z in zones.items()}
+    plant = build_plant(cfg, preset=preset, seed=seed, heat_schedule=schedule)
     clock = {"ts": 0.0}
     current_model = thermal.current_model
 
@@ -150,6 +177,8 @@ def assert_returns_in_bound(run: DasRun, cfg: MpcConfig) -> None:
     elapsed = first_return_after_step(run)
     assert elapsed is not None, sw
     assert cfg.model_return_dwell_s <= elapsed <= return_bound_s(cfg), sw
+    # section 8 item 64: the MPC's own quieter move after the return is not a model fault
+    assert [active for _, active in sw] == ["pi_das", "mpc"], sw
 
 
 def assert_caught_and_held(run: DasRun, bound_s: float = DETECT_BOUND_S) -> None:
@@ -292,3 +321,100 @@ def test_broken_model_sweep(monkeypatch, preset, gain, zone):
     run = load_step_run(cfg, monkeypatch, zone=zone, seed=2, preset=preset, gain=gain)
     assert_safe_and_bumpless(run)
     assert_caught_and_held(run, DETECT_SLOW_BOUND_S if gain in SLOW_GAINS else DETECT_BOUND_S)
+
+
+# ---------------------------------------------------------------------------
+# a healthy enclosure stays on the MPC (section 8 item 65)
+# ---------------------------------------------------------------------------
+
+
+def steady_run(cfg: MpcConfig, *, preset: str, seed: int) -> DasRun:
+    """No fault of any kind: idle bays, the prior model, the truth plant."""
+    plant = build_plant(cfg, preset=preset, seed=seed)
+    return run_das_closed_loop(plant, cfg, step, int(T_END / cfg.dt))
+
+
+@pytest.mark.parametrize("preset", ["basic", "rich"])
+def test_a_healthy_enclosure_never_reaches_the_model_fallback(preset):
+    """Section 8 item 65: the drives' physical warm-up right after ``bay_settle_s`` used to
+    push the plain entry drift over its limit (0.50-0.52 degC/min against the limit 0.5) on
+    three of eight ``rich`` seeds, holding the fallback for 5 minutes each time."""
+    for seed in (1, 5, 7):
+        run = steady_run(scenario_cfg(), preset=preset, seed=seed)
+        assert switches(run) == [], f"{preset} seed {seed}"
+        assert_safe_and_bumpless(run)
+
+
+@pytest.mark.nightly
+@pytest.mark.parametrize("preset", ["basic", "rich"])
+@pytest.mark.parametrize("seed", [1, 2, 3, 4, 5, 6, 7, 8])
+def test_healthy_sweep(preset, seed):
+    run = steady_run(scenario_cfg(), preset=preset, seed=seed)
+    assert switches(run) == []
+    assert_safe_and_bumpless(run)
+
+
+# ---------------------------------------------------------------------------
+# a fouling jump the drive rows cannot see (section 8 item 66)
+# ---------------------------------------------------------------------------
+
+
+def fouling_run(
+    cfg: MpcConfig, *, factor: float | None, preset: str = "basic", seed: int = 1
+) -> DasRun:
+    """The enclosure loses airflow at :data:`T_FOUL`: every fan's ``e`` scaled by
+    ``factor``, the fans themselves unchanged. ``None`` is the same run left healthy."""
+    plant = build_plant(cfg, preset=preset, seed=seed, heat_schedule=FOUL_HEAT)
+    done = {"v": False}
+
+    def on_tick(_rec: Any) -> None:
+        if factor is None or done["v"] or plant.ts < T_FOUL:
+            return
+        done["v"] = True
+        plant.params = dataclasses.replace(
+            plant.params,
+            fans=tuple(
+                dataclasses.replace(f, e_w_per_k=f.e_w_per_k * factor) for f in plant.params.fans
+            ),
+        )
+
+    return run_das_closed_loop(plant, cfg, step, int(FOUL_END / cfg.dt), on_tick=on_tick)
+
+
+def assert_fouling_caught(run: DasRun) -> tuple[float, dict[str, Any]]:
+    sw = [(ts, a) for ts, a in switches(run) if ts >= T_FOUL]
+    assert sw and sw[0][1] == "pi_das", switches(run)
+    assert sw[0][0] - T_FOUL <= FOUL_BOUND_S, sw
+    entered = next(m for ts, m in model_view(run) if ts == sw[0][0])
+    assert entered["reason"].startswith("air_dist:"), entered["reason"]
+    assert_safe_and_bumpless(run)
+    return sw[0][0] - T_FOUL, entered
+
+
+@pytest.mark.parametrize("preset", ["basic", "rich"])
+def test_a_fouling_jump_enters_the_model_fallback(preset):
+    """Section 8 item 66: the fan gains ``E`` only move the air node, so airflow the
+    enclosure no longer has leaves the drive rows' prediction error and drift inside their
+    limits. The air disturbance the estimator has to carry is the evidence that sees it."""
+    _, entered = assert_fouling_caught(
+        fouling_run(scenario_cfg(), factor=FOUL_FACTOR, preset=preset)
+    )
+    checks = entered["checks"]
+    assert checks["pred_err_c"] < checks["max_pred_err_c"]
+    assert checks["drift_c_per_min"] < checks["max_drift_c_per_min"]
+
+
+@pytest.mark.parametrize("preset", ["basic", "rich"])
+def test_the_same_run_without_the_fouling_jump_stays_on_the_mpc(preset):
+    run = fouling_run(scenario_cfg(), factor=None, preset=preset)
+    assert switches(run) == []
+    assert_safe_and_bumpless(run)
+
+
+@pytest.mark.nightly
+@pytest.mark.parametrize("preset", ["basic", "rich"])
+@pytest.mark.parametrize("seed", [1, 2, 3, 4])
+def test_fouling_sweep(preset, seed):
+    cfg = scenario_cfg()
+    assert switches(fouling_run(cfg, factor=None, preset=preset, seed=seed)) == []
+    assert_fouling_caught(fouling_run(cfg, factor=FOUL_FACTOR, preset=preset, seed=seed))

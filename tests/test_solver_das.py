@@ -26,6 +26,7 @@ from aqua_bridge.control import estimates as est
 from aqua_bridge.control import noise, solver_das, thermal
 from aqua_bridge.control.mpc import DAS_SOLVERS, SOLVERS, solver_for, step
 from aqua_bridge.control.solver_das import (
+    DIST_TAU_S,
     DasMpcSolver,
     PenaltyQp,
     check_model,
@@ -52,9 +53,25 @@ def base_cfg() -> MpcConfig:
 
 
 def mpc_cfg(**changes) -> MpcConfig:
-    """The DAS example config with the DAS MPC acting on the prior model."""
+    """The DAS example config with the DAS MPC acting on the prior model.
+
+    The synthetic observations of this module hold every zone-air reading at 35 degC and
+    every drive at its given temperature while the fans move, which no plant does: the
+    estimator has to grow its per-zone air disturbance without bound to explain air that
+    never answers the airflow, and the validity gate's air-disturbance check
+    (``model_max_air_dist_c_per_min``, section 8 item 66) is exactly the check for that.
+    It is relaxed here so these cases keep testing what they are about;
+    :func:`test_the_air_disturbance_check_sees_airflow_the_model_does_not_have` covers it
+    with its shipped limit, and ``tests/test_model_fallback_sim.py`` on the truth plant.
+    """
     return dataclasses.replace(
-        base_cfg(), **{"solver": SolverKind.MPC, "model_accept_prior": True, **changes}
+        base_cfg(),
+        **{
+            "solver": SolverKind.MPC,
+            "model_accept_prior": True,
+            "model_max_air_dist_c_per_min": 1e6,
+            **changes,
+        },
     )
 
 
@@ -834,6 +851,31 @@ def test_check_model_verdicts():
         drift_c_per_min=0.6,
     )
     assert v.reason == "drift:0.6"
+    assert v.reasons == ("drift:0.6",) and v.rate_only  # the entry holds it for the dwell
+    air = dataclasses.replace(cfg, model_max_air_dist_c_per_min=8.0)  # the shipped limit
+    v = check_model(
+        air,
+        status="converged",
+        theta=theta,
+        pred=model.pred,
+        rows=rows,
+        pred_err_c=0.1,
+        drift_c_per_min=0.6,
+        air_dist_c_per_min=99.0,
+    )
+    assert v.reasons == ("drift:0.6", "air_dist:99") and v.rate_only
+    assert v.checks["max_air_dist_c_per_min"] == 8.0
+    v = check_model(
+        air,
+        status="converged",
+        theta=theta,
+        pred=model.pred,
+        rows=rows,
+        pred_err_c=2.0,
+        drift_c_per_min=0.6,
+        air_dist_c_per_min=99.0,
+    )
+    assert not v.rate_only  # a failing prediction error faults the model at once
     assert (
         check_model(
             cfg,
@@ -975,6 +1017,176 @@ def test_a_swap_the_estimator_follows_as_a_jump_is_left_out_of_the_drift_check()
     calm["bays"]["b06"]["q_w"] = 60.0
     res = solver.solve(cfg, fresh_req(req, plant=calm))
     assert res.diagnostics["model"]["reason"].startswith("drift:")
+    # a fresh track has no filter state, so the drift is the plain one; a cold solver
+    # starts on whichever model passes, so this one starts in the fallback
+    assert res.diagnostics["model"]["active"] == "pi_das"
+
+
+#: A bay's heat (W) that settles the model's drift just above ``model_max_drift_c_per_min``
+#: (about 0.8 degC/min) while its one-step prediction error stays inside its own limit, so
+#: the drift is the only failing check.
+HOT_W = 8.0
+#: A bay's heat (W) big enough that the model's rate steps far past every limit at once.
+STEP_W = 300.0
+#: Calm ticks before an injected fault, so the solver is on the MPC when it arrives (a
+#: cold solver starts on whichever model passes, without the entry dwell).
+WARM_TICKS = 2
+
+
+def ticks_with(cfg: MpcConfig, req: SolverRequest, plants, t0: float = 0.0):
+    """Solve once per entry of ``plants`` (a plant dict per tick), carrying the memory."""
+    solver = DasMpcSolver()
+    memory: object = {}
+    out = []
+    for i, plant in enumerate(plants):
+        changes = {"ts": t0 + i * cfg.dt, "memory": memory, "plant": plant}
+        res = solver.solve(cfg, dataclasses.replace(fresh_req(req), **changes))
+        memory = res.memory
+        out.append(res)
+    return out
+
+
+def fast_rate_cfg(**changes) -> MpcConfig:
+    """``mpc_cfg`` with a rate filter shorter than a tick, so the drift is the plain one
+    and the entry dwell is the only thing between a failing check and the fallback."""
+    return mpc_cfg(mpc_every_ticks=1, model_drift_rate_tau_s=0.1, **changes)
+
+
+def first_failing(results) -> int:
+    """Index of the first tick whose drift is over the gate's limit."""
+    for i, res in enumerate(results):
+        checks = res.diagnostics["model"]["checks"]
+        drift, limit = checks["drift_c_per_min"], checks["max_drift_c_per_min"]
+        if drift is not None and drift > limit:
+            return i
+    raise AssertionError("the drift never failed")
+
+
+def test_a_drift_faults_the_model_only_after_the_entry_dwell():
+    """Section 8 items 64 and 65: a rate the plant itself moves is named at once and
+    faults the model only when it keeps failing for ``model_drift_dwell_s``."""
+    cfg = fast_rate_cfg()
+    req = recorded_request(cfg, drive=40.0, ticks=4)
+    plant = copy.deepcopy(req.plant)
+    plant["bays"]["b06"]["q_w"] = HOT_W  # away from the model's equilibrium, drives steady
+    n = int((4 * DIST_TAU_S + cfg.model_drift_dwell_s) / cfg.dt)
+    warm = [copy.deepcopy(req.plant) for _ in range(WARM_TICKS)]
+    results = ticks_with(cfg, req, warm + [copy.deepcopy(plant) for _ in range(n)])
+    actives = [r.diagnostics["model"]["active"] for r in results]
+    assert set(actives[:WARM_TICKS]) == {"mpc"}
+    fails = first_failing(results)
+    switch = actives.index("pi_das")
+    held_s = (switch - fails) * cfg.dt
+    assert cfg.model_drift_dwell_s <= held_s <= cfg.model_drift_dwell_s + cfg.dt, actives
+    assert set(actives[:switch]) == {"mpc"}
+    held = results[switch - 1].diagnostics["model"]
+    assert held["reason"].startswith("drift:")  # named while the model still acts
+    assert held["checks"]["drift_since_ts"] == pytest.approx(fails * cfg.dt)
+    assert results[switch].diagnostics["model"]["reason"].startswith("drift:")
+    # the drift is the only failing check: the prediction error stays inside its limit
+    assert results[switch].diagnostics["model"]["checks"]["pred_err_c"] < 1.0
+
+
+def test_a_drift_that_stops_failing_restarts_the_entry_dwell():
+    cfg = fast_rate_cfg()
+    req = recorded_request(cfg, drive=40.0, ticks=4)
+    hot = copy.deepcopy(req.plant)
+    hot["bays"]["b06"]["q_w"] = HOT_W
+    spell = int((2 * DIST_TAU_S + 0.5 * cfg.model_drift_dwell_s) / cfg.dt)
+    cool = int(4 * DIST_TAU_S / cfg.dt)  # the disturbance decays out of the drift
+    plants = [copy.deepcopy(req.plant) for _ in range(WARM_TICKS)]
+    plants += [copy.deepcopy(hot) for _ in range(spell)]
+    plants += [copy.deepcopy(req.plant) for _ in range(cool)]
+    plants += [copy.deepcopy(hot) for _ in range(spell)]
+    results = ticks_with(cfg, req, plants)
+    assert all(r.diagnostics["model"]["active"] == "mpc" for r in results)
+    # the first spell failed, the calm block cleared it, the second spell starts over
+    assert first_failing(results) < WARM_TICKS + spell
+    second = (WARM_TICKS + spell + cool) * cfg.dt
+    assert results[-1].diagnostics["model"]["checks"]["drift_since_ts"] >= second
+
+
+def test_the_models_own_rate_goes_through_the_drives_rate_filter():
+    """Section 8 item 64: the model's equilibrium rate answers a command or a load change
+    at once while the drives' observed rate lags by ``model_drift_rate_tau_s``. Both sides
+    now go through that filter, so a step in the model's rate enters the drift slowly
+    instead of all at once."""
+    cfg = mpc_cfg(mpc_every_ticks=1)
+    req = recorded_request(cfg, drive=40.0, ticks=4)
+    hot = copy.deepcopy(req.plant)
+    hot["bays"]["b06"]["q_w"] = STEP_W
+    n = int(cfg.model_drift_rate_tau_s / cfg.dt)
+    plants = [copy.deepcopy(req.plant) for _ in range(WARM_TICKS)]
+    plants += [copy.deepcopy(hot) for _ in range(n + 1)]
+    checks = [r.diagnostics["model"]["checks"] for r in ticks_with(cfg, req, plants)]
+    first = checks[WARM_TICKS]
+    assert first["drift_abs_c_per_min"] > 2.0 * cfg.model_max_drift_c_per_min
+    # the model's rate is there at once, and barely in the drift on the tick it happens
+    assert first["drift_c_per_min"] < 0.2 * first["drift_abs_c_per_min"]
+    last = checks[-1]  # one time constant later the filter has followed most of the way
+    assert last["drift_c_per_min"] > 0.35 * last["drift_abs_c_per_min"]
+    assert last["drift_c_per_min"] > 4.0 * first["drift_c_per_min"]
+
+
+def test_the_air_disturbance_check_sees_airflow_the_model_does_not_have():
+    """Section 8 item 66: the fan gains ``E`` only move the air node, whose model the
+    estimator's per-zone air disturbance re-balances, so the drive rows stay clean. A
+    disturbance that steps away from its own slow level is the evidence that is left."""
+    cfg = dataclasses.replace(mpc_cfg(mpc_every_ticks=1), model_max_air_dist_c_per_min=5.0)
+    req = recorded_request(cfg, drive=40.0, ticks=4)
+    steady = copy.deepcopy(req.plant)
+    for info in steady["zones"].values():
+        info["d_air"] = 0.5  # 30 degC/min, and steady: no evidence of anything
+    n = int((cfg.model_drift_dwell_s + 4 * DIST_TAU_S) / cfg.dt)
+    results = ticks_with(cfg, req, [copy.deepcopy(steady) for _ in range(n)])
+    assert {r.diagnostics["model"]["active"] for r in results} == {"mpc"}
+    assert max(r.diagnostics["model"]["checks"]["air_dist_c_per_min"] for r in results) < 1e-6
+
+    stepped = copy.deepcopy(req.plant)
+    for info in stepped["zones"].values():
+        info["d_air"] = 0.0
+    plants = [copy.deepcopy(stepped) for _ in range(20)]
+    jumped = copy.deepcopy(stepped)
+    for info in jumped["zones"].values():
+        info["d_air"] = 0.5
+    plants += [copy.deepcopy(jumped) for _ in range(n)]
+    results = ticks_with(cfg, req, plants)
+    actives = [r.diagnostics["model"]["active"] for r in results]
+    assert set(actives[:20]) == {"mpc"}
+    switch = actives.index("pi_das")
+    assert results[switch].diagnostics["model"]["reason"].startswith("air_dist:")
+    assert switch * cfg.dt >= 20 * cfg.dt + cfg.model_drift_dwell_s
+    checks = results[switch].diagnostics["model"]["checks"]
+    assert checks["drift_c_per_min"] < checks["max_drift_c_per_min"]  # the drives look fine
+    assert checks["max_air_dist_c_per_min"] == 5.0
+
+
+def test_the_prediction_error_guard_skips_a_bay_whose_zone_is_in_fault():
+    """Section 8 item 11: a drive the solver has no row for is not evidence about the
+    model -- the guard neither predicts it nor scores it."""
+    cfg = mpc_cfg(mpc_every_ticks=1)
+    req = recorded_request(cfg, drive=40.0, ticks=4)
+    zone = "z3"
+    bays = [b for b, spec in cfg.topology.bays.items() if spec.zone == zone]
+    later = copy.deepcopy(req.plant)
+    for bay in bays:
+        later["bays"][bay]["t"] += 20.0  # a drive the model never predicted
+    step_ts = cfg.mpc_pred_dt_s
+
+    def run_two(trusted: bool):
+        solver = DasMpcSolver()
+        first = solver.solve(cfg, fresh_req(req, ts=0.0))
+        assert set(bays) <= set(first.memory["pred"]["t"]) if trusted else True
+        changes: dict = {"ts": step_ts, "memory": first.memory, "plant": later}
+        if not trusted:
+            changes["zone_trust"] = {z: z != zone for z in cfg.zone_layout.zones}
+            changes["estimates"] = {b: e for b, e in req.estimates.items() if e["zone"] != zone}
+        return solver.solve(cfg, dataclasses.replace(fresh_req(req), **changes))
+
+    scored = run_two(True)
+    assert scored.diagnostics["pred_err_c"] > 1.0
+    skipped = run_two(False)
+    assert skipped.diagnostics["pred_err_c"] is None or skipped.diagnostics["pred_err_c"] < 1.0
 
 
 # ---------------------------------------------------------------------------
