@@ -114,7 +114,9 @@ mpc:
   fan_curve_refit_s: 600.0     # shortest interval between two fits per fan model, seconds (> 0)
   fan_curve_max_rmse_frac: 0.05  # relative RMSE above which a fit is refused, (0, 1]
   fan_curve_max_age_s: 3600.0  # a fit nothing re-confirms for this long goes stale and its readers
-                         # fall back to the configured curve (>= fan_curve_refit_s)
+                         # fall back to the curve in force before it (the model store's, else the
+                         # configured one). Re-confirmed by an accepted refit and by any tachometer
+                         # reading, not only a settled sample (>= fan_curve_refit_s)
   # DAS MPC (control/solver_das.py: solver "mpc" with topology and no setpoints); inert in legacy mode.
   mpc_pred_dt_s: 30.0    # prediction step, seconds (> 0; >= dt with topology); horizon counts these steps
   mpc_blocks: []         # move blocks summing to horizon; [] = [1, 1, 2, 4, 6, 6] cut to horizon

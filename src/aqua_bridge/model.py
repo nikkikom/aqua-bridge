@@ -1789,9 +1789,11 @@ class MpcConfig:
       readers that follow the fit (``control/fancurve.py``'s ``READERS``), how long a
       commanded duty must hold before a ``(pwm, rpm)`` pair is sampled, how often the
       fit is recomputed, the relative RMSE above which a fit is refused, and how long
-      an accepted fit stays in force without being re-confirmed before the configured
-      curve comes back. ``fan_curve_online: true`` needs ``topology``; the numeric keys
-      are validated always and inert in legacy mode.
+      an accepted fit stays in force without being re-confirmed -- by an accepted refit
+      and by a tachometer reading of that fan model, any reading and not only a settled
+      sample -- before the curve in force before it (the model store's seeded curve,
+      else the configured one) comes back. ``fan_curve_online: true`` needs
+      ``topology``; the numeric keys are validated always and inert in legacy mode.
     * ``model_store_interval_s`` / ``model_store_max_age_days`` / ``model_reconfirm_s`` --
       the model store (``modelstore.py``, ``control/persist.py``): the shortest interval
       between two writes of ``model.json``, the age above which a stored model loads

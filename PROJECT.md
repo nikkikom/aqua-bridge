@@ -2051,13 +2051,22 @@ a restart. One fit per fan model, not per channel: a tach-less output is
 covered by the curve of its own model.
 
 An accepted fit **goes stale** after `fan_curve_max_age_s` without being
-re-confirmed (default 3600 s, validated `≥ fan_curve_refit_s`): every
-accepted fit is stamped with the tick that accepted it, a refused refit
-leaves the stamp alone, and past that age the entry leaves
-`solver_memory["fan_curves"]` and every reader falls back to the configured
-curve. A tachometer that dies, or a fan that stops sweeping enough PWM to
-fit, so returns the controller to the commissioned curve instead of
-planning forever on a fit nothing confirms.
+re-confirmed (default 3600 s, validated `≥ fan_curve_refit_s`). Two stamps
+confirm it, and either one running out is enough: the tick that accepted the
+fit (a refused refit leaves it alone, so a tachometer that lies badly enough
+that no refit passes again ages out) and the tick of the newest **tachometer
+reading** of that fan model (the bins keep their history, so a dead
+tachometer would otherwise let the fit be re-accepted from year-old data for
+ever). The second stamp counts every finite reading, *not* only a settled
+`(pwm, rpm)` sample: the DAS QP moves the duty on nearly every solve, so
+settled samples can stop arriving for hours with the hardware perfectly
+healthy, and a controller that is simply regulating must not lose the curve
+its live tachometers keep confirming. Past that age the fit stops being
+published: its entry leaves `solver_memory["fan_curves"]` — or, when the
+model store's seed carried a curve for that model, falls **back to the
+stored one**, which the store's own age rule judged at load, rather than
+being deleted from the section `model.json` saves — and its readers are on
+whatever is in force again.
 
 **Who reads the curve** (item 107; the table lives in code as
 `fancurve.READERS` and is reported in the diagnostics, so the running
@@ -2068,7 +2077,7 @@ daemon says which curve produced which number):
 | thermal model `u0.<m>`, `n.<m>` (`thermal.model_params`) | fit | it plans on the air a fan moves |
 | DAS MPC prediction (`solver_das`) | fit | the same parameters through the prediction |
 | estimator airflow `Q_z`, `Qn_z` (`estimator._airflow`) | fit | an estimator that disagrees with the model about the airflow is read by the prediction-error guard as a bad model: a fallback, safe but louder than it needs to be |
-| noise objective `u0` (`noise.surrogate`, `channel_power`, `noise_diagnostics`) | fit | it changes the objective, not the safety: with a real dead band of 0.25 and a configured 0.1 the surrogate charges for noise over a band where the fan does not turn, and one `u0` across model, estimator and objective keeps them consistent |
+| noise objective `u0` (`noise.channel_deadband`, read by `surrogate`, `_level`, `rpm_model` and `noise_diagnostics`) | fit | it changes the objective, not the safety: with a real dead band of 0.25 and a configured 0.1 the surrogate charges for noise over a band where the fan does not turn, and one `u0` across model, estimator and objective keeps them consistent. `channel_power` and `noise_db` read no `u0` at all — they take the speed fraction the caller computed, so the curve behind them is the curve behind that fraction |
 | noise `noise_db_at_max` | config | a datasheet figure at `rpm_max` that a PWM → RPM fit says nothing about |
 | noise `rpm_max` (tach normalisation, `rpm_cmd`) | config | a fitted `rpm_max` normalises away the loss of speed it was fitted to |
 | `model_use_rpm` (`thermal._channel_phi`) | config | same: the fit supplies the shape, the commissioned `rpm_max` the reference |
@@ -2077,10 +2086,12 @@ daemon says which curve produced which number):
 
 `GET /api/state`'s `fan_curves` diagnostics carry that table (`readers`)
 and, per fan model, the curve in force, its source (`fit` | `store` |
-`config`), whether an accepted fit has gone `stale` and its `age_s`; the
-`noise` diagnostics carry the `u0` each channel's index was computed with
-and the `curve` it came from, and each estimator zone carries
-`airflow_curve`.
+`config`), whether an accepted fit has gone `stale`, its `age_s` and the
+`sample_age_s` of the newest tachometer reading behind it; the `noise`
+diagnostics carry the `u0` each channel's index was computed with and the
+`curve` it came from, and each estimator zone carries `airflow_curve`
+(`fit` | `config` | `mixed`, the last one for a zone whose channels are of
+several fan models and only some of them have a fitted curve).
 
 **Objective and constraints** (`control/solver_das.py`, `control/noise.py`).
 Noise per output from the fan laws: `r = clip((u − u0)/(1 − u0), 0, 1)`,
@@ -6189,10 +6200,12 @@ Owner decision (2026-09-16):
     cannot disagree about the air a fan moves and have the prediction-error
     guard answer the difference with a fallback — safe, but louder than it
     needs to be; and the noise model's `u0`
-    (`noise.surrogate` / `channel_power` / `noise_diagnostics`), because it
-    changes the objective, not the safety, and a surrogate charging for
-    noise over a band where the fan does not turn sends the solver to the
-    wrong command. **Deliberately stay on the configured curve:** the fan
+    (`noise.channel_deadband`, read by `surrogate`, `_level`, `rpm_model`
+    and `noise_diagnostics`; `channel_power` and `noise_db` read no `u0`,
+    they take the fraction their caller computed), because it changes the
+    objective, not the safety, and a surrogate charging for noise over a
+    band where the fan does not turn sends the solver to the wrong command.
+    **Deliberately stay on the configured curve:** the fan
     health rpm and power rules (a curve fitted to the same tachometer
     readings would follow a fan that slows down and the deviation would
     never show — a floor derived from the configured curve must not drift
@@ -6203,9 +6216,17 @@ Owner decision (2026-09-16):
     own reason. A fit that nothing re-confirms for `fan_curve_max_age_s`
     (new key, default 3600 s, validated `≥ fan_curve_refit_s`) goes stale:
     it leaves `solver_memory["fan_curves"]` and every reader falls back to
-    the configured curve. The noise model's shape is unchanged — `r(u)` is
-    still linear in the dead-band-shifted duty, only `u0` moves — so no
-    golden moves and the legacy path is untouched.
+    what was in force before it — the model store's seeded curve when there
+    was one (the stale rule abandons this run's fit; it never deletes the
+    stored curve from the section `model.json` saves), else `fan_models`.
+    The two stamps that re-confirm a fit are the tick that accepted it and
+    the tick of the newest **tachometer reading** of that fan model, not of
+    the newest settled `(pwm, rpm)` sample: the DAS QP moves the duty on
+    nearly every solve, so a settled-sample rule would flip a healthy
+    controller config → fit → config on an hours timescale while the
+    tachometers were reporting all along. The noise model's shape is
+    unchanged — `r(u)` is still linear in the dead-band-shifted duty, only
+    `u0` moves — so no golden moves and the legacy path is untouched.
 101. **Done, off by default** (2026-09-17): the estimator can now hold a sensor
     node and a map per proximal *sensor* rather than per bay
     (`estimator.proximal_slope_spread`, default 0 — §3 *A node per proximal
