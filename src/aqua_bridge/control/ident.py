@@ -44,9 +44,11 @@ computed once at the start, in plain JSON, and is the same for the same config,
 target and base commands.
 
 Time: the start is armed between ticks; offset 0 is the tick after the last
-recorded one (``last ts + dt``). After every tick the machine checks that tick
-and computes the overrides for the next one at offset ``ts + dt - start``. The
-experiment completes when that offset reaches the duration.
+recorded one (``last ts + dt``), or one tick later when the loop has already taken
+the plan for that tick (``start``'s ``skip_ticks``, set by the supervisor; section 8
+item 20). After every tick the machine checks that tick and computes the overrides
+for the next one at offset ``ts + dt - start``. The experiment completes when that
+offset reaches the duration.
 
 Preconditions (:func:`check_start`, each failure has a named reason)
 --------------------------------------------------------------------
@@ -60,8 +62,12 @@ refuses a second start while one runs. Here:
   ``fan_stall:<ch>`` -- on any channel;
 * ``settle:<zone>`` -- every zone the target serves (``ZoneLayout.served``: the zones
   listing one of its channels plus their declared ``coupled_to``) has been trusted
-  and fault-free for ``ident_settle_s`` (tracked by :func:`track` from every tick; a
-  restart starts the count over);
+  and fault-free for ``ident_settle_s`` (tracked by :func:`track` from every tick);
+* ``sensor_lost:<zone>`` -- no zone the target serves has a zone-air or bay sensor
+  group without a trusted, confirmed member (:func:`lost_sensor_zones`, from
+  ``diagnostics["sigma_floor"]``). Under ``zones.trust_rule: sigma`` a zone with a
+  lost sensor stays trusted while the estimator's sigma is still small, so without
+  this the enclosure would be excited while blind on one node;
 * ``bay_unknown:<bay>`` / ``bay_transition:<bay>`` -- no bay of those zones is
   ``unknown``, has an occupancy change pending (``pending_empty_s``,
   ``pending_occupied_ticks`` or the occupancy debounce ``pending_unknown_s`` of the
@@ -69,7 +75,20 @@ refuses a second start while one runs. Here:
 * ``calibrating:<bay>`` -- no bay of those zones has a SMART calibration still in its
   first 20 samples (:data:`~aqua_bridge.control.estimator.CAL_MIN_SAMPLES`);
 * ``start_band:<bay>`` -- every occupied or unknown bay of those zones has
-  ``T_hat + k sigma <= soft + ident_start_band_c``, plus the running envelope below.
+  ``T_hat <= soft + ident_start_band_c``, plus the running envelope below.
+
+Settle timers across a restart
+-------------------------------
+The tracker is per-zone seconds, not wall times: :func:`settle_snapshot` hands the
+model store ``{zone: seconds settled so far}``,
+:func:`aqua_bridge.control.persist.apply_seed` subtracts the daemon's outage from
+them (and drops the lot when the outage is longer than
+``ident_settle_resume_max_gap_s``, or when the file is stale or the wall clock is
+behind it), and :func:`resume_tracker` installs what is left as a *credit*.
+:func:`track` spends a zone's credit on the first tick that zone is trusted and
+fault-free again, minus the time it took to get there, so no second the daemon did
+not observe is ever counted as settled. A zone that never comes back never spends
+its credit.
 
 Envelope (checked on every tick while running, and at start)
 -------------------------------------------------------------
@@ -77,22 +96,23 @@ For every occupied or unknown bay of the served zones, on the estimates of the
 tick (``diagnostics["estimates"]``: ``t_c``, ``margin_c = k sigma``, ``soft_c``,
 ``hard_c``, ``limit_c``), with ``upper = T_hat + k sigma``:
 
-* ``envelope:<bay>``   -- ``upper > soft + ident_max_over_c`` (3.0 degC, owner-accepted);
-* ``hard:<bay>``       -- ``upper > hard`` (always);
-* ``abort_temp:<bay>`` -- ``upper >= limit - 1`` (:data:`ABORT_BELOW_LIMIT_C`): the base
-  plan's absolute ``ident_abort_temp_c`` becomes per drive class (the bay's limit in
-  force), so there is no ``ident_abort_temp_c`` key;
+* ``envelope:<bay>``   -- ``T_hat > soft + ident_max_over_c`` (3.0 degC, owner-accepted);
+* ``hard:<bay>``       -- ``T_hat > hard`` (always);
+* ``abort_temp:<bay>`` -- ``upper >= limit - ident_abort_below_limit_c``: the base plan's
+  absolute ``ident_abort_temp_c`` becomes per drive class (the bay's limit in force),
+  so there is no ``ident_abort_temp_c`` key;
 * ``no_estimate:<bay>`` -- the bay has no finite estimate.
 
-The formulas are the plan's as written: ``soft`` and ``hard`` already subtract
-``k sigma``, so ``upper <= hard`` means ``T_hat <= limit - 2 k sigma`` (conservative,
-the same double count as PI-DAS). Under PI-DAS, which regulates ``upper`` to
-``soft``, a settled enclosure starts and runs inside this envelope. The DAS MPC
-counts ``k sigma`` once and rides ``T_hat = soft``, i.e. ``upper = soft + k sigma``;
-with the uncalibrated sigma (``k sigma`` about 3 degC) such a state is refused at
-start and aborts at once. That is acceptable: the DAS MPC only acts on a converged
-model, which is what experiments are run to obtain, so experiments run under its
-PI-DAS fallback in practice.
+``k sigma`` is counted **once** (section 8 item 53). ``soft`` and ``hard`` already
+subtract it, so the soft and hard rules read ``T_hat``, and only the absolute rule,
+which is measured against the raw limit, reads ``upper``. ``T_hat <= hard`` therefore
+means ``T_hat + k sigma <= limit``, the 2-sigma statement the plan intends, and
+``abort_temp`` is stricter than it by ``ident_abort_below_limit_c``: the absolute
+abort is the rule that binds and it is unchanged from before item 53. What changed is
+that a settled enclosure is no longer refused at start and no longer sits on the abort
+edge: PI-like DAS regulates ``T_hat`` to ``soft`` (section 8.5 item 1) and the DAS MPC
+rides ``T_hat = soft`` too, so both now start with the whole
+``ident_start_band_c`` / ``ident_max_over_c`` band in hand.
 
 Abort list (:func:`advance`; abort = release the override)
 ----------------------------------------------------------
@@ -102,9 +122,10 @@ controller error), ``degraded`` (any zone in fault anywhere), ``apply_failed``
 or ``ts`` running backwards), ``duration`` (``ts`` beyond the duration plus one tick:
 a clock jump), the envelope reasons above, ``zone_untrusted:<zone>`` and
 ``bay_unknown:<bay>`` in a served zone, ``fan_stall:<ch>`` on an experiment channel,
-a stop intent (``stop``) and any human intent (``human_intent:<kind>``, by the
-supervisor). A daemon restart never resumes: the experiment lives only in the
-supervisor's memory, as do the settle timers.
+``sensor_lost:<zone>`` in a served zone, a stop intent (``stop``) and any human
+intent (``human_intent:<kind>``, by the supervisor). A daemon restart never resumes a
+running experiment: it lives only in the supervisor's memory. The settle timers do
+survive one, through the model store (above).
 
 Release: the supervisor hands the experiment's channels to the loop as
 ``TickPlan.released``, which drops their integrator entries so the solver
@@ -124,7 +145,6 @@ from aqua_bridge.control.estimator import CAL_MIN_SAMPLES, EMPTY, UNKNOWN
 from aqua_bridge.model import MpcCommand, MpcConfig
 
 __all__ = [
-    "ABORT_BELOW_LIMIT_C",
     "ACTIONS",
     "APPLY_FAILURES_ABORT",
     "LEVEL_HIGH",
@@ -143,16 +163,17 @@ __all__ = [
     "groups",
     "hold_sequence",
     "levels_at",
+    "lost_sensor_zones",
     "new_tracker",
+    "resume_tracker",
     "served_zones",
+    "settle_snapshot",
     "start",
     "status",
     "target_channels",
     "track",
 ]
 
-#: The absolute abort sits this far below each drive's limit in force, degC.
-ABORT_BELOW_LIMIT_C = 1.0
 #: This many consecutive failed writes abort a running experiment.
 APPLY_FAILURES_ABORT = 2
 #: Galois LFSR taps (16 bit, maximal length) of the hold-time sequence.
@@ -245,9 +266,9 @@ class TickFacts:
 
     ``mode`` is the solver command's mode (``None``: no solver command, e.g. a
     controller error); ``pwm`` the solver's command per channel; ``zones``,
-    ``estimates``, ``bays``, ``saturated`` and ``fan_stall`` the matching entries of
-    its diagnostics (empty when absent or malformed, which every check reads as
-    unsafe).
+    ``estimates``, ``bays``, ``saturated``, ``fan_stall``, ``sigma_floor`` and
+    ``store`` the matching entries of its diagnostics (empty when absent or
+    malformed, which every check reads as unsafe).
     """
 
     ts: float | None
@@ -259,6 +280,8 @@ class TickFacts:
     bays: dict[str, Any] = field(default_factory=dict)
     saturated: dict[str, Any] = field(default_factory=dict)
     fan_stall: dict[str, Any] = field(default_factory=dict)
+    sigma_floor: dict[str, Any] = field(default_factory=dict)
+    store: dict[str, Any] = field(default_factory=dict)
 
 
 def facts_from_tick(mpc_cmd: MpcCommand | None, *, ts: float | None, applied: bool) -> TickFacts:
@@ -277,6 +300,8 @@ def facts_from_tick(mpc_cmd: MpcCommand | None, *, ts: float | None, applied: bo
         bays=_mapping(diag.get("bays")),
         saturated=_mapping(diag.get("saturated")),
         fan_stall=_mapping(diag.get("fan_stall")),
+        sigma_floor=_mapping(diag.get("sigma_floor")),
+        store=_mapping(diag.get("store")),
     )
 
 
@@ -286,19 +311,57 @@ def facts_from_tick(mpc_cmd: MpcCommand | None, *, ts: float | None, applied: bo
 
 
 def new_tracker() -> dict[str, Any]:
-    """Empty settle tracker: ``{"ts": last ts, "ok_since": {zone: ts}}``."""
+    """Empty settle tracker: ``{"ts": last ts, "ok_since": {zone: ts}}`` (plus the
+    optional ``resume`` credit of :func:`resume_tracker`)."""
     return {"ts": None, "ok_since": {}}
+
+
+def resume_tracker(tracker: Mapping[str, Any], facts: TickFacts) -> dict[str, Any]:
+    """``tracker`` with the settle credit the model store carried across a restart.
+
+    ``facts.store["ident_settle"]`` is what
+    :func:`aqua_bridge.control.persist.apply_seed` put there: ``{"ts": the tick the
+    seed was applied on, "credit_s": {zone: seconds}}``, the settled time each zone
+    had before the shutdown minus the outage. A malformed or absent section leaves the
+    tracker untouched. The credit is spent by :func:`track` on the first tick the zone
+    is trusted and fault-free again, and it keeps decaying until then, so nothing the
+    daemon did not observe is ever counted as settled."""
+    base = dict(tracker) if isinstance(tracker, Mapping) else new_tracker()
+    raw = facts.store.get("ident_settle")
+    if not isinstance(raw, Mapping):
+        return base
+    ts, credits = raw.get("ts"), raw.get("credit_s")
+    if not _finite(ts) or not isinstance(credits, Mapping):
+        return base
+    credit_s = {
+        str(zone): float(value)
+        for zone, value in credits.items()
+        if _finite(value) and float(value) > 0.0
+    }
+    if credit_s:
+        base["resume"] = {"ts": float(ts), "credit_s": credit_s}  # type: ignore[arg-type]
+    return base
 
 
 def track(tracker: Mapping[str, Any], cfg: MpcConfig, facts: TickFacts) -> dict[str, Any]:
     """The tracker after ``facts``: per zone, the ``ts`` since which it has been trusted
     and fault-free without a break. A tick without a finite ``ts``, a clock running
-    backwards or a tick without zone diagnostics starts every count over."""
+    backwards or a tick without zone diagnostics starts every count over (a stored
+    credit survives everything but a clock running backwards: it is timed against its
+    own ``ts``)."""
     last = tracker.get("ts") if isinstance(tracker, Mapping) else None
     old = _mapping(tracker.get("ok_since")) if isinstance(tracker, Mapping) else {}
+    resume = _mapping(tracker.get("resume")) if isinstance(tracker, Mapping) else {}
     ts = facts.ts
-    if ts is None or (_finite(last) and ts < float(last)) or not facts.zones:
-        return {"ts": ts, "ok_since": {}}
+    backwards = ts is not None and _finite(last) and ts < float(last)
+    if ts is None or backwards or not facts.zones:
+        out: dict[str, Any] = {"ts": ts, "ok_since": {}}
+        if resume and not backwards:
+            out["resume"] = resume
+        return out
+    credit_s = _mapping(resume.get("credit_s"))
+    resume_ts = resume.get("ts")
+    left = dict(credit_s)
     ok_since: dict[str, float] = {}
     for zone in cfg.zone_layout.zones:
         info = facts.zones.get(zone)
@@ -307,8 +370,35 @@ def track(tracker: Mapping[str, Any], cfg: MpcConfig, facts: TickFacts) -> dict[
         if info.get("fault") is not False:
             continue
         since = old.get(zone)
-        ok_since[zone] = float(since) if _finite(since) else ts
-    return {"ts": ts, "ok_since": ok_since}
+        if _finite(since):
+            ok_since[zone] = float(since)
+            continue
+        credit = 0.0
+        if zone in left and _finite(resume_ts):
+            credit = max(0.0, float(left[zone]) - (ts - float(resume_ts)))  # type: ignore[arg-type]
+        left.pop(zone, None)  # spent, whatever was left of it
+        ok_since[zone] = ts - credit
+    out = {"ts": ts, "ok_since": ok_since}
+    if left and _finite(resume_ts):
+        out["resume"] = {"ts": float(resume_ts), "credit_s": left}  # type: ignore[arg-type]
+    return out
+
+
+def settle_snapshot(tracker: Mapping[str, Any]) -> dict[str, float]:
+    """``{zone: seconds settled so far}`` for the model store (:mod:`aqua_bridge.modelstore`).
+
+    Seconds, not absolute times, so the file needs no clock conversion: the outage is
+    subtracted from them when the file is loaded again."""
+    if not isinstance(tracker, Mapping):
+        return {}
+    ts = tracker.get("ts")
+    if not _finite(ts):
+        return {}
+    out: dict[str, float] = {}
+    for zone, since in _mapping(tracker.get("ok_since")).items():
+        if _finite(since) and float(ts) >= float(since):  # type: ignore[arg-type]
+            out[str(zone)] = float(ts) - float(since)  # type: ignore[arg-type]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -347,13 +437,31 @@ def envelope_violations(
         if not isinstance(est, Mapping) or not all(_finite(est.get(k)) for k in keys):
             reasons.append(f"no_estimate:{bay}")
             continue
-        upper = float(est["t_c"]) + float(est["margin_c"])
-        if upper > float(est["soft_c"]) + over_c + _EPS:
+        t_hat = float(est["t_c"])
+        upper = t_hat + float(est["margin_c"])
+        if t_hat > float(est["soft_c"]) + over_c + _EPS:
             reasons.append(f"envelope:{bay}")
-        if upper > float(est["hard_c"]) + _EPS:
+        if t_hat > float(est["hard_c"]) + _EPS:
             reasons.append(f"hard:{bay}")
-        if upper >= float(est["limit_c"]) - ABORT_BELOW_LIMIT_C - _EPS:
+        if upper >= float(est["limit_c"]) - cfg.ident_abort_below_limit_c - _EPS:
             reasons.append(f"abort_temp:{bay}")
+    return reasons
+
+
+def lost_sensor_zones(facts: TickFacts, zones: tuple[str, ...]) -> list[str]:
+    """``sensor_lost:<zone>`` reasons: zones of ``zones`` with a zone-air or bay sensor
+    group that has no trusted, confirmed member this tick.
+
+    Under ``zones.trust_rule: sigma`` such a zone stays trusted while the estimator's
+    sigma is still small (the soft sigma floor holds its fans meanwhile), so nothing
+    else in the precondition list sees the loss; under ``strict`` the zone is in fault
+    and ``settle`` / ``degraded`` catch it first. Section 8 item 72."""
+    reasons = []
+    for zone in zones:
+        info = facts.sigma_floor.get(zone)
+        lost = info.get("lost") if isinstance(info, Mapping) else None
+        if isinstance(lost, list | tuple) and lost:
+            reasons.append(f"sensor_lost:{zone}")
     return reasons
 
 
@@ -409,6 +517,7 @@ def check_start(
             or facts.ts - float(since) < cfg.ident_settle_s - _EPS  # type: ignore[arg-type]
         ):
             reasons.append(f"settle:{zone}")
+    reasons.extend(lost_sensor_zones(facts, zones))
     reasons.extend(_bay_reasons(cfg, facts, zones))
     for reason in envelope_violations(cfg, facts, zones, cfg.ident_start_band_c):
         reasons.append(
@@ -502,8 +611,15 @@ def _schedule(cfg: MpcConfig, phases: list[tuple[str, ...]]) -> list[dict[str, A
     return out
 
 
-def start(cfg: MpcConfig, facts: TickFacts, kind: str, name: str) -> dict[str, Any]:
+def start(
+    cfg: MpcConfig, facts: TickFacts, kind: str, name: str, *, skip_ticks: int = 0
+) -> dict[str, Any]:
     """A new experiment (plain JSON) armed for the tick after ``facts``.
+
+    ``skip_ticks`` moves offset 0 that many ticks further out, for the ticks whose plan
+    the loop has already taken and which therefore cannot carry the overrides: the
+    supervisor passes 1 for a start that arrives between ``plan_tick`` and
+    ``record_tick``, so the recorded levels are the levels that ran (section 8 item 20).
 
     Call only when :func:`check_start` returned no reason."""
     channels = target_channels(cfg, kind, name)
@@ -512,7 +628,7 @@ def start(cfg: MpcConfig, facts: TickFacts, kind: str, name: str) -> dict[str, A
     assert facts.ts is not None
     exp: dict[str, Any] = {
         "target": {"kind": kind, "name": name},
-        "start_ts": facts.ts + cfg.dt,
+        "start_ts": facts.ts + cfg.dt * (1 + max(int(skip_ticks), 0)),
         "last_ts": facts.ts,
         "duration_s": cfg.ident_max_duration_s,
         "channels": list(channels),
@@ -591,6 +707,7 @@ def advance(exp: Mapping[str, Any], cfg: MpcConfig, facts: TickFacts) -> Advance
         info = facts.bays.get(bay)
         if not isinstance(info, Mapping) or info.get("occupancy") in (UNKNOWN, None):
             reasons.append(f"bay_unknown:{bay}")
+    reasons.extend(lost_sensor_zones(facts, zones))
     reasons.extend(envelope_violations(cfg, facts, zones, cfg.ident_max_over_c))
     for ch in exp["channels"]:
         if facts.fan_stall.get(ch):
