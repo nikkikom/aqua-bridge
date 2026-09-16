@@ -33,7 +33,10 @@ status is ``first`` / ``ok``, ``obs.temps`` has no key outside
   has been gate-trusted on ``confirm_ticks`` consecutive time-valid ticks,
   exactly the count a zone needs to leave a fault. A dropout (``missing``,
   ``null``, ``non_finite``) starts nothing: the value that returns is gated
-  against the last good one. A confirming sensor is not fused by the
+  against the last good one -- unless there is no last good one to gate it
+  against (a sensor missing since boot, ``gate.no_reference``, item 61):
+  such a first reading has no evidence behind it either, so it confirms too,
+  on the tick it first appears. A confirming sensor is not fused by the
   estimator, not handed to the solver and not a last good value. For zone
   trust it counts as a trusted member only while its zone is already in
   fault (the zone's own confirmation runs beside it, so a sole member costs
@@ -240,7 +243,11 @@ def advance_confirmation(
     of a present value (:data:`CONFIRM_REASONS`) sets the count to 0; a gate-trusted
     value on a time-valid tick adds one, and the sensor leaves the map on reaching
     ``cfg.confirm_ticks``; any other tick of a confirming sensor (a dropout, a time
-    fault) restarts its count. Legacy mode: always empty.
+    fault) restarts its count. A name gate-trusted only because it had no reference to
+    check against (``gate.no_reference``, item 61 -- a sensor missing since boot, while
+    the rest of the system is past its own cold start) starts confirming too, on this
+    same tick, exactly like a fresh rejection: it has no more evidence behind it than a
+    Jump does. Legacy mode: always empty.
     """
     if cfg.zone_layout.implicit:
         return {}
@@ -252,6 +259,8 @@ def advance_confirmation(
             out[name] = 0
             continue
         if name not in old:
+            if time_ok and gate.per_temp.get(name, False) and name in gate.no_reference:
+                out[name] = 0  # a never-referenced first reading confirms like any return
             continue
         raw = old[name]
         valid = isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0

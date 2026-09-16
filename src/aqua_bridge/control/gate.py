@@ -24,7 +24,12 @@ Rules implemented (numbers as in the spec):
    ``last_good_obs.temps[name]`` and the previous (filtered) raw value.
    When neither reference exists (cold state) the slew check passes: with
    no history nothing can be compared, and a controller that could never
-   start would be the less safe choice.
+   start would be the less safe choice. With zones, a name that passes this
+   way while ``last_good_obs`` itself already exists (the run is past its own
+   cold start) is *never referenced* (:attr:`GateResult.no_reference`,
+   item 61): a sensor missing since boot has no evidence at all behind its
+   first reading, so ``zones.advance_confirmation`` starts it confirming
+   like any other return instead of fusing it on trust alone.
 3. **Stuck**: over the last ``cfg.stuck_ticks`` window samples plus the
    current one, every (pre-filter) value lies within ``cfg.stuck_eps_c`` of
    the oldest window sample, and in that same window either the *net*
@@ -178,6 +183,14 @@ class GateResult:
     * ``stuck``        -- per temperature, whether the Stuck rule is active (fresh or latched)
     * ``stuck_latch``  -- per latched temperature, the band reference; feed back into the
       next call (``mpc.step`` keeps it in ``solver_memory["stuck_latch"]``)
+    * ``no_reference``  -- names whose slew check (rule 2) passed with neither a
+      ``last_good_obs`` value nor a previous raw one to compare against -- trusted on
+      trust alone, not on evidence. Empty whenever ``last_good_obs`` itself is ``None``
+      (the whole run's first tick, genuinely cold): a sensor present since boot with
+      everyone else needs no extra scrutiny. Otherwise this is a sensor that has never
+      once been referenced even though the rest of the system has (item 61, DAS: a
+      redundant sensor missing since boot); ``zones.advance_confirmation`` starts it
+      confirming like any other return instead of fusing it on this one trusting tick.
     """
 
     trusted: bool
@@ -188,6 +201,7 @@ class GateResult:
     unknown_keys: tuple[str, ...]
     stuck: dict[str, bool]
     stuck_latch: dict[str, float] = field(default_factory=dict)
+    no_reference: frozenset[str] = frozenset()
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-serialisable form for ``MpcCommand.diagnostics``; never contains NaN."""
@@ -683,6 +697,7 @@ def evaluate_gate(
     reasons: dict[str, tuple[str, ...]] = {}
     stuck: dict[str, bool] = {}
     latch_out: dict[str, float] = {}
+    no_reference: set[str] = set()
     for name in cfg.temps:
         why: list[str] = []
         value = filtered[name]
@@ -703,6 +718,11 @@ def evaluate_gate(
                     refs.append(g)
             if prev_ref[name] is not None:
                 refs.append(prev_ref[name])  # type: ignore[arg-type]
+            if not refs and last_good_obs is not None:
+                # Neither reference exists, yet the system is past its own cold start
+                # (something has already been trusted before): this specific name has
+                # simply never had a reference, not the whole run (item 61).
+                no_reference.add(name)
             if refs and not any(abs(value - r) <= limit for r in refs):
                 why.append(REASON_SLEW)
             latched = latch_in.get(name)
@@ -732,4 +752,5 @@ def evaluate_gate(
         unknown_keys=unknown,
         stuck=stuck,
         stuck_latch=latch_out,
+        no_reference=frozenset(no_reference),
     )

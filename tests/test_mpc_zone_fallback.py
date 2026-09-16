@@ -297,7 +297,13 @@ def test_flicker_in_one_zone_never_resets_another_zone(dcfg):
 def test_dropout_inside_a_redundant_group_is_no_fault(dcfg):
     def temps(i: int) -> dict[str, float | None]:
         patch: dict[str, float | None] = {"air_a2": None, "prox_c1": None, "exhaust": None}
-        if i % 3:
+        # Both bay a1 members are left alone on the very first tick, so each gets a real
+        # reference from the run's genuine cold start (item 61: a member whose own first
+        # ever reading lands later, with the other member simultaneously down, would
+        # otherwise have nothing covering the group -- correctly, not a test of this rule).
+        if i == 0:
+            pass
+        elif i % 3:
             patch["prox_a1b"] = math.nan
         else:
             patch["prox_a1"] = None
