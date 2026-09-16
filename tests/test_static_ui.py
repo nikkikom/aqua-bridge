@@ -120,6 +120,8 @@ _DEVICE_HEALTH: dict[str, Any] = {
             "now": False,
             "since_boot": False,
         },
+        "faults": [],
+        "hints": [],
         "problems": [],
         "ok": True,
     },

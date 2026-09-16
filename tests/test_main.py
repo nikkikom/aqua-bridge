@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from aqua_bridge import __main__ as main_mod
+from aqua_bridge import hostinfo as hostinfo_mod
 from aqua_bridge.config import ConfigError, load_config
 from aqua_bridge.health import FanHealthConfig
 from aqua_bridge.model import Mode, MpcCommand
@@ -310,6 +311,61 @@ def test_a_bad_fan_health_key_exits_2_before_anything_opens(tmp_path, example_co
     with caplog.at_level(logging.ERROR):
         assert main_mod.main(["--config", str(path), "--source", "sim", "--once"]) == 2
     assert "fan_health.rpm_fault_s" in caplog.text
+
+
+def test_a_host_health_air_temps_typo_exits_2_before_anything_opens(
+    tmp_path, example_config_path, caplog
+):
+    """Item 97: the one host_health check that needs mpc.temps runs in main() too.
+
+    Left to HealthMonitor.__init__ it would fire after build_io had opened the
+    hardware and outside main's ConfigError handling: a raw traceback, exit 1 instead
+    of the documented 2, the hidraw handles never released and the section 9 stop path
+    -- the only place fallback_pwm is written at exit -- skipped.
+    """
+    raw = yaml.safe_load(example_config_path.read_text())
+    raw["host_health"]["air_temps"] = ["nope_typo"]
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    with caplog.at_level(logging.ERROR):
+        assert main_mod.main(["--config", str(path), "--source", "sim", "--once"]) == 2
+    assert "host_health.air_temps" in caplog.text and "nope_typo" in caplog.text
+
+
+def test_the_tick_reader_never_starts_a_vcgencmd_process(example_config_path, monkeypatch):
+    """Item 97: HealthMonitor.on_tick runs on the loop thread, so its host reader has
+    the vcgencmd fallback off -- a fork/exec there would stretch the tick and the
+    watchdog ping behind it, invisibly to the step budget (measured before on_tick)."""
+    from aqua_bridge.control.supervisor import Supervisor
+    from aqua_bridge.health import HostHealthConfig, host_metrics_reader
+
+    spawned: list[tuple[list[str], float]] = []
+
+    class _Proc:
+        returncode = 0
+        stdout = "throttled=0x0\n"
+
+    def fake_run(argv, **kwargs):
+        spawned.append((list(argv), kwargs.get("timeout")))
+        return _Proc()
+
+    # A machine that does have vcgencmd: without the fallback switched off, the reader
+    # below would fork one process per refresh.
+    monkeypatch.setattr(hostinfo_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(hostinfo_mod.subprocess, "run", fake_run)
+
+    app = load_config(example_config_path)
+    sup = Supervisor(app.mpc)
+    src, _sink, _release = main_mod.build_io(app, "sim")
+    monitor = main_mod.build_health_monitor(app, sup, src)
+    assert monitor is not None
+    monitor.on_tick(None)
+    assert spawned == [], "the control tick must start no process"
+    assert sup.snapshot().device_health["host"]["throttled"] is None
+
+    # The publishers' reader does keep the fallback, bounded by the documented key.
+    host_metrics_reader(HostHealthConfig(vcgencmd_timeout_s=0.25))()
+    assert [(argv[1], timeout) for argv, timeout in spawned] == [("get_throttled", 0.25)]
 
 
 def test_build_io_sim_and_unknown(example_config_path):
