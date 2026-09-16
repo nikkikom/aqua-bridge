@@ -122,6 +122,11 @@ in fault (the ``error`` names which and why, e.g. ``untrusted:za``, ``empty:b03`
 ``mpc.estimator.smart_max_age_s``; the estimator folds it in once, by sample time,
 exactly as it does a repeated SMART reading), and in ``GET /api/bays`` and
 ``GET /api/model`` as the bay's ``calibration`` with ``calibration_source: "manual"``.
+One reading calibrates nothing on its own: a map is accepted at
+:data:`~aqua_bridge.control.estimator.CAL_MIN_SAMPLES` fresh samples, so the 200 body
+carries ``calibration`` with the bay's ``fresh_samples`` (as of the last tick),
+``samples_required``, ``calibrated`` and ``calibration_source`` for the operator to
+see how far along the bay is.
 
 ``POST /api/in/smart`` (the DAS plan, section 1 "SMART path") is the
 non-MQTT twin of the PC-side SMART agent: same JSON body
@@ -145,7 +150,9 @@ from typing import Any
 from aiohttp import web
 
 from aqua_bridge.config import AppConfig
+from aqua_bridge.control.estimator import CAL_MIN_SAMPLES
 from aqua_bridge.control.intents import (
+    Calibrate,
     ControlSurface,
     IntentConflict,
     IntentError,
@@ -240,6 +247,26 @@ async def _auth_middleware(request: web.Request, handler: Any) -> web.StreamResp
     )
 
 
+def _calibration_progress(surface: ControlSurface, bay: str) -> dict[str, Any]:
+    """What ``POST /api/calibrate`` tells the operator about the bay's map (item 23).
+
+    An accepted calibration needs ``CAL_MIN_SAMPLES`` fresh samples, so one handheld
+    reading leaves the estimate exactly where it was; without this the 200 would read
+    as "this bay is calibrated now". The counts are those of the last completed tick --
+    the reading just taken is folded in on the next one, so ``fresh_samples`` is one
+    short of what this reading will make it.
+    """
+    info = (_diagnostics(surface.snapshot()).get("bays") or {}).get(bay) or {}
+    cal = info.get("calibration") or {}
+    return {
+        "bay": bay,
+        "calibrated": bool(info.get("calibrated")),
+        "calibration_source": info.get("calibration_source"),
+        "fresh_samples": cal.get("fresh_samples", 0),
+        "samples_required": CAL_MIN_SAMPLES,
+    }
+
+
 def _make_intent_handler(kind: str):
     async def handler(request: web.Request) -> web.Response:
         surface: ControlSurface = request.app[_SURFACE_KEY]
@@ -253,7 +280,10 @@ def _make_intent_handler(kind: str):
             return _error(400, str(exc))
         except IntentError as exc:  # pragma: no cover - defensive, no other subclass today
             return _error(400, str(exc))
-        return web.json_response({"ok": True})
+        payload: dict[str, Any] = {"ok": True}
+        if isinstance(intent, Calibrate):
+            payload["calibration"] = _calibration_progress(surface, intent.bay)
+        return web.json_response(payload)
 
     handler.__name__ = f"post_{kind}"
     return handler

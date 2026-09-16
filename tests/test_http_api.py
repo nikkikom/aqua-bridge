@@ -20,6 +20,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from aqua_bridge.config import AppConfig, load_config
+from aqua_bridge.control.estimator import CAL_MIN_SAMPLES
 from aqua_bridge.control.intents import (
     ClearOverride,
     ControlMode,
@@ -806,7 +807,17 @@ def test_post_calibrate_happy_path_reaches_the_estimator_and_the_views() -> None
         )
     )
     assert [s for s, _ in results] == [200, 200]
-    assert results[0][1] == {"ok": True}
+    # the 200 says what the reading is worth: one of the samples an accepted map needs
+    assert results[0][1] == {
+        "ok": True,
+        "calibration": {
+            "bay": "a1",
+            "calibrated": False,
+            "calibration_source": None,
+            "fresh_samples": 0,
+            "samples_required": CAL_MIN_SAMPLES,
+        },
+    }
     offered = results[1][1]["manual_calibrations"]
     assert offered["a1"]["temp_c"] == 41.5
     assert offered["a1"]["ts"] == rig.t  # the last tick's observation clock
@@ -821,9 +832,19 @@ def test_post_calibrate_happy_path_reaches_the_estimator_and_the_views() -> None
     assert cal["calibration"]["samples"] == 1
     assert cal["serial"] is None  # keyed by bay: a handheld reading has no serial
     assert bays["bays"]["a1"]["estimator"]["calibration_source"] == "manual"
-    # a second reading replaces the first instead of queueing behind it
-    _run(_post_real(rig.sup, [("/api/calibrate", {"bay": "a1", "drive_temp_c": 42.5})]))
+    # a second reading replaces the first instead of queueing behind it, and its 200
+    # shows the progress the first one made: one sample of the twenty a map needs
+    second = [("/api/calibrate", {"bay": "a1", "drive_temp_c": 42.5})]
+    ((_, again),) = _run(_post_real(rig.sup, second))
     assert rig.sup.snapshot().extra["calibrations"]["a1"]["temp_c"] == 42.5
+    assert again["calibration"] == {
+        "bay": "a1",
+        "calibrated": False,
+        "calibration_source": "manual",
+        "fresh_samples": 1,
+        "samples_required": CAL_MIN_SAMPLES,
+    }
+    assert CAL_MIN_SAMPLES > 1  # ... so the operator can see the bay is not calibrated yet
 
 
 def test_post_calibrate_invalid_requests_are_400() -> None:
