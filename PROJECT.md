@@ -2788,11 +2788,16 @@ a model converges only with them.
   - **the board diverges from the enclosure air** — its temperature further
     than `divergence_c` from the mean of the air reference for
     `divergence_fault_s`, **and only while the CPU is idle**
-    (`load1 <= idle_load1_max`). Default 25 °C: at idle a Zero 2 W sits
-    roughly 10–20 °C above the air around it, so 25 leaves room for that
-    spread and still catches a board in hot exhaust or an air sensor that
-    stopped tracking; it is judged on the *absolute* difference, since air
-    reading above the board is evidence too. Default 900 s: the enclosure's
+    (`load1 <= idle_load1_max`). Default 40 °C, a deliberately coarse
+    backstop: an un-heatsinked Zero 2 W idles roughly 20–25 °C above the air
+    around it — the owner's reads 47.2 °C at idle, which against room air is
+    already a ~25 °C divergence on a perfectly healthy board — so anything
+    near that figure would stand permanently tripped, and 40 clears the
+    self-heating floor while still catching a board in hot exhaust or an air
+    sensor that stopped tracking. Narrow it only from a *measured*
+    board-vs-air delta with the board in its finished place. It is judged on
+    the *absolute* difference, since air reading above the board is evidence
+    too. Default 900 s: the enclosure's
     air moves in minutes, so a quarter of an hour of continuous idle
     divergence is not a transient. Default `idle_load1_max` 0.5: four
     cores, so below 0.5 the daemon's own tick is the only load and the
@@ -2801,15 +2806,30 @@ a model converges only with them.
     verdict**: it says that either the air sensors or the board's placement
     deserve a look, never which of the two is wrong.
 
+  The first two rules report a *fact*, and their problems join the daemon's
+  one `problems` list (so `/api/health` goes not-ok and Home Assistant's
+  `Controller problem` turns on); the divergence *hint* does not — it shows
+  on `device_health.host` and on the board's own `Board problem` sensor
+  alone, because a hint that flips the daemon-wide flag is indistinguishable
+  from an aquabus device that has gone missing.
+
   The air reference is `air_temps`, empty by default, which means every
   `zone_air` sensor, else every `inlet` sensor, else every configured
   temperature (a legacy config declares no roles); a name that is not in
-  `mpc.temps` is a startup `ConfigError`. Problems are logged at most once
-  per `log_interval_s` (300 s). Every threshold is a `host_health:` key
-  with one default declared once in `health.HostHealthConfig`, validated
-  there, shown in both example configs. Nothing here can change a duty: the
-  board's numbers never enter `PlantObservation` or the `diagnostics` the
-  solver reads.
+  `mpc.temps` is a startup `ConfigError` (exit 2), checked in `main()`
+  before anything is opened, not only where the rules are built. Problems
+  are logged at most once per `log_interval_s` (300 s). Every threshold is
+  a `host_health:` key with one default declared once in
+  `health.HostHealthConfig`, validated there, shown in both example
+  configs — `vcgencmd_timeout_s` (2 s) included, which bounds the only
+  fallback that starts a process. That fallback belongs to the HTTP and
+  MQTT readers: the control tick's reader has it switched off
+  (`health.host_metrics_reader(..., subprocess_fallback=False)`), because
+  `on_tick` runs on the loop thread, where a fork/exec would stretch the
+  tick and the watchdog ping behind it without showing in the step budget,
+  which is measured before the tick's observers run. Nothing here can
+  change a duty: the board's numbers never enter `PlantObservation` or the
+  `diagnostics` the solver reads.
 - `hw/onewire.py`: `W1Source`, DS18B20 over the kernel's `w1_therm`
   bulk-read ABI (assumed layout, unverified on hardware, kept name-based
   and rooted at `onewire.root`): `w1_bus_master<N>/therm_bulk_read`
@@ -3563,9 +3583,12 @@ the board.
   throttling reported the tick it is seen and the `_since_boot` half never
   warning alone; a busy CPU gating the divergence rule and restarting its
   window; a missing temperature, load average or air reading judging
-  nothing; `on_tick` publishing the board's verdict next to the fans',
-  surviving a host reader that raises, and leaving the observation
-  untouched.
+  nothing; the owner's own idle board (47.2 degC) against room air staying
+  clear of the shipped `divergence_c`; the divergence hint leaving the
+  payload's `ok` true while the board's own goes false, and a hot board
+  joining the daemon's problem list; `on_tick` publishing the board's
+  verdict next to the fans', surviving a host reader that raises, and
+  leaving the observation untouched.
 - `tests/test_hw_sources.py` — `CompositeSource` over two fake
   controllers and a fake 1-Wire source: merged reads, each channel
   written to its own device with one SET each, a failing device (first or
@@ -3678,7 +3701,11 @@ runners allow it.
   `record_path`, `--model-store` and `STATE_DIRECTORY` (legacy: ignored /
   exit 2), publisher wiring and start failures, the
   SIGTERM stop path in-process, a SIGTERM delivered inside a stderr write,
-  a second SIGTERM during shutdown, and a real subprocess (`slow`).
+  a second SIGTERM during shutdown, and a real subprocess (`slow`). Item 97:
+  a `host_health.air_temps` typo exits 2 before anything opens, and the
+  tick's host reader starts no `vcgencmd` process even on a machine that has
+  one, while the publishers' reader does and honours
+  `host_health.vcgencmd_timeout_s`.
 - `tests/test_sdnotify.py` — address resolution, the watchdog period
   from `$WATCHDOG_USEC` / `$WATCHDOG_PID`, no-op without
   `$NOTIFY_SOCKET`, failures return `False`, a real `AF_UNIX` datagram
@@ -4014,9 +4041,11 @@ Config `http:` (parsed and validated by `HttpSettings` in
   `expected_power_w`, `problems`), `host` (§8 item 97: the board's own
   `cpu_temp_c`, the `air_c` reference it is compared against with the
   `air_temps` it was averaged from, the signed `divergence_c`, `load1`,
-  `idle`, the decoded `throttled` word and this board's own `problems` and
-  `ok`), `problems` and `ok`. The board's problems are in the same
-  `problems` list, so `/api/health` shows them too. Empty with `ok`
+  `idle`, the decoded `throttled` word and this board's own `faults`,
+  `hints`, `problems` and `ok`), `problems` and `ok`. Only the board's
+  *faults* — it is hot, it is throttling now — are in the top-level
+  `problems` list `/api/health` shows; the divergence *hint* stays in
+  `device_health.host` (§3 "The board itself"). Empty with `ok`
   true before the first tick and with a source that has none (the
   simulator)
 - DAS only: `limits` (`{"classes": {class: limit_c}, "bays": {bay:
@@ -4287,9 +4316,10 @@ availability topic and one device block. Entities:
   `divergence_fault_s`. Its `json_attributes` are the `device_health.host`
   blob: the board's temperature, the air reference, the load average and
   the decoded `get_throttled` word. The board gets an entity of its own so
-  a hot Pi is not read as a controller fault; the daemon-wide
-  `device_problem` still covers it, since the board's problems join the one
-  `health.device_health.problems` list.
+  a hot Pi is not read as a controller fault. Only the board's *facts* —
+  hot, throttling now — also join the one `health.device_health.problems`
+  list behind `device_problem`; the divergence hint turns on `host_problem`
+  alone, so `device_problem` keeps meaning "something is broken".
 - number `setpoint_<temp>` per setpoint (range `temp_min_c..temp_max_c`,
   step 0.5); a DAS config without setpoints publishes none
 - number `pwm_cmd_<channel>` per channel (range `pwm_min..pwm_max`, step
@@ -5633,12 +5663,18 @@ Owner decision (2026-09-16):
     (item 25). `health.HostHealth` adds the three rules and the
     `host_health:` keys described in §3 ("The board itself"), runs on the
     same `on_tick` observer as the fan health with a `CachedHostInfo` on
-    `host.interval_s`, and publishes its verdict as `device_health.host`
-    with its problems in the same `problems` list — so `/api/state`,
-    `/api/health`, the MQTT state blob and the page show it the way item 83
-    shows device health, plus a Home Assistant binary sensor `host_problem`
-    of its own (`device_class: problem`, diagnostic) whose attributes are
-    the host blob. The board stays **out** of `PlantObservation` and out of
+    `host.interval_s` whose `vcgencmd` fallback is switched off (the tick
+    runs on the loop thread; the HTTP and MQTT readers keep the fallback,
+    bounded by `host_health.vcgencmd_timeout_s`), and publishes its verdict
+    as `device_health.host` — so `/api/state`, `/api/health`, the MQTT state
+    blob and the page show it the way item 83 shows device health, plus a
+    Home Assistant binary sensor `host_problem` of its own (`device_class:
+    problem`, diagnostic) whose attributes are the host blob. Only the two
+    rules that report a fact put their problems in the daemon-wide
+    `problems` list; the divergence hint does not, so it never makes
+    `/api/health` not-ok or turns on `device_problem`. `air_temps` is
+    cross-checked against `mpc.temps` in `main()` before anything is opened,
+    so a typo is exit 2 and not a traceback with the hardware open. The board stays **out** of `PlantObservation` and out of
     the `diagnostics` the solver reads: no golden changes, and a failure
     here cannot reduce cooling (§2). Tests: every bit of the throttled word
     in both halves, an unreadable source, a malformed word, a missing
@@ -5648,6 +5684,15 @@ Owner decision (2026-09-16):
     its default; the publishers' payloads and the Discovery entity.
     Follow-up: the defaults are reasoned, not measured — item 94's kind of
     tuning applies here too once the board sits in the finished enclosure.
+    `divergence_c` in particular ships as a coarse backstop (40 °C) because a
+    healthy idle Zero 2 W is already 20–25 °C from room air; it means little
+    until someone measures the board-vs-air delta where the Pi actually sits,
+    and only then should it be narrowed. Still unverified on hardware: which
+    source the firmware exposes on 64-bit trixie (kernel 6.18.50-v8) —
+    `cat /sys/devices/platform/soc/soc:firmware/get_throttled`, and if that
+    is absent, whether `/api/state`'s `host.throttled` is non-null from the
+    `vcgencmd` fallback. Only `hostinfo.THROTTLED_SYSFS` changes if the
+    attribute lives elsewhere.
 
 ### 8.3 Open — needs the DAS hardware
 
