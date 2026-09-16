@@ -1847,7 +1847,7 @@ normalises by the commissioned `fan_models.<m>.rpm_max`, because a
 and hide the very loss of speed the tach branch exists to see. One fit
 per fan model, not per channel: a tach-less output is covered by the
 curve of its own model. The estimator's airflow and the
-noise model's `u0` still read the config (§8 item 96).
+noise model's `u0` still read the config (§8 item 107).
 
 **Objective and constraints** (`control/solver_das.py`, `control/noise.py`).
 Noise per output from the fan laws: `r = clip((u − u0)/(1 − u0), 0, 1)`,
@@ -4738,7 +4738,7 @@ Owner decision (2026-09-16):
     `GET /api/state`'s `fan_curves` diagnostics name the curve in force per
     model and where it came from (`fit` | `store` | `config`). Still on the
     configured curve, deliberately: the estimator's own airflow and the
-    noise model's `u0` (item 96).
+    noise model's `u0` (item 107).
 15. **Done** (2026-09-16): `modelstore.document_from_fit` converts a
     `tools/fit_model.py` report (`kind: aqua_bridge.thermal_model`, whose
     `memory` is already the thermal memory) into a store document: the fit
@@ -5780,7 +5780,7 @@ Owner decision (2026-09-16):
     checks skip, so it moves the DAS goldens: it belongs with item 99's
     decision, not before it.
 
-96. The online fan-curve fit (item 14) feeds the thermal model and the DAS
+107. The online fan-curve fit (item 14) feeds the thermal model and the DAS
     MPC's prediction, but two other users of `fan_models` still read the
     config: the estimator's own airflow (`control/estimator.py`, its `Q_z`
     and `Qn_z`) and the noise model's `u0` (`control/noise.py`). With

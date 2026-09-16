@@ -290,7 +290,7 @@ RICH_TICKS = 1800
 #: moves past stuck_zone_air_dT_c inside a window. Seed 1's zone air does move, but stays
 #: under 1.5 degC within a window -- at stuck_zone_air_dT_c=1.25 this sweep gives 17, 16, 4
 #: (37 of 51), so seed 1 is entirely a question of that margin, not of a flat ambient (item
-#: 96 asks the owner to measure it on the enclosure). Seed 2 gains nothing. The rule only
+#: 97 asks the owner to measure it on the enclosure). Seed 2 gains nothing. The rule only
 #: adds evidence and takes none away.
 RICH_FROZEN_FLAGGED = {0: 17, 1: 7, 2: 4}
 
