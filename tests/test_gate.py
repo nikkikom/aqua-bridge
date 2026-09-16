@@ -30,6 +30,7 @@ from aqua_bridge.control.gate import (
     median3_of,
     push_window,
     sanitize_temps,
+    stuck_pwm_lag,
 )
 from aqua_bridge.control.mpc import step
 from aqua_bridge.control.solver_pi import SolverResult
@@ -365,6 +366,39 @@ def frozen_history(cfg: MpcConfig, pwm_seq, air_seq=None):
 
 def pwm_ramp(n: int, start: float = 0.3, net: float = 0.4) -> list[float]:
     return [start + i * (net / (n - 1)) for i in range(n)]
+
+
+def test_stuck_pwm_lag_matches_the_previous_hardcoded_quarter_window():
+    """Item 60: the default fraction (0.25) reproduces ``stuck_ticks // 4`` bit for bit,
+    for every window length the config allows (``stuck_ticks >= 2``)."""
+    for n in range(2, 50):
+        assert stuck_pwm_lag(n) == max(0, min(n // 4, n - 2))
+
+
+def test_stuck_pwm_lag_fraction_is_configurable():
+    assert stuck_pwm_lag(20, 0.5) == 10
+    assert stuck_pwm_lag(20, 0.0) == 0
+    assert stuck_pwm_lag(3, 1.0) == 1  # capped at stuck_ticks - 2, never the newest sample
+
+
+def test_stuck_pwm_lag_fraction_controls_how_old_a_pwm_move_must_be(gcfg):
+    """A wider ``stuck_pwm_lag_fraction`` requires an even older commanded PWM move before
+    it counts as Stuck evidence: the same net move can flag a frozen reading under the
+    default fraction and stay unnoticed (not yet evidence) under a wider one."""
+    cfg = dataclasses.replace(gcfg, stuck_s=8.0)
+    assert cfg.stuck_ticks == 8
+    pwm_seq = [0.3, 0.3, 0.3, 0.7, 0.7, 0.7, 0.7, 0.7]  # net move 3 ticks into the window
+    window, last_raw = frozen_history(cfg, pwm_seq)
+    obs = make_obs(cfg, 10.0, coolant=SP, air=air_at(len(pwm_seq)))
+
+    # default fraction 0.25 -> lag 2: the move is already 5 ticks old at the lagged
+    # sample, well past the 2-tick cutoff -> evidence -> flagged
+    assert gate(cfg, obs, last_raw=last_raw, window=window).stuck["coolant"]
+
+    # fraction 0.75 -> lag 6: the lagged sample sits before the move (only 3 ticks old,
+    # short of the 6-tick cutoff) -> not evidence -> stays trusted
+    wide = dataclasses.replace(cfg, stuck_pwm_lag_fraction=0.75)
+    assert not gate(wide, obs, last_raw=last_raw, window=window).stuck["coolant"]
 
 
 def test_stuck_flags_when_net_pwm_moved(gcfg):

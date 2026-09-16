@@ -1535,6 +1535,10 @@ class MpcConfig:
       show in a healthy proximal reading whatever the airflow did); and the zone-air
       move that is evidence on its own while the airflow stays inside
       ``stuck_airflow_net``. Validated always, inert in legacy mode.
+    * ``stuck_pwm_lag_fraction`` -- fraction of the Stuck window a PWM or airflow move
+      must be old before it counts as evidence (``control.gate.stuck_pwm_lag``): both
+      modes, both solvers. Default ``0.25`` (a quarter window) reproduces the previous
+      hardcoded ``stuck_ticks // 4``.
     * ``model_shadow`` / ``model_window_s`` / ``model_lambda`` / ``model_p_trace_max`` /
       ``model_converged_rel_se`` / ``model_max_pred_err_c`` / ``model_use_rpm`` -- the
       zoned thermal model's online identification (``control/thermal.py``): shadow
@@ -1611,6 +1615,7 @@ class MpcConfig:
     stuck_air_oppose_c: float = 0.3
     stuck_air_oppose_max_c: float = 3.0
     stuck_zone_air_dT_c: float = 1.5  # noqa: N815 - reads like stuck_sibling_dT_c
+    stuck_pwm_lag_fraction: float = 0.25
     topology: Topology | None = None
     sensors: dict[str, SensorSpec] = field(default_factory=dict)
     drive_classes: dict[str, DriveClass] = field(default_factory=dict)
@@ -1722,6 +1727,11 @@ class MpcConfig:
             _cfg_num("stuck_air_oppose_max_c", self.stuck_air_oppose_max_c),
         )
         s(self, "stuck_zone_air_dT_c", _cfg_num("stuck_zone_air_dT_c", self.stuck_zone_air_dT_c))
+        s(
+            self,
+            "stuck_pwm_lag_fraction",
+            _cfg_num("stuck_pwm_lag_fraction", self.stuck_pwm_lag_fraction),
+        )
         for name in ("model_shadow", "model_use_rpm", "model_accept_prior"):
             _cfg_bool(name, getattr(self, name))
         for name in (
@@ -1967,6 +1977,10 @@ class MpcConfig:
         if self.stuck_zone_air_dT_c <= 0:
             raise ConfigError(
                 f"mpc.stuck_zone_air_dT_c must be > 0, got {self.stuck_zone_air_dT_c}"
+            )
+        if not 0.0 <= self.stuck_pwm_lag_fraction <= 1.0:
+            raise ConfigError(
+                f"mpc.stuck_pwm_lag_fraction must be in [0, 1], got {self.stuck_pwm_lag_fraction}"
             )
         if self.solver is SolverKind.MPC and self.regulates_drive_limits:
             # The DAS MPC (control/solver_das.py) tracks no setpoint: its QP is strictly

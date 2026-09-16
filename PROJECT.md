@@ -613,6 +613,7 @@ Lists become tuples; ints are accepted for floats.
 | `stuck_eps_c` | required | “unchanged” band, °C; > 0 (≥ sensor resolution, aquaero 0.01 °C). DAS: per sensor, `sensors.<name>.stuck_eps_c` |
 | `stuck_pwm_net` | required | net PWM move that must show up in T; in `(0, 1]`. DAS: a zoned sensor's evidence is its zone's relative airflow instead, `stuck_airflow_net` |
 | `stuck_sibling_dT_c` | required | net move of another temperature, °C; > 0. DAS: only the siblings of `stuck_params` (same zone and role; a proximal sensor's own bay) |
+| `stuck_pwm_lag_fraction` | `0.25` | fraction of the Stuck window a PWM (legacy) or airflow (DAS) move must be old before it counts as evidence (`stuck_pwm_lag`); in `[0, 1]`. The default reproduces the previous hardcoded `stuck_ticks // 4` bit for bit |
 | `median3` | `false` | pre-filter; must be a YAML bool (`"false"` is rejected) |
 | `temp_min_c`, `temp_max_c` | `-20.0`, `120.0` | gate absolute valid range, °C; min < max |
 | `solver` | `pi` | `pi` or `mpc`. Legacy: PI / small linear MPC. DAS without setpoints: PI-like DAS form / DAS MPC |
@@ -1088,8 +1089,9 @@ PWM):
    sample, **and** in that window either
    - the **net** commanded PWM displacement on some channel exceeds
      `stuck_pwm_net`, measured from the oldest window sample to the
-     sample `max(0, min(stuck_ticks // 4, stuck_ticks - 2))` ticks
-     **before** the newest (`stuck_pwm_lag`), **or**
+     sample `max(0, min(floor(stuck_ticks * stuck_pwm_lag_fraction),
+     stuck_ticks - 2))` ticks **before** the newest (`stuck_pwm_lag`;
+     `stuck_pwm_lag_fraction` default `0.25`, a quarter window), **or**
    - another temperature in `config.temps` moved (net) by more than
      `stuck_sibling_dT_c` along a physically plausible path: every
      sample finite and in range, no single step above `dT_max_tick`.
@@ -1182,8 +1184,9 @@ number of rule 3 comes from `MpcConfig.stuck_params(name)`:
   `fan_models` (the estimator's fan curve) and `w` the channel's
   `fans.<ch>.count` split evenly over the zones that list it, normalised
   to a sum of 1. It counts when the mean `Qn` of the `L` samples that end
-  at the lagged sample (`L = stuck_pwm_lag`, a quarter window before the
-  newest) differs from the mean of the first `L` samples by more than
+  at the lagged sample (`L = stuck_pwm_lag`, `stuck_pwm_lag_fraction`
+  of the window, default a quarter, before the newest) differs from the
+  mean of the first `L` samples by more than
   `stuck_airflow_net` (`stuck_pwm_net` stays the legacy per-channel rule).
   Block means, not the oldest sample: a drive does not answer a fan dip
   of a tick or two. An inlet without a zone has none: the fans do not move
@@ -1252,10 +1255,11 @@ shares is the zone air, which the zone-air sensor measures directly).
 **Detection time.** A reading frozen from `t0` is flagged at the latest
 at `max(t0 + stuck_s, t1 + stuck_s / 2)` plus two decimation intervals
 (`2 · stuck_decimate · dt`) once its zone's relative airflow has stepped
-by more than `stuck_airflow_net` at `t1 ≥ t0 + stuck_s / 4` and stayed
-there, and not before the step is a quarter window old; a step less than
-a quarter window after the freeze counts only by the share of the first
-quarter window that precedes it (`tests/test_gate.py`). A same-bay sibling
+by more than `stuck_airflow_net` at `t1 ≥ t0 + stuck_s * stuck_pwm_lag_fraction`
+and stayed there, and not before the step is `stuck_pwm_lag_fraction` of a
+window old (default a quarter); a step less than that fraction after the
+freeze counts only by the share of the lag block that precedes it
+(`tests/test_gate.py`). A same-bay sibling
 that moves plausibly by more than `stuck_sibling_dT_c` flags it as well.
 A reading frozen while the airflow stays inside `stuck_airflow_net` is
 flagged once a zone-air sensor of its zone has moved past
@@ -4222,9 +4226,15 @@ Owner decision (2026-09-16):
     `stuck_air_oppose_max_c` / `stuck_zone_air_dT_c` is met first: a zone
     whose fans happen to move must not hide a dead sensor that the same air
     swing would expose in a zone whose fans sit still.
-60. The Stuck rule's quarter-window lag is hardcoded as `stuck_ticks //
-    4` in `control/gate.py` (legacy too); make it a config key (for
-    example a lag fraction, default 0.25, legacy bit for bit).
+60. **Done** (2026-09-16): the Stuck rule's quarter-window lag is now
+    `mpc.stuck_pwm_lag_fraction` (§3 field table), a fraction of the
+    window in `[0, 1]`, default `0.25`; `control/gate.stuck_pwm_lag`
+    takes it as a parameter instead of a literal `// 4`, both call sites
+    (the legacy per-channel PWM lag and the DAS `_airflow_move` block
+    lag) pass `cfg.stuck_pwm_lag_fraction`, and `floor(n * 0.25) == n //
+    4` for every window length the config allows, so the legacy and
+    default-DAS paths stay bit for bit (`tests/test_gate.py`,
+    `tests/test_stuck_sim.py`).
 61. A redundant sensor missing since boot has no reference value, so its
     first reading passes the slew check and is fused at once without
     confirmation.
