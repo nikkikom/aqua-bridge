@@ -286,6 +286,15 @@ mpc:
     associate_window_s: 3600      # serial -> bay association by correlation (no SES)
     associate_min_corr: 0.8
     associate_margin: 0.15
+    sigma_uncalibrated_c: 1.5     # sigma floor of a bay without an accepted SMART calibration
+    p0_t_air: 0.25       # initial variance per state kind: air, air disturbance, drive,
+    p0_d_air: 2.5e-3     # sensor node, heat (the same order as the q_* above)
+    p0_t_drive: 0.1
+    p0_t_sensor: 0.1
+    p0_heat: 2.5e-5
+    reset_drive_var: 25.0  # drive variance a bay restarts from when a drive (possibly) arrived
+    jump_min_c: 0.5      # fast-swap rule: a proximal innovation past both degC and sigmas
+    jump_sigmas: 6.0     # widens the bay's margin at once and drops a correlated serial
   # Thermal model identification (control/thermal.py). model_shadow: true learns the
   # zoned model online after each tick's command is final and reports it (GET
   # /api/model, HA model_status and model_pred_err_c); the learning never moves a fan

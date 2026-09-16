@@ -15,7 +15,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from aqua_bridge.control import estimates as est
-from aqua_bridge.model import MpcConfig
+from aqua_bridge.model import ESTIMATOR_DEFAULTS, MpcConfig
 from das_fixtures import PROX_C, SP, das_cfg, das_mapping
 
 BETA = est.PRIOR_BETA
@@ -36,11 +36,13 @@ def trusted(cfg: MpcConfig, **overrides: float) -> dict[str, float]:
     return temps
 
 
-def test_constants_follow_the_plan():
+def test_constants_follow_the_plan(lcfg):
     assert est.PRIOR_BETA == 0.3
     assert pytest.approx(-2.1) == est.PRIOR_OFFSET_C
-    assert est.SIGMA_UNCALIBRATED_C == 1.5
     assert est.K_SIGMA == 2.0
+    # the uncalibrated floor is a config key with one default (item 71)
+    assert ESTIMATOR_DEFAULTS["sigma_uncalibrated_c"] == 1.5
+    assert est.sigma_uncalibrated_c(lcfg) == lcfg.estimator.sigma_uncalibrated_c == 1.5
 
 
 @given(

@@ -44,7 +44,8 @@ coolest trusted zone-air reading of its zone. Both choices are the
 conservative ones: ``T_d`` rises with ``T_s`` and falls with ``T_a``. The
 sensor lag and the drive's own time constant are ignored (a prior map on a
 lagging sensor is exactly what the estimator improves on), and
-``sigma`` is the uncalibrated calibration floor, 1.5 degC, for every bay:
+``sigma`` is the uncalibrated calibration floor
+(``estimator.sigma_uncalibrated_c``, 1.5 degC by default) for every bay:
 without SMART the absolute offset between sensor and drive is a prior. A
 constrained bay without a trusted proximal reading or zone-air reading gets
 no entry; under the ``strict`` trust rule that only happens in a zone that
@@ -60,13 +61,12 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping
 from typing import Any
 
-from aqua_bridge.model import SIGMA_UNCALIBRATED_C, MpcConfig
+from aqua_bridge.model import ESTIMATOR_DEFAULTS, MpcConfig
 
 __all__ = [
     "K_SIGMA",
     "PRIOR_BETA",
     "PRIOR_OFFSET_C",
-    "SIGMA_UNCALIBRATED_C",
     "SOURCE_ESTIMATOR",
     "SOURCE_PRIOR_MAP",
     "drive_targets",
@@ -74,6 +74,7 @@ __all__ = [
     "occupancy",
     "prior_drive_temp",
     "prior_estimates",
+    "sigma_uncalibrated_c",
 ]
 
 #: Prior air fraction of a proximal sensor's reading (plan section 3 table).
@@ -86,6 +87,20 @@ K_SIGMA = 2.0
 SOURCE_PRIOR_MAP = "prior_map"
 #: ``source`` of an entry built by :mod:`aqua_bridge.control.estimator`.
 SOURCE_ESTIMATOR = "estimator"
+
+
+def sigma_uncalibrated_c(cfg: MpcConfig) -> float:
+    """``estimator.sigma_uncalibrated_c``: the calibration floor of an uncalibrated bay.
+
+    The config's value; a config without an ``estimator`` section (legacy, where no
+    bay is estimated at all) falls back to the one default of the config model.
+    """
+    spec = cfg.estimator
+    return (
+        float(spec.sigma_uncalibrated_c)
+        if spec is not None
+        else float(ESTIMATOR_DEFAULTS["sigma_uncalibrated_c"])
+    )
 
 
 def drive_targets(
@@ -183,7 +198,7 @@ def prior_estimates(
             drive_class=cfg.bay_class(bay),
             occupancy=occupancy(cfg, bay),
             t=prior_drive_temp(max(proximal[bay]), min(air[spec.zone])),
-            sigma=SIGMA_UNCALIBRATED_C,
+            sigma=sigma_uncalibrated_c(cfg),
             k_sigma=K_SIGMA,
             limit=cfg.bay_limit(bay),
             comfort=cfg.bay_comfort(bay),

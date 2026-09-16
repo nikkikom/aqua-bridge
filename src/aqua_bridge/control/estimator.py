@@ -75,7 +75,7 @@ sensor measures air: weight 0.5, ``R / 0.5``). Untrusted sensors are skipped
 for a calibrated bay.
 
 Fast-swap rule (an addition to the plan, conservative): a proximal innovation
-``nu`` with ``|nu| > JUMP_MIN_C`` and ``|nu| > JUMP_SIGMAS * sqrt(S)`` on an
+``nu`` with ``|nu| > jump_min_c`` and ``|nu| > jump_sigmas * sqrt(S)`` on an
 occupied or unknown bay adds ``(nu / s) ** 2`` to the drive variance and
 ``nu ** 2`` to the sensor node's variance before the update, and drops the
 bay's correlation association. ``S`` is that measurement's own innovation
@@ -101,9 +101,10 @@ reading (the hottest trusted member when the anchor is missing, else ``T_a``),
 ``T_d`` the inverted sensor map at steady
 state, ``q`` and ``d_a`` the values that make the model stationary at that
 point, so constant readings at a constant command keep the estimate where it
-starts. ``P0 = diag(0.25, 0.05^2, 0.1, 0.1, 0.005^2)`` per state kind (the drive
-variance only covers the transient: the map offset is ``sigma_cal``), and
-``proximal_offset_c ** 2`` per placement offset, which starts at 0.
+starts. ``P0 = diag(p0_t_air, p0_d_air, p0_t_drive, p0_t_sensor, p0_heat)`` per
+state kind (the drive variance only covers the transient: the map offset is
+``sigma_cal``), and ``proximal_offset_c ** 2`` per placement offset, which
+starts at 0.
 
 **Per bay** (plan section 8 item 69): a bay with no trusted proximal member when
 its zone starts is *not* initialised -- its node holds the prior above until its
@@ -119,14 +120,23 @@ anchor's own first reading is a step the fast-swap rule fires on -- the
 conservative direction, and the trust rule's settling exemption covers it while
 the bay stays observed.
 
+Every number of this module that an operator could tune is a key of the config's
+``estimator`` section with one documented default there (plan section 8 item 71):
+the process noise ``q_*``, the initial covariance ``p0_*``, the fast-swap
+``jump_min_c`` and ``jump_sigmas``, the occupancy thresholds,
+``reset_drive_var``, ``sigma_uncalibrated_c`` and the SMART and association keys.
+The priors of the physical model (``C_a``, ``leak``, ``kappa``, ``E``, ``g0``, ``k``)
+stay module constants: they are the thermal model's, not the operator's.
+
 Output
 ------
 Per constrained bay (occupied or unknown): ``t = T_d``,
 ``sigma = sqrt(P_dd + sigma_cal^2)``, ``margin = k_sigma * sigma`` and the soft /
 hard targets of its class; per zone ``T_a``, ``sigma_air = sqrt(P_aa)``, ``d_a``
 and ``drift = max_j |q_j - g_j (T_d,j - T_a) / C_d|`` (degC/min, a validity
-metric for the DAS MPC milestone). ``sigma_cal`` is 1.5 degC uncalibrated and
-``max(0.5, EW-RMS residual)`` calibrated; the filter cannot shrink it.
+metric for the DAS MPC milestone). ``sigma_cal`` is ``sigma_uncalibrated_c``
+(1.5 degC by default) uncalibrated and ``max(0.5, EW-RMS residual)`` calibrated;
+the filter cannot shrink it.
 
 Per bay the block also carries ``observed`` (a trusted proximal member this tick),
 ``seeded`` (the bay has had a reading of its own; see *Per bay* above),
@@ -163,7 +173,7 @@ an empty bay has no case-to-drive offset, so with the prior ``b`` its plain
   tick restarts the count (conservative: evidence for a drive still counts);
 * ``empty -> occupied`` when ``dT > occupied_dT_c`` on 3 consecutive ticks (or a
   SMART sample of a declared serial arrives), with ``T_d`` reset to ``T_s`` and
-  variance 25 degC^2 and ``q`` reset to 0: an inserted drive raises the fans
+  variance ``reset_drive_var`` (25 degC^2) and ``q`` reset to 0: an inserted drive raises the fans
   through its margin within a few ticks. Entering ``unknown`` from ``empty``
   resets the same way.
 
@@ -203,7 +213,8 @@ is re-mapped through the new map at that moment) and ``sigma_cal`` is
 keyed by serial inside the bay: a different serial starts from the prior, the
 same serial re-inserted finds its calibration again. **Expiry**: without an
 accepted sample for ``calibration_max_age_days`` (or when ``ts`` runs backwards)
-the fresh-sample count restarts at 0, so ``sigma_cal`` returns to 1.5 degC while
+the fresh-sample count restarts at 0, so ``sigma_cal`` returns to
+``sigma_uncalibrated_c`` while
 ``s, b`` stay as the starting point; 20 fresh samples confirm it again.
 
 **Restored from the model store** (:func:`restore_calibration`): entries come back per
@@ -251,7 +262,6 @@ from aqua_bridge.control import associate
 from aqua_bridge.control.estimates import (
     PRIOR_BETA,
     PRIOR_OFFSET_C,
-    SIGMA_UNCALIBRATED_C,
     SOURCE_ESTIMATOR,
     estimate_entry,
 )
@@ -268,8 +278,6 @@ __all__ = [
     "E_W_PER_K_PER_FAN",
     "EMPTY",
     "G0_W_PER_K",
-    "JUMP_MIN_C",
-    "JUMP_SIGMAS",
     "K_W_PER_K",
     "KAPPA_W_PER_K",
     "LEAK_W_PER_K",
@@ -277,7 +285,6 @@ __all__ = [
     "NEW_SAMPLE_EPS_S",
     "OCCUPIED",
     "CAL_OFFSET_BOUNDS",
-    "RESET_DRIVE_VAR",
     "SIGMA_CAL_FLOOR_C",
     "UNKNOWN",
     "EstimatorUpdate",
@@ -302,23 +309,11 @@ G0_W_PER_K = 0.3
 K_W_PER_K = 0.5
 TAU_SENSOR_S = 15.0
 
-#: Initial covariance per state kind: T_a, d_a, T_d, T_s, q.
-P0_T_AIR = 0.25
-P0_D_AIR = 0.05**2
-P0_T_DRIVE = 0.1
-P0_T_SENSOR = 0.1
-P0_HEAT = 0.005**2
-
-#: Occupancy: heat below which a bay may be empty, rising-edge ticks, reset variance.
+#: Occupancy: heat below which a bay may be empty, rising-edge ticks.
 EMPTY_HEAT_W = 1.0
 RISE_TICKS = 3
-RESET_DRIVE_VAR = 25.0
 #: Weight of an empty bay's proximal sensor as an air reading.
 EMPTY_WEIGHT = 0.5
-
-#: Fast-swap rule (module docstring).
-JUMP_MIN_C = 0.5
-JUMP_SIGMAS = 6.0
 
 #: SMART: measurement variance, new-sample tolerance.
 SMART_R = 1.0
@@ -785,13 +780,15 @@ def _parse_smart(raw: object, max_age_s: float) -> dict[str, tuple[float, float,
 # ---------------------------------------------------------------------------
 
 
-def _fresh_calibration() -> dict[str, Any]:
+def _fresh_calibration(sigma_uncalibrated_c: float) -> dict[str, Any]:
+    """A bay-and-serial calibration entry at the prior; ``rms2`` starts at the
+    uncalibrated floor (``estimator.sigma_uncalibrated_c``) squared."""
     return {
         "th": list(CAL_PRIOR),
         "P": [[CAL_PRIOR_VAR[0], 0.0], [0.0, CAL_PRIOR_VAR[1]]],
         "n": 0,
         "fresh": 0,
-        "rms2": SIGMA_UNCALIBRATED_C**2,
+        "rms2": float(sigma_uncalibrated_c) ** 2,
         "ts": None,
         "used": False,
     }
@@ -1035,6 +1032,7 @@ def update(
 
     q_scale = h_pred / cfg.dt if cfg.dt > 0 else 0.0
     offset_var = spec.proximal_offset_c**2
+    jump_var = spec.jump_sigmas**2
     for z, zone in st.zones.items():
         n = len(zone.bays)
         i_d, i_s, i_q, i_off = 2, 2 + n, 2 + 2 * n, 2 + 3 * n
@@ -1052,7 +1050,7 @@ def update(
             x = np.zeros(dim)
             x[0] = air0
             p_diag = np.zeros(dim)
-            p_diag[0], p_diag[1] = P0_T_AIR, P0_D_AIR
+            p_diag[0], p_diag[1] = spec.p0_t_air, spec.p0_d_air
             p_diag[i_off:] = offset_var
             f_air = 0.0
             for j, b in enumerate(zone.bays):
@@ -1060,7 +1058,11 @@ def update(
                 t_s = _seed_sensor(st.bays[b], temps) if members else air0
                 x[i_s + j] = t_s
                 mem["bays"][b]["init"] = bool(members)
-                p_diag[i_d + j], p_diag[i_s + j], p_diag[i_q + j] = P0_T_DRIVE, P0_T_SENSOR, P0_HEAT
+                p_diag[i_d + j], p_diag[i_s + j], p_diag[i_q + j] = (
+                    spec.p0_t_drive,
+                    spec.p0_t_sensor,
+                    spec.p0_heat,
+                )
                 occ = _declared_state(topo.bays[b].occupied, mem["bays"][b]["occ"])
                 if occ == EMPTY:
                     x[i_d + j] = air0
@@ -1150,19 +1152,19 @@ def update(
                 # No trusted member when the zone started: seed the bay from this first
                 # reading instead of leaving the fast-swap rule to see the gap (item 69).
                 t_s = _seed_sensor(bay, temps)
-                _reset_state(x, p, i_s + j, t_s, P0_T_SENSOR)
+                _reset_state(x, p, i_s + j, t_s, spec.p0_t_sensor)
                 for k_off in bay.offsets.values():
                     _reset_state(x, p, i_off + k_off, 0.0, offset_var)
                 air_now = float(x[0])
                 if occ == EMPTY:
-                    _reset_state(x, p, i_d + j, air_now, P0_T_DRIVE)
+                    _reset_state(x, p, i_d + j, air_now, spec.p0_t_drive)
                 else:
                     s_seed, b_seed, _ = sensor_map(b)
                     t_d = air_now + (t_s - air_now - b_seed) / s_seed
                     g_seed = G0_W_PER_K + K_W_PER_K * qn
                     cd_seed = drive_capacity(cfg, classes[b][0])
-                    _reset_state(x, p, i_d + j, t_d, P0_T_DRIVE)
-                    _reset_state(x, p, i_q + j, g_seed * (t_d - air_now) / cd_seed, P0_HEAT)
+                    _reset_state(x, p, i_d + j, t_d, spec.p0_t_drive)
+                    _reset_state(x, p, i_q + j, g_seed * (t_d - air_now) / cd_seed, spec.p0_heat)
                 bm["init"] = True
             for name in present:
                 value = float(temps[name])
@@ -1178,7 +1180,7 @@ def update(
                     off = i_off + k_off
                     nu = value - x[idx] - x[off]
                     s_innov = p[idx, idx] + 2.0 * p[idx, off] + p[off, off] + r
-                if abs(nu) > JUMP_MIN_C and nu * nu > JUMP_SIGMAS**2 * s_innov:
+                if abs(nu) > spec.jump_min_c and nu * nu > jump_var * s_innov:
                     # something moved: follow the sensor (the placement offset did not
                     # move, so it keeps its own variance)
                     if occ != EMPTY:
@@ -1213,7 +1215,7 @@ def update(
             continue
         mem["count"]["smart_used"] += 1
         per_bay = mem["cal"].setdefault(b, {})
-        entry = per_bay.get(serial) or _fresh_calibration()
+        entry = per_bay.get(serial) or _fresh_calibration(spec.sigma_uncalibrated_c)
         entry, _ = calibration_update(entry, temp - x[0], x[i_s] - x[0], sample_ts)
         if _calibrated(entry, float(ts), max_age_cal):
             entry["used"] = True
@@ -1288,11 +1290,11 @@ def update(
                 if before == EMPTY:  # a drive (possibly) arrived: start from the sensor, wide
                     x[i_d] = x[i_s]
                     p[i_d, :], p[:, i_d] = 0.0, 0.0
-                    p[i_d, i_d] = RESET_DRIVE_VAR
+                    p[i_d, i_d] = spec.reset_drive_var
                 if before == EMPTY or after == EMPTY:
                     x[i_q] = 0.0
                     p[i_q, :], p[:, i_q] = 0.0, 0.0
-                    p[i_q, i_q] = P0_HEAT
+                    p[i_q, i_q] = spec.p0_heat
                 if before == EMPTY or after == EMPTY:  # a deliberate widening, as a jump
                     _mark_disturbed(bm, float(ts), spec.bay_settle_max_s)
             if (before == EMPTY) != (after == EMPTY):
@@ -1411,7 +1413,7 @@ def update(
             max(SIGMA_CAL_FLOOR_C, math.sqrt(float(entry["rms2"])))  # type: ignore[index]
             * float(entry.get("inflate", 1.0))  # type: ignore[union-attr]
             if calibrated
-            else SIGMA_UNCALIBRATED_C
+            else spec.sigma_uncalibrated_c
         )
         info: dict[str, Any] = {
             "zone": bay.zone,
