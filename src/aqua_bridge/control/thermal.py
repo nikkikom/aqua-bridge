@@ -304,6 +304,7 @@ __all__ = [
     "project",
     "restore",
     "sensor_lag_s",
+    "state_jacobian",
     "structure",
     "summary",
     "theta_from_memory",
@@ -868,6 +869,59 @@ class Linearisation:
     f: np.ndarray
 
 
+def state_jacobian(
+    st: Structure, p: ThermalParams, u: Mapping[str, float] | np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(A, dQ/du, dQn/du)`` at command ``u``, from one airflow evaluation.
+
+    ``A = df/dx`` does not depend on the state (every entry is built from the
+    parameters and the airflow alone), and ``dQ/du`` / ``dQn/du`` are what
+    :func:`airflow_gradients` returns, so the DAS MPC's linearisation
+    (:func:`aqua_bridge.control.solver_das._dynamics`) gets everything it needs
+    from this one call instead of a :func:`jacobians` whose input matrix,
+    derivatives and affine term it discards (item 73). Same ``A`` as
+    :func:`jacobians` builds, entry for entry.
+    """
+    uv = _vec_u(st, u)
+    flow, qn, dq, dqn = _airflow(st, p, uv)
+    return _jacobian_a(st, p, flow, qn), dq, dqn
+
+
+def _jacobian_a(st: Structure, p: ThermalParams, flow: np.ndarray, qn: np.ndarray) -> np.ndarray:
+    """``df/dx`` of the zoned network at an airflow (state-independent)."""
+    th = p.theta
+    a = np.zeros((st.n_states, st.n_states))
+    for zone in st.zones.values():
+        z, zi = zone.name, zone.index
+        ca = p.c_air[z]
+        a[zi, zi] -= (flow[zi] + th[f"leak.{z}"]) / ca
+        for other in zone.coupled:
+            kap = th[f"kappa.{z}.{other}"]
+            a[zi, zi] -= kap / ca
+            a[zi, st.i_air(other)] += kap / ca
+        for bay in zone.bays:
+            if not p.occupied[bay]:
+                continue
+            g = th[f"g0.{bay}"] + th[f"k.{bay}"] * qn[zi]
+            a[zi, zi] -= g / ca
+            a[zi, st.i_drive(bay)] += g / ca
+    for bay, bs in st.bays.items():
+        zi = st.zones[bs.zone].index
+        di, si = st.i_drive(bay), st.i_sensor(bay)
+        tau = p.tau_s[bay]
+        a[si, si] = -1.0 / tau
+        if p.occupied[bay]:
+            g = th[f"g0.{bay}"] + th[f"k.{bay}"] * qn[zi]
+            cd = p.c_drive[bay]
+            a[di, di] = -g / cd
+            a[di, zi] = g / cd
+            a[si, di] = p.s[bay] / tau
+            a[si, zi] = (1.0 - p.s[bay]) / tau
+        else:
+            a[si, zi] = 1.0 / tau
+    return a
+
+
 def jacobians(
     st: Structure,
     p: ThermalParams,
@@ -884,44 +938,22 @@ def jacobians(
     tin, qv, dv = _inputs(st, t_in, q, d_air)
     flow, qn, dq, dqn = _airflow(st, p, uv)
     th = p.theta
-    n, m = st.n_states, len(st.channels)
-    a = np.zeros((n, n))
-    b = np.zeros((n, m))
+    a = _jacobian_a(st, p, flow, qn)
+    b = np.zeros((st.n_states, len(st.channels)))
     for zone in st.zones.values():
         z, zi = zone.name, zone.index
         ca = p.c_air[z]
         ta = x[zi]
-        a[zi, zi] -= (flow[zi] + th[f"leak.{z}"]) / ca
         b[zi] -= dq[zi] * (ta - tin[zi]) / ca
-        for other in zone.coupled:
-            kap = th[f"kappa.{z}.{other}"]
-            a[zi, zi] -= kap / ca
-            a[zi, st.i_air(other)] += kap / ca
         for bay in zone.bays:
             if not p.occupied[bay]:
                 continue
-            k = th[f"k.{bay}"]
-            g = th[f"g0.{bay}"] + k * qn[zi]
-            di = st.i_drive(bay)
-            a[zi, zi] -= g / ca
-            a[zi, di] += g / ca
-            b[zi] += k * dqn[zi] * (x[di] - ta) / ca
+            b[zi] += th[f"k.{bay}"] * dqn[zi] * (x[st.i_drive(bay)] - ta) / ca
     for bay, bs in st.bays.items():
-        zi = st.zones[bs.zone].index
-        di, si = st.i_drive(bay), st.i_sensor(bay)
-        tau = p.tau_s[bay]
-        a[si, si] = -1.0 / tau
         if p.occupied[bay]:
-            k = th[f"k.{bay}"]
-            g = th[f"g0.{bay}"] + k * qn[zi]
-            cd = p.c_drive[bay]
-            a[di, di] = -g / cd
-            a[di, zi] = g / cd
-            b[di] = -k * dqn[zi] * (x[di] - x[zi]) / cd
-            a[si, di] = p.s[bay] / tau
-            a[si, zi] = (1.0 - p.s[bay]) / tau
-        else:
-            a[si, zi] = 1.0 / tau
+            zi = st.zones[bs.zone].index
+            di = st.i_drive(bay)
+            b[di] = -th[f"k.{bay}"] * dqn[zi] * (x[di] - x[zi]) / p.c_drive[bay]
     f = derivatives(st, p, x, uv, t_in=tin, q=qv, d_air=dv)
     c = f - a @ x - b @ uv
     return Linearisation(a=a, b=b, c=c, f=f)

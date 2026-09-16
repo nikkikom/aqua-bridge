@@ -668,10 +668,12 @@ def _dynamics(
     h: float,
 ) -> _Dynamics:
     zones = tuple(st.zones)
-    x_any = np.zeros(st.n_states)  # A does not depend on the state
-    lin = thermal.jacobians(st, params, x_any, uq, t_in=np.zeros(len(zones)))
+    # A does not depend on the state, and neither do the airflow gradients, so one
+    # thermal.state_jacobian gives both (the full jacobians' input matrix, derivatives
+    # and affine term were built and thrown away here; item 73).
+    a_full, dq, dqn = thermal.state_jacobian(st, params, uq)
     idx = [st.i_air(z) for z in zones] + [st.i_drive(b) for b in drives]
-    a = lin.a[np.ix_(idx, idx)]
+    a = a_full[np.ix_(idx, idx)]
     n = a.shape[0]
     lam = np.linalg.eigvals(a) if n else np.zeros(0)
     eig_real = bool(np.all(np.abs(lam.imag) <= EIG_IMAG_REL * np.maximum(1.0, np.abs(lam))))
@@ -686,7 +688,6 @@ def _dynamics(
         inv = None
     w_ss = None if inv is None else inv[len(zones) :]
     ad, m_int = zoh(a, h, inv)
-    dq, dqn = thermal.airflow_gradients(st, params, uq)
     zone_of = np.array([st.zones[st.bays[b].zone].index for b in drives], dtype=int)
     incidence = np.zeros((len(zones), len(drives)))
     incidence[zone_of, np.arange(len(drives))] = 1.0

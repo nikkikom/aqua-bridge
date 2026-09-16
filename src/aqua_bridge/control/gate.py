@@ -293,13 +293,18 @@ def stuck_pwm_lag(stuck_ticks: int) -> int:
     return max(0, min(stuck_ticks // 4, stuck_ticks - 2))
 
 
+def _is_mapping(value: object) -> bool:
+    """``isinstance(value, Mapping)`` with the stored ``dict`` answered first.
+
+    ``Mapping`` is an ABC, so its ``isinstance`` walks the registry; this runs over
+    every sample of every decimated window on every tick (item 73).
+    """
+    return type(value) is dict or isinstance(value, Mapping)
+
+
 def _slow_sample_ok(sample: object) -> bool:
     """Structure of a stored decimated sample (values are read through ``_finite_or_none``)."""
-    return (
-        isinstance(sample, Mapping)
-        and isinstance(sample.get("t"), Mapping)
-        and isinstance(sample.get("p"), Mapping)
-    )
+    return _is_mapping(sample) and _is_mapping(sample.get("t")) and _is_mapping(sample.get("p"))  # type: ignore[union-attr]
 
 
 def advance_slow_windows(
