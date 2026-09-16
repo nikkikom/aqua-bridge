@@ -1538,7 +1538,11 @@ class MpcConfig:
     * ``stuck_pwm_lag_fraction`` -- fraction of the Stuck window a PWM or airflow move
       must be old before it counts as evidence (``control.gate.stuck_pwm_lag``): both
       modes, both solvers. Default ``0.25`` (a quarter window) reproduces the previous
-      hardcoded ``stuck_ticks // 4``.
+      hardcoded ``stuck_ticks // 4``. Capped at ``0.5``: the lag eats the newest part of
+      the window, so the move itself is only ever measured over the oldest ``1 -
+      fraction`` of it, and a lag above half the window leaves less window to measure the
+      move over than it skips. Raising the fraction is strictly more conservative (less
+      of the window carries evidence, so fewer readings are flagged Stuck).
     * ``model_shadow`` / ``model_window_s`` / ``model_lambda`` / ``model_p_trace_max`` /
       ``model_converged_rel_se`` / ``model_max_pred_err_c`` / ``model_use_rpm`` -- the
       zoned thermal model's online identification (``control/thermal.py``): shadow
@@ -1978,9 +1982,9 @@ class MpcConfig:
             raise ConfigError(
                 f"mpc.stuck_zone_air_dT_c must be > 0, got {self.stuck_zone_air_dT_c}"
             )
-        if not 0.0 <= self.stuck_pwm_lag_fraction <= 1.0:
+        if not 0.0 <= self.stuck_pwm_lag_fraction <= 0.5:
             raise ConfigError(
-                f"mpc.stuck_pwm_lag_fraction must be in [0, 1], got {self.stuck_pwm_lag_fraction}"
+                f"mpc.stuck_pwm_lag_fraction must be in [0, 0.5], got {self.stuck_pwm_lag_fraction}"
             )
         if self.solver is SolverKind.MPC and self.regulates_drive_limits:
             # The DAS MPC (control/solver_das.py) tracks no setpoint: its QP is strictly

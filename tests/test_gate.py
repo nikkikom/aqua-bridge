@@ -369,16 +369,18 @@ def pwm_ramp(n: int, start: float = 0.3, net: float = 0.4) -> list[float]:
 
 
 def test_stuck_pwm_lag_matches_the_previous_hardcoded_quarter_window():
-    """Item 60: the default fraction (0.25) reproduces ``stuck_ticks // 4`` bit for bit,
-    for every window length the config allows (``stuck_ticks >= 2``)."""
+    """Item 60: the default fraction reproduces ``stuck_ticks // 4`` bit for bit, for
+    every window length the config allows (``stuck_ticks >= 2``). The one place the
+    literal ``0.25`` belongs: everywhere else it is read from the config."""
+    assert MpcConfig.stuck_pwm_lag_fraction == 0.25
     for n in range(2, 50):
-        assert stuck_pwm_lag(n) == max(0, min(n // 4, n - 2))
+        assert stuck_pwm_lag(n, 0.25) == max(0, min(n // 4, n - 2))
 
 
 def test_stuck_pwm_lag_fraction_is_configurable():
     assert stuck_pwm_lag(20, 0.5) == 10
     assert stuck_pwm_lag(20, 0.0) == 0
-    assert stuck_pwm_lag(3, 1.0) == 1  # capped at stuck_ticks - 2, never the newest sample
+    assert stuck_pwm_lag(3, 0.5) == 1  # capped at stuck_ticks - 2, never the newest sample
 
 
 def test_stuck_pwm_lag_fraction_controls_how_old_a_pwm_move_must_be(gcfg):
@@ -387,17 +389,17 @@ def test_stuck_pwm_lag_fraction_controls_how_old_a_pwm_move_must_be(gcfg):
     default fraction and stay unnoticed (not yet evidence) under a wider one."""
     cfg = dataclasses.replace(gcfg, stuck_s=8.0)
     assert cfg.stuck_ticks == 8
-    pwm_seq = [0.3, 0.3, 0.3, 0.7, 0.7, 0.7, 0.7, 0.7]  # net move 3 ticks into the window
+    pwm_seq = [0.3, 0.3, 0.3, 0.3, 0.7, 0.7, 0.7, 0.7]  # net move 4 ticks into the window
     window, last_raw = frozen_history(cfg, pwm_seq)
     obs = make_obs(cfg, 10.0, coolant=SP, air=air_at(len(pwm_seq)))
 
-    # default fraction 0.25 -> lag 2: the move is already 5 ticks old at the lagged
-    # sample, well past the 2-tick cutoff -> evidence -> flagged
+    # default fraction 0.25 -> lag 2: the lagged sample (index 5) sits after the move,
+    # which is already 3 ticks old there -> evidence -> flagged
     assert gate(cfg, obs, last_raw=last_raw, window=window).stuck["coolant"]
 
-    # fraction 0.75 -> lag 6: the lagged sample sits before the move (only 3 ticks old,
-    # short of the 6-tick cutoff) -> not evidence -> stays trusted
-    wide = dataclasses.replace(cfg, stuck_pwm_lag_fraction=0.75)
+    # fraction 0.5 (the top of the allowed range) -> lag 4: the lagged sample (index 3)
+    # sits before the move, so it is not yet old enough to count -> stays trusted
+    wide = dataclasses.replace(cfg, stuck_pwm_lag_fraction=0.5)
     assert not gate(wide, obs, last_raw=last_raw, window=window).stuck["coolant"]
 
 
@@ -635,6 +637,10 @@ def _base_temps() -> dict[str, float | None]:
     return default_temps(das_cfg())
 
 
+#: Bay a2's frozen DS18B20 code (1/16 degC) in the idle-bay scenario below.
+IDLE_PROX_A2 = _q(40.0, 0.0625)
+
+
 def test_ds18b20_plateaus_next_to_a_drive_never_flag_stuck():
     """A proximal DS18B20 (1/16 degC) follows a slow drive: minutes on one code at every
     turning point while its zone's fans move hardest. The per-role window (1800 s) and
@@ -686,50 +692,114 @@ def test_ds18b20_plateaus_next_to_a_drive_never_flag_stuck():
     assert len(replay.window) == cfg.window_ticks == 36
 
 
-def test_a_truly_idle_drive_frozen_longer_than_the_window_never_flags_stuck():
+#: Item 27's idle-bay scenario: ``prox_a2`` (bay a2's only DS18B20, so its Stuck rule has
+#: no sibling evidence at all) held at one exact code for the whole run, while zone za's
+#: fans step from 0.2 to 0.9 over 300 s and stay there -- a real net airflow move, the
+#: rule's only other evidence path.
+IDLE_TICKS = 1100
+IDLE_FAN_STEP_TICK = 400
+IDLE_FAN_STEP_TICKS = 60
+
+
+def _idle_bay_cfg() -> MpcConfig:
+    m = das_mapping()
+    m.update(dt=5.0, confirm_s=10.0, fallback_hold_s=20.0, stuck_s=10.0)
+    return MpcConfig.from_mapping(m)
+
+
+def _idle_bay_sample(
+    cfg: MpcConfig, i: int, air_rise_c: float
+) -> tuple[dict[str, float | None], dict[str, float]]:
+    """One tick of the idle-bay scenario. ``air_rise_c`` is how much zone za's air warms
+    per Stuck window: 0.0 leaves the airflow move as plain evidence, a rise above
+    ``stuck_air_oppose_c`` makes the zone air oppose it (``_air_opposes``)."""
+    w = 2.0 * math.pi * i * cfg.dt / 1800.0
+    window_s = cfg.stuck_params("prox_a2").ticks * cfg.dt
+    rise = air_rise_c * i * cfg.dt / window_s
+    dither = 0.03 * (-1) ** i  # thermistor noise on the zone-air sensors
+    temps: dict[str, float | None] = {
+        "inlet": 25.0,
+        "air_a": _q(35.0 + rise + dither, 0.01),
+        "air_a2": _q(35.1 + rise + dither, 0.01),
+        "air_b": 35.0,
+        "air_c": 35.0,
+        "prox_a1": _q(41.0 + 0.5 * math.sin(w + 1.0), 0.0625),
+        "prox_a1b": _q(41.2 + 0.5 * math.sin(w + 1.1), 0.0625),
+        "prox_a2": IDLE_PROX_A2,  # genuinely idle for the whole run, not a turning point
+        "prox_b1": 40.0,
+        "prox_c1": 30.0,
+        "exhaust": 38.0,
+    }
+    if i < IDLE_FAN_STEP_TICK:
+        fan = 0.2
+    elif i >= IDLE_FAN_STEP_TICK + IDLE_FAN_STEP_TICKS:
+        fan = 0.9
+    else:
+        fan = 0.2 + 0.7 * (i - IDLE_FAN_STEP_TICK) / IDLE_FAN_STEP_TICKS
+    return temps, {"fa1": fan, "fa2": fan, "fb1": 0.5, "fc1": 0.5}
+
+
+def _idle_bay_run(cfg: MpcConfig, air_rise_c: float) -> list[int]:
+    """Ticks on which ``prox_a2`` was flagged Stuck; no other sensor may ever be."""
+    replay = DasReplay(cfg)
+    flagged: list[int] = []
+    for i in range(IDLE_TICKS):
+        temps, pwm = _idle_bay_sample(cfg, i, air_rise_c)
+        r = replay.tick(temps, pwm)
+        others = sorted(n for n, stuck in r.stuck.items() if stuck and n != "prox_a2")
+        assert not others, f"tick {i}: {others}"
+        if r.stuck["prox_a2"]:
+            flagged.append(i)
+        else:
+            assert r.trusted, f"tick {i}: {r.reasons}"
+    return flagged
+
+
+def test_a_truly_idle_drive_frozen_longer_than_the_window_is_spared_by_its_zone_air():
     """Item 27: the sine above turns every few minutes, so no single plateau in it comes
     close to ``stuck_s`` (1800 s) -- the scenario PROJECT.md actually describes ("An idle
     bay's DS18B20 sat inside its band for half an hour") is a reading held flat for at
-    least a whole window, not just near a turning point. Hold ``prox_a2`` at one exact
-    value for the entire run while its siblings and its zone's fans keep moving on the
-    same sine as above: the frozen reading must still never flag, on a real plateau
-    several times longer than ``stuck_s`` itself."""
-    m = das_mapping()
-    m.update(dt=5.0, confirm_s=10.0, fallback_hold_s=20.0, stuck_s=10.0)
-    cfg = MpcConfig.from_mapping(m)
-    temp_period = 1800.0
-    fan_period = 240.0  # much faster than the window: every window sees several full swings
-    idle_prox_a2 = _q(40.0, 0.0625)
+    least a whole window, not just near a turning point.
 
-    def sample(i: int) -> tuple[dict[str, float | None], dict[str, float]]:
-        w = 2.0 * math.pi * i * cfg.dt / temp_period
-        wf = 2.0 * math.pi * i * cfg.dt / fan_period
-        dither = 0.03 * (-1) ** i  # thermistor noise on the zone-air sensors
-        temps: dict[str, float | None] = {
-            "inlet": 25.0,
-            "air_a": _q(35.0 + 0.3 * math.sin(w) + dither, 0.01),
-            "air_a2": _q(35.1 + 0.3 * math.sin(w) + dither, 0.01),
-            "air_b": 35.0,
-            "air_c": 35.0,
-            "prox_a1": _q(41.0 + 0.5 * math.sin(w + 1.0), 0.0625),
-            "prox_a1b": _q(41.2 + 0.5 * math.sin(w + 1.1), 0.0625),
-            "prox_a2": idle_prox_a2,  # genuinely idle for the whole run, not a turning point
-            "prox_b1": 40.0,
-            "prox_c1": 30.0,
-            "exhaust": 38.0,
-        }
-        fan = 0.55 + 0.4 * math.cos(wf)  # moves the zone's air throughout, unlike prox_a2
-        return temps, {"fa1": fan, "fa2": fan, "fb1": 0.5, "fc1": 0.5}
-
-    replay = DasReplay(cfg)
-    ticks = 1100
-    for i in range(ticks):
-        temps, pwm = sample(i)
-        r = replay.tick(temps, pwm)
-        assert not r.stuck["prox_a2"], f"tick {i}: {r.reasons['prox_a2']}"
-        assert r.trusted, f"tick {i}: {r.reasons}"
+    Hold ``prox_a2`` at one exact code for the whole run, on a real plateau several times
+    longer than ``stuck_s``, and give zone za a fan step that really does move its
+    airflow. What spares the reading is the designed protection and not the absence of
+    evidence: while za's air warms against the rising airflow by more than
+    ``stuck_air_oppose_c`` over the window, the airflow move is no evidence for a
+    ``drive_proximal`` sensor (``_air_opposes``) and the frozen reading never flags. The
+    companion case below holds the same reading over the same fan step with the zone air
+    saying nothing, and there it *is* flagged -- so this run is not passing by
+    construction."""
+    cfg = _idle_bay_cfg()
+    params = cfg.stuck_params("prox_a2")
+    assert params.siblings == ()  # bay a2's only sensor: airflow is the only evidence
+    assert _idle_bay_run(cfg, air_rise_c=4 * cfg.stuck_air_oppose_c) == []
     # a real plateau, several times the length of the window it is checked against
-    assert ticks * cfg.dt >= 2 * cfg.stuck_params("prox_a2").ticks * cfg.dt
+    assert IDLE_TICKS * cfg.dt >= 2 * params.ticks * cfg.dt
+
+
+def test_the_same_idle_plateau_flags_when_the_zone_air_says_nothing():
+    """The control for the test above: the same frozen ``prox_a2`` over the same fan step,
+    with za's air flat, is branded Stuck -- the run really does carry airflow evidence, so
+    the run above is spared by ``stuck_air_oppose_c`` and by nothing else."""
+    cfg = _idle_bay_cfg()
+    flagged = _idle_bay_run(cfg, air_rise_c=0.0)
+    assert flagged, "the scenario carries no airflow evidence at all"
+    # after the step, and from then on without a gap (the latch holds the flag)
+    assert flagged[0] > IDLE_FAN_STEP_TICK + IDLE_FAN_STEP_TICKS
+    assert flagged == list(range(flagged[0], IDLE_TICKS))
+
+
+@pytest.mark.parametrize("fraction", [0.0, 0.25, 1 / 3, 0.4, 0.5])
+def test_every_allowed_stuck_pwm_lag_fraction_still_flags_a_frozen_reading(fraction):
+    """``stuck_pwm_lag_fraction`` may not silently switch the Stuck rule off. The lagged
+    block used to be ``L`` samples wide, so at ``L = m // 2`` it *was* the first block (a
+    move of exactly 0.0) and above that the slice ran off the start (``None``): a zoned
+    sensor without siblings could then never be flagged at all. Over the whole allowed
+    range the frozen reading is still flagged, only later the wider the lag."""
+    cfg = dataclasses.replace(_idle_bay_cfg(), stuck_pwm_lag_fraction=fraction)
+    flagged = _idle_bay_run(cfg, air_rise_c=0.0)
+    assert flagged, f"fraction {fraction} left the frozen reading unflagged"
 
 
 def _dense_das(**extra: Mapping[str, object]) -> MpcConfig:

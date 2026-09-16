@@ -292,6 +292,7 @@ def test_horizon_extremes_still_satisfy_invariants(cfg, horizon):
         {"stuck_zone_air_dT_c": 0.0},
         {"stuck_zone_air_dT_c": -1.5},
         {"stuck_pwm_lag_fraction": -0.1},
+        {"stuck_pwm_lag_fraction": 0.6},
         {"stuck_pwm_lag_fraction": 1.1},
         {"median3": "false"},
         {"median3": 0},
