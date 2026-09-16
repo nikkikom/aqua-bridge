@@ -179,10 +179,16 @@ hardware.
    (PROJECT.md §2 "Software-sensor heartbeat and profiles", §8 item 84).
    Set the key in the same step as the sensor: a sensor enabled on the
    device with `heartbeat_sensor: 0` falls back and fires the alarm one
-   timeout after boot, for good. Once the daemon has run a tick and its
-   duties look right, with the service **stopped**, commission that
-   configuration so a power cycle brings it back instead of falling to
-   whatever aquasuite last saved:
+   timeout after boot, for good. Then, with the service **stopped**,
+   commission the controller's own configuration — the one it falls back
+   to — so that a power cycle brings that back. What the tool sees is
+   never the daemon's live duties: the daemon restores every control
+   field it wrote when it stops (`release()`), and the software-sensor
+   heartbeat times out a few tens of seconds later, so the controller is
+   running its own saved profile (or the safe profile the alarm selected)
+   by the time the tool can read it. Check that what it prints is the
+   safe configuration — temperature-driven sources, sane min/max, the
+   right profile — and only then save it:
 
    ```bash
    .venv/bin/python tools/aquacomputer_commission.py \
@@ -191,9 +197,11 @@ hardware.
 
    shows every output's duty, source and limits and the active profile
    without writing anything; add `--save` to store it, after a typed
-   confirmation (PROJECT.md §8 item 88; run once per controller, so
-   `--device quadro` too when one is configured — its save report is not
-   verified to persist, unlike the aquaero's). As the
+   confirmation and a re-read that aborts when the controller changed
+   while you were reading (PROJECT.md §8 item 88; run once per
+   controller, so `--device quadro` too when one is configured — its save
+   report is not verified to persist, unlike the aquaero's, §8 item 96).
+   As the
    service user:
    `HYPOTHESIS_PROFILE=pi .venv/bin/python -m pytest -m hardware`. Warm
    each mapped thermistor and confirm the right `obs.temps` key moves (a
