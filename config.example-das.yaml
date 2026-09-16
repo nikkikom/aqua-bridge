@@ -342,9 +342,17 @@ aquacomputer:
     duty_mismatch_s: 5.0          # a mismatch lasting longer re-reads and rewrites every channel (> 0)
     write_min_interval_s: 0.0     # a falling duty is written at most this often (>= 0; 0 writes every change; rises go out at once)
     write_deadband: 0             # a falling duty is written only this far below the written one, 1/100 % (0..10000; 0 writes every change)
-    heartbeat_sensor: 0           # software sensor softN (aquaero 1..8) the daemon writes every tick as a
-                                  # hardware watchdog; 0 is off (the controller's own timeout, fallback
-                                  # temperature and alarm action are set on the device itself)
+    heartbeat_sensor: 0           # software sensor softN (aquaero 1..8) the daemon writes on every tick
+                                  # that commanded the duties, as a hardware watchdog; 0 is off (the
+                                  # controller's own timeout, fallback temperature and alarm action are
+                                  # set on the device itself). Shown here at its default, but 0 is right
+                                  # only while no software sensor is enabled on the controller: this
+                                  # aquaero has soft1 enabled (30 s, fallback 90.00 degC, alarm -> the
+                                  # 100 % profile 2; PROJECT.md section 2 "Software-sensor heartbeat and
+                                  # profiles"), so with 0 that sensor falls back 30 s after boot, the
+                                  # alarm selects profile 2 for good and the watchdog can never fire
+                                  # again. Set heartbeat_sensor: 1 once the daemon's heartbeat has run
+                                  # against the hardware (PROJECT.md section 8 item 93).
     heartbeat_value_c: 20.0       # the temperature the heartbeat writes, degC: below the sensor's alarm
   # The alternative, the Quadro on its own USB port instead of aquabus: remove qd1-qd4
   # from the aquaero entry above and add

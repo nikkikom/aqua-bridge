@@ -1862,9 +1862,15 @@ converges only with them.
   the serials found. `HidrawTransport` opens `/dev/hidrawN` non-blocking,
   drains input reports, waits with `select`, and sends `HIDIOCGFEATURE`
   / `HIDIOCSFEATURE` (`buf[0]` = report id). `write_report` sends a HID
-  *output* report with `write` (the software-sensor heartbeat); the kernel does
-  that transfer synchronously, so it counts as one device operation like a
-  feature report. An errno meaning the node is
+  *output* report with `write` (the software-sensor heartbeat). It is handed to
+  the kernel, **not acknowledged by the device**: on an interface with an
+  interrupt OUT endpoint usbhid queues the URB and `write` returns at once
+  (only without one does the kernel fall back to a synchronous SET_REPORT
+  control transfer), and a full usbhid output queue drops the report. So the
+  returned byte count means "accepted for sending", never "delivered" — what
+  proves delivery is reading the sensor back out of a status report (§8 item
+  93) — and it is budgeted as one device operation all the same. An errno
+  meaning the node is
   gone raises `DeviceUnavailable`, any other failed feature or output report
   `FeatureReportError`. The adapter only needs the `HidTransport`
   protocol, so tests run it against a fake controller.
@@ -1941,25 +1947,36 @@ converges only with them.
     failed SET may or may not have reached the device). A Quadro control
     report whose checksum does not match is a failed read. An aquabus output
     with no device behind it is written with the others and `apply()` does
-    not raise for it: `read()` already raises, which runs the fallback, and
-    the loop rate limits the fallback ramp against the last command whose
-    `apply()` succeeded, so an `apply()` that raised after its SET went out
-    would keep every fan of the composite below `fallback_pwm` while the
-    slot stays empty (and would hold back `READY=1` and report the stop
-    write as failed).
+    not raise for it (`read()` reports that channel as `None` and lists it in
+    `absent_channels`, §8 item 90): the loop rate limits the fallback ramp
+    against the last command whose `apply()` succeeded, so an `apply()` that
+    raised after its SET went out would keep every fan of the composite below
+    `fallback_pwm` while the slot stays empty (and would hold back `READY=1`
+    and report the stop write as failed).
   - **Software-sensor heartbeat** (§8 items 33, 84), off by default
-    (`heartbeat_sensor: 0`). With a sensor configured, every `apply()` first
+    (`heartbeat_sensor: 0`). With a sensor configured, every `apply()`
     writes `heartbeat_value_c` into that aquaero software sensor with output
-    report `0x07` — once per tick, before the duties, and once per `apply()`
-    however often the control write is retried. Only that sensor is written;
-    the other seven slots carry `0x7FFF`, so the device keeps its own values
-    for them. It is the daemon's half of the controller's own watchdog: the
-    sensor is enabled on the device with a timeout and a high fallback
-    temperature, and an alarm on it selects a safe profile, so a daemon or a
-    Pi that stops writing lets the controller take over (§2 "Software-sensor
-    heartbeat and profiles": 30 s, then every output at 100 %). The heartbeat
-    is sequenced like any other control operation — it waits `ctrl_gap_ms`
-    and runs inside `ctrl_budget_s` — so the worst case per tick is unchanged.
+    report `0x07` — once per tick, **after** the duty work and only when it
+    succeeded, so once per `apply()` however often the control write is
+    retried. Only that sensor is written; the other seven slots carry
+    `0x7FFF`, so the device keeps its own values for them. It is the daemon's
+    half of the controller's own watchdog: the sensor is enabled on the device
+    with a timeout and a high fallback temperature, and an alarm on it selects
+    a safe profile, so a daemon or a Pi that stops writing lets the controller
+    take over (§2 "Software-sensor heartbeat and profiles": 30 s, then every
+    output at 100 %).
+    **The order is the point.** The failure mode only this watchdog covers is
+    a daemon that is alive but cannot write — a live node whose every control
+    operation fails, where the loop logs "apply failed" and keeps ticking. A
+    heartbeat sent before the duties would hold the watchdog shut through
+    exactly that, leaving the fans at the last duty that did go out. So it
+    goes out behind an `apply()` that reached the device; a tick that did not
+    sends none and the controller falls back on its own. An `apply()` with
+    nothing to send (no duty changed) still counts as commanding — the cadence
+    is one heartbeat per tick, not one per SET.
+    The heartbeat is sequenced like any other control operation — it waits
+    `ctrl_gap_ms` and runs inside `ctrl_budget_s` — so the worst case per tick
+    is unchanged; running last, it is the operation a spent budget drops.
     A failed heartbeat never fails the tick: it is logged once per state
     change (error when it starts failing, info when it goes out again), and
     what it costs is exactly the fallback the controller is configured for,
@@ -1967,7 +1984,18 @@ converges only with them.
     does not match, the heartbeat included. Only the aquaero has a known
     software-sensor report, so `heartbeat_sensor` on a `quadro` entry is a
     startup `ConfigError`. `heartbeat_on` / `heartbeat_ok` expose the state
-    (publishing it is §8 item 83).
+    (publishing it is §8 item 83); `heartbeat_ok: true` means the report was
+    accepted for sending, not that the controller saw it (`write_report`
+    queues an output report, §2), so reading the sensor back from a status
+    report is what would prove delivery (§8 item 93).
+    **`heartbeat_sensor: 0` is right only while no software sensor is enabled
+    on the controller.** A sensor enabled there with a timeout and an alarm
+    that nothing writes falls back one timeout after boot and the alarm
+    selects its profile for good: the watchdog has fired and can never fire
+    again, and live writes keep working, so nothing in the journal says so.
+    Both example files show the key at its default, with that written next to
+    it; on the owner's aquaero (`soft1` enabled since 2026-09-15) the value to
+    run is `1`, after item 93.
   - **Profile changes** (§8 item 84). Byte `0x06` of the aquaero's control
     report is the profile it runs (`active_profile`, 1-based). A switch — the
     alarm above, or the controller's own panel — reloads the **saved**
@@ -1980,9 +2008,24 @@ converges only with them.
     defaults) whenever the reloaded profile drives an output differently than
     the daemon last wrote — the duty verification sees that and re-reads the
     report — and otherwise at the latest after `ctrl_refresh_s` (60 s).
-    Waiting is safe: the profile an alarm selects is the safe one (on the
-    owner's controller every output at 100 %), so the delay only postpones the
-    daemon taking the fans back down.
+    **Both edges matter, and byte `0x06` bounds neither.** On the *alarm-set*
+    edge the reloaded profile is the safe one (on the owner's controller every
+    output at 100 %), so a late rewrite only postpones the daemon taking the
+    fans back down. On the *alarm-clear* edge — the one a daemon restart after
+    an alarm goes through: its first heartbeat clears the alarm, the controller
+    reloads saved profile 1 and every output drops to what that profile holds
+    (20 % on the owner's controller) while the daemon still believes it
+    commands what it last wrote. That direction **reduces cooling**, and what
+    bounds it is the duty verification, not the profile byte: the reloaded duty
+    differs from the written one, so within `duty_mismatch_s` plus a tick
+    (about 5–10 s) the cache is invalidated, the report re-read, the profile
+    change logged and every configured channel written again. The
+    `ctrl_refresh_s` worst case is reached only when the reloaded profile
+    happens to drive the outputs exactly as the daemon last wrote them — when
+    there is nothing to lose by waiting. In between, `obs.pwm` still reports
+    what the outputs really drive (it comes from the status report), so the
+    solver and the gate see the drop; only `applied_cmd` names the duty the
+    daemon wrote.
   - **Write limiting**, off by default. It was introduced against memory
     wear while every SET was followed by the save report and so stored in
     the controller's non-volatile memory (§8 item 77). A SET without the
@@ -2102,7 +2145,8 @@ converges only with them.
     duty_mismatch_s: 5.0
     write_min_interval_s: 0.0
     write_deadband: 0
-    heartbeat_sensor: 0           # softN written every tick; 0 = off
+    heartbeat_sensor: 0           # softN written on every tick that commanded the duties;
+                                  # 0 = off, and right only while no softN is enabled there
     heartbeat_value_c: 20.0
   ```
 
@@ -2117,7 +2161,7 @@ converges only with them.
   | `duty_mismatch_s` | 5.0 | finite, > 0 | a mismatch lasting longer re-reads the report and rewrites every channel |
   | `write_min_interval_s` | 0.0 | finite, ≥ 0 | a falling duty is written at most this long after the device's last write (rises at once); 0 writes every fall; only limits USB traffic since writes are not saved (§8 item 86) |
   | `write_deadband` | 0 | integer 0..10000 | 1/100 %: a falling duty is written only this far below the written one; 0 writes every fall (§8 item 86) |
-  | `heartbeat_sensor` | 0 (off) | integer 0..8, aquaero only | the software sensor `softN` every `apply()` writes as the heartbeat of the controller's own watchdog (§8 item 84) |
+  | `heartbeat_sensor` | 0 (off) | integer 0..8, aquaero only | the software sensor `softN` every `apply()` writes, after its duty work and only when that succeeded, as the heartbeat of the controller's own watchdog; 0 only while no software sensor is enabled on the device (§8 item 84) |
   | `heartbeat_value_c` | 20.0 | finite, −327.68..327.66 °C | the temperature the heartbeat writes; it must stay below the alarm the controller has on that sensor |
 
   The defaults live once, in `AquacomputerTiming`, and the one that
@@ -2135,7 +2179,12 @@ converges only with them.
   aquabus; Quadro `pwm1..4`), `rpm` one of its tachometers (aquaero
   `fan1..8`, Quadro `fan1..4`), `temp_map` values one of its temperature
   inputs (aquaero `temp1..8`, `bus1..8`, `soft1..8`, `virt1..4`; Quadro
-  `temp1..4`, `soft1..16`), and two names on one input are rejected. A
+  `temp1..4`, `soft1..16`), and two names on one input are rejected. **Do not
+  bind a `busN` of a device that can leave aquabus yet**: such a slot keeps
+  the last value it read instead of reading as missing (§8 item 92), and since
+  item 90 `read()` no longer fails the controller for the empty output slots
+  next to it, so a frozen temperature would reach the solver as an ordinary
+  reading. Nothing in the config model checks that (the check is item 92). A
   name of the hwmon driver's numbering that means another input now is
   rejected with the new name: aquaero `temp9..16` (`soft1..8`) and
   `temp17..20` (`virt1..4`), Quadro `temp5..20` (`soft1..16`), and the
@@ -2888,8 +2937,10 @@ the board.
   output absent named in that line, rpm `0xFFFF` on an own output not
   treated as absent, no duty evidence from an empty slot), the
   software-sensor heartbeat (the report's bytes and the configured sensor
-  only, one per `apply()` and none per retry, off by default, the gap before
-  it, a failed write logged once and not failing the tick, a spent budget,
+  only, one per `apply()` after the duty work and none per retry, off by
+  default, the gap before it, a failed write logged once and not failing the
+  tick, none from a tick whose control write failed or whose budget the duties
+  spent, a budget too short for the heartbeat dropping it and not the tick,
   none to a device with the wrong serial) and profile changes (a changed
   byte `0x06` rewriting every channel with one log line, found by the duty
   verification or by the periodic refresh, no extra control read per tick,
@@ -3814,17 +3865,29 @@ Owner decision (2026-09-15):
     aquaero, and the commissioning tool for it is item 88.
     - `heartbeat_sensor` (0 = off, the default; aquaero `softN` 1..8) and
       `heartbeat_value_c` (20.0 °C) are per-device config keys. Every
-      `apply()` writes that one sensor with HID output report `0x07` before
-      the duties — once per `apply()`, however often the control write is
-      retried — and leaves the other seven slots at `0x7FFF` ("no data"), so
-      the device keeps its own values for them. The heartbeat waits
+      `apply()` writes that one sensor with HID output report `0x07` **after**
+      the duty work and only when it succeeded — once per `apply()`, however
+      often the control write is retried — and leaves the other seven slots at
+      `0x7FFF` ("no data"), so the device keeps its own values for them. The
+      order is the safety property: a heartbeat ahead of the duties would hold
+      the watchdog shut through the one failure it uniquely covers, a daemon
+      alive on a live node whose every control operation fails; a tick that
+      could not command a duty now sends none and the controller falls back on
+      its own. An `apply()` with nothing to send still counts as commanding,
+      so the cadence stays one per tick. The heartbeat waits
       `ctrl_gap_ms` and runs inside `ctrl_budget_s` like any control
       operation, so the worst case per tick and the watchdog bound are
-      unchanged; a failed write never fails the tick and is logged once per
-      state change. Nothing is written to a device whose serial does not
-      match, so the controller takes over then too. The Quadro's
-      software-sensor report is unknown, so `heartbeat_sensor` on a `quadro`
-      entry is a startup `ConfigError`.
+      unchanged, and running last it is what a spent budget drops; a failed
+      write never fails the tick and is logged once per state change. Nothing
+      is written to a device whose serial does not match, so the controller
+      takes over then too. The Quadro's software-sensor report is unknown, so
+      `heartbeat_sensor` on a `quadro` entry is a startup `ConfigError`.
+      `heartbeat_sensor: 0` is right only while **no** software sensor is
+      enabled on the controller: an enabled sensor nothing writes falls back
+      one timeout after boot and its alarm selects that profile for good, so
+      the watchdog has fired and cannot fire again while live writes keep
+      working. Both example files show the key at its default with that said
+      next to it; `1` is the value for the owner's aquaero, after item 93.
     - Byte `0x06` of the aquaero's control report is the active profile
       (`active_profile`, 1-based). Every fresh control report is compared
       against the last one: a change logs one line naming both profiles and
@@ -3834,14 +3897,22 @@ Owner decision (2026-09-15):
       or an invalidation already fetches, so a switch is noticed within
       `duty_mismatch_s` plus a tick when the reloaded profile drives an
       output differently (the duty verification sees it) and at the latest
-      after `ctrl_refresh_s` = 60 s otherwise. That delay is safe: the
-      profile the alarm selects is the safe one (every output at 100 %), so
-      it only postpones the daemon taking the fans back down.
+      after `ctrl_refresh_s` = 60 s otherwise. Both edges, and byte `0x06`
+      bounds neither: on the alarm-**set** edge the reloaded profile is the
+      safe one (every output at 100 %), so the delay only postpones the daemon
+      taking the fans back down; on the alarm-**clear** edge — a daemon
+      restarted after an alarm — the reloaded profile is the quiet one (20 %
+      on the owner's controller), which reduces cooling, and what bounds that
+      is the duty verification (the reloaded duty differs from the written
+      one), about 5–10 s. The 60 s worst case is reached only when the
+      reloaded profile drives the outputs exactly as the daemon last wrote
+      them (§3 Track B).
     - `heartbeat_on`, `heartbeat_ok` and `active_profile` are on the adapter
       for diagnostics; publishing them is item 83.
       `tools/aquacomputer_probe.py` prints the active profile.
     Fake-transport tests for the report bytes and cadence, the configured
-    sensor only, a failed write, a profile change forcing the rewrite, no
+    sensor only, a failed write, a tick that could not command the duties
+    sending no heartbeat, a profile change forcing the rewrite, no
     extra control read per tick and the config keys (§4.7). Not yet run
     against the hardware: item 93. Verified on the Pi
     (2026-09-15, §2 "Apply without saving", "Software-sensor heartbeat and
@@ -3974,7 +4045,10 @@ Owner decision (2026-09-15):
     writes an absent output with the others and does not raise for it (an
     `apply()` that raised after its SET would freeze the loop's rate-limited
     fallback ramp). Publishing `absent_channels` stays item 83; the frozen
-    `busN` temperatures of an absent device stay item 92.
+    `busN` temperatures of an absent device stay item 92 — and they got more
+    urgent here, because the read that used to raise was also what kept them
+    out of the solver, so §3 Track B and the README now say not to bind a
+    `busN` of a device that can leave aquabus until item 92 lands.
 83. Publish the adapter's device health: `AquacomputerAdapter.stuck_channels`
     (outputs that keep reporting another duty after a rewrite, item 81), the
     aquaero outputs not in PWM mode, outputs with no device behind them on
@@ -4010,9 +4084,15 @@ Owner decision (2026-09-15):
     the software-sensor heartbeat of item 84 is configured, which is the
     answer: about 30 s after the last write the aquaero's alarm selects the
     safe profile and every output runs at 100 %, verified on the hardware
-    (§2 "Software-sensor heartbeat and profiles"). What is left of this item
-    is the owner's decision whether `release()` runs at exit, and running
-    the daemon's own heartbeat on the hardware (item 93).
+    (§2 "Software-sensor heartbeat and profiles"). It covers the daemon or
+    the Pi stopping **and** a daemon that runs but can no longer write (the
+    heartbeat goes out only behind an `apply()` that reached the device, §3
+    Track B). What it does not cover is a write the kernel accepts and the
+    device never sees: `write_report` queues an output report rather than
+    waiting for an acknowledgement, so `heartbeat_ok` means "accepted", and
+    reading the sensor back is the check item 93 adds. What is left of this
+    item is the owner's decision whether `release()` runs at exit, and
+    running the daemon's own heartbeat on the hardware (item 93).
 34. Spike: which Quadro temperature inputs carry a reading in its status
     report (`tools/aquacomputer_probe.py`); bind them in its `temp_map`.
     Over aquabus the Quadro's sensors 1–4 appear in the aquaero's aquabus
@@ -4172,7 +4252,16 @@ Owner decision (2026-09-15):
     missing while the device behind them is absent (for the Quadro: its fan
     slots 5–8 read `0xFFFF`), or refuse to bind them without such a check —
     item 90 now judges that absence per slot, so the evidence a `busN`
-    temperature would need is already decoded;
+    temperature would need is already decoded. **This got more urgent with
+    item 90**: until then a commanded aquabus output reading `0xFFFF` made
+    `read()` raise, which kept the frozen `busN` values out of the solver as a
+    side effect; now the observation comes through with only that channel's
+    `rpm`/`pwm` nulled, so a bound `busN` of a departed device reaches the
+    gate as an ordinary reading and its zone would hold its fans while the
+    real temperature climbs (the Stuck rule catches it only once some channel
+    moves). No shipped example binds a `busN` — they bind `temp1..temp8` —
+    and §3 Track B and the README now say not to bind one until this item
+    lands, but that is a warning, not a check;
     once the link is back, repeat the adapter's live write to outputs 5–8 on
     the hardware (PR for items 85 and 86 was checked on the aquaero's own
     outputs only: no save report, live writes, the fault floor).
@@ -4187,8 +4276,24 @@ Owner decision (2026-09-15):
     configured channel is written again within `ctrl_refresh_s`; and that a
     heartbeat write costs no more than a few milliseconds on the Pi (it is
     inside `ctrl_budget_s`, but the measured cost belongs next to the other
-    timings in §2). Then decide whether `heartbeat_sensor: 1` goes into
-    `config.example-das.yaml` as the owner's default rather than 0. While
+    timings in §2). Confirm the **negative** half too, which is the point of
+    the ordering: with the daemon running and its writes failing (pull the
+    aquaero's USB after `read()` has an observation, or make the SET fail),
+    no heartbeat goes out and the alarm fires on schedule.
+    **Read the heartbeat back**: `write_report` only hands the report to the
+    kernel (§2), so `heartbeat_ok` is "accepted", not "delivered". Compare
+    `soft1` in the status report against `heartbeat_value_c` on the hardware;
+    if the sensor can be bound or read cheaply every tick, make that read-back
+    drive `heartbeat_ok` so a queued-but-lost heartbeat is visible instead of
+    showing a healthy watchdog while the controller runs down its timeout.
+    Then set `heartbeat_sensor: 1` on the owner's deployment and decide
+    whether it goes into `config.example-das.yaml` as well, against the
+    convention that both example files show every timing key at its default
+    (`tests/test_model_config.py::test_example_configs_show_every_timing_key_at_its_default`).
+    Until then that file ships 0 with the cost of 0 written next to it:
+    `soft1` is enabled on that aquaero, so with nothing writing it the alarm
+    selects profile 2 about 30 s after boot and the watchdog is spent — live
+    writes keep working, so only the profile byte shows it. While
     the Quadro is off aquabus (item 92), also confirm item 90 on the
     hardware: the aquaero's own thermistors and outputs keep working with
     `pwm5..pwm8` absent, one error line instead of a read failure per tick,
@@ -4772,9 +4877,13 @@ on a Zero W; the hardware steps are waiting for the aquaero.
    devices (`device: aquaero` or `quadro`, `serial:` when several of one
    kind are attached, `fans` with `{pwm: pwmN, rpm: fanN}` per output (the
    Quadro on aquabus: the aquaero's `pwm5..pwm8` / `fan5..fan8`),
-   `temp_map` per input actually present (`tempN` physical sensors, `busN`
-   the Quadro's sensors on aquabus), the timing keys at their defaults
-   unless §8 item 80 says otherwise), `onewire.sensors`
+   `temp_map` per input actually present (`tempN` physical sensors; `busN`
+   are the Quadro's sensors on aquabus — do not bind one until §8 item 92
+   lands: the slot keeps its last value when the Quadro leaves the bus), the
+   timing keys at their defaults
+   unless §8 item 80 says otherwise; `heartbeat_sensor` matching the software
+   sensor enabled on the controller, since 0 next to an enabled sensor spends
+   its watchdog one timeout after boot, §8 item 84), `onewire.sensors`
    (step 9), MQTT
    host and credentials (the MQTT command topics rely on the broker's
    authentication, §7), `http.enabled` / `mqtt.enabled`. Every name must

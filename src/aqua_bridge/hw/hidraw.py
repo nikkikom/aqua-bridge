@@ -376,10 +376,15 @@ class HidrawTransport:
     def write_report(self, data: bytes) -> None:
         """Sends one HID output report with ``write`` (``data[0]`` = the report id).
 
-        An output report goes out over the device's interrupt OUT endpoint (the
-        kernel falls back to a SET_REPORT control transfer), so this call is
-        synchronous like a feature report even on the non-blocking node: the
-        caller must treat it as one device operation and give it a time budget.
+        The report is **handed to the kernel, not acknowledged by the device**.
+        On an interface with an interrupt OUT endpoint usbhid queues the URB and
+        ``write`` returns at once; only on one without it does the kernel fall
+        back to a synchronous SET_REPORT control transfer. So a returned byte
+        count says the report was accepted for sending, and nothing more: it is
+        no proof of delivery (a full usbhid output queue drops the report), and
+        the caller that needs that must read the effect back from the device.
+        Treat it as one device operation under a time budget all the same -- it
+        can take a control transfer's time, and it shares the driver's queue.
         """
         fd = self._require_fd()
         what = f"OUTPUT report 0x{data[0]:02X}"
