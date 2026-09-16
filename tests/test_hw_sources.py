@@ -28,6 +28,10 @@ from aquacomputer_fakes import (
 )
 
 
+def _messages(caplog, level: str) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelname == level]
+
+
 def _fleet(clock: FakeClock | None = None):
     clock = clock or FakeClock()
     aquaero = FakeController(AQUAERO, clock, node="/dev/hidraw2")
@@ -585,33 +589,77 @@ def _aquabus_loop(cfg, device: FakeController):
     return adapter, loop, notifier, run
 
 
-def test_the_fallback_ramp_reaches_fallback_pwm_while_an_aquabus_slot_is_empty(fast_cfg) -> None:
-    """Review finding: an apply() that raised after its write for an empty aquabus slot
-    left the loop's applied command at the last good one, so the rate-limited fallback
-    ramp stayed one d_pwm_max step above it on every output. Only read() fails now: the
-    ramp reaches fallback_pwm, and the stop write reports success."""
+def test_an_empty_aquabus_slot_does_not_blind_the_rest_of_the_controller(fast_cfg, caplog) -> None:
+    """Item 90: the Quadro drops off aquabus mid-run. The channel it served reports no
+    rpm and no duty, but the aquaero's own thermistors and output keep working, the loop
+    never runs its fallback for it, and the error is logged once, not once per tick."""
     cfg = fast_cfg
     device = aquabus_aquaero(FakeClock(), node="/dev/hidraw2")
     adapter, loop, notifier, run = _aquabus_loop(cfg, device)
     good = run(20)
     assert all(r.ok for r in good[-3:]) and notifier.ready_n == 1
-    assert max(good[-1].cmd.pwm.values()) <= cfg.fallback_pwm["radiator"] - 2 * cfg.d_pwm_max
+    assert good[-1].obs.pwm["intake"] is not None and good[-1].obs.rpm["intake"] is not None
 
-    device.status_template = fixture_bytes("aquaero-status.bin")  # the Quadro left aquabus
-    faults = run(60)
-    assert all(r.read_error and "pwm5 (intake)" in r.read_error for r in faults)
-    assert faults[-1].cmd.mode is Mode.FALLBACK
-    assert control_duty(AQUAERO, device.ctrl, 0) == round(cfg.fallback_pwm["radiator"] * 10000)
-    assert control_duty(AQUAERO, device.ctrl, 4) == round(cfg.fallback_pwm["intake"] * 10000)
-    assert faults[-1].cmd.pwm == pytest.approx(cfg.fallback_pwm)
-    assert all(r.applied and r.apply_error is None for r in faults)
-    assert adapter.absent_channels == ("intake",)
+    with caplog.at_level("INFO", logger="aqua_bridge.hw.aquacomputer"):
+        device.status_template = fixture_bytes("aquaero-status.bin")  # the Quadro left aquabus
+        absent = run(20)
+        assert all(r.ok and r.read_error is None for r in absent)
+        assert all(r.cmd.mode is Mode.AUTO for r in absent)
+        for result in absent:
+            assert result.obs.rpm["intake"] is None and result.obs.pwm["intake"] is None
+            assert result.obs.pwm["radiator"] is not None
+            assert set(result.obs.temps) == {"coolant", "air"}
+            assert all(value is not None for value in result.obs.temps.values())
+        assert adapter.absent_channels == ("intake",)
+        # Both channels are still commanded, the healthy one by the solver.
+        assert control_duty(AQUAERO, device.ctrl, 0) == round(absent[-1].cmd.pwm["radiator"] * 1e4)
+        assert control_duty(AQUAERO, device.ctrl, 4) == round(absent[-1].cmd.pwm["intake"] * 1e4)
+
+        device.status_template = fixture_bytes("aquaero-status-aquabus-fan7-100.bin")  # back
+        back = run(3)
+    assert all(r.ok for r in back) and adapter.absent_channels == ()
+    assert back[-1].obs.rpm["intake"] is not None
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1 and "no device behind pwm5 (intake), fan5 (intake)" in errors[0]
+    assert [m for m in _messages(caplog, "INFO") if "again" in m] == [
+        "aquaero: a device is behind pwm5 (intake), fan5 (intake) again"
+    ]
     assert loop.shutdown() is True
+
+
+def test_every_commanded_channel_absent_is_logged_but_still_not_a_failed_read(
+    fast_cfg, caplog
+) -> None:
+    """The other half of item 90: with every commanded output on the missing device the
+    controller says so once, and its temperatures still reach the solver -- they are what
+    makes the remaining fans of the other controllers ramp."""
+    clock = FakeClock()
+    device = FakeController(AQUAERO, clock, node="/dev/hidraw2")  # nothing on aquabus
+    adapter = AquacomputerAdapter(
+        DeviceBinding(
+            kind=AQUAERO,
+            pwm_map={"intake": 5, "exhaust": 6},
+            fan_map={"intake": 5},
+            temp_map={"coolant": "temp6", "air": "temp7"},
+        ),
+        clock=clock,
+        sleep=FakeSleep(clock),
+        opener=FakeBus(device),
+    )
+    with caplog.at_level("ERROR", logger="aqua_bridge.hw.aquacomputer"):
+        obs = CompositeSource([adapter], clock=clock).read()
+    assert obs.pwm == {"intake": None, "exhaust": None} and obs.rpm == {"intake": None}
+    # temp7 has nothing connected in this fixture; temp6 still reaches the solver.
+    assert obs.temps == {"coolant": pytest.approx(22.26), "air": None}
+    assert adapter.absent_channels == ("exhaust", "intake")
+    (error,) = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert "commands no reachable output now" in error
 
 
 def test_a_daemon_started_with_an_empty_aquabus_slot_becomes_ready(fast_cfg) -> None:
     device = FakeController(AQUAERO, FakeClock(), node="/dev/hidraw2")  # nothing on aquabus
     _adapter, _loop, notifier, run = _aquabus_loop(fast_cfg, device)
     (first,) = run(1)
-    assert first.read_error is not None and first.applied
+    assert first.read_error is None and first.applied
+    assert first.obs.pwm == {"radiator": pytest.approx(1.0), "intake": None}
     assert notifier.ready_n == 1
