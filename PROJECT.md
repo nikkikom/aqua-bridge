@@ -5781,20 +5781,26 @@ Owner decision (2026-09-16):
     one would have fitted the Zero W too. Hence the default `true` on every
     board; `false` is there to get the frozen plan back, not to save time.
 
-    *Identification* (`sim/das.py`, `rich` preset, `k_sigma: 1`, one
-    experiment at a time as the supervisor runs them, 24 h, seeds 1–4,
-    scratch harness): the two modes start the same experiments (21 / 22 / 47
-    / 38 starts per seed) and abort on the same bays, except seed 3 where
-    the frozen plan aborted four times on the envelope and the re-planned
-    one three (a rising demand that the frozen plan could not follow). The
-    fit is the same within the seed spread — worst in-zone `E` error median
-    0.51 (frozen) against 0.51 (re-planned), rms 0.356 against 0.356; worst
-    per-bay `k` median 0.53 against 0.53, its worst seed 0.58 against 0.81 —
-    while the cooling the experiment withheld goes away: **1991 channel-ticks
-    below the solver's own command (worst 0.10 PWM, a full `d_pwm_max`) →
-    0**. With every channel excited at once (8 h, seeds 1–4) the enclosure
-    runs cold, the demand never rises above the anchors and the two modes
-    are identical to the digit. Neither mode reaches `converged` in this
+    *Identification* (`sim/das.py`, `rich` preset, `k_sigma: 1`, the real
+    loop with experiments started one at a time as the supervisor runs them,
+    24 h per run, seeds 1–8, paired frozen against re-planned, scratch
+    harness): both modes start the same 174 experiments and abort on the
+    same bays, 17 aborts against 16 — seed 3 is the difference, where the
+    frozen plan aborted four times on the envelope and the re-planned one
+    three, following a rising demand the frozen plan could not. The fit is
+    the same within the seed spread: relative error of the in-zone `E`,
+    rms over the parameters, median over the seeds 0.408 (frozen) against
+    0.420 (re-planned), seed spread (sd) 0.127 against 0.124, per-seed
+    difference median +0.004 and worst +0.021; its worst parameter median
+    0.758 against 0.830, per-seed difference median 0.000, worst +0.106.
+    Per-bay `k`: rms median 0.273 against 0.275 (sd 0.062 against 0.058,
+    per-seed difference median +0.001, worst +0.032), worst parameter median
+    0.572 against 0.580, worst seed difference +0.230 (seed 4). What changes
+    is the cooling the experiment withheld: **3071 channel-ticks below the
+    solver's own command (worst 0.106 PWM, a full `d_pwm_max`) → 0**. With
+    every channel excited at once instead (8 h, seeds 1–4) the enclosure runs
+    cold, the demand never rises above the anchors and the two modes come out
+    identical to the digit. Neither mode reaches `converged` in this
     closed-loop scenario (`pe_min` stays near zero: with the solver moving
     the other channels of a zone, one experiment at a time does not excite
     the zoned regressors) — that is the scenario, not this item; the
