@@ -24,6 +24,12 @@ owner yet (section 5, "after Command is stable"), so ``_warn_bad_digole_enabled`
 below only logs a warning at config load -- nothing reads the section, so there
 is nowhere yet to raise.
 
+A key written twice in one mapping is a :class:`ConfigError` naming the line
+(:class:`_UniqueKeyLoader`): YAML itself keeps the last of them and drops the
+rest without a word, which would let an edit written next to an existing key
+(a raised ``mpc.budget_ms`` above the shipped one, §8 item 73) load cleanly and
+change nothing.
+
 ``aquacomputer`` is the one section shaped as a *list* rather than a mapping
 (one entry per Aqua Computer controller over hidraw, plan section 12 Q1: the
 Quadro on its own USB port alongside the aquaero) and so is parsed separately
@@ -39,7 +45,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Hashable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -167,6 +173,37 @@ class AppConfig:
         return cls(mpc=mpc, aquacomputer=devices, extra=extra, source=source, **sections)
 
 
+class _DuplicateKeyError(yaml.YAMLError):
+    """A mapping key written twice (raised by :class:`_UniqueKeyLoader`)."""
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """``yaml.SafeLoader`` that refuses a repeated mapping key (item 73).
+
+    Plain YAML keeps the *last* of the repeated keys and drops the earlier ones
+    without a word, so an edit written next to an existing key -- a raised
+    ``mpc.budget_ms`` above the shipped one, say -- can load cleanly and change
+    nothing. A key written twice is always an editing mistake here, so it is a
+    config error naming the line, not a silent choice.
+    """
+
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
+        seen: set[Any] = set()
+        for key_node, _value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if not isinstance(key, Hashable):  # a list or mapping key: never in our configs
+                continue
+            if key in seen:
+                mark = key_node.start_mark
+                raise _DuplicateKeyError(
+                    f"key {key!r} is written twice in the same mapping (line {mark.line + 1}, "
+                    f"column {mark.column + 1}); YAML would keep only the last one, so edit the "
+                    f"existing key in place instead of adding a second copy"
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
 def load_config(path: str | os.PathLike[str]) -> AppConfig:
     """Read and validate a YAML config file. Raises :class:`ConfigError`."""
     path = Path(path)
@@ -175,7 +212,7 @@ def load_config(path: str | os.PathLike[str]) -> AppConfig:
     except OSError as exc:
         raise ConfigError(f"cannot read config {path}: {exc}") from exc
     try:
-        data = yaml.safe_load(text)
+        data = yaml.load(text, Loader=_UniqueKeyLoader)
     except yaml.YAMLError as exc:
         raise ConfigError(f"invalid YAML in {path}: {exc}") from exc
     if data is None:
