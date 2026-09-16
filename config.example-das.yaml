@@ -312,6 +312,11 @@ mpc:
   model_max_pred_err_c: 1.0     # ... and the one-window prediction error below this: converged
   model_use_rpm: false   # airflow from the tachometer instead of the PWM curve where one reports
   model_reset_on_swap: true  # a hot-swapped bay's g0, k and q_s start over from the prior
+  # Freeze a converged model: with model_freeze the zone that reaches the converged rule is
+  # entered frozen instead, so online identification never moves its coefficients again. The
+  # DAS MPC accepts frozen exactly like converged. It freezes a good model only: a zone whose
+  # prediction error later goes bad still becomes suspect and learns again.
+  model_freeze: false
   # DAS MPC (solver: mpc; control/solver_das.py): least modelled fan noise with every drive
   # under its targets, planned over horizon steps of mpc_pred_dt_s. It acts only on a model
   # that passes its validity gate (a converged thermal model, finite bounded parameters,

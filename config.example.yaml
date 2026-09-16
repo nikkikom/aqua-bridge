@@ -95,6 +95,8 @@ mpc:
   model_use_rpm: false   # true (needs topology): airflow from the tachometer where one reports
   model_reset_on_swap: true  # DAS only (inert here): a hot-swapped bay's identified g0, k, q_s
                              # start over from the prior (they described the drive that left)
+  model_freeze: false    # true (needs topology): a zone that converges is entered frozen and
+                         # stops adapting; a model the data contradicts still goes suspect and relearns
   # DAS MPC (control/solver_das.py: solver "mpc" with topology and no setpoints); inert in legacy mode.
   mpc_pred_dt_s: 30.0    # prediction step, seconds (> 0; >= dt with topology); horizon counts these steps
   mpc_blocks: []         # move blocks summing to horizon; [] = [1, 1, 2, 4, 6, 6] cut to horizon

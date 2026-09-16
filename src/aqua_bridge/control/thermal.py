@@ -209,14 +209,18 @@ Status machine per zone (the model's status is the least advanced zone, with
 * ``suspect`` -> ``learning`` when excitation returns;
 * ``error``: ``step`` resets the memory to the prior with this status after any
   exception; the next excited window moves it to ``learning``;
-* ``frozen`` (model store): a zone that was ``converged`` or ``frozen`` when a file
-  younger than ``model_store_max_age_days`` was saved loads ``frozen``
-  (:func:`restore`). It is accepted by the DAS MPC's validity gate like ``converged``
-  and its windows still close, score the prediction error and advance the PE monitor,
-  but never move ``theta``/``P`` (``learn=False`` for its blocks). It becomes
-  ``suspect`` by the same rule as ``converged`` and then learns again from
-  ``learning``. A stored zone that had not converged keeps its status (conservative:
-  a fresh file does not make a model that never converged act).
+* ``frozen``: a zone whose coefficients are held. Two ways in. (a) The model store: a
+  zone that was ``converged`` or ``frozen`` when a file younger than
+  ``model_store_max_age_days`` was saved loads ``frozen`` (:func:`restore`).
+  (b) ``model_freeze: true``: a zone that reaches the ``converged`` rule is entered as
+  ``frozen`` instead, so a model the owner considers converged stops adapting online
+  (plan section 8 item 16). Either way the zone is accepted by the DAS MPC's validity
+  gate like ``converged`` and its windows still close, score the prediction error and
+  advance the PE monitor, but never move ``theta``/``P`` (``learn=False`` for its
+  blocks). It becomes ``suspect`` by the same rule as ``converged`` and then learns
+  again from ``learning``: the switch freezes a *good* model, it never holds a model
+  the data has contradicted. A stored zone that had not converged keeps its status
+  (conservative: a fresh file does not make a model that never converged act).
 
 Hot swap (plan section 8 item 12): ``update`` takes ``reset_bays``, the bays the
 estimator reported as ``swapped`` this tick (the occupancy crossed the ``empty``
@@ -237,7 +241,8 @@ carries ``"hold": {"since": ts | None}``. Its zones restart at ``learning`` (a z
 had not left ``prior`` stays there) with no prediction error, and the model's status is
 ``stale`` whatever its zones say, so neither the validity gate nor
 ``model_accept_prior`` lets it act. After every tick, ``since`` is set when every zone
-is ``converged`` and every zone's prediction error is below ``model_max_pred_err_c``,
+is ``converged`` (or ``frozen``: with ``model_freeze`` a re-confirmed zone enters
+``frozen``) and every zone's prediction error is below ``model_max_pred_err_c``,
 and cleared when either fails; the hold is dropped (the model's status is its zones'
 again) once that has lasted ``model_reconfirm_s``. The DAS MPC then still needs its own
 checks, including its rolling one-step prediction error, for its dwell before it acts.
@@ -1863,7 +1868,8 @@ def _advance_status(
         and pred_err < cfg.model_max_pred_err_c
         and _zone_blocks_converged(mem, cfg, st, z, params, zone_specs, bay_specs)
     ):
-        status = "converged"
+        # model_freeze: enter the converged model as frozen, so nothing adapts it further
+        status = "frozen" if cfg.model_freeze else "converged"
         zm["conv"] = max(pred_err, PRED_ERR_FLOOR_C)
         zm["bad"] = 0
     elif status in ("converged", "frozen"):
@@ -1882,7 +1888,8 @@ def _advance_hold(mem: dict[str, Any], cfg: MpcConfig, ts: float) -> None:
     zones = list(mem["zones"].values())
     errs = [zm["err2"] for zm in zones]
     ok = (
-        overall_status([zm["status"] for zm in zones]) == "converged"
+        # frozen counts: with model_freeze every re-confirmed zone enters frozen
+        overall_status([zm["status"] for zm in zones]) in ("converged", "frozen")
         and all(e is not None for e in errs)
         and math.sqrt(max(float(e) for e in errs)) < cfg.model_max_pred_err_c
     )
@@ -2104,6 +2111,7 @@ def summary(
         "pred_err_c": worst,
         "max_pred_err_c": cfg.model_max_pred_err_c,
         "window_s": cfg.model_window_s,
+        "freeze": cfg.model_freeze,
         "zones": zones_out,
         "bays": bays_out,
     }

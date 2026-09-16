@@ -1725,9 +1725,14 @@ trust region per window, projection on the bounds, residual clipping. A
 PE monitor over ~30 windows and a one-window prediction error
 `pred_err_c` feed the status machine per zone:
 `prior → learning → converged → suspect → learning`, `error` after an
-exception (memory reset to the prior), `frozen` for a zone loaded
-converged from a fresh store file (never moves its coefficients, goes
-`suspect` by the converged rule). `converged` needs enough excited
+exception (memory reset to the prior), `frozen` for a zone whose
+coefficients are held (never moves them, goes `suspect` by the converged
+rule): one loaded converged from a fresh store file, or — with
+`model_freeze: true` — one that reaches the converged rule at all, so a
+model the owner considers finished stops adapting online. The switch
+freezes a good model only: a frozen zone whose prediction error goes bad
+still becomes `suspect` and learns again, and a stale file's hold counts
+`frozen` as re-confirmed. `converged` needs enough excited
 windows, `pe_min` above its floor, every in-zone `E` and every `k` with a
 relative standard error below `model_converged_rel_se`, and `pred_err_c
 < model_max_pred_err_c`. The model's status is the least advanced zone's;
@@ -4244,8 +4249,15 @@ Owner decision (2026-09-16):
     `fan_models` by hand.
 15. Load `tools/fit_model.py`'s `model.json` into the model store
     (different file shape today).
-16. A switch that freezes online adaptation of a converged model (today
-    only a fresh store file loads zones `frozen`).
+16. **Done** (2026-09-16): `mpc.model_freeze` (needs `topology`, default
+    `false`). With it on, a zone that reaches the `converged` rule is
+    entered `frozen` instead, which online identification never moves; the
+    DAS MPC's validity gate accepts `frozen` exactly as it accepts
+    `converged`, and a stale store file's hold counts `frozen` as
+    re-confirmed. It freezes a good model only: a frozen zone whose
+    prediction error crosses the `suspect` rule still becomes `suspect` and
+    learns again, so the switch cannot hold a model the data has
+    contradicted (§3 *Identification*).
 17. Estimator accuracy on the `rich` sim preset: calibrated estimates up to
     2 °C off make the MPC up to 1.30× the uniform-curve noise.
 18. **Done** (2026-09-16): a correlation pair now has to keep proving itself.
