@@ -46,7 +46,9 @@ their times are converted from the controller's clock (``obs.ts``, monotonic on 
 hardware) to wall time at the snapshot, so they survive a reboot:
 ``last_sample_wall = saved_wall - (ts - entry.ts)`` and ``expires_wall = last_sample_wall
 + calibration_max_age_days``. ``bays`` is the last view per bay from the diagnostics.
-``fan_curves`` is ``solver_memory["fan_curves"]`` (nothing produces it yet: empty).
+``fan_curves`` is ``solver_memory["fan_curves"]``: the PWM -> RPM curve per fan model
+that ``mpc.fan_curve_online`` fits online (:mod:`aqua_bridge.control.fancurve`), empty
+without the switch.
 
 The fingerprint covers ``dt``, ``channels``, ``temps``, the zones (channels, coupling,
 inlet), the bay-to-zone map, the sensors' placement (role, zone, bay, redundant) and the

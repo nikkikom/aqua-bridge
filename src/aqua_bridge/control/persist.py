@@ -17,8 +17,12 @@ testable without files:
   and serial; each bad entry is dropped with a warning; the time of each entry is
   re-based on ``ts``; a stale file inflates ``sigma_cal``).
 * ``fan_curves`` -- per fan model ``{rpm_max, deadband, exponent}`` inside the bounds of
-  ``fan_models`` validation, kept in ``solver_memory["fan_curves"]``. Nothing reads it
-  yet (the online fan-curve fit is not implemented; the configured curves are used).
+  ``fan_models`` validation, kept in ``solver_memory["fan_curves"]``. With
+  ``mpc.fan_curve_online`` the online fit (:mod:`aqua_bridge.control.fancurve`) keeps
+  that section current and the thermal model and the DAS MPC plan on it in place of the
+  ``fan_models`` entry, so a fitted curve survives a restart through the store. Without
+  the switch the section is still loaded and saved, but nothing reads it: the configured
+  curves are used.
 * ``bays`` -- the last occupancy, class, serial and association per bay, reported only.
   Conservative choice: occupancy restarts ``unknown`` (a drive may have been inserted
   while the daemon was down) and associations by correlation are formed again (drives

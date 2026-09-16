@@ -1690,6 +1690,14 @@ class MpcConfig:
       the limit on the zone-air disturbance's move away from its slow level and that
       level's time constant, and whether a thermal model that has not converged (its
       prior or what it learnt so far) may drive the fans. Inert in legacy mode.
+    * ``fan_curve_online`` / ``fan_curve_settle_s`` / ``fan_curve_refit_s`` /
+      ``fan_curve_max_rmse_frac`` -- the online PWM -> RPM curve fit per fan model
+      (``control/fancurve.py``): whether it runs and its accepted curves replace
+      ``fan_models``' ``deadband`` / ``exponent`` / ``rpm_max`` in the thermal model,
+      how long a commanded duty must hold before a ``(pwm, rpm)`` pair is sampled, how
+      often the fit is recomputed, and the relative RMSE above which a fit is refused.
+      ``fan_curve_online: true`` needs ``topology``; the numeric keys are validated
+      always and inert in legacy mode.
     * ``model_store_interval_s`` / ``model_store_max_age_days`` / ``model_reconfirm_s`` --
       the model store (``modelstore.py``, ``control/persist.py``): the shortest interval
       between two writes of ``model.json``, the age above which a stored model loads
@@ -1766,6 +1774,10 @@ class MpcConfig:
     model_use_rpm: bool = False
     model_reset_on_swap: bool = True
     model_freeze: bool = False
+    fan_curve_online: bool = False
+    fan_curve_settle_s: float = 30.0
+    fan_curve_refit_s: float = 600.0
+    fan_curve_max_rmse_frac: float = 0.05
     mpc_pred_dt_s: float = 30.0
     mpc_blocks: tuple[int, ...] = ()
     mpc_every_ticks: int = 1
@@ -1876,10 +1888,14 @@ class MpcConfig:
             "model_accept_prior",
             "model_reset_on_swap",
             "model_freeze",
+            "fan_curve_online",
         ):
             _cfg_bool(name, getattr(self, name))
         for name in (
             "model_window_s",
+            "fan_curve_settle_s",
+            "fan_curve_refit_s",
+            "fan_curve_max_rmse_frac",
             "model_lambda",
             "model_p_trace_max",
             "model_converged_rel_se",
@@ -2179,9 +2195,23 @@ class MpcConfig:
         DAS MPC keys (module docstring)."""
         self._validate_das_mpc_keys()
         self._validate_ident_keys()
-        for name in ("model_shadow", "model_use_rpm", "model_accept_prior", "model_freeze"):
+        for name in (
+            "model_shadow",
+            "model_use_rpm",
+            "model_accept_prior",
+            "model_freeze",
+            "fan_curve_online",
+        ):
             if getattr(self, name) and self.topology is None:
                 raise ConfigError(f"mpc.{name}: true requires mpc.topology (DAS layout)")
+        if self.fan_curve_settle_s < 0:
+            raise ConfigError(f"mpc.fan_curve_settle_s must be >= 0, got {self.fan_curve_settle_s}")
+        if self.fan_curve_refit_s <= 0:
+            raise ConfigError(f"mpc.fan_curve_refit_s must be > 0, got {self.fan_curve_refit_s}")
+        if not 0.0 < self.fan_curve_max_rmse_frac <= 1.0:
+            raise ConfigError(
+                f"mpc.fan_curve_max_rmse_frac must be in (0, 1], got {self.fan_curve_max_rmse_frac}"
+            )
         if self.model_window_s <= 0 or self.model_window_s > 600:
             raise ConfigError(f"mpc.model_window_s must be in (0, 600], got {self.model_window_s}")
         if self.model_shadow and self.model_window_s < 2 * self.dt:

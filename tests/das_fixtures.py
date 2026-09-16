@@ -142,14 +142,17 @@ def das_obs(
     *,
     temps: Mapping[str, float | None] | None = None,
     pwm: float | Mapping[str, float | None] = 0.5,
+    rpm: Mapping[str, float | None] | None = None,
     drop: tuple[str, ...] = (),
     **overrides: float | None,
 ) -> PlantObservation:
     """A well-formed observation: :func:`default_temps` patched by ``overrides``,
-    keys in ``drop`` removed, PWM ``pwm`` on every channel, 1000 rpm."""
+    keys in ``drop`` removed, PWM ``pwm`` on every channel, 1000 rpm unless ``rpm``
+    says otherwise."""
     t = default_temps(cfg) if temps is None else dict(temps)
     t.update(overrides)
     for name in drop:
         t.pop(name, None)
     p = dict.fromkeys(cfg.channels, float(pwm)) if isinstance(pwm, int | float) else dict(pwm)
-    return PlantObservation(temps=t, rpm=dict.fromkeys(cfg.channels, 1000.0), pwm=p, ts=ts)
+    r = dict.fromkeys(cfg.channels, 1000.0) if rpm is None else dict(rpm)
+    return PlantObservation(temps=t, rpm=r, pwm=p, ts=ts)

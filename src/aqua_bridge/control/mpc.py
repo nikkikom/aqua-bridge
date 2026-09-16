@@ -208,7 +208,9 @@ windows ``stuck_slow`` and ``stuck_seq`` (gate module docstring), with zones
 ``estimator`` (step 3c), ``sensor_confirm`` (dict temperature -> consecutive
 trusted ticks, confirming sensors only; step 3b) and, with ``model_shadow``,
 ``thermal`` (step 8b), with a model store ``store`` and ``fan_curves`` (step
-3b'), and one sub-dict per solver under ``solver.name``.
+3b'), with ``fan_curve_online`` the online fan-curve fit's accumulator ``fan_fit``
+(step 3b''), which also writes the accepted curves into ``fan_curves``, and one
+sub-dict per solver under ``solver.name``.
 """
 
 from __future__ import annotations
@@ -220,7 +222,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from aqua_bridge.control import estimates, estimator, noise, persist, thermal, zones
+from aqua_bridge.control import estimates, estimator, fancurve, noise, persist, thermal, zones
 from aqua_bridge.control.gate import (
     GateResult,
     advance_slow_windows,
@@ -548,6 +550,23 @@ def step(
     if das and STORE_SEED_KEY in mem:
         persist.apply_seed(mem, cfg, mem.pop(STORE_SEED_KEY), obs.ts)
 
+    # 3b''. online PWM -> RPM fit per fan model (zones only; module docstring). Its
+    # accepted curves go into solver_memory["fan_curves"], the section the model store
+    # already saves and loads, and are read by the thermal model and the DAS MPC.
+    fan_curves: dict[str, Any] | None = None
+    if das and cfg.fan_curve_online:
+        fit = fancurve.update(mem.get("fan_fit"), cfg, u=prev, rpm=obs.rpm, ts=obs.ts)
+        mem["fan_fit"] = fit.memory
+        if fit.curves:
+            stored = mem.get("fan_curves")
+            merged = dict(stored) if isinstance(stored, Mapping) else {}
+            merged.update(fit.curves)
+            mem["fan_curves"] = merged
+        curves = mem.get("fan_curves")
+        fan_curves = dict(curves) if isinstance(curves, Mapping) else {}
+    else:
+        mem.pop("fan_fit", None)
+
     # 3c. estimator (zones only; module docstring)
     est_block: dict[str, dict[str, Any]] = {}
     est_update: estimator.EstimatorUpdate | None = None
@@ -693,6 +712,7 @@ def step(
                 ),
                 ts=obs.ts,
                 thermal=mem.get("thermal") if cfg.model_shadow else None,
+                fan_curves=fan_curves,
                 plant=_plant_view(est_block, est_update),
             )
         else:
@@ -822,7 +842,7 @@ def step(
     thermal_summary: dict[str, Any] | None = None
     if das and cfg.model_shadow:
         thermal_summary = _thermal_shadow(
-            mem, obs, cfg, trusted_temps, prev, est_update, verdicts, faulted
+            mem, obs, cfg, trusted_temps, prev, est_update, verdicts, faulted, fan_curves
         )
     else:
         mem.pop("thermal", None)
@@ -928,6 +948,10 @@ def step(
         }
         if thermal_summary is not None:
             diagnostics["thermal"] = thermal_summary
+        if cfg.fan_curve_online:
+            diagnostics["fan_curves"] = fancurve.summary(
+                mem.get("fan_fit"), cfg, mem.get("fan_curves")
+            )
         if isinstance(mem.get(STORE_KEY), Mapping):
             diagnostics["store"] = mem[STORE_KEY]
         diagnostics["noise"] = noise.noise_diagnostics(cfg, prev=prev, pwm=pwm, rpm=obs.rpm)
@@ -994,6 +1018,7 @@ def _thermal_shadow(
     est_update: estimator.EstimatorUpdate | None,
     verdicts: Mapping[str, zones.ZoneTrust],
     faulted: list[str],
+    fan_curves: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Step 8b: advance ``mem["thermal"]`` in place and return its summary (module docstring)."""
     occupancy: dict[str, str] | None = None
@@ -1024,6 +1049,7 @@ def _thermal_shadow(
             classes=classes,
             rpm=obs.rpm,
             reset_bays=reset_bays,
+            curves=fan_curves,
         )
     except Exception as exc:  # identification never raises out of step and never faults
         error = f"{type(exc).__name__}: {exc}"[:200]
