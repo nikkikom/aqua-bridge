@@ -9,6 +9,7 @@ machine, determinism and the integration in ``mpc.step``.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import math
 from typing import Any
@@ -1047,3 +1048,56 @@ def test_estimator_error_on_a_setpoint_config_is_only_reported(monkeypatch):
     monkeypatch.setattr(E, "update", broken)
     cmd, _ = step(das_obs(cfg, 0.0), cfg, MpcState.cold())
     assert cmd.mode is Mode.AUTO and cmd.diagnostics["estimator"]["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# hot swap: which bays report ``swapped`` (item 12)
+# ---------------------------------------------------------------------------
+
+
+def test_swapped_is_a_step_of_the_bay_s_mean_reading_not_of_one_sensor():
+    """Two members at different placements disagree, and the per-sensor fast-swap test is
+    sequential, so one of them jumps on almost every tick; the mean of the pair does not
+    move, and it is the mean that says a drive changed (item 12)."""
+    cfg = lcfg()
+    mem = run_ticks(cfg, 30)[-1].memory
+    one = tick(cfg, mem, 30.0, prox_a1=PROX_C + 1.0)  # a disagreement, not a swap
+    assert one.memory["bays"]["a1"]["occ"] == "occupied"
+    assert one.bays["a1"]["swapped"] is False
+    both = tick(cfg, mem, 30.0, prox_a1=PROX_C + 1.0, prox_a1b=PROX_C + 1.0)
+    assert both.bays["a1"]["swapped"] is True  # both members moved: a drive changed
+    assert all(not up.bays[b]["swapped"] for up in (one, both) for b in ("a2", "b1"))
+
+
+def test_swapped_on_the_edge_of_empty(as_empty):
+    cfg, mem = as_empty()
+    quiet = run_ticks(cfg, 3, mem=mem, t0=100.0, prox_b1=SP + 0.1)
+    assert all(not up.bays["b1"]["swapped"] for up in quiet)
+    ins = run_ticks(cfg, 5, mem=quiet[-1].memory, t0=103.0, prox_b1=SP + 4.0)
+    states = [up.bays["b1"]["occupancy"] for up in ins]
+    swaps = [up.bays["b1"]["swapped"] for up in ins]
+    assert "occupied" in states and states.index("occupied") == swaps.index(True)
+    assert sum(swaps) == 1  # the one tick the bay filled
+
+
+def test_a_hot_swap_resets_only_that_bay_s_thermal_coefficients():
+    """The whole chain through ``step``: the estimator's ``swapped`` reaches
+    ``thermal.update`` and the bay's identification starts over (item 12)."""
+    cfg = dataclasses.replace(lcfg(empty_confirm_s=10.0), model_shadow=True)
+    state = MpcState.cold()
+    ts = 0.0
+    for _ in range(40):  # nothing in b1: its sensor reads the air, the bay turns empty
+        _, state = step(das_obs(cfg, ts, prox_b1=SP + 0.1), cfg, state)
+        ts += cfg.dt
+    for b in ("b1", "a1"):
+        state.solver_memory["thermal"]["bays"][b]["w"] = 11
+    swapped = []
+    for k in range(6):  # a drive goes in: the sensor warms within the gate's slew limit
+        value = min(SP + 0.1 + 1.5 * (k + 1), SP + 4.5)
+        cmd, state = step(das_obs(cfg, ts, prox_b1=value), cfg, state)
+        swapped.append(cmd.diagnostics["bays"]["b1"]["swapped"])
+        ts += cfg.dt
+    assert cmd.diagnostics["bays"]["b1"]["occupancy"] == "occupied"
+    assert swapped[0] is False and any(swapped), swapped  # the insert, not the quiet bay
+    assert cmd.diagnostics["thermal"]["bays"]["b1"]["windows"] == 0
+    assert cmd.diagnostics["thermal"]["bays"]["a1"]["windows"] == 11

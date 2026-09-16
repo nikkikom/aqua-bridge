@@ -965,8 +965,11 @@ FLOOR_REFERENCE_TICKS = int(LOSS_S / 5.0) + 60
 def test_the_soft_sigma_floor_on_the_das_mpc():
     """The DAS MPC loses b02's only proximal sensor after 10 minutes. Without a floor it
     reproduces the case the floor exists for: it had followed a warming the blind estimate
-    does not show, lowers z0's command by about 0.04 on the tick of the loss and plans
-    about 21 % less z0 airflow than the run with the sensor within the first minutes. With
+    does not show, lowers z0's command by about 0.07 below the pre-loss level within the
+    first minutes and plans about 19 % less z0 airflow than the run with the sensor. (The
+    drop on the tick of the loss itself is now small: the occupancy debounce of item 19
+    keeps the bay's state for ``occupancy_hold_s`` while it is blind, so the estimate
+    changes a few ticks later.) With
     the soft floor nothing goes below the command before the loss while the floor holds,
     the bay's sigma growth ends the hold before ``sigma_floor_hold_s``, the release lowers
     the floor by at most its rate, and no drive exceeds its limit. The margin and noise
@@ -977,7 +980,7 @@ def test_the_soft_sigma_floor_on_the_das_mpc():
     before = case.soft.records[start - 1].cmd.pwm
     assert before == case.bare.records[start - 1].cmd.pwm == case.healthy.records[start - 1].cmd.pwm
     # without a floor
-    drop = before["xt1"] - case.bare.records[start].cmd.pwm["xt1"]
+    drop = max(before["xt1"] - r.cmd.pwm["xt1"] for r in case.bare.records[start:])
     assert drop > 0.03, drop
     ratio = min(
         zone_airflow(cfg, case.zone, b.cmd.pwm) / zone_airflow(cfg, case.zone, h.cmd.pwm)

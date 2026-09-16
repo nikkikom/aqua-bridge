@@ -127,7 +127,10 @@ Order inside :func:`step`
    command is final, so it learns and predicts without acting: it reads this
    tick's gate-trusted temperatures, ``prev``, ``obs.rpm``, the zones that are
    trusted and not in fault (only their windows accumulate) and the estimator's
-   occupancy, class and accepted sensor map per bay; its memory is
+   occupancy, class and accepted sensor map per bay. A bay the estimator reports
+   as ``swapped`` this tick is handed over as a reset: with
+   ``model_reset_on_swap`` its identified coefficients start over from the prior,
+   because they describe the drive that left (plan section 8 item 12). Its memory is
    ``solver_memory["thermal"]`` and ``diagnostics["thermal"]`` its summary
    (status, prediction error, coefficients). Any exception resets the memory to
    the prior with ``status: error`` (never a raise, never a fault; the DAS MPC,
@@ -997,6 +1000,7 @@ def _thermal_shadow(
     try:
         classes: dict[str, str] | None = None
         maps: dict[str, tuple[float, float]] = {}
+        reset_bays: set[str] = set()
         if est_update is not None:
             occupancy = {b: str(info["occupancy"]) for b, info in est_update.bays.items()}
             classes = {b: str(info["class"]) for b, info in est_update.bays.items()}
@@ -1004,6 +1008,8 @@ def _thermal_shadow(
                 cal = info.get("calibration")
                 if info.get("serial") is not None and cal is not None and cal.get("accepted_once"):
                     maps[b] = (float(cal["slope"]), float(cal["offset_c"]))
+                if info.get("swapped"):  # a hot swap: those coefficients were another drive's
+                    reset_bays.add(b)
         faulted_set = set(faulted)
         zones_ok = {z for z, v in verdicts.items() if v.trusted and z not in faulted_set}
         result = thermal.update(
@@ -1017,6 +1023,7 @@ def _thermal_shadow(
             maps=maps,
             classes=classes,
             rpm=obs.rpm,
+            reset_bays=reset_bays,
         )
     except Exception as exc:  # identification never raises out of step and never faults
         error = f"{type(exc).__name__}: {exc}"[:200]
