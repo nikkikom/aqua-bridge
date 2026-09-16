@@ -284,6 +284,8 @@ mpc:
                          # spends a window or two, a sensor that keeps jumping runs out and
                          # faults its zone again. 0: no settling exemption at all
     calibration_max_age_days: 30  # a SMART calibration without samples this long is not trusted
+    calibrate_min_c: 5.0  # POST /api/calibrate: the drive temperature a handheld reading may
+    calibrate_max_c: 80.0 # report, degC; must be a range inside (temp_min_c, temp_max_c)
     associate_window_s: 3600      # serial -> bay association by correlation (no SES)
     associate_min_corr: 0.8
     associate_margin: 0.15
