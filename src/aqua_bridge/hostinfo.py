@@ -10,12 +10,29 @@ with a refresh interval, so a caller polled more often than ``host.interval_s``
 (the HTTP ``/api/state`` route, the MQTT per-tick publisher) does not re-read
 ``/proc`` and ``/sys`` on every call.
 
-Besides the metrics, :func:`read_throttled` decodes the Raspberry Pi firmware's
-``get_throttled`` word -- under-voltage, a capped ARM frequency, hard throttling
-and the soft temperature limit, each both *now* and *since boot*. It rides
-``collect_hostinfo``'s ``throttled`` key and feeds the host-health rules
-(:mod:`aqua_bridge.health`, PROJECT.md section 8 item 97). Like the board's own
-temperature it is a health signal only: nothing here ever reaches the solver.
+Besides the metrics, :func:`read_throttled` reports the Raspberry Pi's throttling
+state -- under-voltage, a capped ARM frequency, hard throttling and the soft
+temperature limit, each both *now* and *since boot*. It rides ``collect_hostinfo``'s
+``throttled`` key and feeds the host-health rules (:mod:`aqua_bridge.health`,
+PROJECT.md section 8 item 97). Like the board's own temperature it is a health
+signal only: nothing here ever reaches the solver.
+
+Three sources, best first, because no single one is present everywhere:
+
+1. the firmware driver's sysfs attribute :data:`THROTTLED_SYSFS` -- the whole word
+   for a file read, but **absent** on a Raspberry Pi Zero 2 W running kernel 6.18,
+   where the ``soc:firmware`` platform device carries no such attribute;
+2. ``vcgencmd get_throttled`` -- the whole word, and on that kernel the only source
+   of it, but a process: 3.3 ms median / 3.8 ms p95 on that board. Rate limited by
+   :class:`ThrottledReader` so a caller polled every tick forks once a minute;
+3. the ``rpi_volt`` hwmon device's ``in0_lcrit_alarm`` (:func:`read_rpi_volt_hwmon`)
+   -- the under-voltage condition *only*, 0.17 ms, found by the device's ``name``
+   because hwmon numbering is not stable across boots.
+
+A source that reads less than the whole word says so: the conditions it did not
+read are ``None``, ``partial`` is true and ``unknown`` names them. An unknown bit is
+never reported as a false one. A board with none of the three sources gets ``None``
+and warns about nothing.
 """
 
 from __future__ import annotations
@@ -26,23 +43,31 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "HWMON_ROOT",
+    "RPI_VOLT_HWMON_NAME",
     "THROTTLED_BITS",
     "THROTTLED_SINCE_BOOT_SHIFT",
+    "THROTTLED_SYSFS",
+    "UNDER_VOLTAGE_ALARM",
     "CachedHostInfo",
+    "ThrottledReader",
     "collect_hostinfo",
     "decode_throttled",
     "read_cpu_temp_c",
     "read_disk",
     "read_loadavg",
     "read_memory",
+    "read_rpi_volt_hwmon",
     "read_throttled",
+    "read_throttled_sysfs",
     "read_uptime_s",
     "read_wifi_rssi",
+    "run_vcgencmd",
 ]
 
 _LOG = logging.getLogger(__name__)
@@ -197,27 +222,97 @@ THROTTLED_BITS: tuple[tuple[int, str], ...] = (
 #: The same four conditions repeat this many bits up as "has occurred since boot".
 THROTTLED_SINCE_BOOT_SHIFT = 16
 
-#: Where the firmware driver exposes the word without ``vcgencmd``: an attribute of
-#: the ``raspberrypi-firmware`` platform device, one ``0x``-prefixed hex number.
+#: Where the firmware driver exposes the *whole* word without ``vcgencmd``: an
+#: attribute of the ``raspberrypi-firmware`` platform device, one ``0x``-prefixed hex
+#: number. Preferred where it exists, but it is not the usual case: on a Raspberry Pi
+#: Zero 2 W running kernel 6.18 the ``soc:firmware`` platform device is there and
+#: carries no ``get_throttled`` attribute at all (nothing under ``/sys`` is named for
+#: throttling on that kernel), which is why the chain below has two more sources.
 THROTTLED_SYSFS = Path("/sys/devices/platform/soc/soc:firmware/get_throttled")
 
+#: Where the kernel exposes the under-voltage condition -- and only that one -- as a
+#: plain file: the ``rpi_volt`` hwmon device's ``in0_lcrit_alarm``, ``0`` or ``1``.
+#: Found by the device's ``name``, never by its index: hwmon numbering is not stable
+#: across boots (on the owner's board ``hwmon0`` is ``cpu_thermal`` and ``hwmon1`` is
+#: ``rpi_volt`` today, and nothing promises that tomorrow).
+HWMON_ROOT = Path("/sys/class/hwmon")
 
-def decode_throttled(word: int) -> dict[str, Any]:
-    """Decode a ``get_throttled`` word into named booleans.
+#: The ``name`` of the hwmon device that carries :data:`UNDER_VOLTAGE_ALARM`.
+RPI_VOLT_HWMON_NAME = "rpi_volt"
+
+#: The under-voltage alarm attribute of that device.
+UNDER_VOLTAGE_ALARM = "in0_lcrit_alarm"
+
+
+def _summary(values: Sequence[bool | None]) -> bool | None:
+    """``True`` if any condition holds, ``False`` if none does *and* all were read,
+    ``None`` while a condition nobody read could be the one in force.
+
+    An unknown bit never reads as false: a summary over a partial reading that saw
+    nothing is ``None``, not "fine".
+    """
+    if any(value is True for value in values):
+        return True
+    return None if any(value is None for value in values) else False
+
+
+def _throttled_reading(
+    now_bits: Mapping[str, bool | None],
+    since_bits: Mapping[str, bool | None],
+    *,
+    word: int | None = None,
+    source: str | None = None,
+    age_s: float | None = None,
+) -> dict[str, Any]:
+    """One reading of the board's throttling state, however much of it was read.
+
+    Every condition :data:`THROTTLED_BITS` names gets a ``<name>_now`` and a
+    ``<name>_since_boot`` key, each ``True``, ``False`` or -- for a source that
+    could not see that bit -- ``None``. ``now`` / ``since_boot`` summarise them
+    (:func:`_summary`), ``unknown`` lists the conditions whose *now* bit this source
+    did not read and ``partial`` is true whenever any bit is unknown, so a consumer
+    never has to infer "not read" from a false. ``raw``/``hex`` carry the word where
+    one was read and are ``None`` otherwise -- a partial reading invents no word.
+    ``source`` names where it came from and ``age_s`` how long ago it was read
+    (``0.0`` fresh, ``None`` where the question does not apply).
+    """
+    out: dict[str, Any] = {
+        "raw": None if word is None else int(word),
+        "hex": None if word is None else f"0x{int(word):x}",
+        "source": source,
+        "age_s": None if age_s is None else float(age_s),
+    }
+    for _, name in THROTTLED_BITS:
+        out[f"{name}_now"] = now_bits.get(name)
+        out[f"{name}_since_boot"] = since_bits.get(name)
+    names = [name for _, name in THROTTLED_BITS]
+    out["now"] = _summary([out[f"{name}_now"] for name in names])
+    out["since_boot"] = _summary([out[f"{name}_since_boot"] for name in names])
+    out["unknown"] = [name for name in names if out[f"{name}_now"] is None]
+    out["partial"] = any(
+        out[f"{name}_{half}"] is None for name in names for half in ("now", "since_boot")
+    )
+    return out
+
+
+def decode_throttled(
+    word: int, *, source: str | None = None, age_s: float | None = None
+) -> dict[str, Any]:
+    """Decode a whole ``get_throttled`` word into named booleans.
 
     ``<name>_now`` is the condition in force at the read, ``<name>_since_boot``
     the latched "has occurred" half :data:`THROTTLED_SINCE_BOOT_SHIFT` bits up;
     ``now`` / ``since_boot`` are the two summaries. ``raw`` keeps the word and
     ``hex`` its usual spelling, so a bit this table does not name is still visible
-    in the payload.
+    in the payload. Nothing here is unknown -- the word carries every condition --
+    so ``partial`` is false and ``unknown`` empty; see :func:`_throttled_reading`
+    for the sources that read less than the whole word.
     """
-    out: dict[str, Any] = {"raw": int(word), "hex": f"0x{int(word):x}"}
-    for bit, name in THROTTLED_BITS:
-        out[f"{name}_now"] = bool(word & (1 << bit))
-        out[f"{name}_since_boot"] = bool(word & (1 << (bit + THROTTLED_SINCE_BOOT_SHIFT)))
-    out["now"] = any(out[f"{name}_now"] for _, name in THROTTLED_BITS)
-    out["since_boot"] = any(out[f"{name}_since_boot"] for _, name in THROTTLED_BITS)
-    return out
+    now = {name: bool(word & (1 << bit)) for bit, name in THROTTLED_BITS}
+    since = {
+        name: bool(word & (1 << (bit + THROTTLED_SINCE_BOOT_SHIFT))) for bit, name in THROTTLED_BITS
+    }
+    return _throttled_reading(now, since, word=int(word), source=source, age_s=age_s)
 
 
 def _parse_throttled_word(text: str) -> int | None:
@@ -235,10 +330,16 @@ def _parse_throttled_word(text: str) -> int | None:
 def run_vcgencmd(timeout_s: float = 2.0) -> str | None:
     """``vcgencmd get_throttled``'s output, or ``None`` when there is no such binary.
 
-    The default fallback of :func:`read_throttled`, used only where the sysfs
-    attribute is missing. Never raises: no ``vcgencmd`` on ``PATH`` (every machine
-    that is not a Raspberry Pi, the test machines included) short-circuits before
-    any process is started, and a failure, a timeout or a non-zero exit is ``None``.
+    The only source of the *whole* word on a kernel that exposes no sysfs attribute,
+    and the only one that costs a process: measured at 3.3 ms median / 3.8 ms p95 on
+    a Raspberry Pi Zero 2 W (kernel 6.18, 4 cores at 1.0 GHz). :class:`ThrottledReader`
+    is what keeps that off the tick more often than ``vcgencmd_interval_s``.
+
+    Never raises: no ``vcgencmd`` on ``PATH`` (every machine that is not a Raspberry
+    Pi, the test machines included) short-circuits before any process is started, and
+    a failure, a timeout or a non-zero exit is ``None``. ``timeout_s`` is the guard
+    against the one way this can hurt a caller that is on a thread with work to do:
+    the VideoCore mailbox not answering, which would otherwise block indefinitely.
     """
     binary = shutil.which("vcgencmd")
     if binary is None:
@@ -256,31 +357,170 @@ def run_vcgencmd(timeout_s: float = 2.0) -> str | None:
     return proc.stdout if proc.returncode == 0 else None
 
 
-def read_throttled(
-    path: Path = THROTTLED_SYSFS,
-    *,
-    vcgencmd: Callable[[], str | None] | None = run_vcgencmd,
-) -> dict[str, Any] | None:
-    """The board's throttling state, decoded, or ``None`` when neither source reads.
+def read_throttled_sysfs(path: Path = THROTTLED_SYSFS) -> dict[str, Any] | None:
+    """The whole word from the firmware driver's sysfs attribute, or ``None``.
 
-    The sysfs attribute is preferred: it is a plain file read on the caller's own
-    thread, where ``vcgencmd`` would be a process per refresh. ``vcgencmd`` is the
-    fallback for a board whose firmware driver does not expose the attribute; pass
-    ``vcgencmd=None`` to switch that fallback off. Like every other reader here
-    this never raises -- a machine that is not a Raspberry Pi simply has neither
-    source and gets ``None``.
+    The cheapest complete source and so the first one tried -- a plain file read on
+    the caller's own thread. Absent on kernel 6.18 (see :data:`THROTTLED_SYSFS`), so
+    "``None`` here" is the normal case on the owner's board, not a fault.
     """
     text = _read_text(path)
-    if text is None and vcgencmd is not None:
-        try:
-            text = vcgencmd()
-        except Exception:  # the runner is the caller's; a diagnostic must not raise
-            _LOG.exception("vcgencmd get_throttled failed")
-            text = None
     if text is None:
         return None
     word = _parse_throttled_word(text)
-    return None if word is None else decode_throttled(word)
+    return None if word is None else decode_throttled(word, source="sysfs")
+
+
+def read_rpi_volt_hwmon(root: Path = HWMON_ROOT) -> dict[str, Any] | None:
+    """The under-voltage condition alone, from the ``rpi_volt`` hwmon device.
+
+    One bit, not the word: ``in0_lcrit_alarm`` says whether the board is under-volted
+    *now* and nothing about the other three conditions or about anything since boot.
+    The reading says so -- those bits are ``None``, ``partial`` is true and ``unknown``
+    names them -- rather than reporting a zero nobody read. 0.17 ms median / 0.23 ms
+    p95 on a Raspberry Pi Zero 2 W (kernel 6.18), against 3.3 ms for ``vcgencmd``.
+
+    The device is found by its ``name`` across ``/sys/class/hwmon/hwmon*``: the index
+    is not stable across boots, and on this board ``hwmon0`` is the ``cpu_thermal``
+    zone the temperature already comes from. Returns ``None`` where no such device
+    exists (every machine that is not a Raspberry Pi) or its attribute does not read.
+    """
+    if not root.is_dir():
+        return None
+    for entry in sorted(root.glob("hwmon*")):
+        name = _read_text(entry / "name")
+        if name is None or name.strip() != RPI_VOLT_HWMON_NAME:
+            continue
+        raw = _read_text(entry / UNDER_VOLTAGE_ALARM)
+        if raw is None:
+            continue
+        try:
+            alarm = int(raw.strip(), 10)
+        except ValueError:
+            continue
+        return _throttled_reading({"under_voltage": bool(alarm)}, {}, source="hwmon")
+    return None
+
+
+def _vcgencmd_word(runner: Callable[[], str | None]) -> int | None:
+    """``runner()``'s output parsed into a word, or ``None``; never raises."""
+    try:
+        text = runner()
+    except Exception:  # the runner is the caller's; a diagnostic must not raise
+        _LOG.exception("vcgencmd get_throttled failed")
+        return None
+    return None if text is None else _parse_throttled_word(text)
+
+
+def _throttled_chain(
+    sysfs_path: Path,
+    word_source: Callable[[], tuple[int | None, float | None]],
+    hwmon_root: Path,
+) -> dict[str, Any] | None:
+    """The source chain, best first: the sysfs attribute's whole word, then whatever
+    word ``word_source`` has (``vcgencmd``, possibly the last one it read), then the
+    hwmon under-voltage bit on its own, then ``None`` -- a board with no source at
+    all degrades to "unknown" and warns about nothing.
+    """
+    reading = read_throttled_sysfs(sysfs_path)
+    if reading is not None:
+        return reading
+    word, age_s = word_source()
+    if word is not None:
+        return decode_throttled(word, source="vcgencmd", age_s=age_s)
+    return read_rpi_volt_hwmon(hwmon_root)
+
+
+def read_throttled(
+    path: Path = THROTTLED_SYSFS,
+    *,
+    vcgencmd: Callable[[], str | None] | None = None,
+    hwmon_root: Path = HWMON_ROOT,
+) -> dict[str, Any] | None:
+    """The board's throttling state, decoded, or ``None`` when no source reads.
+
+    The one-shot form of the chain (:func:`_throttled_chain`), with no cache: the
+    ``vcgencmd`` runner, when one is given at all, is called on every read where the
+    sysfs attribute is missing. The daemon uses :class:`ThrottledReader` instead,
+    which is the same chain with that one process rate limited. ``vcgencmd`` defaults
+    to ``None`` -- a bare ``read_throttled()`` reads files and starts nothing.
+
+    Like every other reader here this never raises: a machine that is not a Raspberry
+    Pi simply has no source and gets ``None``.
+    """
+
+    def once() -> tuple[int | None, float | None]:
+        if vcgencmd is None:
+            return None, None
+        return _vcgencmd_word(vcgencmd), 0.0
+
+    return _throttled_chain(path, once, hwmon_root)
+
+
+class ThrottledReader:
+    """The source chain with the ``vcgencmd`` process rate limited: callable, returns
+    what :func:`read_throttled` returns.
+
+    Order: the sysfs attribute (whole word, a file read), then ``vcgencmd`` (whole
+    word, a process) at most once per ``poll_interval_s`` with the last word it read
+    served in between, then the ``rpi_volt`` hwmon alarm (the under-voltage condition
+    only), then ``None``.
+
+    The cadence is what makes ``vcgencmd`` affordable on the control-loop thread. One
+    fork costs 3.3 ms median / 3.8 ms p95 on a Raspberry Pi Zero 2 W (kernel 6.18);
+    at one poll per minute against ``dt = 5 s`` that is 3.3 ms in 60 s of wall clock,
+    0.005 % of the loop's time and 0.5 % of one tick's 600 ms solver budget on the
+    tick it actually runs. A word served from the cache carries its ``age_s``, so a
+    consumer can see how old the bits it is reading are.
+
+    A poll that fails (no binary, a timeout, a non-zero exit, a word that does not
+    parse) drops the cached word rather than serving it on: a failed poll is not a
+    reading. The next attempt still waits out the cadence, so a board where the
+    binary hangs costs one timed-out call per ``poll_interval_s`` and not one per
+    tick -- and the chain falls through to the hwmon bit in the meantime.
+
+    One instance per caller; it is not thread-safe, and each caller (the tick's
+    reader, the HTTP app's, the MQTT service's) builds its own in
+    :func:`aqua_bridge.health.host_metrics_reader`.
+    """
+
+    def __init__(
+        self,
+        *,
+        sysfs_path: Path = THROTTLED_SYSFS,
+        hwmon_root: Path = HWMON_ROOT,
+        vcgencmd: Callable[[], str | None] | None = None,
+        poll_interval_s: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._sysfs_path = sysfs_path
+        self._hwmon_root = hwmon_root
+        self._vcgencmd = vcgencmd
+        self._poll_interval_s = max(0.0, float(poll_interval_s))
+        self._clock = clock
+        self._word: int | None = None
+        self._word_at = 0.0
+        self._polled_at = float("-inf")
+
+    def __call__(self) -> dict[str, Any] | None:
+        return _throttled_chain(self._sysfs_path, self._poll, self._hwmon_root)
+
+    def _poll(self) -> tuple[int | None, float | None]:
+        """The last ``vcgencmd`` word and its age, polling again when it is due."""
+        if self._vcgencmd is None:
+            return None, None
+        now = self._clock()
+        if now - self._polled_at < self._poll_interval_s:
+            age_s = None if self._word is None else max(0.0, now - self._word_at)
+            return self._word, age_s
+        self._polled_at = now
+        word = _vcgencmd_word(self._vcgencmd)
+        if word is None:
+            self._word = None
+            return None, None
+        self._word = word
+        self._word_at = now
+        return word, 0.0
 
 
 def collect_hostinfo(
@@ -293,13 +533,18 @@ def collect_hostinfo(
     wireless_path: Path = Path("/proc/net/wireless"),
     wifi_iface: str | None = None,
     throttled_path: Path = THROTTLED_SYSFS,
-    vcgencmd: Callable[[], str | None] | None = run_vcgencmd,
+    hwmon_root: Path = HWMON_ROOT,
+    throttled: Callable[[], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
     """Collect every host metric into one JSON-serialisable dict.
 
     Missing/unreadable sources leave their key ``None``; this never raises.
-    ``throttled`` is the only nested value: the decoded ``get_throttled`` word
-    (:func:`read_throttled`), ``None`` where neither source reads.
+    ``throttled`` is the only nested value: the board's throttling state as
+    :func:`read_throttled` returns it, ``None`` where no source reads. Pass a
+    ``throttled`` callable -- a :class:`ThrottledReader`, which is what
+    :func:`aqua_bridge.health.host_metrics_reader` builds -- to use a source chain
+    that may start a ``vcgencmd`` process; left ``None`` the file sources are read
+    and no process is ever started.
     """
     load = read_loadavg(loadavg_path)
     mem = read_memory(meminfo_path)
@@ -315,8 +560,23 @@ def collect_hostinfo(
         "disk_free_gb": disk["free_gb"] if disk else None,
         "wifi_rssi_dbm": read_wifi_rssi(wireless_path, wifi_iface),
         "uptime_s": read_uptime_s(uptime_path),
-        "throttled": read_throttled(throttled_path, vcgencmd=vcgencmd),
+        "throttled": _throttled(throttled, throttled_path, hwmon_root),
     }
+
+
+def _throttled(
+    reader: Callable[[], dict[str, Any] | None] | None,
+    throttled_path: Path,
+    hwmon_root: Path,
+) -> dict[str, Any] | None:
+    """``reader()`` where one is given, else the file-only chain; never raises."""
+    if reader is None:
+        return read_throttled(throttled_path, hwmon_root=hwmon_root)
+    try:
+        return reader()
+    except Exception:  # the reader is the caller's; collect_hostinfo must not raise
+        _LOG.exception("the throttled reader failed")
+        return None
 
 
 class CachedHostInfo:
