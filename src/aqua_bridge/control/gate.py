@@ -34,8 +34,9 @@ Rules implemented (numbers as in the spec):
    range, no single step above ``dT_max_tick`` -- a Spike or Jump on the
    sibling is a sensor event, not plant motion, and must not brand a calm
    sensor as Stuck). The net PWM displacement is measured from the oldest
-   window sample to the sample ``stuck_ticks // 4`` ticks *before* the
-   newest (:func:`stuck_pwm_lag`), not to the newest itself: the spec's
+   window sample to the sample ``cfg.stuck_pwm_lag_fraction`` (default a quarter)
+   of the window's ticks *before* the newest (:func:`stuck_pwm_lag`), not to the
+   newest itself: the spec's
    own sizing rule says the window exists so that "the coolant must have
    had time to answer a PWM move", and a move commanded two ticks ago has
    had no such time. Taken literally (``|pwm[t] - pwm[t - stuck_ticks]|``)
@@ -43,7 +44,7 @@ Rules implemented (numbers as in the spec):
    moves faster than ``stuck_pwm_net`` within a couple of ticks from a
    still equilibrium -- a setpoint step or the return from a fault -- and
    nominal operation would flicker into fallback. A sustained ramp across
-   the window is still caught (three quarters of it are counted). The
+   the window is still caught (all but the lag fraction of it is counted). The
    check needs a full window; a ``None`` inside the run breaks it (the
    dropout tick was untrusted anyway). Once fired the flag is **latched** on the
    band's reference (the oldest window sample at that moment) and stays
@@ -289,14 +290,15 @@ def push_window(
     return out
 
 
-def stuck_pwm_lag(stuck_ticks: int) -> int:
+def stuck_pwm_lag(stuck_ticks: int, fraction: float = 0.25) -> int:
     """Ticks a PWM move must be old before it counts as Stuck evidence (rule 3).
 
-    A quarter of the window (the window is sized at several plant time
-    constants, so a quarter of it is still a plant-scale delay), at least
-    one command interval left to compare over.
+    ``fraction`` of the window (``cfg.stuck_pwm_lag_fraction``, default a quarter: the
+    window is sized at several plant time constants, so a quarter of it is still a
+    plant-scale delay), at least one command interval left to compare over. The default
+    reproduces the previous hardcoded ``stuck_ticks // 4`` bit for bit (item 60).
     """
-    return max(0, min(stuck_ticks // 4, stuck_ticks - 2))
+    return max(0, min(math.floor(stuck_ticks * fraction), stuck_ticks - 2))
 
 
 def _is_mapping(value: object) -> bool:
@@ -451,7 +453,7 @@ def _stuck(
         )
 
     if params.airflow:  # zoned: the net move of the zone's relative airflow
-        move = _airflow_move(params.airflow, commands)
+        move = _airflow_move(params.airflow, commands, cfg.stuck_pwm_lag_fraction)
         if move is not None:
             if abs(move) > cfg.stuck_airflow_net and not _air_opposes(
                 cfg, air_moves() if params.air else None, move
@@ -466,7 +468,7 @@ def _stuck(
     else:  # legacy / no zone: the net PWM move of each channel on its own
         # the PWM move must be old enough for the plant to have answered it
         oldest_pwm = commands[0]
-        newest_pwm = commands[-1 - stuck_pwm_lag(len(commands))]
+        newest_pwm = commands[-1 - stuck_pwm_lag(len(commands), cfg.stuck_pwm_lag_fraction)]
         for ch in params.channels:
             move = _pwm_move(oldest_pwm.get(ch), newest_pwm.get(ch))
             if move is not None and abs(move) > cfg.stuck_pwm_net:
@@ -487,12 +489,13 @@ def _pwm_move(old: object, new: object) -> float | None:
 def _airflow_move(
     airflow: Sequence[tuple[str, float, float, float]],
     commands: Sequence[Mapping[str, Any]],
+    lag_fraction: float = 0.25,
 ) -> float | None:
     """Net move of a zone's relative airflow over a Stuck window (``StuckParams.airflow``).
 
     ``commands`` are the window's commands, oldest first (``m`` of them). With
-    ``L = stuck_pwm_lag(m)`` and ``B = max(1, L)`` the move is the mean airflow
-    of the ``B`` commands that end at the lagged one (``L`` before the newest)
+    ``L = stuck_pwm_lag(m, lag_fraction)`` and ``B = max(1, L)`` the move is the mean
+    airflow of the ``B`` commands that end at the lagged one (``L`` before the newest)
     minus the mean of the first ``B``: a move must be ``L`` samples old to count,
     as in the legacy rule, and a short excursion of the command at either end
     (the DAS MPC dips a fan for a tick or two) counts only by the share of the
@@ -504,7 +507,7 @@ def _airflow_move(
     adds nothing, and a block without any usable command gives ``None``.
     """
     m = len(commands)
-    lag = stuck_pwm_lag(m)
+    lag = stuck_pwm_lag(m, lag_fraction)
     block = max(1, lag)
     first = _mean_airflow(airflow, commands[:block])
     last = _mean_airflow(airflow, commands[m - lag - block : m - lag])
