@@ -142,7 +142,10 @@ def test_estimator_section_parses_and_round_trips():
         {"k_sigma": 4.5},
         {"k_sigma": -0.1},
         {"q_heat": 0.0},
+        {"q_offset": 0.0},
         {"sensor_noise_c": -1.0},
+        {"proximal_offset_c": -0.1},
+        {"air_blind_fault_s": -1.0},
         {"smart_max_age_s": 0.5},  # < dt
         {"occupied_dT_c": 0.5},  # not above empty_dT_c
         {"empty_dT_c": 0.0},
@@ -276,6 +279,135 @@ def test_a_redundant_member_keeps_the_bay_observed():
     ups = run_ticks(cfg, 5, mem=ups[-1].memory, t0=60.0, prox_a1=None, prox_a1b=None)
     assert all(up.bays["a1"]["occupancy"] == "unknown" for up in ups)  # observability lost
     assert "a1" in ups[-1].estimates  # still constrained
+
+
+# ---------------------------------------------------------------------------
+# placement offsets (plan section 8 item 67)
+# ---------------------------------------------------------------------------
+
+#: How far apart the two proximal sensors of bay a1 sit in these tests, degC.
+PLACEMENT_GAP_C = 4.0
+
+
+def test_two_proximal_sensors_at_different_placements_are_an_offset_not_a_swap():
+    """The second member reads PLACEMENT_GAP_C below the first on every tick: the filter
+    carries that as its placement offset, and the bay's sigma stays at the uncalibrated
+    floor instead of the fast-swap rule inflating it every tick (item 67)."""
+    cfg = lcfg()
+    ups = run_ticks(cfg, 60, prox_a1b=PROX_C - PLACEMENT_GAP_C)
+    sigmas = [up.estimates["a1"]["sigma"] for up in ups]
+    assert max(sigmas) < est.SIGMA_UNCALIBRATED_C + 0.05, max(sigmas)
+    offsets = [up.bays["a1"]["offsets_c"]["prox_a1b"] for up in ups]
+    assert offsets[0] == 0.0
+    assert offsets[-1] == pytest.approx(-PLACEMENT_GAP_C, abs=0.05)
+    # the node itself still follows the anchor, so the drive estimate is the anchor's
+    assert ups[-1].estimates["a1"]["t"] == pytest.approx(est.prior_drive_temp(PROX_C, SP), abs=0.1)
+
+
+def test_one_node_for_both_members_is_what_item_67_reported():
+    """``proximal_offset_c: 0`` is the fusion before item 67: the same disagreement trips
+    the fast-swap rule and the bay's sigma stays far above ``sigma_fault_c``."""
+    cfg = lcfg(proximal_offset_c=0.0)
+    ups = run_ticks(cfg, 60, prox_a1b=PROX_C - PLACEMENT_GAP_C)
+    sigmas = [up.estimates["a1"]["sigma"] for up in ups]
+    assert max(sigmas) > 4.0, max(sigmas)
+    assert ups[-1].bays["a1"]["offsets_c"] == {}
+
+
+def test_a_bay_with_one_proximal_sensor_carries_no_offset():
+    cfg = lcfg()
+    up = run_ticks(cfg, 5)[-1]
+    assert up.bays["a1"]["offsets_c"] == {"prox_a1b": pytest.approx(0.0, abs=0.2)}
+    for bay in ("a2", "b1", "c1"):
+        assert up.bays[bay]["offsets_c"] == {}
+    # one offset state in za (bay a1), none in zb or zc
+    assert len(up.memory["zones"]["za"]["x"]) == 2 + 3 * 2 + 1
+    assert len(up.memory["zones"]["zb"]["x"]) == 2 + 3 * 1
+
+
+def test_a_swap_still_widens_a_bay_with_two_proximal_sensors():
+    """A swap moves the drive, so both members step together: the fast-swap rule fires and
+    the margin widens, exactly as on a bay with one sensor."""
+    cfg = lcfg()
+    mem = run_ticks(cfg, 60, prox_a1b=PROX_C - PLACEMENT_GAP_C)[-1].memory
+    before = run_ticks(cfg, 1, mem=mem, t0=60.0, prox_a1b=PROX_C - PLACEMENT_GAP_C)[-1]
+    hot = run_ticks(
+        cfg, 1, mem=before.memory, t0=61.0, prox_a1=PROX_C + 8.0, prox_a1b=PROX_C + 4.0
+    )[-1]
+    assert hot.estimates["a1"]["sigma"] > 4.0 > before.estimates["a1"]["sigma"]
+    assert hot.bays["a1"]["settling"] is True and hot.bays["a1"]["observed"] is True
+
+
+def test_the_anchor_alone_is_enough_and_so_is_the_other_member():
+    """Either member keeps the bay observed; the one carrying an offset costs the offset's
+    own uncertainty, which is small once it has converged."""
+    cfg = lcfg()
+    mem = run_ticks(cfg, 120, prox_a1b=PROX_C - PLACEMENT_GAP_C)[-1].memory
+    both = run_ticks(cfg, 5, mem=mem, t0=120.0, prox_a1b=PROX_C - PLACEMENT_GAP_C)[-1]
+    anchor = run_ticks(cfg, 5, mem=mem, t0=120.0, prox_a1b=None)[-1]
+    other = run_ticks(cfg, 5, mem=mem, t0=120.0, prox_a1=None, prox_a1b=PROX_C - PLACEMENT_GAP_C)[
+        -1
+    ]
+    for up in (anchor, other):
+        assert up.estimates["a1"]["sigma"] < est.SIGMA_UNCALIBRATED_C + 0.1
+        assert up.estimates["a1"]["t"] == pytest.approx(both.estimates["a1"]["t"], abs=0.3)
+
+
+# ---------------------------------------------------------------------------
+# per-bay seeding, settling and the blind air clock (items 69 and 70)
+# ---------------------------------------------------------------------------
+
+
+def test_a_bay_missing_on_the_first_tick_is_seeded_by_its_first_reading():
+    """Item 69: the bay's node starts at the zone air while nothing reads it, so the
+    reading that arrives later would look like a 5 degC jump. It seeds the bay instead."""
+    cfg = lcfg()
+    first = run_ticks(cfg, 3, prox_b1=None)[-1]
+    assert first.bays["b1"]["seeded"] is False
+    assert "b1" in first.estimates  # still constrained, on the prior
+    back = run_ticks(cfg, 3, mem=first.memory, t0=3.0)
+    assert back[0].bays["b1"]["seeded"] is True
+    assert max(up.estimates["b1"]["sigma"] for up in back) < est.SIGMA_UNCALIBRATED_C + 0.05
+    assert back[-1].estimates["b1"]["t"] == pytest.approx(est.prior_drive_temp(PROX_C, SP), abs=0.5)
+    assert not any(up.bays["b1"]["settling"] for up in back)
+
+
+def test_a_sensor_that_returns_after_a_later_loss_still_widens_its_bay():
+    """The counterpart: a bay is seeded once. A drive can be changed while nothing watches,
+    so the reading that comes back after a loss is judged, not trusted blindly."""
+    cfg = lcfg()
+    mem = run_ticks(cfg, 30)[-1].memory
+    lost = run_ticks(cfg, 30, mem=mem, t0=30.0, prox_b1=None)[-1]
+    back = run_ticks(cfg, 1, mem=lost.memory, t0=60.0, prox_b1=PROX_C + 10.0)[-1]
+    assert back.estimates["b1"]["sigma"] > lost.estimates["b1"]["sigma"]
+    assert back.bays["b1"]["settling"] is True
+
+
+def test_settling_expires_after_bay_settle_s():
+    cfg = lcfg(bay_settle_s=10.0)
+    mem = run_ticks(cfg, 30)[-1].memory
+    jump = run_ticks(cfg, 1, mem=mem, t0=30.0, prox_b1=PROX_C + 10.0)[-1]
+    assert jump.bays["b1"]["settling"] is True
+    later = run_ticks(cfg, 12, mem=jump.memory, t0=31.0, prox_b1=PROX_C + 10.0)
+    assert [up.bays["b1"]["settling"] for up in later][-1] is False
+
+
+def test_air_blind_s_counts_the_time_without_a_trusted_zone_air_reading():
+    cfg = lcfg()
+    ups = run_ticks(cfg, 5)
+    assert all(up.zones["za"]["air_blind_s"] == 0.0 for up in ups)
+    blind = run_ticks(cfg, 6, mem=ups[-1].memory, t0=5.0, air_a=None, air_a2=None)
+    assert [up.zones["za"]["air_blind_s"] for up in blind] == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert blind[-1].zones["zb"]["air_blind_s"] == 0.0  # zb kept its own sensor
+    back = run_ticks(cfg, 1, mem=blind[-1].memory, t0=11.0)[-1]
+    assert back.zones["za"]["air_blind_s"] == 0.0
+
+
+def test_a_redundant_air_sensor_keeps_the_zone_from_going_blind():
+    cfg = lcfg()
+    mem = run_ticks(cfg, 5)[-1].memory
+    ups = run_ticks(cfg, 5, mem=mem, t0=5.0, air_a=None)
+    assert all(up.zones["za"]["air_blind_s"] == 0.0 for up in ups)
 
 
 # ---------------------------------------------------------------------------
