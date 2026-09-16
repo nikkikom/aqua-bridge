@@ -433,17 +433,20 @@ def test_aquabus_outputs_and_quadro_outputs_over_usb_are_refused_together() -> N
         },
         "temp_map": {"air_z0": "temp1", "air_z1": "bus2"},
     }
+    bus = FakeBus()
     with pytest.raises(
         ConfigError,
         match=r"aquacomputer\[0\] \(aquaero\) commands aquabus outputs pwm7 .*"
         r"aquacomputer\[1\] \(quadro\) commands the outputs of whichever Quadro is attached"
-        r".*needs 'serial:' in its entry",
+        r".*refused either way",
     ):
         _build(
             aquacomputer_section=(aquabus, dict(_QUADRO_ENTRY, temp_map={})),
             channels=("radiator", "rear", "exhaust"),
             temps=("air_z0", "air_z1"),
+            opener=bus,
         )
+    assert bus.opened == []  # the check runs before any device is opened (item 106)
     with pytest.raises(ConfigError, match="commands aquabus outputs pwm7"):
         _build(
             aquacomputer_section=(dict(_QUADRO_ENTRY, temp_map={}),),
@@ -467,29 +470,41 @@ def test_aquabus_outputs_and_quadro_outputs_over_usb_are_refused_together() -> N
     )
 
 
-def test_a_second_quadro_named_by_serial_next_to_aquabus_outputs_is_accepted_with_a_warning(
+def test_a_second_quadro_named_by_serial_next_to_aquabus_outputs_is_refused(
     caplog,
 ) -> None:
-    """Review finding: Quadro A on the aquaero's aquabus (pwm5..8) and Quadro B on its own
-    USB port is a valid topology. Which Quadro is on aquabus is unknown before opening, so
-    an entry with a serial is taken as the second one, with a warning."""
+    """Item 106: Quadro A on the aquaero's aquabus (pwm5..8) and a commanding Quadro B
+    entry, distinguished only by 'serial:', is a second, physically distinct Quadro on
+    its own USB port -- a second, independent controller, which is not the supported
+    topology (PROJECT.md section 2 "Supported topology"). Superseded review finding:
+    this used to be accepted with a warning; the owner's 2026-09-16 topology decision
+    closed that."""
     aquabus = {
         "device": "aquaero",
         "fans": {"rear": {"pwm": "pwm5", "rpm": "fan5"}},
         "temp_map": {"air_z0": "temp1"},
     }
     quadro_b = dict(_QUADRO_ENTRY, serial="00000-22222", temp_map={})
-    with caplog.at_level("WARNING", logger="aqua_bridge.hw.sources"):
-        composite, _ = _build(
+    bus = FakeBus()
+    with (
+        caplog.at_level("WARNING", logger="aqua_bridge.hw.sources"),
+        pytest.raises(
+            ConfigError,
+            match=r"aquacomputer\[0\] \(aquaero\) commands aquabus outputs pwm5 .*"
+            r"aquacomputer\[1\] \(quadro 00000-22222\) commands a second, physically distinct "
+            r"Quadro.*exactly one controlling",
+        ),
+    ):
+        _build(
             aquacomputer_section=(aquabus, quadro_b),
             channels=("rear", "exhaust"),
             temps=("air_z0",),
+            opener=bus,
         )
-    assert [d.binding.serial for d in composite.devices] == [None, "00000-22222"]
-    (warning,) = [r.getMessage() for r in caplog.records if r.name == "aqua_bridge.hw.sources"]
-    assert "aquacomputer[0] (aquaero) commands aquabus outputs pwm5" in warning
-    assert "aquacomputer[1] (quadro 00000-22222) commands Quadro outputs over USB" in warning
-    assert "not the one on the aquaero's aquabus" in warning
+    # No warning either: this is a hard refusal now, not a logged-and-accepted shape.
+    assert [r for r in caplog.records if r.name == "aqua_bridge.hw.sources"] == []
+    # And nothing was opened: the check runs before any device is (item 106).
+    assert bus.opened == []
 
 
 def _stuck_quadro_next_to(aquaero_device: FakeController, caplog) -> list[str]:

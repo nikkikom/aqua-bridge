@@ -39,10 +39,16 @@ aquabus) and also, through a quadro entry without ``serial:``, the outputs of
 whichever Quadro is attached over USB: a Quadro on aquabus ignores writes over
 its USB, so that entry may command the Quadro on aquabus and do nothing
 (PROJECT.md section 8 item 85). Which Quadro sits on aquabus cannot be read
-before the devices are opened, so a commanding quadro entry with a serial is
-accepted with a warning, as a second Quadro on its own USB port. At runtime, a
-Quadro whose outputs do not follow while an aquaero next to it reports a device
-on its aquabus gets that explanation in its stuck-channel error.
+before the devices are opened, so this is refused whichever way the second
+entry names its Quadro: with a ``serial:`` it opens a second, physically
+distinct Quadro on its own USB port, which is a second, independent
+controller -- not the supported topology (PROJECT.md section 2 "Supported
+topology", section 8 item 106): exactly one controlling controller, with any
+slave devices hanging off it over aquabus. At runtime, a Quadro whose outputs
+do not follow while an aquaero next to it reports a device on its aquabus
+gets that explanation in its stuck-channel error (this can still happen with
+a single commanding Quadro entry, opened before the aquaero's aquabus use was
+added to its config or the Quadro moved to the wrong port).
 A ROM id missing from the 1-Wire bus at this point is only a warning (see
 :meth:`~aqua_bridge.hw.onewire.W1Source.start`) -- a sensor may be legitimately
 unplugged with its drive.
@@ -284,10 +290,13 @@ def _check_distinct_devices(bindings: Sequence[tuple[str, DeviceBinding]]) -> No
 
 def _check_quadro_commanded_once(bindings: Sequence[tuple[str, DeviceBinding]]) -> None:
     """Aquaero outputs 5-8 command a Quadro on the aquaero's aquabus, which ignores
-    writes over its own USB. Which Quadro is on aquabus cannot be known before the
-    devices are opened: a commanding Quadro entry without ``serial:`` opens whichever
-    Quadro is attached, possibly that one, and is refused; one with a serial is taken
-    as a second Quadro on its own USB port, with a warning."""
+    writes over its own USB. A commanding Quadro entry alongside those outputs is
+    refused either way (PROJECT.md section 2 "Supported topology", section 8 item 106):
+    one without ``serial:`` opens whichever Quadro is attached, possibly the very one
+    already reached through the aquaero, and might silently do nothing; one with a
+    ``serial:`` is a second, physically distinct Quadro on its own USB port -- a second,
+    independent controller, which is not the supported topology (exactly one
+    controlling controller, with any slave devices hanging off it over aquabus)."""
     aquabus = [
         (holder, sorted(n for n in binding.pwm_map.values() if n in binding.kind.aquabus_outputs))
         for holder, binding in bindings
@@ -309,16 +318,20 @@ def _check_quadro_commanded_once(bindings: Sequence[tuple[str, DeviceBinding]]) 
             f"and {unidentified[0]} commands the outputs of whichever Quadro is attached over "
             "USB, which can be that one; a Quadro on aquabus ignores writes over its USB. "
             "Command the Quadro either through the aquaero (pwm5..pwm8, and 'fans: {}' in the "
-            "quadro entry) or over its own USB (no aquaero pwm5..pwm8); a second Quadro on its "
-            "own USB port needs 'serial:' in its entry"
+            "quadro entry) or over its own USB (no aquaero pwm5..pwm8, and a second Quadro on "
+            "its own USB port needs a distinct 'serial:' too -- naming one here does not make "
+            "this config valid, since two commanding entries are refused either way)"
         )
-    _LOG.warning(
-        "%s commands aquabus outputs %s and %s commands Quadro outputs over USB: this "
-        "works only if that Quadro is not the one on the aquaero's aquabus, which ignores "
-        "writes over its USB (its outputs would then be logged as stuck)",
-        holder,
-        names,
-        ", ".join(quadro for quadro, _ in quadros),
+    identified = quadros[0][0]
+    raise ConfigError(
+        f"{holder} commands aquabus outputs {names} (a Quadro on the aquaero's aquabus) and "
+        f"{identified} commands a second, physically distinct Quadro's outputs over its own "
+        "USB: two independent controllers are not a supported topology (PROJECT.md section 2 "
+        "'Supported topology', section 8 item 106). The supported shape is exactly one "
+        "controlling controller, with any slave devices (a Quadro on its aquaero's aquabus, "
+        "for instance) hanging off it -- command the Quadro through the aquaero (pwm5..pwm8, "
+        "and 'fans: {}' in the quadro entry) instead of over its own USB, or remove the "
+        "aquaero's pwm5..pwm8 mapping if this Quadro is really meant to stay independent"
     )
 
 
