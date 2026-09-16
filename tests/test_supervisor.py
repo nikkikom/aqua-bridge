@@ -12,6 +12,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from aqua_bridge.control.intents import (
+    Calibrate,
     ClearOverride,
     ControlMode,
     ControlSurface,
@@ -570,3 +571,74 @@ def test_compose_applies_experiment_levels_like_an_override_and_fallback_beats_t
     snap = rig.sup.snapshot()
     assert snap.control_mode is ControlMode.AUTO and snap.overrides == {}
     assert snap.extra["experiment"]["overrides"] == {"fb1": pytest.approx(0.65)}
+
+
+# ---------------------------------------------------------------------------
+# Manual calibration (POST /api/calibrate, PROJECT.md section 6, item 23)
+# ---------------------------------------------------------------------------
+
+
+def _cal_rig(**changes):
+    from test_ident_experiment import Rig, ident_cfg
+
+    rig = Rig(ident_cfg(**changes))
+    rig.ticks(8)
+    return rig
+
+
+def test_a_manual_calibration_is_offered_until_it_goes_stale():
+    """A reading waits for a tick that can use it, then expires by the SMART rule --
+    it never lands in the filter minutes after it was taken."""
+    rig = _cal_rig()
+    rig.sup.submit(Calibrate(bay="a1", drive_temp_c=41.0))
+    stamp = rig.t
+    plan = rig.sup.plan_tick()
+    assert plan.calibrations == {"a1": {"temp_c": 41.0, "ts": stamp}}
+    # the same sample time on every plan: the estimator, not the supervisor, decides
+    # what is new, exactly as it does for a repeated SMART reading
+    rig.ticks(3)
+    assert rig.sup.plan_tick().calibrations == {"a1": {"temp_c": 41.0, "ts": stamp}}
+    assert rig.cfg.estimator is not None
+    rig.ticks(int(rig.cfg.estimator.smart_max_age_s / rig.cfg.dt) + 2)
+    assert rig.sup.plan_tick().calibrations == {}
+    assert rig.sup.snapshot().extra["calibrations"] == {}
+
+
+def test_a_manual_calibration_reaches_step_as_an_observation_input():
+    rig = _cal_rig()
+    rig.sup.submit(Calibrate(bay="a1", drive_temp_c=41.0))
+    stamp = rig.t
+    result = rig.ticks(1)[0]
+    assert result.obs.inputs["calibration"] == {"a1": {"temp_c": 41.0, "ts": stamp}}
+    assert result.mpc_cmd.diagnostics["estimator"]["manual_fresh"] == ["a1"]
+    assert result.mpc_cmd.diagnostics["bays"]["a1"]["calibration"]["samples"] == 1
+
+
+def test_a_manual_calibration_aborts_a_running_experiment_like_any_other_intent():
+    from aqua_bridge.control.intents import Ident
+
+    rig = _cal_rig()
+    rig.sup.submit(Ident("start", group="front"))
+    assert rig.sup.snapshot().extra["experiment"]["running"] is True
+    rig.sup.submit(Calibrate(bay="a1", drive_temp_c=41.0))
+    status = rig.sup.snapshot().extra["experiment"]
+    assert status["running"] is False
+    assert status["last_abort_reason"] == "human_intent:calibrate"
+
+
+def test_a_legacy_supervisor_refuses_a_calibration(sup):
+    with pytest.raises(IntentInvalid, match="DAS"):
+        sup.submit(Calibrate(bay="b03", drive_temp_c=41.0))
+    assert "calibrations" not in sup.snapshot().extra  # legacy payloads keep their shape
+
+
+def test_calibrate_parses_from_a_request_body_like_every_other_intent():
+    assert parse_intent("calibrate", {"bay": "a1", "drive_temp_c": 41.5}) == Calibrate(
+        bay="a1", drive_temp_c=41.5
+    )
+    for body in ({}, {"bay": "a1"}, {"drive_temp_c": 1.0}, {"bay": 1, "drive_temp_c": 1.0}):
+        with pytest.raises(IntentInvalid):
+            parse_intent("calibrate", body)
+    for bad in (float("nan"), float("inf"), "41", True, None):
+        with pytest.raises(IntentInvalid):
+            Calibrate(bay="a1", drive_temp_c=bad)
