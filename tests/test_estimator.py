@@ -22,6 +22,7 @@ from hypothesis import strategies as st
 from aqua_bridge.config import load_config
 from aqua_bridge.control import estimates as est
 from aqua_bridge.control import estimator as E
+from aqua_bridge.control import zones
 from aqua_bridge.control.mpc import step
 from aqua_bridge.model import (
     DAS_SECTIONS,
@@ -466,6 +467,255 @@ def test_the_anchor_alone_is_enough_and_so_is_the_other_member():
 
 
 # ---------------------------------------------------------------------------
+# a node per proximal sensor (plan section 8 item 101)
+# ---------------------------------------------------------------------------
+
+#: How much less of the drive the second member of bay a1 sees in these tests. A *slope*
+#: difference: the disagreement it makes is proportional to the drive-to-air rise, which
+#: is exactly what one node with a constant offset per member cannot carry.
+MEMBER_SLOPE_DELTA = -0.2
+#: The two drive-to-air rises the tests alternate between, degC. A constant offset fits
+#: either one on its own; only a rise that moves tells an offset from a slope.
+RISES_C = (5.0, 20.0)
+#: A prior spread wide enough for :data:`MEMBER_SLOPE_DELTA`.
+SLOPE_SPREAD = 0.25
+
+
+def member_reading(t_drive: float, t_air: float, slope_delta: float = 0.0) -> float:
+    """The steady reading of a proximal sensor whose slope is the prior's plus
+    ``slope_delta``: ``s T_d + (1 - s) T_a + b`` with the prior offset ``b``."""
+    s = (1.0 - est.PRIOR_BETA) + slope_delta
+    return s * t_drive + (1.0 - s) * t_air + est.PRIOR_OFFSET_C
+
+
+def pair_cfg(spread: float = 0.0) -> MpcConfig:
+    """The small fixture at one of the two layouts, with a short settling window: these
+    tests move the load between two plateaus, and every move is a transient the fast-swap
+    rule fires on, so ``settling`` has to be able to expire inside a plateau."""
+    return lcfg(proximal_slope_spread=spread, bay_settle_s=5.0)
+
+
+def rise_profile(cycles: int, *, ramp: int = 100, hold: int = 200) -> list[float]:
+    """A drive-to-air rise sweeping between :data:`RISES_C` and back, ``cycles`` times.
+
+    Ramped between long plateaus: the readings here are the steady values of each rise, so
+    while the rise moves the filter's own drive estimate lags them and the rows it takes
+    are biased. What identifies the slope is the plateaus, where it does not.
+    """
+    lo, hi = RISES_C
+    out: list[float] = []
+    for i in range(cycles):
+        a, b = (lo, hi) if i % 2 == 0 else (hi, lo)
+        out += [a + (b - a) * k / ramp for k in range(ramp)] + [b] * hold
+    return out
+
+
+def pair_ticks(cfg: MpcConfig, rises, *, mem=None, t0: float = 0.0):
+    """Both members of bay a1 reporting at each rise of ``rises``: (updates, memory)."""
+    ups = []
+    t = t0
+    for rise in rises:
+        up = tick(
+            cfg,
+            mem,
+            t,
+            prox_a1=member_reading(SP + rise, SP),
+            prox_a1b=member_reading(SP + rise, SP, MEMBER_SLOPE_DELTA),
+        )
+        mem, t = up.memory, t + cfg.dt
+        ups.append(up)
+    return ups, mem
+
+
+def truth_gap(rise: float) -> float:
+    """What the two members really differ by at this rise."""
+    return MEMBER_SLOPE_DELTA * rise
+
+
+def test_a_node_per_sensor_learns_the_slope_between_two_placements():
+    """Item 101: with ``proximal_slope_spread`` every proximal member of a bay is its own
+    node with its own map, learned as a difference from the anchor's out of the two
+    readings alone -- no SMART, because both members see the same drive and the same air."""
+    cfg = pair_cfg(SLOPE_SPREAD)
+    profile = rise_profile(6)
+    ups, _ = pair_ticks(cfg, profile)
+    learned = ups[-1].bays["a1"]["proximal_map"]["prox_a1b"]
+    assert learned["slope_delta"] == pytest.approx(MEMBER_SLOPE_DELTA, abs=0.05)
+    assert learned["offset_delta_c"] == pytest.approx(0.0, abs=0.5)
+    assert learned["samples"] > 400
+    # the anchor still holds the bay's own map, so the drive estimate is the anchor's
+    assert ups[-1].estimates["a1"]["t"] == pytest.approx(SP + profile[-1], abs=0.3)
+
+
+def silent_member_run(cfg: MpcConfig, ramp: int = 120, hold: int = 30):
+    """Train at the high rise, lose the redundant member, let the load fall to the low one
+    while only the anchor reports, then hand the member back its own (correct) reading."""
+    lo, hi = RISES_C
+    train = rise_profile(5)  # an odd number of cycles ends at the high rise
+    _, mem = pair_ticks(cfg, train)
+    t = float(len(train))
+    for rise in [hi + (lo - hi) * k / ramp for k in range(ramp)] + [lo] * hold:
+        up = tick(cfg, mem, t, prox_a1=member_reading(SP + rise, SP), prox_a1b=None)
+        mem, t = up.memory, t + cfg.dt
+    return tick(
+        cfg,
+        mem,
+        t,
+        prox_a1=member_reading(SP + lo, SP),
+        prox_a1b=member_reading(SP + lo, SP, MEMBER_SLOPE_DELTA),
+    )
+
+
+def test_a_member_that_returns_after_the_load_moved_is_a_swap_only_on_the_fused_node():
+    """The alternative item 101 weighs this against: one node and a random-walk offset.
+
+    While both members report, the offset is *measured* every tick and follows a slope
+    almost as well as a map would. What it cannot do is **predict**: a member that goes
+    quiet leaves its offset at whatever rise it last saw, so when the load moves under it
+    and the member comes back, the reading it brings is a jump. That is what keeps the
+    example's redundant pairs out of ``trust_rule: sigma`` (item 67's leftover). A node of
+    its own carries the member through the same drive and air the anchor sees, so the
+    return is an ordinary reading.
+    """
+    fused = silent_member_run(pair_cfg())
+    per_sensor = silent_member_run(pair_cfg(SLOPE_SPREAD))
+    assert fused.bays["a1"]["settling"] is True
+    assert fused.bays["a1"]["settling_reason"] == "jump"
+    assert fused.estimates["a1"]["sigma"] > est.sigma_uncalibrated_c(pair_cfg()) + 2.0
+    assert per_sensor.bays["a1"]["settling"] is False
+    assert per_sensor.estimates["a1"]["sigma"] == pytest.approx(
+        est.sigma_uncalibrated_c(pair_cfg(SLOPE_SPREAD)), abs=0.05
+    )
+    assert per_sensor.bays["a1"]["offsets_c"]["prox_a1b"] == pytest.approx(
+        truth_gap(RISES_C[0]), abs=0.3
+    )
+
+
+def test_a_node_per_sensor_costs_no_extra_state():
+    """The offset row of item 67 becomes the further member's own node, so the filter has
+    exactly the states it had -- which is what keeps the step budget where it was."""
+    fused = run_ticks(lcfg(), 3)[-1]
+    per_sensor = run_ticks(lcfg(proximal_slope_spread=SLOPE_SPREAD), 3)[-1]
+    for zone in ("za", "zb", "zc"):
+        assert len(per_sensor.memory["zones"][zone]["x"]) == len(fused.memory["zones"][zone]["x"])
+    assert len(per_sensor.memory["zones"]["za"]["x"]) == 2 + 3 * 2 + 1
+
+
+def _no_redundant_cfg(**estimator):
+    """The small fixture with bay a1's redundant member removed: one sensor per bay."""
+    m = das_mapping()
+    m["temps"] = [t for t in m["temps"] if t != "prox_a1b"]
+    del m["sensors"]["prox_a1b"]
+    m["setpoints"] = {}
+    if estimator:
+        m["estimator"] = estimator
+    return MpcConfig.from_mapping(m)
+
+
+def test_one_sensor_per_bay_is_the_same_arithmetic_either_way():
+    """A config without a redundant proximal pair has nothing for the new layout to do, so
+    it must be bit-identical -- which is what lets the key default to the fused layout
+    without splitting the estimator into two filters to maintain."""
+    fused = run_ticks(_no_redundant_cfg(), 40)
+    per_sensor = run_ticks(_no_redundant_cfg(proximal_slope_spread=SLOPE_SPREAD), 40)
+    for a, b in zip(fused, per_sensor, strict=True):
+        assert a.estimates == b.estimates
+        for zone in a.memory["zones"]:
+            assert a.memory["zones"][zone]["x"] == b.memory["zones"][zone]["x"]
+            assert a.memory["zones"][zone]["P"] == b.memory["zones"][zone]["P"]
+
+
+@pytest.mark.parametrize("absent", ["prox_a1", "prox_a1b"])
+def test_either_member_alone_keeps_the_bay_on_its_own_node(absent):
+    """One member silent: the bay stays observed and its estimate stays where both members
+    had it, whichever one is missing -- the anchor's node is predicted through the drive,
+    the other member's through its own learned map."""
+    cfg = pair_cfg(SLOPE_SPREAD)
+    train = rise_profile(6)
+    _, mem = pair_ticks(cfg, train)
+    rise = train[-1]
+    both = tick(
+        cfg,
+        mem,
+        float(len(train)),
+        prox_a1=member_reading(SP + rise, SP),
+        prox_a1b=member_reading(SP + rise, SP, MEMBER_SLOPE_DELTA),
+    )
+    values = {
+        "prox_a1": member_reading(SP + rise, SP),
+        "prox_a1b": member_reading(SP + rise, SP, MEMBER_SLOPE_DELTA),
+    }
+    values[absent] = None
+    alone = tick(cfg, mem, float(len(train)), **values)
+    assert alone.bays["a1"]["observed"] is True
+    assert alone.bays["a1"]["settling"] is False
+    assert alone.estimates["a1"]["t"] == pytest.approx(both.estimates["a1"]["t"], abs=0.4)
+    assert alone.estimates["a1"]["sigma"] < est.sigma_uncalibrated_c(cfg) + 0.1
+
+
+def test_a_member_that_lies_the_other_way_is_not_a_swap_on_either_layout():
+    """The agreement test (item 17) still decides: one bay holds one drive, so a swap moves
+    both members the same way and a disagreement is placement, not a swap."""
+    for cfg in (pair_cfg(), pair_cfg(SLOPE_SPREAD)):
+        train = rise_profile(4)
+        _, mem = pair_ticks(cfg, train)
+        rise = train[-1]
+        lying = tick(
+            cfg,
+            mem,
+            float(len(train)),
+            prox_a1=member_reading(SP + rise, SP) + 6.0,
+            prox_a1b=member_reading(SP + rise, SP, MEMBER_SLOPE_DELTA) - 6.0,
+        )
+        assert lying.bays["a1"]["settling"] is False, cfg.estimator.proximal_slope_spread
+
+
+def test_a_hot_swap_widens_the_bay_on_either_layout():
+    """Both members step together, which is what a swap does; the rule fires and the bay
+    reports ``settling`` with ``jump`` as its reason (item 100)."""
+    for cfg in (pair_cfg(), pair_cfg(SLOPE_SPREAD)):
+        train = rise_profile(4)
+        _, mem = pair_ticks(cfg, train)
+        rise = train[-1]
+        hot = tick(
+            cfg,
+            mem,
+            float(len(train)),
+            prox_a1=member_reading(SP + rise + 12.0, SP),
+            prox_a1b=member_reading(SP + rise + 12.0, SP, MEMBER_SLOPE_DELTA),
+        )
+        assert hot.estimates["a1"]["sigma"] > 4.0
+        assert hot.bays["a1"]["settling"] is True
+        assert hot.bays["a1"]["settling_reason"] == "jump"
+
+
+@pytest.mark.parametrize("missing", [("prox_a1",), ("prox_a1b",), ("prox_a1", "prox_a1b")])
+def test_a_member_lost_and_returned_is_judged_like_any_other_reading(missing):
+    """A drive may be changed while a member is silent, so its return is an innovation --
+    and a return that agrees with the member that never left is not a swap."""
+    cfg = pair_cfg(SLOPE_SPREAD)
+    train = rise_profile(4)
+    _, mem = pair_ticks(cfg, train)
+    rise = train[-1]
+    values = {
+        "prox_a1": member_reading(SP + rise, SP),
+        "prox_a1b": member_reading(SP + rise, SP, MEMBER_SLOPE_DELTA),
+    }
+    gone = tick(cfg, mem, float(len(train)), **{**values, **dict.fromkeys(missing)})
+    back = tick(cfg, gone.memory, float(len(train)) + 1.0, **values)
+    assert back.bays["a1"]["seeded"] is True
+    assert back.bays["a1"]["settling"] is False
+    assert back.estimates["a1"]["sigma"] < est.sigma_uncalibrated_c(cfg) + 0.2
+
+
+def test_proximal_slope_spread_is_a_config_key():
+    assert ESTIMATOR_DEFAULTS["proximal_slope_spread"] == 0.0
+    for bad in (-0.1, 0.6):
+        with pytest.raises(ConfigError, match="proximal_slope_spread"):
+            lcfg(proximal_slope_spread=bad)
+
+
+# ---------------------------------------------------------------------------
 # per-bay seeding, settling and the blind air clock (items 69 and 70)
 # ---------------------------------------------------------------------------
 
@@ -598,6 +848,104 @@ def test_air_blind_s_counts_a_tick_gap_in_full():
     later = tick(cfg, gap.memory, 1205.0, air_a=None, air_a2=None)
     assert later.zones["za"]["air_blind_s"] == pytest.approx(1201.0)
     assert later.zones["za"]["sigma_air_c"] < 1.0  # the variance never says it
+
+
+# ---------------------------------------------------------------------------
+# the two notions of settling (plan section 8 item 100)
+# ---------------------------------------------------------------------------
+
+
+def test_a_jump_is_named_in_the_diagnostics_with_the_time_it_has_left():
+    """One owner, and it says which exemption and for how long: the ``sigma`` trust rule's
+    (``settling``, a deliberate widening, bounded by ``bay_settle_max_s``) and the DAS
+    MPC validity gate's (``model_exempt``, which also covers what the trust rule must not
+    excuse). ``/api/state`` carries both per bay."""
+    cfg = lcfg(bay_settle_s=10.0)
+    mem = run_ticks(cfg, 30)[-1].memory
+    jump = run_ticks(cfg, 1, mem=mem, t0=30.0, prox_b1=PROX_C + 10.0)[-1]
+    info = jump.bays["b1"]
+    assert info["settling"] is True and info["settling_reason"] == "jump"
+    assert info["settling_until_s"] == pytest.approx(cfg.estimator.bay_settle_s)
+    assert info["settling_spent_s"] == 0.0  # charged from the next tick on
+    assert info["settling_budget_s"] == cfg.estimator.bay_settle_max_s
+    # the model gate excuses the same tick, but for the level, not the event
+    assert info["model_exempt"] is True and info["model_exempt_reason"] == "uncertain"
+    assert info["model_exempt_until_s"] == pytest.approx(cfg.estimator.bay_settle_s)
+    later = run_ticks(cfg, 6, mem=jump.memory, t0=31.0, prox_b1=PROX_C)[-1]
+    assert later.bays["b1"]["settling_until_s"] < info["settling_until_s"]
+    assert later.bays["b1"]["settling_spent_s"] > 0.0
+
+
+def test_an_occupancy_change_is_its_own_reason():
+    cfg = lcfg(empty_confirm_s=10.0, bay_settle_s=60.0)
+    pulled = run_ticks(cfg, 100, prox_b1=SP + 0.1)
+    gone = next(up for up in pulled if up.bays["b1"]["occupancy"] == "empty")
+    assert gone.bays["b1"]["settling_reason"] == "occupancy"
+    assert gone.bays["b1"]["model_exempt_reason"] == "occupancy"
+    # an empty bay carries no estimate, so nothing marks ``uncertain`` for it either
+    assert gone.bays["b1"]["model_exempt"] is True
+    assert "b1" not in gone.estimates
+
+
+def test_a_bay_nobody_reads_is_out_of_the_model_checks_but_still_faults_its_zone():
+    """The untangling: what the solver used to infer from a wide sigma was **two** facts.
+    A bay the filter widened on purpose is following a swap, and the trust rule may excuse
+    it; a bay whose sigma is wide because nothing has read it for a while is an
+    observability loss, and the trust rule must not. Both keep it out of the model checks,
+    because neither is evidence about a model -- so the model gate honours ``uncertain``
+    and the trust rule does not."""
+    cfg = lcfg(bay_settle_s=600.0)
+    mem = run_ticks(cfg, 30)[-1].memory
+    blind = run_ticks(cfg, 900, mem=mem, t0=30.0, prox_b1=None)[-1]
+    info = blind.bays["b1"]
+    assert info["observed"] is False
+    assert info["settling"] is False and info["settling_reason"] is None
+    assert info["model_exempt"] is True and info["model_exempt_reason"] == "uncertain"
+    assert blind.estimates["b1"]["sigma"] > cfg.estimator.sigma_fault_c
+    (reason,) = zones.sigma_reasons("zb", cfg, blind)
+    assert reason.startswith("sigma:bay:b1=")
+
+
+def test_an_accepted_calibration_is_a_model_exemption_and_not_a_trust_one():
+    """An accepted map re-maps the drive estimate and moves the ``sigma_cal`` floor under
+    it, which the model's own prediction cannot be blamed for -- and which is no reason to
+    stop checking the bay's sigma, because the filter did not widen anything."""
+    cfg = das_cfg(setpoints={})
+    ups, mem = [], None
+    for k in range(1, 61):
+        ts = float(k) * 10.0
+        up = tick(
+            cfg,
+            mem,
+            ts,
+            calibration=_manual("a1", 44.0 + 3.0 * math.sin(0.7 * k), ts),
+            prox_a1=PROX_C,
+        )
+        mem = up.memory
+        ups.append(up)
+    step = next(
+        up
+        for up, before in zip(ups[1:], ups, strict=False)
+        if up.bays["a1"]["calibrated"] and not before.bays["a1"]["calibrated"]
+    )
+    assert step.bays["a1"]["sigma_cal_c"] != FLOOR_C  # the floor moved on acceptance
+    after = next(up for up in ups if up.bays["a1"]["model_exempt_reason"] == "calibration")
+    assert after.bays["a1"]["settling"] is False
+    assert after.bays["a1"]["model_exempt"] is True
+
+
+def test_the_model_exemption_keys_are_config_keys():
+    assert ESTIMATOR_DEFAULTS["bay_uncertain_var_c2"] == 1.0
+    assert ESTIMATOR_DEFAULTS["bay_cal_step_c"] == 0.05
+    for key in ("bay_uncertain_var_c2", "bay_cal_step_c"):
+        with pytest.raises(ConfigError, match=key):
+            lcfg(**{key: 0.0})
+    # a bay whose variance stays under a raised threshold is no longer excused
+    cfg = lcfg(bay_settle_s=10.0, bay_uncertain_var_c2=1000.0)
+    mem = run_ticks(cfg, 30)[-1].memory
+    jump = run_ticks(cfg, 1, mem=mem, t0=30.0, prox_b1=PROX_C + 10.0)[-1]
+    assert jump.bays["b1"]["settling"] is True  # the trust rule still excuses the jump
+    assert jump.bays["b1"]["model_exempt"] is False
 
 
 def test_a_redundant_air_sensor_keeps_the_zone_from_going_blind():

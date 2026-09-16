@@ -132,6 +132,21 @@ def recorded_request(cfg: MpcConfig, drive=38.0, ticks: int = 3) -> SolverReques
     return rec.requests[-1]
 
 
+def exempt(plant: dict, *bays: str, reason: str = "occupancy") -> dict:
+    """``plant`` with exactly ``bays`` reported ``model_exempt`` by the estimator (item 100).
+
+    The estimator owns that verdict and recomputes it every tick; a recorded request carries
+    the one it published on the tick it was recorded, so a test that replays that request on
+    another clock -- or that wants one particular bay excused -- says so here rather than
+    leaving a stale flag to decide.
+    """
+    out = copy.deepcopy(plant)
+    for bay, info in out["bays"].items():
+        info["model_exempt"] = bay in bays
+        info["model_exempt_reason"] = reason if bay in bays else None
+    return out
+
+
 def full_integrator(cfg: MpcConfig, value: float = 0.5) -> dict[str, float]:
     return dict.fromkeys(cfg.channels, value)
 
@@ -977,7 +992,9 @@ def test_a_clock_stepped_back_keeps_the_prediction_error_guard_and_the_dwell():
     def ticks(memory, ts, n, warming=0.0):
         res = None
         for i in range(n):
-            plant = copy.deepcopy(req.plant)
+            # the estimator excuses no bay on these clocks: the run's occupancy changes
+            # are a day away from every timestamp below (item 100)
+            plant = exempt(req.plant)
             for info in plant["bays"].values():
                 info["t"] += warming * i  # drives the model does not see coming
             changes = {"ts": ts + i * cfg.dt, "memory": memory, "plant": plant}
@@ -999,11 +1016,25 @@ def test_a_clock_stepped_back_keeps_the_prediction_error_guard_and_the_dwell():
     assert res.diagnostics["model"]["active"] == "mpc"
 
 
+def test_the_plant_view_carries_the_estimators_own_exemption():
+    """Item 100: ``mpc.step`` hands the solver the estimator's verdict per bay, and the
+    validity gate's exempt set is exactly the bays it marks -- no second rule here."""
+    cfg = mpc_cfg()
+    req = recorded_request(cfg, ticks=4)
+    flags = {bay: info.get("model_exempt") for bay, info in req.plant["bays"].items()}
+    assert flags and all(isinstance(v, bool) for v in flags.values()), flags
+    assert DasMpcSolver._settling_bays(req) == {bay for bay, v in flags.items() if v}
+    reasons = {info.get("model_exempt_reason") for info in req.plant["bays"].values()}
+    assert reasons <= {None, "occupancy", "uncertain", "calibration"}, reasons
+
+
 def test_a_swap_the_estimator_follows_as_a_jump_is_left_out_of_the_drift_check():
     cfg = mpc_cfg()
     req = recorded_request(cfg, drive=40.0, ticks=4)
     solver = DasMpcSolver()
-    plant = copy.deepcopy(req.plant)
+    # the estimator reports the bay ``uncertain``: its fast-swap variance is over
+    # ``bay_uncertain_var_c2``, and it is the estimator that says so (item 100)
+    plant = exempt(req.plant, "b06", reason="uncertain")
     plant["bays"]["b06"]["sigma"] = 5.0  # the estimator's fast-swap variance
     plant["bays"]["b06"]["q_w"] = 60.0  # a transient far from equilibrium
     mem = {"v": 1}
@@ -1011,8 +1042,7 @@ def test_a_swap_the_estimator_follows_as_a_jump_is_left_out_of_the_drift_check()
     checks = res.diagnostics["model"]["checks"]
     assert res.diagnostics["model"]["active"] == "mpc"
     assert checks["drift_c_per_min"] is None or checks["drift_c_per_min"] < 0.5
-    assert "b06" in res.memory["settle"]
-    calm = copy.deepcopy(req.plant)
+    calm = exempt(req.plant)
     calm["bays"]["b06"]["q_w"] = 60.0
     res = solver.solve(cfg, fresh_req(req, plant=calm))
     assert res.diagnostics["model"]["reason"].startswith("drift:")
