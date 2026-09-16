@@ -47,10 +47,11 @@ Rules
    alone. Keeping a pair asks less than choosing one, because a correct pair
    dips through a quiet window while a wrong one sits near zero. A dropped
    pair's history starts over, so it must win rule 3 again over a full window
-   before it may calibrate that bay. A wrong pair from a coincidence over one
-   window does not survive the next ones; the absolute SMART band
-   (``smart_reject_c``) cannot tell the two apart, because an uncalibrated bay's
-   estimate carries the prior map's own offset.
+   before it may calibrate that bay; so does an accepted one, so that a pair's
+   first re-check scores a fresh window instead of the one that accepted it.
+   A wrong pair from a coincidence over one window does not survive the next
+   ones; the absolute SMART band (``smart_reject_c``) cannot tell the two apart,
+   because an uncalibrated bay's estimate carries the prior map's own offset.
 
 Series layout (plain JSON, kept by the estimator)::
 
