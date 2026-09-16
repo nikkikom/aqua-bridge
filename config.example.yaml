@@ -65,7 +65,7 @@ mpc:
   stuck_airflow_net: 0.15  # DAS only (inert here): zone relative-airflow move that is Stuck evidence, (0, 1]
   stuck_air_oppose_c: 0.3  # DAS only (inert here): zone-air move against it that voids it for a proximal sensor, degC
   stuck_air_oppose_max_c: 3.0  # DAS only (inert here): an opposing move above this no longer voids it, degC (> stuck_air_oppose_c)
-  stuck_zone_air_dT_c: 1.5  # DAS only (inert here): zone-air move that is evidence on its own while the airflow is steady, degC
+  stuck_zone_air_dT_c: 1.5  # DAS only (inert here): zone-air move that is evidence when another proximal reading of the zone followed it, degC
   solver_max_iter: 50    # MPC iteration cap; hitting it is a solver fault (fallback)
   channels:
     - radiator

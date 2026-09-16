@@ -130,10 +130,13 @@ mpc:
   # airflow, cooler after less) by more than stuck_air_oppose_c, degC (> 0), and at most
   # stuck_air_oppose_max_c, degC (> stuck_air_oppose_c): an airflow move shifts the
   # drive-to-air difference by a few degC at most, so a larger air swing cannot excuse a
-  # reading that did not move. With the airflow inside stuck_airflow_net (fans pinned at
-  # pwm_max, a slow trim) a zone-air move above stuck_zone_air_dT_c, degC (> 0), is the
-  # evidence instead: at constant airflow the drive-to-air difference moves only with the
-  # bay's own power, so that much air movement had to reach a healthy proximal reading.
+  # reading that did not move. With no airflow evidence (the airflow inside
+  # stuck_airflow_net -- fans pinned at pwm_max, a slow trim -- or an excused move) a
+  # zone-air move above stuck_zone_air_dT_c, degC (> 0), is the evidence instead, but only
+  # while another proximal reading of the same zone moved with it by more than
+  # stuck_sibling_dT_c: at constant airflow the drive-to-air difference moves only with the
+  # bay's own power, so that much air movement had to reach a healthy proximal reading,
+  # while a zone-air sensor that is merely drifting moves alone and must flag nobody.
   stuck_airflow_net: 0.15
   stuck_air_oppose_c: 0.3
   stuck_air_oppose_max_c: 3.0
