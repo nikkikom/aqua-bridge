@@ -2702,9 +2702,11 @@ when no aquaero hidraw node, USB `0c70:f001` interface 2, exists), `fuzzy`
 long simulations: excluded from PR and `main` runs, run by the nightly
 job), `solver_cases(*cases)` (restricts `solver_kind`), `pi` (only on the
 Raspberry Pi, e.g. the absolute step budget; skipped elsewhere),
-`mqtt_live` (the publisher against a **real** broker: skipped unless
-`$AQUA_BRIDGE_MQTT_TEST_HOST` names one, with `_PORT`, `_USERNAME` and
-`_PASSWORD` completing the set, so CI stays offline; §8 item 21). PR and
+`mqtt_live` (the publisher against a **real** broker: needs both
+`$AQUA_BRIDGE_MQTT_TEST_HOST` naming one — with `_PORT`, `_USERNAME` and
+`_PASSWORD` completing the set — and `-m mqtt_live` on the command line, so
+CI stays offline and a variable left exported in a shell cannot make an
+ordinary suite run connect; §8 item 21). PR and
 `main` CI run `-m "not hardware and not nightly"`; the nightly job runs
 `-m "not hardware"`.
 
@@ -3249,16 +3251,23 @@ runners allow it.
   `MqttClient` publishes (fake paho): a clean checklist, a missing
   entity, a stale retained PWM number, a config payload from another
   build, a missing or `offline` availability topic, no state topic, SMART
-  ages, a retained command; `--send` naming the command and doing nothing
-  without a typed `yes`, credentials never printed, never the daemon's
-  client id. No broker.
+  ages, a retained command; a template's `| default(...)` read as a value
+  and not as "unknown" (a DAS with `model_shadow: false`); `--send`
+  naming the command, saying what outlives it and doing nothing without a
+  typed `yes`; credentials never printed, the broker host only under
+  `--verbose`, never the daemon's client id; a negative `--wait` refused
+  as an argument error. Its broker layer against a fake paho client: a
+  CONNACK that never comes and one that refuses, a refused SUBACK, and
+  that neither is charged to the collection window. No broker.
 - `tests/test_mqtt_live.py` (`mqtt_live`) — the publisher against a real
-  broker when `$AQUA_BRIDGE_MQTT_TEST_HOST` names one: retained
+  broker when `$AQUA_BRIDGE_MQTT_TEST_HOST` names one **and** `-m
+  mqtt_live` selects it: retained
   Discovery and state, a command from another client reaching the
   supervisor, `in/smart` reaching the inbox, `ha_check` clean, a clean
   stop leaving a retained `offline`. Its own `node_id`
   (`aqua-bridge-test-<pid>`); every retained message it leaves is deleted
-  afterwards.
+  afterwards, and a cleanup that cannot reach the broker prints the
+  topics it left rather than raising over the real failure.
 - `tests/test_inputs_smart.py`, `tests/test_smart_agent.py` — inbox
   staleness by receipt time and rejection of malformed payloads; the
   agent's discovery, `smartctl -j` fixtures including `-n standby`, never
@@ -3986,17 +3995,33 @@ Owner decision (2026-09-16):
       expected entity announced and retained, the availability topic
       `online`, the state blob carrying what every template reads. Add
       `--verbose` for every entity with its value, `--strict` to fail on the
-      warnings too.
+      warnings too. `--verbose` also prints the broker host in the header:
+      that host lives in `private.md`, so paste the plain run's output, not
+      the verbose one, into the PR or an issue.
     - `AQUA_BRIDGE_MQTT_TEST_HOST=<broker> AQUA_BRIDGE_MQTT_TEST_USERNAME=<user>
       AQUA_BRIDGE_MQTT_TEST_PASSWORD=<password> .venv/bin/python -m pytest -m
-      mqtt_live -q` — the publisher end to end against that broker. It uses
-      its own `node_id` (`aqua-bridge-test-<pid>`) and deletes its retained
-      messages afterwards, so it is safe to run next to the live daemon.
-    - the three commands, each of which names its topic and payload and waits
-      for a typed `yes`: `tools/ha_check.py ... --send cmd/mode manual`, then
-      `--send cmd/pwm/<channel> 0.5`, then `--send cmd/mode auto`. Each
+      mqtt_live -q` — the publisher end to end against that broker. Both
+      signals are needed: the variable **and** `-m mqtt_live`, so a variable
+      left exported in a shell cannot make an ordinary suite run open a
+      session on the live broker. It uses its own `node_id`
+      (`aqua-bridge-test-<pid>`) and deletes its retained messages
+      afterwards, so it is safe to run next to the live daemon; if it cannot
+      delete them it prints the topics it left, to clear with
+      `mosquitto_pub -r -n -t <topic>`.
+    - the three commands, each of which names its topic and payload, says
+      what stands after the message, and waits for a typed `yes`:
+      `tools/ha_check.py ... --send cmd/mode manual`, then
+      `--send cmd/pwm/<channel> <duty>`, then `--send cmd/mode auto`. Each
       prints the state topic again afterwards, so the effect is visible
-      without Home Assistant.
+      without Home Assistant. **Both of the first two stand until something
+      clears them**: manual mode takes the solver off the fans, and the PWM
+      override replaces the solver's duty on that channel
+      (`Supervisor.compose` only refuses one in fallback). So pick `<duty>`
+      at or **above** that channel's current duty — the same run prints it,
+      `cmd.pwm.<channel>` under "home assistant would show" — and if the
+      sequence is interrupted, a declined prompt or a dropped ssh session
+      included, `--send cmd/mode auto` puts it back and clears every
+      override.
 
     **In Home Assistant**: one device `aqua-bridge` (MQTT integration → the
     device page). Confirm the entity list of §7 — the host sensors, a
@@ -4017,16 +4042,33 @@ Owner decision (2026-09-16):
     **What a failure would mean.** Entities missing altogether: the broker
     account may not be allowed to publish retained messages under
     `{discovery_prefix}/#`, or Home Assistant's MQTT integration uses another
-    discovery prefix than `mqtt.discovery_prefix`. Entities present but
-    permanently unavailable: the availability topic is not readable by Home
-    Assistant's account, or the daemon never connected (`/api/health`'s
-    `mqtt_connected`). Entities available but "unknown": the state blob and a
-    template disagree — `ha_check` names the missing path, and that is a bug
-    here, not a Home Assistant setting. A number that moves in the UI and
-    changes nothing: either the broker drops the command (an ACL on
-    `{node_id}/cmd/#`) or the supervisor refused it (the journal logs the
-    rejected intent, like HTTP's 409). No SMART: the agent's `--node-id` or
-    its broker account, not the daemon (§10 step 13).
+    discovery prefix than `mqtt.discovery_prefix`. Every entity missing *and*
+    nothing on `{node_id}/status`, while Home Assistant shows the device
+    working: that is `ha_check`'s own account, not the daemon — the tool
+    subscribes with the `mqtt:` credentials, and a publish-only ACL leaves it
+    subscribed to nothing. It says so (`the broker refused the subscription
+    to …`) and exits 2; grant that account read on `{node_id}/#` and
+    `{discovery_prefix}/#`. Entities present but permanently unavailable: the
+    availability topic is not readable by Home Assistant's account, or the
+    daemon never connected (`/api/health`'s `mqtt_connected`). Entities
+    available but "unknown": the state blob and a template disagree —
+    `ha_check` names the missing path, and that is a bug here, not a Home
+    Assistant setting. Not this, though: a path the state blob does not carry
+    but whose template has a `| default(...)` is listed separately as reading
+    its default and is neither a problem nor a warning — `model_status` is
+    `off` on a healthy daemon with `model_shadow: false`, and the per-bay
+    sensors read their default until the first DAS tick. "Announced but not
+    expected": an entity in Home Assistant that this config does not have.
+    The daemon deletes the *other control modes'* configs of the config it is
+    running, so this is either another build or an entity dropped from an
+    older `config.yaml` (a bay, zone, channel, temp or drive class) whose
+    retained config nothing deletes; confirm it really is gone from
+    `config.yaml`, then clear it with
+    `mosquitto_pub -r -n -t <the config topic ha_check printed>`. A number
+    that moves in the UI and changes nothing: either the broker drops the
+    command (an ACL on `{node_id}/cmd/#`) or the supervisor refused it (the
+    journal logs the rejected intent, like HTTP's 409). No SMART: the agent's
+    `--node-id` or its broker account, not the daemon (§10 step 13).
 
 22. **Done:** `GET /api/zones` (§6 View) and the HA entity
     `zone_status_<zone>` (§7), both reusing `diagnostics["zones"]`.
@@ -5346,8 +5388,10 @@ on a Zero W; the hardware steps are waiting for the aquaero.
     exits non-zero when an expected entity is missing) prints which Discovery
     entities the broker holds, whether the availability and state topics carry
     what the code publishes, and what Home Assistant would show for each
-    entity; `--verbose` lists them all, `--send` is the only way it ever
-    publishes and it asks first. Then the device page in Home Assistant
+    entity; `--verbose` lists them all (and the broker host, which belongs
+    in `private.md` — the plain run is the one to paste anywhere), `--send`
+    is the only way it ever publishes and it asks first, naming what stands
+    after the message. Then the device page in Home Assistant
     (§8 item 21 says what to look at and what a failure would mean).
     Digole later.
 13. Optional, on the PC with the DAS: the SMART agent,

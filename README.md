@@ -238,13 +238,14 @@ hardware.
     .venv/bin/python tools/ha_check.py --config /etc/aqua-bridge/config.yaml
     ```
 
-    Read-only (it publishes only with `--send`, which names the command
-    and asks first) and driven by the same config the daemon uses: it
-    lists which Discovery entities the broker holds, which expected ones
-    are missing, whether the availability and state topics carry what the
-    code publishes and what Home Assistant would show for each entity
-    (`--verbose` for all of them). It exits non-zero when something
-    expected is missing. Then the device page in Home Assistant.
+    Read-only (it publishes only with `--send`, which names the command,
+    says what stands after it and asks first) and driven by the same config
+    the daemon uses: it lists which Discovery entities the broker holds,
+    which expected ones are missing, whether the availability and state
+    topics carry what the code publishes and what Home Assistant would show
+    for each entity (`--verbose` for all of them, and for the broker host,
+    which the plain run keeps out of its output). It exits non-zero when
+    something expected is missing. Then the device page in Home Assistant.
 
     `/api/health`'s `device_health` should be `{"ok": true, "problems":
     []}`; the page's **Controllers** section (and `/api/state`'s
