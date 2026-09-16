@@ -709,7 +709,9 @@ def test_sibling_evidence_counts_only_same_zone_role_and_bay():
         def temps(i: int) -> dict[str, float | None]:
             t = _base_temps()
             for name in names:
-                t[name] = float(t[name]) + 0.2 * i  # net 1.6 degC > stuck_sibling_dT_c, no jump
+                # net 1.2 degC: above stuck_sibling_dT_c, below stuck_zone_air_dT_c (so a
+                # zone-air sensor moving this far is not evidence either), no jump
+                t[name] = float(t[name]) + 0.15 * i
             return t
 
         return temps
@@ -818,6 +820,56 @@ def test_zone_air_against_the_airflow_voids_it_for_a_proximal_reading():
     # a frozen zone-air reading is flagged by the airflow and does not void it either
     _, r = _history(cfg, n, _zone_air_drift(0.0, 2 * tol), up)
     assert r.stuck["air_a"] and r.stuck["prox_a2"]  # air_a did not oppose: evidence stays
+
+
+def test_a_zone_air_swing_above_the_bound_no_longer_voids_the_airflow_evidence():
+    """Item 59: the cancellation has an upper bound. An airflow move can shift the
+    drive-to-air difference by a few degrees C at most, so a zone-air swing larger than
+    stuck_air_oppose_max_c cannot explain a reading that did not move at all."""
+    cfg = _dense_das(air_a={"stuck_s": 8.0}, air_a2={"stuck_s": 8.0})
+    lo, hi = cfg.stuck_air_oppose_c, cfg.stuck_air_oppose_max_c
+    assert lo < hi
+    n = cfg.stuck_params("prox_a2").ticks + 1
+
+    def up(i: int) -> dict[str, float]:
+        return {"fa1": 0.3 + 0.04 * i, "fa2": 0.3 + 0.04 * i, "fb1": 0.5, "fc1": 0.5}
+
+    def stuck(air_a: float, air_a2: float) -> bool:
+        return _history(cfg, n, _zone_air_drift(air_a, air_a2), up)[1].stuck["prox_a2"]
+
+    assert not stuck(2 * lo, 2 * lo)  # inside the bound: a plausible cancellation
+    assert not stuck(hi - 0.5, hi - 0.5)
+    assert stuck(hi + 0.5, hi + 0.5)  # too large to be cancelled: the evidence stands
+    assert stuck(hi + 0.5, 2 * lo)  # one sensor past the bound is enough
+
+
+def test_a_zone_air_move_at_steady_airflow_flags_a_frozen_proximal_reading():
+    """Item 58: with the fans pinned or trimmed slowly there is no airflow move to measure,
+    and before this rule such a reading was never flagged. A proximal reading is its zone's
+    air plus the drive-to-air difference, which at constant airflow moves only with the
+    bay's own power, so a zone-air move above stuck_zone_air_dT_c had to reach it."""
+    cfg = _dense_das(air_a={"stuck_s": 8.0}, air_a2={"stuck_s": 8.0})
+    thr = cfg.stuck_zone_air_dT_c
+    n = cfg.stuck_params("prox_a2").ticks + 1
+
+    def pinned(i: int) -> dict[str, float]:
+        return dict.fromkeys(cfg.channels, 1.0)  # at pwm_max: nothing to measure
+
+    def trim(i: int) -> dict[str, float]:  # a slow trim, below stuck_airflow_net
+        return {"fa1": 0.5 + 0.005 * i, "fa2": 0.5 + 0.005 * i, "fb1": 0.5, "fc1": 0.5}
+
+    def result(drift: float, pwm=pinned, other: float | None = None) -> GateResult:
+        air_a2 = drift if other is None else other
+        return _history(cfg, n, _zone_air_drift(drift, air_a2), pwm)[1]
+
+    assert not result(thr / 2).stuck["prox_a2"]  # too small to have to show
+    r = result(2 * thr)
+    assert r.stuck["prox_a2"] and r.reasons["prox_a2"] == (REASON_STUCK,)
+    assert not r.stuck["prox_b1"]  # its own zone's air (air_b) did not move
+    assert not r.stuck["exhaust"] and not r.stuck["inlet"]  # drive_proximal sensors only
+    assert result(2 * thr, trim).stuck["prox_a2"]  # a trim is still a steady airflow
+    assert result(2 * thr, other=0.0).stuck["prox_a2"]  # one zone-air sensor is enough
+    assert result(-2 * thr).stuck["prox_a2"]  # a falling zone air counts the same
 
 
 def test_frozen_readings_are_flagged_within_the_documented_time():

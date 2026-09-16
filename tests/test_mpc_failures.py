@@ -287,6 +287,10 @@ def test_horizon_extremes_still_satisfy_invariants(cfg, horizon):
         {"stuck_airflow_net": 1.5},
         {"stuck_air_oppose_c": 0.0},
         {"stuck_air_oppose_c": -0.3},
+        {"stuck_air_oppose_max_c": 0.3},  # == stuck_air_oppose_c
+        {"stuck_air_oppose_max_c": 0.1},  # < stuck_air_oppose_c
+        {"stuck_zone_air_dT_c": 0.0},
+        {"stuck_zone_air_dT_c": -1.5},
         {"median3": "false"},
         {"median3": 0},
     ],

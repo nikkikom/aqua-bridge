@@ -88,10 +88,20 @@ every number of rule 3 comes from :meth:`MpcConfig.stuck_params`:
   fans do not move the inlet temperature;
 * for a ``drive_proximal`` sensor that evidence does not count when every
   zone-air sensor of the zone with a plausible path over the window moved
-  *against* it by more than ``stuck_air_oppose_c`` (warmer air after more
-  airflow, cooler after less): the proximal reading mixes the zone air with
-  the drive-to-air difference, which airflow moves the other way, and the
-  two cancel on a healthy sensor;
+  *against* it by more than ``stuck_air_oppose_c`` and at most
+  ``stuck_air_oppose_max_c`` (warmer air after more airflow, cooler after
+  less): the proximal reading mixes the zone air with the drive-to-air
+  difference, which airflow moves the other way, and the two cancel on a
+  healthy sensor. The upper bound is the cancellation's own limit -- the
+  airflow move can shift the drive-to-air difference by a few degrees C at
+  most, so a larger air swing must show in the reading anyway;
+* for a ``drive_proximal`` sensor whose zone airflow stayed *inside*
+  ``stuck_airflow_net`` over the window (fans pinned at ``pwm_max``, a slow
+  trim: nothing to measure), a zone-air sensor of the zone whose plausible
+  net move exceeds ``stuck_zone_air_dT_c`` is the evidence instead: at
+  constant airflow the drive-to-air difference moves only with the bay's own
+  power, so an air move that much larger than the band the reading sits in
+  had to reach it;
 * the sibling evidence counts only the other sensors of the same zone and
   the same role, and for a ``drive_proximal`` sensor only those of its own
   bay: another bay's reading follows that bay's drive heat, which does not
@@ -418,31 +428,37 @@ def _stuck(
         return None
 
     # Frozen. Did anything that should have moved it actually move?
-    pwm_moves: list[tuple[float | None, float]]
-    if params.airflow:  # zoned: the net move of the zone's relative airflow
-        pwm_moves = [(_airflow_move(params.airflow, commands), cfg.stuck_airflow_net)]
-    else:  # legacy / no zone: the net PWM move of each channel on its own
-        # the PWM move must be old enough for the plant to have answered it
-        oldest_pwm = commands[0]
-        newest_pwm = commands[-1 - stuck_pwm_lag(len(commands))]
-        pwm_moves = [
-            (_pwm_move(oldest_pwm.get(ch), newest_pwm.get(ch)), cfg.stuck_pwm_net)
-            for ch in params.channels
-        ]
-    air_moves: list[float] | None = None
-    for move, threshold in pwm_moves:
-        if move is None or abs(move) <= threshold:
-            continue
-        if params.air and air_moves is None:
-            air_moves = []
+    cached: list[float] | None = None
+
+    def air_moves() -> list[float]:
+        """Plausible net moves of the zone-air sensors of ``params.air`` (computed once)."""
+        nonlocal cached
+        if cached is None:
+            cached = []
             for air in params.air:
                 air_move = _plausible_move(
                     cfg, [*series_of(air), filtered_now.get(air)], step_limit
                 )
                 if air_move is not None:
-                    air_moves.append(air_move)
-        if not _air_opposes(cfg, air_moves, move):
+                    cached.append(air_move)
+        return cached
+
+    if params.airflow:  # zoned: the net move of the zone's relative airflow
+        move = _airflow_move(params.airflow, commands)
+        if move is not None and abs(move) > cfg.stuck_airflow_net:
+            if not _air_opposes(cfg, air_moves() if params.air else None, move):
+                return first
+        elif move is not None and params.air and _zone_air_moved(cfg, air_moves()):
+            # Steady airflow: a zone-air move the reading had to follow (item 58).
             return first
+    else:  # legacy / no zone: the net PWM move of each channel on its own
+        # the PWM move must be old enough for the plant to have answered it
+        oldest_pwm = commands[0]
+        newest_pwm = commands[-1 - stuck_pwm_lag(len(commands))]
+        for ch in params.channels:
+            move = _pwm_move(oldest_pwm.get(ch), newest_pwm.get(ch))
+            if move is not None and abs(move) > cfg.stuck_pwm_net:
+                return first
     for other in params.siblings:
         if _plausible_net_move(cfg, [*series_of(other), filtered_now.get(other)], step_limit):
             return first
@@ -514,16 +530,39 @@ def _air_opposes(cfg: MpcConfig, air_moves: Sequence[float] | None, pwm_move: fl
     so a proximal reading falls; warmer air (a rising inlet) raises it by as
     much. When every zone-air sensor with a plausible path over the window
     (``air_moves``) moved against the airflow move -- warmer after more
-    airflow, cooler after less -- by more than ``stuck_air_oppose_c``, the two
-    effects can cancel on a healthy reading and the airflow move is no evidence
-    that it should have moved. No plausible zone-air path (a dropout, a Spike)
-    keeps the evidence, and so does a zone-air sensor that did not move (a
-    frozen one included): flagging more readily only raises cooling.
+    airflow, cooler after less -- by more than ``stuck_air_oppose_c`` and at most
+    ``stuck_air_oppose_max_c``, the two effects can cancel on a healthy reading
+    and the airflow move is no evidence that it should have moved. No plausible
+    zone-air path (a dropout, a Spike) keeps the evidence, and so does a zone-air
+    sensor that did not move (a frozen one included): flagging more readily only
+    raises cooling.
+
+    The upper bound is item 59: the cancellation is bounded by the drive-to-air
+    difference the airflow move can shift, a few degrees C at most, so a zone-air
+    swing larger than ``stuck_air_oppose_max_c`` cannot excuse a reading that did
+    not move at all -- without the bound an arbitrarily large air move kept a dead
+    sensor trusted for as long as it lasted.
     """
     if not air_moves:
         return False
     sign = 1.0 if pwm_move > 0 else -1.0
-    return all(sign * move > cfg.stuck_air_oppose_c for move in air_moves)
+    return all(
+        cfg.stuck_air_oppose_c < sign * move <= cfg.stuck_air_oppose_max_c for move in air_moves
+    )
+
+
+def _zone_air_moved(cfg: MpcConfig, air_moves: Sequence[float]) -> bool:
+    """Zone-air evidence at steady airflow for a frozen proximal reading (item 58).
+
+    A proximal reading is its zone's air plus the drive-to-air difference, and at
+    constant airflow that difference moves only with the bay's own drive power.
+    A zone-air move above ``stuck_zone_air_dT_c`` -- much larger than the band the
+    reading sits in -- therefore has to show in a healthy reading unless the bay's
+    own heat happened to cancel it over the whole window, so it is evidence in its
+    own right: a reading frozen while the fans are pinned at ``pwm_max`` or trimmed
+    slowly (no airflow move to measure) is caught by the zone air instead.
+    """
+    return any(abs(move) > cfg.stuck_zone_air_dT_c for move in air_moves)
 
 
 def _plausible_move(

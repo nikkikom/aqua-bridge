@@ -43,12 +43,27 @@ FREEZE_S = 300.0
 LOAD_S = 600.0
 
 
-def rich_run(cfg: MpcConfig, seed: int, ticks: int) -> DasRun:
-    """The example config on the ``rich`` simulator (drawn physics, activity bursts)."""
+def rich_run(
+    cfg: MpcConfig, seed: int, ticks: int, freeze: str | None = None, freeze_s: float = 0.0
+) -> DasRun:
+    """The example config on the ``rich`` simulator (drawn physics, activity bursts).
+
+    ``freeze`` names a sensor whose reading is held at its value from ``freeze_s`` on.
+    """
     plant = build_das_plant(
         topology_from_config(cfg), preset="rich", seed=seed, dt=cfg.dt, initial_pwm=0.5
     )
-    return run_das_closed_loop(plant, cfg, step, ticks)
+    held: dict[str, float | None] = {}
+
+    def hold(i: int, obs: PlantObservation) -> PlantObservation:
+        if obs.ts < freeze_s or obs.temps.get(freeze) is None:
+            return obs
+        temps = dict(obs.temps)
+        temps[freeze] = held.setdefault(freeze, temps[freeze])  # type: ignore[index]
+        return dataclasses.replace(obs, temps=temps)
+
+    hook = None if freeze is None else hold
+    return run_das_closed_loop(plant, cfg, step, ticks, observe_hook=hook)
 
 
 def assert_no_false_stuck(run: DasRun) -> None:
@@ -149,3 +164,114 @@ def test_frozen_proximal_reading_is_flagged_once_its_zone_airflow_moves(
     else:  # prox_b03 still covers bay b03
         assert in_fault == set()
     assert run.violations() == 0
+
+
+# ---------------------------------------------------------------------------
+# a frozen reading with no airflow move to measure (item 58)
+# ---------------------------------------------------------------------------
+
+#: Ambient step and when it comes, in the pinned-airflow scenario below.
+AMBIENT_C = 25.0
+AMBIENT_STEP_C = 6.0
+AMBIENT_S = 600.0
+
+
+def pinned_run(cfg: MpcConfig, sensor: str, ticks: int) -> DasRun:
+    """``basic`` physics, the fans held where they started by a rate limit that cannot move
+    them across a window, and the ambient stepped so the zone air rises on its own."""
+    topology = topology_from_config(cfg)
+    for entry in topology["sensors"].values():
+        entry["noise_sigma_c"] = SENSOR_TYPES[entry["type"]].noise_sigma_c
+    topology["inlet"] = {
+        "base_c": AMBIENT_C,
+        "schedule": [[AMBIENT_S, AMBIENT_C + AMBIENT_STEP_C]],
+    }
+    plant = build_das_plant(topology, preset="basic", dt=cfg.dt, initial_pwm=0.5)
+    held: dict[str, float | None] = {}
+
+    def freeze(i: int, obs: PlantObservation) -> PlantObservation:
+        if obs.ts < FREEZE_S:
+            return obs
+        temps = dict(obs.temps)
+        temps[sensor] = held.setdefault(sensor, temps[sensor])
+        return dataclasses.replace(obs, temps=temps)
+
+    return run_das_closed_loop(plant, cfg, step, ticks, observe_hook=freeze)
+
+
+def test_a_frozen_reading_is_flagged_by_its_zone_air_while_the_airflow_stays_put(
+    das_example_cfg,
+):
+    """Item 58: with the fans pinned there is no airflow move to be evidence, and before
+    this rule the reading stayed trusted for as long as the run lasted. The zone air rises
+    with the ambient at constant airflow, which a healthy proximal reading has to follow."""
+    cfg = dataclasses.replace(das_example_cfg, d_pwm_max=1e-4)
+    sensor = "prox_b01"
+    params = cfg.stuck_params(sensor)
+    window_s = params.ticks * cfg.dt
+    run = pinned_run(cfg, sensor, int((AMBIENT_S + 2 * window_s) / cfg.dt))
+    # the rate limit cannot move a channel by stuck_airflow_net inside one window, and the
+    # run really stays under it: no airflow evidence exists anywhere in it
+    assert params.ticks * cfg.d_pwm_max < cfg.stuck_airflow_net
+    pwm = [r.cmd.pwm for r in run.records]
+    span = max(
+        abs(pwm[i][ch] - pwm[i - params.ticks][ch])
+        for i in range(params.ticks, len(pwm))
+        for ch in cfg.channels
+    )
+    assert span < cfg.stuck_airflow_net, span
+    flags = [r.obs.ts for r in run.records if r.cmd.diagnostics["gate"]["stuck"][sensor]]
+    assert flags, f"{sensor} frozen from {FREEZE_S} s was never flagged"
+    assert flags[0] <= AMBIENT_S + 2 * window_s
+    others = sorted(
+        {
+            name
+            for r in run.records
+            for name, stuck in r.cmd.diagnostics["gate"]["stuck"].items()
+            if stuck and name != sensor
+        }
+    )
+    assert others == [], f"healthy sensors flagged Stuck: {others}"
+    assert {z for r in run.records for z in r.cmd.diagnostics["zones_in_fault"]} == {"z0"}
+    # and the flag is this rule's: with a threshold the zone air never reaches (the rule
+    # as it stood before item 58) the dead sensor stays trusted for the whole run
+    without = pinned_run(
+        dataclasses.replace(cfg, stuck_zone_air_dT_c=90.0), sensor, len(run.records)
+    )
+    assert not any(r.cmd.diagnostics["gate"]["stuck"][sensor] for r in without.records)
+
+
+#: Freeze point and length of the coverage runs below: 20 minutes into 2.5 hours.
+RICH_FREEZE_S = 1200.0
+RICH_TICKS = 1800
+#: Proximal readings the rules flag per seed, of the 17 the example config has. With the
+#: airflow move as the only zoned evidence (before item 58) the counts were 6, 7 and 4:
+#: seed 0's drawn inlet drifts, so every zone's air moves past stuck_zone_air_dT_c inside
+#: a window; seeds 1 and 2 have a flat ambient and gain nothing, which is the point of the
+#: rule -- it adds evidence where the fans give none and takes none away.
+RICH_FROZEN_FLAGGED = {0: 17, 1: 7, 2: 4}
+
+
+@pytest.mark.nightly
+@pytest.mark.parametrize("seed", sorted(RICH_FROZEN_FLAGGED))
+def test_frozen_proximal_readings_are_flagged_on_rich_runs(das_example_cfg, seed):
+    """Coverage of the Stuck evidence: freeze each proximal reading in turn 20 minutes into
+    a 2.5-hour run and count the ones the rules catch (PROJECT.md section 3, item 58). No
+    other sensor of those runs may be flagged: a fault must not be invented on a healthy
+    one, whatever the frozen sensor does to the zone it is in."""
+    cfg = das_example_cfg
+    proximals = [t for t in cfg.temps if cfg.sensors[t].role == "drive_proximal"]
+    flagged, false_flags = [], set()
+    for name in proximals:
+        run = rich_run(cfg, seed, RICH_TICKS, freeze=name, freeze_s=RICH_FREEZE_S)
+        stuck = {
+            other
+            for rec in run.records
+            for other, is_stuck in rec.cmd.diagnostics["gate"]["stuck"].items()
+            if is_stuck
+        }
+        if name in stuck:
+            flagged.append(name)
+        false_flags |= stuck - {name}
+    assert false_flags == set(), f"healthy sensors flagged Stuck: {sorted(false_flags)}"
+    assert len(flagged) >= RICH_FROZEN_FLAGGED[seed], (seed, flagged)
