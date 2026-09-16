@@ -62,6 +62,12 @@ coefficients alone (``Es`` is not a gain for ``rel_se``, and the excitation and 
 monitors still see ``phi_zG``), so turning the switch on cannot stop a model
 converging. ``GET /api/model`` reports ``e_per_channel`` per zone.
 
+After every window -- and when a stored memory is read -- the split is projected by
+:func:`split_scale`: scaled back by the largest factor in ``[0, 1]`` that leaves every
+``E_ch >= 0``. ``Q_zG = sum_ch E_ch phi_ch`` exactly, so a feasible split can never
+reverse a zone's modelled airflow, and a split at its prior (or any other feasible one)
+is left untouched.
+
 Parameter table (:data:`PARAMETERS`; keys as in :func:`parameter_keys`)
 ------------------------------------------------------------------------
 
@@ -347,6 +353,7 @@ __all__ = [
     "project",
     "restore",
     "sensor_lag_s",
+    "split_scale",
     "state_jacobian",
     "structure",
     "summary",
@@ -867,6 +874,47 @@ def dphi(u: float, deadband: float, exponent: float) -> float:
     return exponent * max(frac, 1e-6) ** (exponent - 1.0) / (1.0 - deadband)
 
 
+def split_scale(gr: Group, theta: Mapping[str, float]) -> float:
+    """The largest factor in ``[0, 1]`` on the group's split coefficients that leaves
+    every per-channel effectiveness (:func:`channel_effectiveness`) at or above zero.
+
+    A fan never cools less than nothing, and ``Q_zG = sum_ch E_ch phi_ch`` exactly
+    (module docstring, *Split*), so a split with every ``E_ch >= 0`` can never reverse
+    the zone's modelled airflow. Scaling the whole split toward the prior split is the
+    projection that keeps its direction and its total: at 1 nothing moves, at 0 the
+    group is back at the shared-``E`` model. 1 whenever the split is already feasible,
+    so the ordinary case costs one pass and changes nothing.
+    """
+    total = gr.prior
+    if not gr.splits or total <= 0:
+        return 1.0
+    e = float(theta[gr.key])
+    values = {ch: float(theta[key]) for key, ch in gr.splits}
+    net = sum(values.values())
+    alpha = 1.0
+    for ch, w in gr.weights.items():
+        share = w / total
+        base = e * share  # >= 0: E is bounded below by 0 and the weights are positive
+        delta = values.get(ch, 0.0) - share * net
+        if delta < 0.0 and base + delta < 0.0:
+            alpha = min(alpha, base / -delta)
+    return max(0.0, alpha)
+
+
+def _project_split(theta: list[float], zone: ZoneStruct, keys: tuple[str, ...]) -> None:
+    """Project one zone's air-block ``theta`` (in ``keys`` order, mutated in place) so no
+    group's split makes a channel's effectiveness negative (:func:`split_scale`)."""
+    if not any(gr.splits for gr in zone.groups):
+        return
+    index = {key: i for i, key in enumerate(keys)}
+    values = {key: float(theta[i]) for key, i in index.items()}
+    for gr in zone.groups:
+        alpha = split_scale(gr, values)
+        if alpha < 1.0:
+            for key, _ in gr.splits:
+                theta[index[key]] = values[key] * alpha
+
+
 def _group_phi(gr: Group, phis: Mapping[str, float]) -> float:
     return sum(w * phis[ch] for ch, w in gr.weights.items()) / gr.prior if gr.prior > 0 else 0.0
 
@@ -940,9 +988,12 @@ def _airflow(
                 dq[zi, col[ch]] += value * dphis[ch]
                 for other, w in gr.weights.items():
                     dq[zi, col[other]] -= value * w * dphis[other] / gr.prior
-        if split and q[zi] < 0.0:  # a split redistributes; it never reverses the airflow
+        # Q_zG = sum_ch E_ch phi_ch exactly, and the split is projected so no E_ch is
+        # negative (:func:`split_scale`), so this guard is unreachable by construction;
+        # it is kept for a theta handed in directly. The Jacobian stays as computed: a
+        # zero row would tell the optimiser that no fan in the zone moves any air.
+        if split and q[zi] < 0.0:
             q[zi] = 0.0
-            dq[zi] = 0.0
     qn = np.divide(q, total, out=np.zeros(n_z), where=total > _EPS)
     dqn = np.divide(dq, total[:, None], out=np.zeros_like(dq), where=total[:, None] > _EPS)
     return q, qn, dq, dqn
@@ -1599,6 +1650,9 @@ def _parse(memory: object, cfg: MpcConfig, st: Structure) -> dict[str, Any]:
             "prev": _parse_sample(raw.get("prev")),
             "air": _parse_block(raw["air"], zone_specs[z], _n_fan_air(zone)),
         }
+        # a stored split that would reverse a channel's airflow is projected, as a
+        # coefficient outside its bounds is clamped (:func:`split_scale`)
+        _project_split(out["zones"][z]["air"]["theta"], zone, zone_specs[z].keys)
     for b in st.bays:
         out["bays"][b] = _parse_block(memory["bays"][b], bay_specs[b], 1)
     return out
@@ -1925,6 +1979,9 @@ def update(
         residual, excited = _rls_window(
             block, zone_specs[z], x, acc["y"] / norm, fan, cfg, learn=zone_learn
         )
+        # a window may have moved a split past the point where a channel would cool
+        # less than nothing; the projection scales it back, total untouched
+        _project_split(block["theta"], zone, zone_specs[z].keys)
         conductance = q_flow + theta[f"leak.{z}"]
         conductance += sum(theta[f"kappa.{z}.{o}"] for o in zone.coupled)
         conductance += sum(theta[f"g0.{b}"] + theta[f"k.{b}"] * qn for b in occ)
@@ -2129,6 +2186,11 @@ def _convert_air_block(
     the other shared keys, and a key that is new starts at its prior with its initial
     variance and no covariance. The open window is dropped (its accumulator has the old
     width) and the relative standard errors come back on the next closing window.
+
+    Raises ``ValueError`` -- never anything else -- for a malformed block, so a corrupt
+    coefficient costs the thermal section alone and not the whole seed
+    (:func:`aqua_bridge.control.persist.apply_seed`); the bounds themselves are checked
+    afterwards, on the converted block.
     """
     if not isinstance(raw, Mapping):
         raise ValueError(f"{where}: not a mapping")
@@ -2148,6 +2210,10 @@ def _convert_air_block(
     p = np.diag(spec.var0).astype(float)
     shared = [(i, where_old[key]) for i, key in enumerate(spec.keys) if key in where_old]
     for i, j in shared:
+        # checked here, not only in _check_block_bounds afterwards: a null or a string in
+        # the file must raise ValueError like every other malformed field, never TypeError
+        if not _finite(theta_in[j]):
+            raise ValueError(f"{where}: {spec.keys[i]} is not a finite number")
         theta[i] = float(theta_in[j])
     rows = np.array([i for i, _ in shared], dtype=int)
     cols = np.array([j for _, j in shared], dtype=int)
