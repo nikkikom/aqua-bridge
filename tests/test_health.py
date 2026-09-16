@@ -32,7 +32,6 @@ def test_every_threshold_is_a_key_with_one_default() -> None:
         "enabled",
         "min_duty",
         "settle_s",
-        "settle_duty",
         "rpm_tolerance_frac",
         "rpm_fault_s",
         "rail_min_v",
@@ -170,20 +169,68 @@ def test_a_recovering_fan_clears_the_deviation() -> None:
     assert mon.check_channel("qd3", _reading(rpm=0.0), later)["problems"] == []
 
 
-def test_a_duty_change_restarts_the_settle_window_so_the_aquabus_lag_never_fires() -> None:
+def test_a_duty_step_widens_the_band_so_the_aquabus_lag_never_fires() -> None:
     """An aquabus fan's rpm in the aquaero's status report lags its own report by
     several seconds (PROJECT.md section 2): the step to 100 % must not read as drift."""
     settings = FanHealthConfig(settle_s=10.0, rpm_fault_s=5.0)
     mon = _monitor(settings, case120=FanModel(rpm_max=1100.0, deadband=0.1))
     mon.check_channel("qd3", _reading(duty=0.3, rpm=330.0), 0.0)
-    t = 20.0  # settled at 30 %
+    t = 20.0  # a full settle_s of readings at 30 %
     assert mon.check_channel("qd3", _reading(duty=0.3, rpm=330.0), t)["problems"] == []
-    # the duty steps to 100 % and the reported rpm has not caught up yet
+    # the duty steps to 100 % and the reported rpm has not caught up yet: the band
+    # still covers the 30 % the fan may still be turning at
     for dt in (0.0, 2.0, 4.0, 6.0, 8.0, 9.9):
         assert mon.check_channel("qd3", _reading(rpm=330.0), t + dt)["problems"] == []
-    # once settled, the same stale speed does become a deviation after rpm_fault_s
+    # once the band has narrowed to 100 %, the same stale speed is a deviation
     assert mon.check_channel("qd3", _reading(rpm=330.0), t + 11.0)["problems"] == []
     assert mon.check_channel("qd3", _reading(rpm=330.0), t + 17.0)["problems"]
+
+
+def test_a_duty_that_moves_every_tick_is_still_judged() -> None:
+    """A creeping duty must not defer every rule for ever: during a fallback ramp or an
+    ident experiment is exactly when a sagging rail or a stalled fan matters. The rail
+    does not depend on the duty at all; rpm is judged against the band the duty spanned.
+    """
+    mon = _monitor(case120=FanModel(rpm_max=1100.0, deadband=0.1))
+    duty = 0.3
+    rail: list[str] = []
+    rpm: list[str] = []
+    for step in range(200):  # 2 s ticks, the duty creeping 3 % a tick (past settle_duty)
+        duty = 0.3 + 0.03 * step
+        reading = _reading(duty=min(duty, 1.0), rpm=0.0, voltage_v=9.5)
+        for text in mon.check_channel("qd3", reading, 2.0 * step)["problems"]:
+            (rail if " V, outside " in text else rpm).append(text)
+    assert rail and "9.50 V, outside 11..13 V" in rail[0]
+    assert rpm and "0 rpm at" in rpm[0]
+
+
+def test_a_gap_in_the_readings_restarts_every_window() -> None:
+    """read() raised for ten minutes (an aquabus link loss, item 92) and the loop fed
+    blank observations: the deviation from before the outage is not evidence held
+    across it, and the first reading back is not judged against a stale band."""
+    settings = FanHealthConfig(settle_s=10.0, rail_fault_s=30.0, rpm_fault_s=30.0)
+    mon = _monitor(settings, case120=FanModel(rpm_max=1100.0, deadband=0.1))
+    sagging = {"qd3": _reading(voltage_v=10.8, rpm=0.0)}
+    for step in range(6):  # 10 s of a sagging rail and a dead fan: under both windows
+        assert mon.update(sagging, 2.0 * step)["problems"] == []
+    for step in range(300):  # ten minutes of ticks with no readings at all
+        mon.update({}, 12.0 + 2.0 * step)
+    back = mon.update(sagging, 620.0)
+    assert back["problems"] == []  # nothing is "held for 610 s"
+    assert mon.update(sagging, 640.0)["problems"] == []  # and the band is not settled
+    assert mon.update(sagging, 700.0)["problems"]  # only live evidence counts
+
+
+def test_a_channel_that_missed_one_tick_starts_its_windows_again() -> None:
+    """Per channel, not only per source: an aquabus slot that went away and came back
+    leaves the others' windows alone."""
+    mon = _monitor(FanHealthConfig(settle_s=0.0, rail_fault_s=20.0))
+    sagging = _reading(voltage_v=10.0)
+    for step in range(3):
+        mon.update({"qd3": sagging, "xt2": sagging}, 10.0 * step)
+    mon.update({"xt2": sagging}, 30.0)  # qd3 missing for one tick
+    problems = mon.update({"qd3": sagging, "xt2": sagging}, 40.0)["problems"]
+    assert [p.split(":")[0] for p in problems] == ["xt2"]
 
 
 def test_below_min_duty_no_rpm_rule_fires() -> None:
@@ -318,6 +365,39 @@ def test_on_tick_without_a_device_health_source_still_publishes_the_fan_verdicts
         "ok": True,
     }
     assert published[-1]["fans"]["qd3"]["power_w"] == pytest.approx(0.32)
+
+
+def test_a_single_controller_source_is_published_as_one_device() -> None:
+    """--source xt6 (the argparse default, and what deploy/install-pi.sh installs)
+    hands the loop a bare adapter, whose device_health() is that one controller's own
+    dict, not a {devices, problems} one. It must reach /api/state, the page and Home
+    Assistant in the same shape a composite does (PROJECT.md section 8 items 83, 91)."""
+    source = _FakeSource(
+        {
+            "label": "aquaero",
+            "device": "aquaero",
+            "serial": "12345-54321",
+            "firmware": 2104,
+            "stuck_channels": [],
+            "absent_channels": ["qd3"],
+            "not_pwm_channels": [],
+            "unconfigured_channels": [],
+            "flows": {"flow1": 0, "flow2": None},
+            "problems": ["aquaero: no device on aquabus behind qd3"],
+        }
+    )
+    mon = HealthMonitor(_cfg(), FanHealthConfig(), source=source)
+    payload = mon.update({}, 0.0)
+    assert [d["label"] for d in payload["devices"]] == ["aquaero"]
+    assert payload["devices"][0]["flows"] == {"flow1": 0, "flow2": None}
+    assert payload["devices"][0]["absent_channels"] == ["qd3"]
+    assert payload["problems"] == ["aquaero: no device on aquabus behind qd3"]
+    assert payload["ok"] is False
+
+
+def test_a_source_answering_with_neither_shape_contributes_nothing() -> None:
+    mon = HealthMonitor(_cfg(), FanHealthConfig(), source=_FakeSource({}))
+    assert mon.update({}, 0.0) == {"devices": [], "fans": {}, "problems": [], "ok": True}
 
 
 def test_disabled_still_publishes_device_health_but_runs_no_rule() -> None:

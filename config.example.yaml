@@ -157,15 +157,17 @@ xt6:
 fan_health:
   enabled: true              # false: the readings are still recorded and published, no rule runs
   min_duty: 0.25             # below this output duty no rpm or power rule fires (0..1)
-  settle_s: 15.0             # after a duty move, do not judge that channel for this long (>= 0):
-                             # an aquabus fan's rpm in the aquaero's report lags several seconds
-  settle_duty: 0.02          # how far the output duty must move to restart settle_s (0..1)
-  rpm_tolerance_frac: 0.25   # |rpm - curve| above this fraction of rpm_max is a deviation (>= 0)
+  settle_s: 15.0             # the rpm and power rules judge a reading against the band the duty
+                             # spanned over this long, and judge nothing until that much has
+                             # accumulated (>= 0): an aquabus fan's rpm in the aquaero's report
+                             # lags several seconds, so a step must not read as drift
+  rpm_tolerance_frac: 0.25   # a speed this fraction of rpm_max outside the band is a deviation
   rpm_fault_s: 120.0         # an rpm deviation held this long is reported, seconds (> 0)
   rail_min_v: 11.0           # 12 V rail window, volts; a block reading 0.0 V is not judged
   rail_max_v: 13.0           # (that is an empty aquabus slot, not a dead rail); max > min
-  rail_fault_s: 30.0         # a rail excursion held this long is reported, seconds (> 0)
-  power_tolerance_frac: 0.5  # measured power outside +- this fraction of expected is a deviation
+  rail_fault_s: 30.0         # a rail excursion held this long is reported, seconds (> 0); the
+                             # rail rule needs no duty, so it is judged while the duty moves too
+  power_tolerance_frac: 0.5  # measured power this fraction outside the band is a deviation
   power_exponent: 3.0        # expected power = power_w_at_max * phi(duty) ** this (fan law, > 0)
   power_min_w: 0.2           # expected power below this is not judged, watts (>= 0)
   power_fault_s: 120.0       # a power deviation held this long is reported, seconds (> 0)
