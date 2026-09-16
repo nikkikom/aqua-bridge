@@ -284,6 +284,24 @@ the first window of a guessed pair is exactly the window the re-check cannot
 judge yet, and a wrong map there would bias the drive estimate that sets the fan
 speed. A declared serial is used as before.
 
+Manual calibration (PROJECT.md section 8 item 23)
+-------------------------------------------------
+Where no SMART agent can reach the drives, an operator measures one with a handheld
+thermometer and posts it (``POST /api/calibrate {bay, drive_temp_c}``); it arrives
+here as ``obs.inputs["calibration"]``, ``{bay: {"temp_c", "ts"}}`` on the
+observation clock. It is **keyed by bay, not by serial** -- the operator names the
+bay, so there is nothing to associate -- and is otherwise the same sample as a
+SMART one: fresh within ``smart_max_age_s``, skipped on a tick whose proximal
+reading jumped or for an empty bay, dropped and counted when further than
+``smart_reject_c`` from ``T_d``, one RLS row otherwise, and a measurement of ``T_d``
+at ``R = SMART_R`` once the entry is accepted. It is presence evidence for the
+occupancy machine exactly like a SMART sample. Its entry lives in ``mem["manual"]``
+(never in ``mem["cal"]``, which the model store owns per serial), so a swapped
+drive's SMART calibration and the bay's manual one can never be confused. A bay's
+associated serial's calibration wins while it exists; the manual one is what a bay
+without SMART gets. Manual calibrations do **not** survive a restart (section 8 item
+104).
+
 Memory (plain JSON)::
 
     {"v": 1, "fp": <structure fingerprint>, "ts": last ts,
@@ -294,6 +312,7 @@ Memory (plain JSON)::
      "cal": {bay: {serial: {"th", "P", "n", "fresh", "rms2", "ts", "used"
                             [, "inflate", "confirm"]}}},
      "smart": {serial: {"ts", "t", "model", "hist"}},
+     "manual": {bay: {"ts": last sample ts, "cal": calibration entry | None}},
      "series": associate series | None, "scores": {serial: {bay: score}},
      "pending": {bay: [serial, evaluations]}, "next_assoc": ts,
      "count": {"smart_used", "smart_rejected"}}
@@ -645,6 +664,7 @@ def _fresh_memory(st: _Structure) -> dict[str, Any]:
         "bays": {b: _fresh_bay() for b in st.bays},
         "cal": {},
         "smart": {},
+        "manual": {},
         "series": None,
         "scores": {},
         "pending": {},
@@ -762,29 +782,7 @@ def _parse(memory: object, st: _Structure) -> dict[str, Any]:
         for serial, raw in dict(per_serial).items():
             if not isinstance(serial, str):
                 raise TypeError("serial")
-            th = [_num(v) for v in raw["th"]]
-            p = [[_num(v) for v in row] for row in raw["P"]]
-            n_all, fresh = raw["n"], raw["fresh"]
-            if len(th) != 2 or len(p) != 2 or any(len(row) != 2 for row in p):
-                raise ValueError("calibration shape")
-            for count in (n_all, fresh):
-                if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-                    raise ValueError("count")
-            entries[serial] = {
-                "th": th,
-                "P": p,
-                "n": n_all,
-                "fresh": fresh,
-                "rms2": _num(raw["rms2"]),
-                "ts": _opt_num(raw.get("ts")),
-                "used": bool(raw.get("used", False)),
-            }
-            if "inflate" in raw:
-                inflate, confirm = _num(raw["inflate"]), raw.get("confirm")
-                if inflate < 1.0 or isinstance(confirm, bool) or not isinstance(confirm, int):
-                    raise ValueError("inflate")
-                entries[serial]["inflate"] = inflate
-                entries[serial]["confirm"] = confirm
+            entries[serial] = _parse_calibration_entry(raw)
         out["cal"][b] = entries
     for serial, raw in dict(memory.get("smart") or {}).items():
         if not isinstance(serial, str):
@@ -802,6 +800,16 @@ def _parse(memory: object, st: _Structure) -> dict[str, Any]:
             "t": _num(raw["t"]),
             "model": model,
             "hist": hist,
+        }
+    for b, raw in dict(memory.get("manual") or {}).items():
+        if b not in st.bays:
+            raise KeyError(b)
+        if not isinstance(raw, Mapping):
+            raise TypeError("manual")
+        cal = raw.get("cal")
+        out["manual"][b] = {
+            "ts": _num(raw["ts"]),
+            "cal": None if cal is None else _parse_calibration_entry(cal),
         }
     series = memory.get("series")
     if series is not None and not isinstance(series, Mapping):
@@ -825,6 +833,62 @@ def _parse(memory: object, st: _Structure) -> dict[str, Any]:
             raise ValueError("counter")
         out["count"][key] = value
     return out
+
+
+def _parse_calibration_entry(raw: object) -> dict[str, Any]:
+    """One stored calibration entry (SMART or manual); raises on any malformed field."""
+    if not isinstance(raw, Mapping):
+        raise TypeError("calibration entry")
+    th = [_num(v) for v in raw["th"]]
+    p = [[_num(v) for v in row] for row in raw["P"]]
+    n_all, fresh = raw["n"], raw["fresh"]
+    if len(th) != 2 or len(p) != 2 or any(len(row) != 2 for row in p):
+        raise ValueError("calibration shape")
+    for count in (n_all, fresh):
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError("count")
+    entry: dict[str, Any] = {
+        "th": th,
+        "P": p,
+        "n": n_all,
+        "fresh": fresh,
+        "rms2": _num(raw["rms2"]),
+        "ts": _opt_num(raw.get("ts")),
+        "used": bool(raw.get("used", False)),
+    }
+    if "inflate" in raw:
+        inflate, confirm = _num(raw["inflate"]), raw.get("confirm")
+        if inflate < 1.0 or isinstance(confirm, bool) or not isinstance(confirm, int):
+            raise ValueError("inflate")
+        entry["inflate"] = inflate
+        entry["confirm"] = confirm
+    return entry
+
+
+def _parse_manual(
+    raw: object, bays: Mapping[str, Any], ts: float, max_age_s: float
+) -> dict[str, tuple[float, float]]:
+    """Fresh manual calibrations ``{bay: (sample_ts, temp_c)}`` (module docstring).
+
+    ``obs.inputs["calibration"]`` is ``{bay: {"temp_c", "ts"}}`` on the observation
+    clock. An unknown bay, a malformed entry, a sample time in the future or older
+    than ``max_age_s`` is ignored -- like SMART, a manual reading can only ever add
+    information and must never raise into ``step``.
+    """
+    out: dict[str, tuple[float, float]] = {}
+    if not isinstance(raw, Mapping):
+        return out
+    for bay, entry in raw.items():
+        if bay not in bays or not isinstance(entry, Mapping):
+            continue
+        temp, sample_ts = entry.get("temp_c"), entry.get("ts")
+        if not _finite(temp) or not _finite(sample_ts):
+            continue
+        age = float(ts) - float(sample_ts)  # type: ignore[arg-type]
+        if age < 0 or age > max_age_s:
+            continue
+        out[str(bay)] = (float(sample_ts), float(temp))  # type: ignore[arg-type]
+    return dict(sorted(out.items()))
 
 
 def _parse_smart(raw: object, max_age_s: float) -> dict[str, tuple[float, float, str | None]]:
@@ -895,6 +959,43 @@ def calibration_update(
             out["inflate"] = float(entry["inflate"])
             out["confirm"] = confirm
     return out, drive_residual
+
+
+def _absorb_sample(
+    mem: dict[str, Any],
+    spec: Any,
+    arrays: tuple[np.ndarray, np.ndarray],
+    idx: tuple[int, int],
+    entry: Mapping[str, Any],
+    sample: tuple[float, float],
+    ts: float,
+    max_age_cal: float,
+    *,
+    gate: bool,
+) -> dict[str, Any] | None:
+    """One drive-temperature sample into a bay's calibration RLS (module docstring).
+
+    The single rule both a SMART sample and a manual reading (item 23) follow:
+    ``None`` (counted as rejected) when the value is further than
+    ``smart_reject_c`` from ``T_d``; otherwise the updated entry. ``gate``
+    withholds ``used`` and the filter's drive-temperature measurement even
+    once the entry is accepted (SMART's correlation-pair re-check, item 18):
+    a wrong guess would otherwise feed another drive's reading straight into
+    this bay's estimate. A manual reading has no association to re-check, so
+    it always gates true.
+    """
+    x, p = arrays
+    i_d, i_s = idx
+    sample_ts, temp = sample
+    if abs(temp - x[i_d]) > spec.smart_reject_c:
+        mem["count"]["smart_rejected"] += 1
+        return None
+    mem["count"]["smart_used"] += 1
+    out, _ = calibration_update(entry, temp - x[0], x[i_s] - x[0], sample_ts)
+    if gate and _calibrated(out, float(ts), max_age_cal):
+        out["used"] = True
+        _scalar_update(x, p, i_d, temp, SMART_R)
+    return out
 
 
 def _calibrated(entry: Mapping[str, Any] | None, ts: float, max_age_s: float) -> bool:
@@ -1024,15 +1125,17 @@ def update(
     u: Mapping[str, float],
     ts: float,
     smart: object = None,
+    calibration: object = None,
 ) -> EstimatorUpdate:
     """One estimator tick (module docstring).
 
     ``temps`` holds the gate-trusted values of this tick only (a missing name is
     untrusted), ``u`` the command on the fans since the previous tick (``prev``),
-    ``ts`` the observation time and ``smart`` the raw ``PlantObservation.inputs
-    ["smart"]`` (``None`` or malformed: no SMART). Raises only on a numerical
-    failure of the filter (non-finite state), which ``step`` turns into an
-    estimator fault.
+    ``ts`` the observation time, ``smart`` the raw ``PlantObservation.inputs
+    ["smart"]`` (``None`` or malformed: no SMART) and ``calibration`` the raw
+    ``PlantObservation.inputs["calibration"]`` -- manual drive readings per bay
+    (``None`` or malformed: none, item 23). Raises only on a numerical failure of the
+    filter (non-finite state), which ``step`` turns into an estimator fault.
     """
     topo = cfg.topology
     spec = cfg.estimator
@@ -1046,6 +1149,7 @@ def update(
     h_occ = min(max(elapsed, 0.0), 3.0 * cfg.dt)
     max_age_cal = spec.calibration_max_age_days * _DAY_S
     fresh_smart = _parse_smart(smart, spec.smart_max_age_s)
+    fresh_manual = _parse_manual(calibration, topo.bays, float(ts), spec.smart_max_age_s)
 
     # -- SMART samples: which are new ----------------------------------------
     new_samples: dict[str, tuple[float, float]] = {}
@@ -1059,6 +1163,14 @@ def update(
             entry.update(ts=sample_ts, t=temp)
         entry["model"] = model if model is not None else entry.get("model")
         mem["smart"][serial] = entry
+
+    # -- manual calibrations: which are new (item 23) --------------------------
+    new_manual: dict[str, tuple[float, float]] = {}
+    for b, (sample_ts, temp) in fresh_manual.items():
+        known = mem["manual"].get(b)
+        if known is None or sample_ts > known["ts"] + NEW_SAMPLE_EPS_S:
+            new_manual[b] = (sample_ts, temp)
+            mem["manual"][b] = {"ts": sample_ts, "cal": None if known is None else known["cal"]}
 
     # -- association before the filter: declared wins, silent serials drop --------
     declared = {b: bay.serial for b, bay in topo.bays.items() if bay.serial}
@@ -1079,13 +1191,13 @@ def update(
         if serial is not None:
             assoc[b] = (serial, "correlation")
 
-    # -- calibration expiry -----------------------------------------------------
-    for entries in mem["cal"].values():
-        for entry in entries.values():
-            if entry["ts"] is not None and entry["fresh"] > 0:
-                age = float(ts) - entry["ts"]
-                if age > max_age_cal or age < 0:
-                    entry["fresh"] = 0
+    # -- calibration expiry (SMART and manual alike) ----------------------------
+    manual_entries = [known["cal"] for known in mem["manual"].values() if known["cal"]]
+    for entry in [e for entries in mem["cal"].values() for e in entries.values()] + manual_entries:
+        if entry["ts"] is not None and entry["fresh"] > 0:
+            age = float(ts) - entry["ts"]
+            if age > max_age_cal or age < 0:
+                entry["fresh"] = 0
 
     classes: dict[str, tuple[str, str]] = {}
     for b in topo.bays:
@@ -1096,20 +1208,38 @@ def update(
         classes[b] = _drive_class(cfg, b, model, may_relax=b in assoc and assoc[b][1] == "declared")
 
     def cal_entry(b: str) -> dict[str, Any] | None:
-        if b not in assoc:
-            return None
-        return mem["cal"].get(b, {}).get(assoc[b][0])
+        """The calibration in force for bay ``b``: its serial's, else the manual one."""
+        if b in assoc:
+            entry = mem["cal"].get(b, {}).get(assoc[b][0])
+            if entry is not None:
+                return entry
+        known = mem["manual"].get(b)
+        return None if known is None else known["cal"]
+
+    def cal_source(b: str) -> str | None:
+        if b in assoc and mem["cal"].get(b, {}).get(assoc[b][0]) is not None:
+            return "smart"
+        known = mem["manual"].get(b)
+        return "manual" if known is not None and known["cal"] is not None else None
 
     def verified(b: str) -> bool:
         """Whether the bay's association may calibrate it: declared, or re-checked once."""
         return b in assoc and (assoc[b][1] == "declared" or bool(mem["bays"][b]["ver"]))
 
     def sensor_map(b: str) -> tuple[float, float, str | None]:
-        """``(s, b, source)`` the filter uses for bay ``b``."""
+        """``(s, b, source)`` the filter uses for bay ``b``: the source is the
+        associated serial for a SMART map (re-verified here, item 18 -- an
+        unverified correlation guess is never used, however calibrated its
+        entry), ``"manual"`` for a handheld one (item 23, no association to
+        re-check), else ``None``."""
         entry = cal_entry(b)
-        if entry is not None and entry["used"] and verified(b):
+        if entry is None or not entry["used"]:
+            return CAL_PRIOR[0], CAL_PRIOR[1], None
+        if cal_source(b) == "smart":
+            if not verified(b):
+                return CAL_PRIOR[0], CAL_PRIOR[1], None
             return entry["th"][0], entry["th"][1], assoc[b][0]
-        return CAL_PRIOR[0], CAL_PRIOR[1], None
+        return entry["th"][0], entry["th"][1], "manual"
 
     prev_air = {z: float(zm["x"][0]) for z, zm in mem["zones"].items()}
     trusted_air = {z: [temps[t] for t in zone.air if t in temps] for z, zone in st.zones.items()}
@@ -1313,35 +1443,65 @@ def update(
         # under-count the time the air node has run unmeasured (it delays the fault).
         mem["zones"][z]["blind"] = 0.0 if trusted_air[z] else zm.get("blind", 0.0) + h_pred
 
+    def _bay_slot(b: str) -> tuple[tuple[np.ndarray, np.ndarray], tuple[int, int]] | None:
+        """``((x, P), (i_d, i_s))`` of bay ``b``, or ``None`` when it takes no sample."""
+        bay = st.bays[b]
+        if bay.zone not in arrays or mem["bays"][b]["occ"] == EMPTY:
+            return None
+        n = len(st.zones[bay.zone].bays)
+        return arrays[bay.zone], (2 + bay.index, 2 + n + bay.index)
+
     # -- SMART: reject, calibrate, measure ------------------------------------------
     for b, (serial, _source) in assoc.items():
         if serial not in new_samples or jumped.get(b):
             continue  # a jump this tick: the sample may describe the drive that just left
         smart_arrived[b] = True
-        bay = st.bays[b]
-        bm = mem["bays"][b]
-        if bay.zone not in arrays or bm["occ"] == EMPTY:
+        slot = _bay_slot(b)
+        if slot is None:
             continue
-        x, p = arrays[bay.zone]
-        n = len(st.zones[bay.zone].bays)
-        i_d, i_s = 2 + bay.index, 2 + n + bay.index
-        sample_ts, temp = new_samples[serial]
-        if abs(temp - x[i_d]) > spec.smart_reject_c:
-            mem["count"]["smart_rejected"] += 1
-            continue
-        mem["count"]["smart_used"] += 1
         per_bay = mem["cal"].setdefault(b, {})
-        entry = per_bay.get(serial) or _fresh_calibration(spec.sigma_uncalibrated_c)
-        entry, _ = calibration_update(entry, temp - x[0], x[i_s] - x[0], sample_ts)
-        if _calibrated(entry, float(ts), max_age_cal) and verified(b):
-            entry["used"] = True
-            _scalar_update(x, p, i_d, temp, SMART_R)
+        entry = _absorb_sample(
+            mem,
+            spec,
+            slot[0],
+            slot[1],
+            per_bay.get(serial) or _fresh_calibration(spec.sigma_uncalibrated_c),
+            new_samples[serial],
+            float(ts),
+            max_age_cal,
+            gate=verified(b),
+        )
+        if entry is None:
+            continue
         per_bay[serial] = entry
         if len(per_bay) > CAL_SERIALS_PER_BAY:
             oldest = min(
                 (s for s in per_bay if s != serial), key=lambda s: (per_bay[s]["ts"] or -1e300, s)
             )
             del per_bay[oldest]
+
+    # -- manual calibration: the same rule, keyed by bay (item 23) -------------------
+    for b, sample in new_manual.items():
+        if jumped.get(b):
+            continue
+        smart_arrived[b] = True  # a measured drive is presence evidence, like SMART
+        slot = _bay_slot(b)
+        if slot is None:
+            continue
+        known = mem["manual"][b]
+        entry = _absorb_sample(
+            mem,
+            spec,
+            slot[0],
+            slot[1],
+            known["cal"] or _fresh_calibration(spec.sigma_uncalibrated_c),
+            sample,
+            float(ts),
+            max_age_cal,
+            gate=True,
+        )
+        if entry is not None:
+            known["cal"] = entry
 
     # -- occupancy -----------------------------------------------------------------------
     evidence: dict[str, tuple[float, float]] = {}
@@ -1562,7 +1722,10 @@ def update(
         cls, cls_source = classes[b]
         serial, assoc_source = assoc.get(b, (None, None))
         entry = cal_entry(b)
-        calibrated = _calibrated(entry, float(ts), max_age_cal) and verified(b)
+        # A SMART map needs its association re-verified (item 18); a manual one
+        # (item 23) has no association to re-check.
+        map_verified = verified(b) if cal_source(b) == "smart" else True
+        calibrated = _calibrated(entry, float(ts), max_age_cal) and map_verified
         sigma_cal = (
             max(SIGMA_CAL_FLOOR_C, math.sqrt(float(entry["rms2"])))  # type: ignore[index]
             * float(entry.get("inflate", 1.0))  # type: ignore[union-attr]
@@ -1594,6 +1757,7 @@ def update(
             "association": assoc_source,
             "calibrated": calibrated,
             "sigma_cal_c": sigma_cal,
+            "calibration_source": cal_source(b),
             "calibration": None
             if entry is None
             else {
@@ -1607,7 +1771,7 @@ def update(
                 # The thermal identification anchors on this flag (``mpc._thermal_shadow``),
                 # so it says what the filter itself does: a pair the estimator refuses to
                 # use is not a map the RLS may convert a row with either (item 18).
-                "accepted_once": bool(entry["used"]) and verified(b),
+                "accepted_once": bool(entry["used"]) and map_verified,
             },
             "candidates": associate.top_candidates(mem["scores"], b) if b not in assoc else [],
         }
@@ -1655,6 +1819,7 @@ def update(
         "smart_used": mem["count"]["smart_used"],
         "smart_rejected": mem["count"]["smart_rejected"],
         "smart_fresh": list(fresh_smart),
+        "manual_fresh": list(fresh_manual),
         "unassigned": unassigned,
     }
     return EstimatorUpdate(
