@@ -448,6 +448,8 @@ def test_noise_diagnostics_use_the_tach_where_one_reports():
         "rpm": 750.0,
         "source": "tach",
         "rpm_cmd": pytest.approx(750.0),
+        "u0": cfg.fan_models[cfg.fans["xt1"].model].deadband,
+        "curve": "config",  # no fitted curve was given (item 107)
     }
     assert out["channels"]["qd4"]["source"] == "model"
     assert out["channels"]["qd3"]["source"] == "model"
