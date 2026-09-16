@@ -265,11 +265,11 @@ PRECONDITIONS = [
         "calibrating:b1",
         lambda cfg, f, t: (_patched(f, "bays", "b1", {"samples": 19}, "calibration"), t, False),
     ),
-    (
+    (  # k sigma counts once: T_hat itself, not T_hat + margin, against soft (item 53)
         "start_band:a1",
-        lambda cfg, f, t: (_patched(f, "estimates", "a1", 44.1, "t_c"), t, False),
+        lambda cfg, f, t: (_patched(f, "estimates", "a1", 46.1, "t_c"), t, False),
     ),
-    ("hard:a1", lambda cfg, f, t: (_patched(f, "estimates", "a1", 39.5, "hard_c"), t, False)),
+    ("hard:a1", lambda cfg, f, t: (_patched(f, "estimates", "a1", 37.5, "hard_c"), t, False)),
     (
         "abort_temp:b1",
         lambda cfg, f, t: (_patched(f, "estimates", "b1", 41.0, "limit_c"), t, False),
@@ -322,6 +322,51 @@ def test_bay_settle_s_blocks_a_recent_occupancy_change():
     )
 
 
+def _lost(facts, zone: str, *labels: str):
+    floor = dict(facts.sigma_floor)
+    floor[zone] = {"lost": list(labels), "phase": "hold", "held_s": 0.0, "floor": {}}
+    return dataclasses.replace(facts, sigma_floor=floor)
+
+
+def test_a_lost_sensor_group_blocks_the_start_under_sigma():
+    # item 72: under trust_rule sigma the zone is still trusted, so nothing else in the
+    # precondition list sees the loss.
+    cfg = ident_cfg()
+    facts = _lost(good_facts(cfg), "za", "bay:a1")
+    assert facts.zones["za"]["trusted"] is True
+    reasons = ident.check_start(
+        cfg, settled_tracker(cfg), facts, "group", "front", human_control=False
+    )
+    assert reasons == ["sensor_lost:za"]
+    # a zone the target does not serve does not block it
+    far = _lost(good_facts(cfg), "zc", "zone_air")
+    assert (
+        ident.check_start(cfg, settled_tracker(cfg), far, "group", "front", human_control=False)
+        == []
+    )
+    # an episode that has run its course (nothing lost any more) does not block it
+    closed = dataclasses.replace(
+        good_facts(cfg),
+        sigma_floor={"za": {"lost": [], "phase": "released", "held_s": 90.0, "floor": {}}},
+    )
+    assert (
+        ident.check_start(cfg, settled_tracker(cfg), closed, "group", "front", human_control=False)
+        == []
+    )
+
+
+def test_a_lost_sensor_group_aborts_a_running_experiment():
+    cfg = ident_cfg()
+    exp = _running(cfg)
+    facts = _lost(good_facts(cfg, ts=1001.0), "zb", "zone_air")
+    out = ident.advance(exp, cfg, facts)
+    assert (out.experiment, out.result, out.reason) == (
+        None,
+        ident.RESULT_ABORTED,
+        "sensor_lost:zb",
+    )
+
+
 def test_track_counts_trusted_fault_free_time_and_restarts_on_a_break():
     cfg = ident_cfg()
     tracker = ident.new_tracker()
@@ -339,6 +384,66 @@ def test_track_counts_trusted_fault_free_time_and_restarts_on_a_break():
     assert ident.track(tracker, cfg, no_zones)["ok_since"] == {}
 
 
+def _store_facts(cfg, ts: float, credit: dict[str, float]):
+    return dataclasses.replace(
+        good_facts(cfg, ts=ts), store={"ident_settle": {"ts": ts, "credit_s": credit}}
+    )
+
+
+def test_a_restored_settle_credit_is_spent_when_the_zone_is_trusted_again():
+    # item 20: the seconds a zone had settled before the shutdown, minus the outage,
+    # which persist.apply_seed has already subtracted.
+    cfg = ident_cfg()
+    tracker = ident.resume_tracker(ident.new_tracker(), _store_facts(cfg, 100.0, {"za": 400.0}))
+    assert tracker["resume"] == {"ts": 100.0, "credit_s": {"za": 400.0}}
+    blind = dataclasses.replace(good_facts(cfg, ts=100.0), zones={})
+    tracker = ident.track(tracker, cfg, blind)  # the zones are not trusted yet
+    assert tracker["ok_since"] == {} and tracker["resume"]["credit_s"] == {"za": 400.0}
+    tracker = ident.track(tracker, cfg, good_facts(cfg, ts=130.0))
+    assert tracker["ok_since"]["za"] == pytest.approx(130.0 - (400.0 - 30.0))
+    assert tracker["ok_since"]["zb"] == 130.0  # no credit for zb
+    assert "resume" not in tracker  # spent
+    settled = ident.check_start(
+        cfg, tracker, good_facts(cfg, ts=130.0), "group", "front", human_control=False
+    )
+    assert "settle:za" not in settled and "settle:zb" in settled
+
+
+def test_a_settle_credit_decays_while_the_zone_stays_untrusted_and_a_bad_clock_drops_it():
+    cfg = ident_cfg()
+    tracker = ident.resume_tracker(ident.new_tracker(), _store_facts(cfg, 0.0, {"za": 10.0}))
+    late = ident.track(tracker, cfg, good_facts(cfg, ts=100.0))
+    assert late["ok_since"]["za"] == 100.0  # the credit ran out on the way
+    back = ident.track(dict(tracker, ts=50.0), cfg, good_facts(cfg, ts=5.0))
+    assert "resume" not in back  # a clock running backwards drops everything
+
+
+def test_settle_snapshot_is_seconds_and_round_trips_through_the_store():
+    cfg = ident_cfg()
+    tracker = ident.new_tracker()
+    for ts in (10.0, 11.0, 12.0):
+        tracker = ident.track(tracker, cfg, good_facts(cfg, ts=ts))
+    assert ident.settle_snapshot(tracker) == {"za": 2.0, "zb": 2.0, "zc": 2.0}
+    assert ident.settle_snapshot({"ts": None, "ok_since": {"za": 1.0}}) == {}
+    assert ident.settle_snapshot("nonsense") == {}
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        5,
+        {"ts": 1.0},
+        {"ts": None, "credit_s": {"za": 1.0}},
+        {"ts": 1.0, "credit_s": {"za": -1.0}},
+    ],
+)
+def test_a_malformed_settle_credit_is_ignored(raw):
+    cfg = ident_cfg()
+    facts = dataclasses.replace(good_facts(cfg, ts=1.0), store={"ident_settle": raw})
+    assert "resume" not in ident.resume_tracker(ident.new_tracker(), facts)
+
+
 # ---------------------------------------------------------------------------
 # envelope and abort list (pure)
 # ---------------------------------------------------------------------------
@@ -349,9 +454,12 @@ def _running(cfg: MpcConfig, **kw: Any) -> dict[str, Any]:
 
 
 def test_envelope_aborts_at_the_threshold_not_before():
-    cfg = ident_cfg()
+    # soft 45.0 and k sigma is inside soft already (item 53); ident_max_over_c is kept
+    # under the absolute abort here (limit 50.0, margin 2.0) so the soft rule is the one
+    # that fires
+    cfg = ident_cfg(ident_max_over_c=1.0)
     exp = _running(cfg)
-    at = _patched(good_facts(cfg, ts=1001.0), "estimates", "a1", 45.0 + 3.0 - 2.0, "t_c")
+    at = _patched(good_facts(cfg, ts=1001.0), "estimates", "a1", 45.0 + 1.0, "t_c")
     assert ident.advance(exp, cfg, at).experiment is not None
     over = _patched(good_facts(cfg, ts=1001.0), "estimates", "a1", 46.01, "t_c")
     out = ident.advance(exp, cfg, over)
@@ -359,15 +467,40 @@ def test_envelope_aborts_at_the_threshold_not_before():
     assert (out.result, out.reason) == (ident.RESULT_ABORTED, "envelope:a1")
 
 
+def test_a_settled_enclosure_at_its_soft_target_starts_and_runs(sigma_c=2.0):
+    # PI-like DAS regulates T_hat to soft; before item 53 that state was refused by the
+    # start band and sat on the abort edge.
+    cfg = ident_cfg()
+    facts = _patched(good_facts(cfg), "estimates", "a1", 45.0, "t_c")
+    facts = _patched(facts, "estimates", "b1", 45.0, "t_c")
+    facts = _patched(facts, "estimates", "a2", 45.0, "t_c")
+    assert (
+        ident.check_start(cfg, settled_tracker(cfg), facts, "group", "front", human_control=False)
+        == []
+    )
+    exp = ident.start(cfg, facts, "group", "front")
+    ahead = dataclasses.replace(facts, ts=facts.ts + cfg.dt)
+    assert ident.advance(exp, cfg, ahead).experiment is not None
+
+
 def test_hard_and_absolute_limits_abort_even_inside_the_soft_envelope():
     cfg = ident_cfg()
     exp = _running(cfg)
-    facts = _patched(good_facts(cfg, ts=1001.0), "estimates", "b1", 39.9, "hard_c")
+    facts = _patched(good_facts(cfg, ts=1001.0), "estimates", "b1", 37.9, "hard_c")
     assert ident.advance(exp, cfg, facts).reason == "hard:b1"
     facts = _patched(good_facts(cfg, ts=1001.0), "estimates", "b1", 41.0, "limit_c")
     assert ident.advance(exp, cfg, facts).reason == "abort_temp:b1"
     facts = _patched(good_facts(cfg, ts=1001.0), "estimates", "b1", math.inf, "t_c")
     assert ident.advance(exp, cfg, facts).reason == "no_estimate:b1"
+
+
+def test_the_absolute_abort_margin_is_a_config_key():
+    # item 54: ident_abort_below_limit_c, the only rule measured against the raw limit
+    facts = _patched(good_facts(ident_cfg(), ts=1001.0), "estimates", "b1", 43.0, "limit_c")
+    wide = ident_cfg(ident_abort_below_limit_c=3.0)
+    assert ident.advance(_running(wide), wide, facts).reason == "abort_temp:b1"
+    narrow = ident_cfg(ident_abort_below_limit_c=1.0)
+    assert ident.advance(_running(narrow), narrow, facts).experiment is not None
 
 
 ABORTS = [
@@ -466,7 +599,8 @@ def test_random_tick_sequences_never_raise_and_keep_levels_in_bounds(seq, levels
             break
         exp = out.experiment
         assert item["mode"] in ("auto", "saturated")
-        assert item["t_c"] + 2.0 <= 45.0 + cfg.ident_max_over_c + TOL
+        assert item["t_c"] <= 45.0 + cfg.ident_max_over_c + TOL  # soft envelope
+        assert item["t_c"] + 2.0 < 50.0 - cfg.ident_abort_below_limit_c + TOL  # absolute
         json.dumps(exp, allow_nan=False)
         for u in exp["overrides"].values():
             assert cfg.pwm_min <= u <= cfg.pwm_max
@@ -791,6 +925,25 @@ def test_a_restart_never_resumes():
     fresh.ticks(2)
     with pytest.raises(IntentConflict, match="settle"):
         fresh.sup.submit(Ident("start", group="front"))
+
+
+def test_a_start_between_plan_tick_and_record_tick_does_not_shift_the_levels():
+    # item 20: the loop already holds the plan for the tick that follows, so that tick
+    # cannot carry the overrides and offset 0 belongs to the one after it.
+    plain = Rig(ident_cfg())
+    last = plain.ticks(8)[-1].obs.ts
+    plain.sup.submit(Ident("start", group="front"))
+    assert plain.sup.experiment["start_ts"] == pytest.approx(last + plain.cfg.dt)
+
+    shifted = Rig(ident_cfg())
+    last = shifted.ticks(8)[-1].obs.ts
+    plan = shifted.sup.plan_tick()  # the loop holds the plan for the next tick already
+    shifted.sup.submit(Ident("start", group="front"))
+    assert not plan.overrides  # that tick runs on the solver, it cannot carry the levels
+    assert shifted.sup.experiment["start_ts"] == pytest.approx(last + 2 * shifted.cfg.dt)
+    assert ident.levels_at(shifted.sup.experiment, 0.0) == {
+        k: shifted.sup.experiment[k] for k in ("phase", "level", "overrides")
+    }
 
 
 def test_status_is_json_and_counts_time():
