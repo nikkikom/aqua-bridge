@@ -97,6 +97,8 @@ mpc:
                              # start over from the prior (they described the drive that left)
   model_freeze: false    # true (needs topology): a zone that converges is entered frozen and
                          # stops adapting; a model the data contradicts still goes suspect and relearns
+  model_split_channels: false  # true (needs topology): a fan group carries a per-channel split
+                         # coefficient the single-channel experiment phases identify
   fan_curve_online: false      # true (needs topology): fit each fan model's PWM -> RPM curve online
   fan_curve_settle_s: 30.0     # a duty must hold this long before its (pwm, rpm) pair is sampled (>= 0)
   fan_curve_refit_s: 600.0     # shortest interval between two fits per fan model, seconds (> 0)

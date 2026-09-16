@@ -317,6 +317,15 @@ mpc:
   # DAS MPC accepts frozen exactly like converged. It freezes a good model only: a zone whose
   # prediction error later goes bad still becomes suspect and learns again.
   model_freeze: false
+  # Per-channel split of a fan group's effectiveness (control/thermal.py). Regulation moves a
+  # group's channels together, so only the group coefficient E.<zone>.<group> is identifiable
+  # from it; an experiment's single-channel phases move them apart. With model_split_channels
+  # each group of more than one channel in a zone carries one extra coefficient per channel
+  # beyond the first, whose regressor is exactly zero while the channels hold the same duty --
+  # so under regulation the model is the shared-E model term for term, and the split only
+  # redistributes the group's coefficient, never changes its total. GET /api/model then reports
+  # e_per_channel per zone. A store file written with the switch the other way is converted.
+  model_split_channels: false
   # Online PWM -> RPM curve per fan model (control/fancurve.py). With fan_curve_online the
   # daemon collects settled (pwm, rpm) pairs from every output that reports a speed, fits
   # rpm_max / deadband / exponent per fan model on the same grid tools/fit_fans.py uses, and
