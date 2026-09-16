@@ -721,6 +721,49 @@ def test_status_machine_transitions(small, monkeypatch):
     assert advance(high, 2.0, True, True) == "learning"  # prediction error above the maximum
 
 
+def test_model_freeze_enters_a_converged_zone_frozen(small, monkeypatch):
+    """PROJECT.md section 8 item 16: the switch freezes a converged model in place. A zone
+    that meets the ``converged`` rule is entered ``frozen``, which ``update`` never learns
+    on; a model the data later contradicts still goes ``suspect`` and learns again."""
+    c = dataclasses.replace(small, model_freeze=True)
+    d = thermal._derived(c)
+    params = thermal.model_params(c, st=d.st)
+    mem = thermal.fresh_memory(c)
+
+    def advance(zm, err, excited, converged):
+        monkeypatch.setattr(thermal, "_zone_blocks_converged", lambda *a, **k: converged)
+        thermal._advance_status(
+            zm, mem, c, d.st, "za", err, excited, params, d.zone_specs, d.bay_specs
+        )
+        return zm["status"]
+
+    zm = _zone_state(status="learning")
+    assert advance(zm, 0.05, True, True) == "frozen"
+    assert zm["conv"] == pytest.approx(max(0.1, thermal.PRED_ERR_FLOOR_C))
+    for _ in range(thermal.SUSPECT_WINDOWS):
+        status = advance(zm, 1.0, False, True)
+    assert status == "suspect"  # a frozen model the data contradicts is not held
+    assert advance(zm, 1.0, True, False) == "learning"
+    assert advance(zm, 0.05, True, True) == "frozen"
+
+
+def test_model_freeze_holds_a_frozen_zone_theta_while_its_windows_close(small):
+    """The freeze is the same hold a fresh store file gets: windows keep closing and
+    scoring the prediction error, ``theta`` never moves."""
+    c = dataclasses.replace(small, model_freeze=True)
+    mem = thermal.fresh_memory(c, status="frozen")
+    before = json.dumps({z: zm["air"]["theta"] for z, zm in mem["zones"].items()}, sort_keys=True)
+    zones_ok = set(c.zone_layout.zones)
+    for i in range(40):
+        ts = float(i) * c.dt
+        temps = _temps(c, ts, ripple=0.5)
+        u = dict.fromkeys(c.channels, 0.4 if i % 8 < 4 else 0.8)
+        mem = thermal.update(mem, c, temps=temps, u=u, ts=ts, zones_ok=zones_ok).memory
+    after = json.dumps({z: zm["air"]["theta"] for z, zm in mem["zones"].items()}, sort_keys=True)
+    assert after == before
+    assert any(zm["air"]["w"] > 0 for zm in mem["zones"].values())
+
+
 def test_overall_status_precedence():
     assert thermal.overall_status([]) == "prior"
     assert thermal.overall_status(["prior", "prior"]) == "prior"

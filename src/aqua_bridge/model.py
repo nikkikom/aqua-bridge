@@ -75,8 +75,9 @@ choice for cooling:
   defaults to :data:`ESTIMATOR_DEFAULTS` with ``topology``.
 * The ``model_*`` keys configure the zoned thermal model's online identification
   (``aqua_bridge.control.thermal``). They are flat keys like the plan's table.
-  ``model_shadow: true`` (learn and predict without acting) and
-  ``model_use_rpm: true`` need ``topology``; the numeric keys are validated
+  ``model_shadow: true`` (learn and predict without acting),
+  ``model_use_rpm: true`` and ``model_freeze: true`` need ``topology``; the
+  numeric keys are validated
   always and inert in legacy mode, and ``model_window_s >= 2 * dt`` is checked
   only with ``model_shadow`` so a default never invalidates a legacy config with
   a long ``dt``.
@@ -1663,11 +1664,13 @@ class MpcConfig:
       move over than it skips. Raising the fraction is strictly more conservative (less
       of the window carries evidence, so fewer readings are flagged Stuck).
     * ``model_shadow`` / ``model_window_s`` / ``model_lambda`` / ``model_p_trace_max`` /
-      ``model_converged_rel_se`` / ``model_max_pred_err_c`` / ``model_use_rpm`` -- the
+      ``model_converged_rel_se`` / ``model_max_pred_err_c`` / ``model_use_rpm`` /
+      ``model_freeze`` -- the
       zoned thermal model's online identification (``control/thermal.py``): shadow
       learning on/off, regression window, RLS forgetting per window, covariance trace
-      bound, relative standard error and prediction error for ``converged``, and fan
-      airflow from the tachometer instead of the PWM curve.
+      bound, relative standard error and prediction error for ``converged``, fan
+      airflow from the tachometer instead of the PWM curve, and whether a zone that
+      reaches ``converged`` is frozen there instead of adapting on.
     * ``model_reset_on_swap`` -- reset a bay's identified coefficients (``g0``, ``k``,
       ``q_s``) to the prior when the estimator reports a hot swap on it (default
       ``true``; they describe the drive that left). Validated always, inert in legacy
@@ -1762,6 +1765,7 @@ class MpcConfig:
     model_max_pred_err_c: float = 1.0
     model_use_rpm: bool = False
     model_reset_on_swap: bool = True
+    model_freeze: bool = False
     mpc_pred_dt_s: float = 30.0
     mpc_blocks: tuple[int, ...] = ()
     mpc_every_ticks: int = 1
@@ -1871,6 +1875,7 @@ class MpcConfig:
             "model_use_rpm",
             "model_accept_prior",
             "model_reset_on_swap",
+            "model_freeze",
         ):
             _cfg_bool(name, getattr(self, name))
         for name in (
@@ -2174,7 +2179,7 @@ class MpcConfig:
         DAS MPC keys (module docstring)."""
         self._validate_das_mpc_keys()
         self._validate_ident_keys()
-        for name in ("model_shadow", "model_use_rpm", "model_accept_prior"):
+        for name in ("model_shadow", "model_use_rpm", "model_accept_prior", "model_freeze"):
             if getattr(self, name) and self.topology is None:
                 raise ConfigError(f"mpc.{name}: true requires mpc.topology (DAS layout)")
         if self.model_window_s <= 0 or self.model_window_s > 600:

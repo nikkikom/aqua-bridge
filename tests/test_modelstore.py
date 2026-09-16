@@ -527,6 +527,21 @@ def test_the_stale_hold_restarts_when_convergence_or_the_error_fails():
     assert "hold" not in mem and thermal.model_status(mem) == "converged"
 
 
+def test_the_stale_hold_releases_with_model_freeze_on():
+    """PROJECT.md section 8 item 16: with ``model_freeze`` a re-confirmed zone enters
+    ``frozen``, not ``converged``. The stale hold must still count that as re-confirmed,
+    or a stale file with the switch on would never act again."""
+    cfg = shadow_cfg(model_reconfirm_s=100.0, model_freeze=True)
+    mem = thermal.fresh_memory(cfg, status="frozen")
+    for zm in mem["zones"].values():
+        zm["err2"] = 0.04
+    mem["hold"] = {"since": None}
+    thermal._advance_hold(mem, cfg, 10.0)
+    assert mem["hold"] == {"since": 10.0}
+    thermal._advance_hold(mem, cfg, 110.0)
+    assert "hold" not in mem and thermal.model_status(mem) == "frozen"
+
+
 def test_a_saved_pending_hold_stays_pending_in_a_fresh_file(tmp_path):
     cfg = shadow_cfg()
     memory = thermal.fresh_memory(cfg, status="converged")
