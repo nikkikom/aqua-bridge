@@ -25,6 +25,11 @@ hundred closed-form evaluations, no iterative solver, no scipy. The recorded
 ``pwm``/``rpm`` fields are the source's readback pair (the output duty and speed the
 aquaero or Quadro reports), not the controller's command -- both read by the same
 source at the same tick, unlike ``prev``/``cmd``, which are controller-side.
+
+The daemon can fit the same curve **online** (``mpc.fan_curve_online``,
+:mod:`aqua_bridge.control.fancurve`), over the same grid, and then reads it from the
+model store instead of ``fan_models``. This tool stays the way to fit from a recording
+and to see the residual before trusting a curve.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from aqua_bridge.config import AppConfig, ConfigError, load_config
+from aqua_bridge.control import fancurve
 from aqua_bridge.control.thermal import phi
 from aqua_bridge.model import MpcConfig
 from aqua_bridge.recorder import iter_records
@@ -47,9 +53,10 @@ __all__ = ["build_parser", "fit_fan_curves", "fit_one_model", "main"]
 _LOG = logging.getLogger("aqua_bridge.fit_fans")
 
 #: Grid resolution over the table's bounds (thermal.PARAMETERS: deadband [0, 0.5),
-#: exponent [0.5, 1.5]).
-DEADBAND_GRID = tuple(round(0.025 * i, 4) for i in range(19))  # 0.000 .. 0.450
-EXPONENT_GRID = tuple(round(0.5 + 0.05 * i, 4) for i in range(21))  # 0.50 .. 1.50
+#: exponent [0.5, 1.5]). One definition, shared with the online fit
+#: (:mod:`aqua_bridge.control.fancurve`), so both searches have the same shape.
+DEADBAND_GRID = fancurve.DEADBAND_GRID  # 0.000 .. 0.450
+EXPONENT_GRID = fancurve.EXPONENT_GRID  # 0.50 .. 1.50
 MIN_SAMPLES = 10
 
 

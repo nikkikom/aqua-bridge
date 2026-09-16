@@ -64,8 +64,10 @@ Parameter table (:data:`PARAMETERS`; keys as in :func:`parameter_keys`)
     beta.j       -     [0.02, 0.7]     0.3                             SMART calibration (estimator)
     b.j          degC  [-10, 10]       -2.1                            SMART calibration (estimator)
     tau_s.j      s     [3, 120]        sensors.<name>.tau_s, else type  prior only (config)
-    u0.m         -     [0, 0.5)        fan_models.<m>.deadband         config (offline fit later)
-    n.m          -     [0.5, 1.5]      fan_models.<m>.exponent         config (offline fit later)
+    u0.m         -     [0, 0.5)        fan_models.<m>.deadband         config, tools/fit_fans.py,
+    n.m          -     [0.5, 1.5]      fan_models.<m>.exponent         or the online fan-curve fit
+                                                                       (control/fancurve.py,
+                                                                       fan_curve_online)
 
 Linearisation and discretisation
 --------------------------------
@@ -272,6 +274,7 @@ from typing import Any
 
 import numpy as np
 
+from aqua_bridge.control import fancurve
 from aqua_bridge.control.estimates import PRIOR_BETA, PRIOR_OFFSET_C
 from aqua_bridge.control.estimator import (
     C_AIR_J_PER_K,
@@ -430,8 +433,12 @@ PARAMETERS: dict[str, ParamSpec] = {
     "tau_s": ParamSpec(
         "s", 3.0, 120.0, "sensors.<name>.tau_s, else 5 (thermistor) / 15 (DS18B20)", "config"
     ),
-    "u0": ParamSpec("-", 0.0, 0.5, "fan_models.<m>.deadband", "config (offline fit later)"),
-    "n": ParamSpec("-", 0.5, 1.5, "fan_models.<m>.exponent", "config (offline fit later)"),
+    "u0": ParamSpec(
+        "-", 0.0, 0.5, "fan_models.<m>.deadband", "config, tools/fit_fans.py, or fan_curve_online"
+    ),
+    "n": ParamSpec(
+        "-", 0.5, 1.5, "fan_models.<m>.exponent", "config, tools/fit_fans.py, or fan_curve_online"
+    ),
 }
 
 #: Random walk per window on the constants, scaled units.
@@ -703,11 +710,19 @@ def model_params(
     occupancy: Mapping[str, str] | None = None,
     maps: Mapping[str, tuple[float, float]] | None = None,
     classes: Mapping[str, str] | None = None,
+    curves: Mapping[str, Any] | None = None,
 ) -> ThermalParams:
     """:class:`ThermalParams` from identified ``theta`` (default: the prior), the
     estimator's occupancy (``empty`` freezes the drive; default: declared), sensor
     maps ``(s, b)`` (default, or not a finite slope in ``(0, 1]`` with a finite offset:
-    the prior map) and drive classes (default: declared)."""
+    the prior map) and drive classes (default: declared).
+
+    ``curves`` is ``solver_memory["fan_curves"]`` (the model store's section, produced
+    online by :mod:`aqua_bridge.control.fancurve` with ``fan_curve_online``): a usable
+    entry replaces its fan model's ``deadband`` / ``exponent`` for the ``u0.<m>`` /
+    ``n.<m>`` rows of the table. ``None``, a missing entry or a malformed one keeps the
+    configured curve (:func:`aqua_bridge.control.fancurve.curve_pair`).
+    """
     d = _derived(cfg)
     st = d.st if st is None else st
     base = dict(d.prior) if st is d.st else prior_theta(cfg, st)
@@ -727,8 +742,15 @@ def model_params(
         s[bay], b[bay] = _sensor_map((maps or {}).get(bay))
     fan = {}
     for ch in st.channels:
-        model = cfg.fan_models[cfg.fans[ch].model]
-        fan[ch] = (float(model.deadband), float(model.exponent))
+        name = cfg.fans[ch].model
+        model = cfg.fan_models[name]
+        if curves is None:
+            fan[ch] = (float(model.deadband), float(model.exponent))
+        else:
+            deadband, exponent, _ = fancurve.curve_pair(
+                curves.get(name), model.deadband, model.exponent, model.rpm_max
+            )
+            fan[ch] = (deadband, exponent)
     return ThermalParams(
         theta=base,
         c_air=dict.fromkeys(st.zones, C_AIR_J_PER_K),
@@ -1486,18 +1508,28 @@ def _mean(values: list[float]) -> float | None:
 
 
 def _channel_phi(
-    cfg: MpcConfig, st: Structure, u: Mapping[str, float], rpm: Mapping[str, Any] | None
+    cfg: MpcConfig,
+    st: Structure,
+    u: Mapping[str, float],
+    rpm: Mapping[str, Any] | None,
+    curves: Mapping[str, Any] | None = None,
 ) -> dict[str, float]:
     out: dict[str, float] = {}
     for ch in st.channels:
-        model = cfg.fan_models[cfg.fans[ch].model]
+        name = cfg.fans[ch].model
+        model = cfg.fan_models[name]
+        deadband, exponent, rpm_max = float(model.deadband), float(model.exponent), model.rpm_max
+        if curves is not None:
+            deadband, exponent, rpm_max = fancurve.curve_pair(
+                curves.get(name), deadband, exponent, rpm_max
+            )
         reading = None if rpm is None else rpm.get(ch)
         if cfg.model_use_rpm and _finite(reading):
-            frac = min(1.0, max(0.0, float(reading) / model.rpm_max))  # type: ignore[arg-type]
-            out[ch] = frac**model.exponent if frac > 0 else 0.0
+            frac = min(1.0, max(0.0, float(reading) / rpm_max))  # type: ignore[arg-type]
+            out[ch] = frac**exponent if frac > 0 else 0.0
         else:
             value = u.get(ch)
-            out[ch] = phi(float(value), model.deadband, model.exponent) if _finite(value) else 0.0  # type: ignore[arg-type]
+            out[ch] = phi(float(value), deadband, exponent) if _finite(value) else 0.0  # type: ignore[arg-type]
     return out
 
 
@@ -1575,6 +1607,7 @@ def update(
     classes: Mapping[str, str] | None = None,
     rpm: Mapping[str, Any] | None = None,
     reset_bays: Collection[str] = (),
+    curves: Mapping[str, Any] | None = None,
     learn: bool = True,
 ) -> ThermalUpdate:
     """One identification tick (module docstring).
@@ -1610,8 +1643,10 @@ def update(
 
     # current snapshot of the coefficients (for H_z and Qn)
     theta = theta_from_memory(cfg, mem, st=st)
-    params = model_params(cfg, theta, st=st, occupancy=occupancy, maps=maps, classes=classes)
-    phis = _channel_phi(cfg, st, u, rpm)
+    params = model_params(
+        cfg, theta, st=st, occupancy=occupancy, maps=maps, classes=classes, curves=curves
+    )
+    phis = _channel_phi(cfg, st, u, rpm, curves)
     closed: dict[str, list[tuple[float, bool]]] = {}  # zone -> (residual degC, excited)
 
     for z, zone in st.zones.items():

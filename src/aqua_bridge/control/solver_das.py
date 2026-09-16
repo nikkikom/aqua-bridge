@@ -1712,7 +1712,14 @@ class DasMpcSolver:
                 occupancy[b] = occ
             if isinstance(info.get("class"), str) and info["class"] in cfg.drive_classes:
                 classes[b] = info["class"]
-        params = thermal.model_params(cfg, model.theta, st=st, occupancy=occupancy, classes=classes)
+        params = thermal.model_params(
+            cfg,
+            model.theta,
+            st=st,
+            occupancy=occupancy,
+            classes=classes,
+            curves=req.fan_curves,
+        )
         x_drive: dict[str, float] = {}
         q: dict[str, float] = {}
         for b, bs in st.bays.items():

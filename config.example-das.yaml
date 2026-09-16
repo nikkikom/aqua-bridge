@@ -317,6 +317,17 @@ mpc:
   # DAS MPC accepts frozen exactly like converged. It freezes a good model only: a zone whose
   # prediction error later goes bad still becomes suspect and learns again.
   model_freeze: false
+  # Online PWM -> RPM curve per fan model (control/fancurve.py). With fan_curve_online the
+  # daemon collects settled (pwm, rpm) pairs from every output that reports a speed, fits
+  # rpm_max / deadband / exponent per fan model on the same grid tools/fit_fans.py uses, and
+  # -- once a fit passes -- the thermal model and the DAS MPC plan on the fitted curve instead
+  # of the fan_models entry. The accepted curves live in the model store's fan_curves section,
+  # so they survive a restart; the configured curve stays in force until a fit is accepted, and
+  # a tach-less output is covered by the curve of its own fan model.
+  fan_curve_online: false
+  fan_curve_settle_s: 30.0     # a duty must hold this long before its (pwm, rpm) pair is sampled
+  fan_curve_refit_s: 600.0     # shortest interval between two fits per fan model, seconds
+  fan_curve_max_rmse_frac: 0.05  # a fit whose relative RMSE is worse than this is refused
   # DAS MPC (solver: mpc; control/solver_das.py): least modelled fan noise with every drive
   # under its targets, planned over horizon steps of mpc_pred_dt_s. It acts only on a model
   # that passes its validity gate (a converged thermal model, finite bounded parameters,

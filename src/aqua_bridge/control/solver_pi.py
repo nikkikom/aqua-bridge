@@ -127,6 +127,11 @@ class SolverRequest:
     * ``thermal``        -- the thermal model's memory as the previous tick left it
       (``solver_memory["thermal"]``, read-only; ``None`` without ``model_shadow`` or in
       legacy mode), for the DAS MPC's model (``aqua_bridge.control.solver_das``)
+    * ``fan_curves``     -- the PWM -> RPM curve in force per fan model
+      (``solver_memory["fan_curves"]``: the model store's section, produced online with
+      ``mpc.fan_curve_online``), read by the DAS MPC's prediction in place of
+      ``fan_models``' ``deadband`` / ``exponent``; ``None`` without the switch and in
+      legacy mode, which keeps the configured curve
     * ``plant``          -- the estimator's state for the DAS MPC's prediction, every
       zone including those in fault: ``{"zones": {zone: {"t_air", "d_air", "t_in"}},
       "bays": {bay: {"occupancy", "class", "since_ts", "t"?, "q_w"?, "sigma"?, "sigma_cal"?}}}``
@@ -143,6 +148,7 @@ class SolverRequest:
     occupancy: dict[str, str] = field(default_factory=dict)
     ts: float | None = None
     thermal: Mapping[str, Any] | None = None
+    fan_curves: Mapping[str, Any] | None = None
     plant: dict[str, Any] = field(default_factory=dict)
 
 

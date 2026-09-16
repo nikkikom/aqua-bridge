@@ -810,6 +810,9 @@ skipped in legacy mode):
    - 3b. DAS: sensor confirmation (below).
    - 3b'. DAS, first tick only: apply a model loaded from the store
      (`control/persist.py`).
+   - 3b''. DAS with `fan_curve_online`: the online fan-curve fit
+     (`control/fancurve.py`), whose accepted curves go into the store's
+     `fan_curves` section and into the model's airflow.
    - 3c. DAS: the estimator (`control/estimator.py`), every tick, fault
      ticks included, on this tick's gate-trusted, confirmed temperatures;
      an estimator error faults the zones with constrained bays (reason
@@ -1699,7 +1702,7 @@ when `z` is only coupled to such a zone, else not at all. Channels of one
 | `c_drive.<bay>` | J/K | [50, 2000] | `tau_d_s·(g0 + k)` | prior only |
 | `beta.<bay>`, `b.<bay>` | –, °C | [0.02, 0.7], [−10, 10] | 0.3, −2.1 | **SMART calibration only** (estimator) |
 | `tau_s.<bay>` | s | [3, 120] | `sensors.<name>.tau_s`, else by sensor type | prior only (config) |
-| `u0.<model>`, `n.<model>` | – | [0, 0.5), [0.5, 1.5] | `fan_models` deadband / exponent | config; `tools/fit_fans.py` offline |
+| `u0.<model>`, `n.<model>` | – | [0, 0.5), [0.5, 1.5] | `fan_models` deadband / exponent | config; `tools/fit_fans.py` offline; the online fit with `fan_curve_online` (item 14) |
 
 **Identifiability:** each proximal sensor has its own two-coefficient
 regression, so more sensors never hurt; `E` has fewer unknowns than there
@@ -1742,6 +1745,21 @@ placement: per-bay `k` within 7–16 % and in-zone `E` within 9–22 %
 across 8 seeds. `E` is sensitive to relative zone-air/inlet sensor
 offsets (0.1 °C moves it 15–35 %, because a zone's air rise is only
 0.3–1 °C); `k` is not.
+
+**Fan curve** (`control/fancurve.py`, `fan_curve_online`). `u0.<m>` and
+`n.<m>` are config by default. With the switch on, the daemon collects
+settled `(pwm, rpm)` pairs — a duty that has held for
+`fan_curve_settle_s` — into PWM bins per fan model (bounded: a full bin
+becomes an exponential mean, so a replaced fan is followed), refits every
+`fan_curve_refit_s` over the same `deadband × exponent` grid
+`tools/fit_fans.py` searches with `rpm_max` in closed form, and accepts a
+fit only with enough bins over enough PWM span and a relative RMSE at
+most `fan_curve_max_rmse_frac`. Until then the configured curve stays.
+Accepted curves live in the store's `fan_curves` section, so they survive
+a restart, and the identification above and the MPC's prediction both use
+them. One fit per fan model, not per channel: a tach-less output is
+covered by the curve of its own model. The estimator's airflow and the
+noise model's `u0` still read the config (§8 item 96).
 
 **Objective and constraints** (`control/solver_das.py`, `control/noise.py`).
 Noise per output from the fan laws: `r = clip((u − u0)/(1 − u0), 0, 1)`,
@@ -2030,7 +2048,8 @@ converges only with them.
   `tests/test_gate.py`, `tests/test_zones.py`, `tests/test_mpc_*.py`
 - DAS core: `control/estimates.py`, `control/estimator.py`,
   `control/associate.py`, `control/thermal.py`, `control/noise.py`,
-  `control/solver_das.py`, `control/persist.py`, `control/ident.py`,
+  `control/solver_das.py`, `control/persist.py`, `control/fancurve.py`,
+  `control/ident.py`,
   `sim/das.py`, and their suites (§4.10)
 - **DAS truth simulator** (`aqua_bridge.sim.das`), the reference plant for
   every DAS milestone and deliberately richer than any controller model:
@@ -2796,6 +2815,7 @@ aqua-bridge/
     control/noise.py         # fan noise index and cost surrogate
     control/solver_das.py    # DAS MPC: active-piece SQP, bands, validity gate, bumpless
     control/persist.py       # apply a stored model to the controller memory (pure)
+    control/fancurve.py      # online PWM -> RPM fit per fan model (pure)
     control/ident.py         # identification experiments on fan groups (pure)
     control/intents.py       # intents, ControlSurface, ControlSnapshot, payloads
     control/supervisor.py    # control mode, overrides, setpoints, limits, bays, presets, experiments, compose
@@ -2822,7 +2842,7 @@ aqua-bridge/
     aquacomputer_probe.py    # read-only: attached controllers, status and control reports (Pi)
     smart_agent.py           # SMART over MQTT (PC)
     fit_model.py             # offline zoned model fit from recordings (--store-out: a store file)
-    fit_fans.py              # PWM -> RPM curve per fan model
+    fit_fans.py              # PWM -> RPM curve per fan model (offline; online: fan_curve_online)
     replay.py                # replay recordings through the thermal model
     http_user.py             # create or update an HTTPS API user (Pi, as root)
     ha_check.py              # read-only MQTT / Home Assistant check against the broker (Pi)
@@ -2858,6 +2878,7 @@ aqua-bridge/
     test_noise_regression.py # MPC noise vs the quietest uniform curve (sweeps: nightly)
     test_bench_budget.py     # relative step budget; absolute budget on the Pi
     test_modelstore.py
+    test_fancurve.py         # online PWM -> RPM fit, its acceptance rules and the store
     test_ident_experiment.py
     test_recorder.py
     test_tools_fit_replay.py
@@ -3565,7 +3586,8 @@ tests carry the `nightly` marker.
 | `tests/test_model_fallback_sim.py` | the validity gate against the truth plant: the observed drive rate (ramp, restarts, memory), a sound model returns within `model_return_dwell_s + 2 · mpc_every_ticks · dt` and does not re-enter (§8 items 10, 64), a model with wrong bay gains is caught and held, a healthy enclosure never reaches the fallback (§8 item 65), a fouling jump to 0.15× airflow does (§8 item 66) and the same run without it does not, every drive within its limit and bumpless switches; the plain drift holds the same step | PR: 1 return, 1 broken model, 3 healthy seeds and the fouling pair per preset; nightly: zones × seeds on `basic` and `rich`, more broken gains, 8 healthy seeds and 4 fouling seeds per preset |
 | `tests/test_noise_regression.py` | calibrated DAS MPC noise ≤ 0.8× the quietest uniform curve at equal or better worst true margin (measured 0.31–0.48×); uncalibrated bound 2.0 (0.30–0.69×); rich preset bound 1.35 (up to 1.30×); MPC vs PI-DAS reported, not asserted (PI-DAS has not settled within the window on several seeds) | PR: 2 seeds; nightly: 8-seed sweeps |
 | `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× (named constant) the legacy MPC p99, the 75th percentile of several interleaved, warm-up-discarded repeats (§8 item 6); `bench_step.py` runs both DAS solvers; absolute p99 ≤ `mpc.budget_ms` only on `armv6l`; the Zero W fallback of §8 item 73 (`budget_ms` 1000 with `budget_alarm_ms` 1250 loads, `budget_ms` 1000 alone is rejected, `mpc_every_ticks: 3` solves a third of the ticks and a solve tick is the expensive one) | PR / Pi |
-| `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise | PR |
+| `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise; a `tools/fit_model.py` report in the store's place loads as a model, ages like a store file and drops a model of another structure (item 15) | PR |
+| `tests/test_fancurve.py` | the online PWM → RPM fit (item 14): a swept fan is identified per fan model, one duty or a ramping command is never enough, a noisy tachometer is refused by the residual, the bins stay bounded and follow a fan that changes, a malformed memory or a changed channel → fan-model map starts over, `curve_pair` falls back to the config for anything unusable, `step` publishes the fit into the store's `fan_curves` and reports it, and the curve round-trips through `model.json` | PR |
 | `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes; legacy refuses | PR |
 | `tests/test_sim_das.py` | the truth plant: energy balance through transients and hot swap, steady state, more airflow never warms anything, dead band and exponent, quantisation per sensor type, lags, SMART cadence, determinism per seed | PR |
 
@@ -4245,9 +4267,27 @@ Owner decision (2026-09-16):
     runs), and one swap produced exactly one reset.
 13. Split a fan group's shared `E` into per-channel coefficients from the
     single-channel experiment phases.
-14. Online fan-curve fit: `fan_curves` in the store is validated but
-    nothing produces or reads it; `tools/fit_fans.py` output is copied into
-    `fan_models` by hand.
+14. **Done** (2026-09-16): `mpc.fan_curve_online` (needs `topology`,
+    default `false`) fits each fan model's PWM → RPM curve online
+    (`control/fancurve.py`, pure). Settled pairs only: a channel
+    contributes `(pwm, rpm)` once its commanded duty has held for
+    `fan_curve_settle_s`, into PWM bins per fan model that cap at a bounded
+    exponential mean, so a worn or replaced fan is followed rather than
+    outvoted by a year of old samples. Every `fan_curve_refit_s` the same
+    grid over `deadband × exponent` `tools/fit_fans.py` uses (one
+    definition, shared) is searched with `rpm_max` in closed form, and the
+    fit is accepted only with enough bins over enough PWM span and a
+    relative RMSE at most `fan_curve_max_rmse_frac` — otherwise the
+    previous curve, or the configured one, stays, so a stalled or lying
+    tachometer widens the residual instead of moving the model. Accepted
+    curves go into `solver_memory["fan_curves"]`, the store section that
+    was written and validated but never produced or read, and from there
+    the thermal model's identification and the DAS MPC's prediction plan on
+    them (`u0.<m>`, `n.<m>` in §3's table) and they survive a restart.
+    `GET /api/state`'s `fan_curves` diagnostics name the curve in force per
+    model and where it came from (`fit` | `store` | `config`). Still on the
+    configured curve, deliberately: the estimator's own airflow and the
+    noise model's `u0` (item 96).
 15. **Done** (2026-09-16): `modelstore.document_from_fit` converts a
     `tools/fit_model.py` report (`kind: aqua_bridge.thermal_model`, whose
     `memory` is already the thermal memory) into a store document: the fit
@@ -5182,6 +5222,19 @@ Owner decision (2026-09-16):
     does not mark), so one rule decides. It changes which ticks the model
     checks skip, so it moves the DAS goldens: it belongs with item 99's
     decision, not before it.
+
+96. The online fan-curve fit (item 14) feeds the thermal model and the DAS
+    MPC's prediction, but two other users of `fan_models` still read the
+    config: the estimator's own airflow (`control/estimator.py`, its `Q_z`
+    and `Qn_z`) and the noise model's `u0` (`control/noise.py`). With
+    `fan_curve_online` and a curve far from the configured one the
+    estimator and the model then disagree about the airflow, which the
+    MPC's prediction-error guard sees and answers with a fallback — safe,
+    but louder than it needs to be. Thread the curve into both (the
+    estimator's `_airflow` takes `cfg` only today) and decide whether the
+    noise index should move with a fitted curve at all: it changes the
+    objective, not the safety, and `noise_db_at_max` is a datasheet figure
+    the fit says nothing about.
 
 ### 8.3 Open — needs the DAS hardware
 
