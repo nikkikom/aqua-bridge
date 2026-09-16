@@ -293,7 +293,7 @@ def test_build_health_monitor_is_none_when_disabled_with_a_source_that_has_none(
     from aqua_bridge.control.supervisor import Supervisor
 
     app = load_config(example_config_path)
-    app = dataclasses.replace(app, fan_health={"enabled": False})
+    app = dataclasses.replace(app, fan_health={"enabled": False}, host_health={"enabled": False})
     sup = Supervisor(app.mpc)
     sim_src, _sink, _release = main_mod.build_io(app, "sim")
     assert main_mod.build_health_monitor(app, sup, sim_src) is None

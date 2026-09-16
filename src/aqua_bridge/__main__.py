@@ -32,13 +32,15 @@ CI; ``--sim-plant`` picks it:
   legacy config without ``sim.das``, or missing names: :class:`ConfigError`,
   exit code 2.
 
-Fan and device health (:mod:`aqua_bridge.health`, PROJECT.md section 8 items 79
-and 83) is one more ``on_tick`` observer: it reads the tick's per-output
-readings from ``PlantObservation.inputs["fans"]`` and the source's own
-``device_health()``, applies the ``fan_health:`` drift rules and hands the result
-to ``Supervisor.set_device_health``, whence ``/api/state``, ``/api/health``, the
-MQTT state blob and the page show it. A bad ``fan_health:`` key is a
-:class:`ConfigError` (exit 2).
+Fan, device and host health (:mod:`aqua_bridge.health`, PROJECT.md section 8
+items 79, 83 and 97) is one more ``on_tick`` observer: it reads the tick's
+per-output readings from ``PlantObservation.inputs["fans"]``, the source's own
+``device_health()`` and the board's own metrics (a
+:class:`~aqua_bridge.hostinfo.CachedHostInfo` on ``host.interval_s``), applies
+the ``fan_health:`` and ``host_health:`` rules and hands the result to
+``Supervisor.set_device_health``, whence ``/api/state``, ``/api/health``, the
+MQTT state blob and the page show it. A bad ``fan_health:`` or ``host_health:``
+key is a :class:`ConfigError` (exit 2).
 
 HTTP (``http.enabled``) and MQTT (``mqtt.enabled``) run next to the loop via
 :mod:`aqua_bridge.publishers.runtime`; both attach to the supervisor's
@@ -77,7 +79,8 @@ from typing import Any
 from aqua_bridge.config import AppConfig, ConfigError, load_config
 from aqua_bridge.control.loop import Loop, Sink, Source
 from aqua_bridge.control.supervisor import Supervisor
-from aqua_bridge.health import FanHealthConfig, HealthMonitor
+from aqua_bridge.health import FanHealthConfig, HealthMonitor, HostHealthConfig
+from aqua_bridge.hostinfo import CachedHostInfo
 from aqua_bridge.model import MpcCommand, MpcConfig, MpcState, PlantObservation
 from aqua_bridge.modelstore import ModelPersister, initial_state, store_path
 from aqua_bridge.modelstore import load as load_model_store
@@ -335,17 +338,31 @@ def build_recorder(app: AppConfig, cfg: MpcConfig, cli_path: str | None) -> Reco
 def build_health_monitor(
     app: AppConfig, supervisor: Supervisor, source: Any
 ) -> HealthMonitor | None:
-    """The fan-health / device-health observer for ``on_tick``, or ``None`` when
-    ``fan_health.enabled`` is false and the source has no device health of its own
-    to publish either (PROJECT.md section 8 items 79 and 83).
+    """The fan-, device- and host-health observer for ``on_tick``, or ``None`` when
+    both ``fan_health.enabled`` and ``host_health.enabled`` are false and the source
+    has no device health of its own to publish either (PROJECT.md section 8 items
+    79, 83 and 97).
 
-    ``fan_health:`` is validated here, so a bad threshold is a startup
-    :class:`ConfigError` (exit 2) rather than a rule that silently never fires.
+    ``fan_health:`` and ``host_health:`` are validated here, so a bad threshold is a
+    startup :class:`ConfigError` (exit 2) rather than a rule that silently never
+    fires. The board's own metrics come from a
+    :class:`~aqua_bridge.hostinfo.CachedHostInfo` of this monitor's own, refreshed
+    at most every ``host.interval_s`` seconds like the HTTP app's and the MQTT
+    service's -- a tick shorter than that costs no ``/proc`` or ``/sys`` read.
     """
     settings = FanHealthConfig.from_section(app.section("fan_health"))
-    if not settings.enabled and not hasattr(source, "device_health"):
+    host_settings = HostHealthConfig.from_section(app.section("host_health"))
+    if not settings.enabled and not host_settings.enabled and not hasattr(source, "device_health"):
         return None
-    return HealthMonitor(app.mpc, settings, source=source, publish=supervisor.set_device_health)
+    interval_s = float(app.section("host").get("interval_s", 5.0))
+    return HealthMonitor(
+        app.mpc,
+        settings,
+        source=source,
+        publish=supervisor.set_device_health,
+        host_settings=host_settings,
+        hostinfo=CachedHostInfo(interval_s=interval_s).get,
+    )
 
 
 def build_model_store(
@@ -456,7 +473,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         app = load_config(args.config)
         cfg = app.mpc
         recorder = build_recorder(app, cfg, args.record)
-        FanHealthConfig.from_section(app.section("fan_health"))  # fail before anything opens
+        # fail before anything opens
+        FanHealthConfig.from_section(app.section("fan_health"))
+        HostHealthConfig.from_section(app.section("host_health"))
         initial, persister = build_model_store(
             cfg,
             args.model_store,
