@@ -103,7 +103,10 @@ Forbidden PWM bands (``fans.<ch>.forbidden_pwm``) are non-convex and handled aft
 solve (:func:`snap_bands`): a demand inside a band snaps to its upper edge (more
 cooling); a channel held at a band leaves it upward when the demand exceeds the upper
 edge and downward only when the demand drops below ``lo - noise.band_hysteresis``.
-Deterministic, and ``step`` rate-limits the result as usual.
+Deterministic, and ``step`` rate-limits the result as usual. The snap is on the
+demand: the bumpless-transfer offset added after it (a channel that has just
+become free is held at exactly its previous output, then a decaying bias) is not
+band-checked, so such a channel can sit inside a band until the bias decays.
 
 ``mpc_every_ticks``: the SQP and the validity gate run on every n-th call (and at once
 when the fixed channels, the trusted zones, the constrained bays or the active model

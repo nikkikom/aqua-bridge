@@ -1031,9 +1031,14 @@ class FanSpec:
 
     ``group`` names the air path the channel shares with other channels
     (``None``: its own). ``forbidden_pwm`` (a resonance band to skip) is
-    honoured by the DAS solver (:func:`~aqua_bridge.control.solver_das.snap_bands`,
-    both the PI-like form and the MPC), not by the legacy solvers -- there is
-    no ``fans:`` section, hence no ``forbidden_pwm``, without ``topology``.
+    honoured by the DAS solver's post-solve band snap
+    (:func:`~aqua_bridge.control.solver_das.snap_bands`, on both the PI-like
+    and the MPC path), not by the legacy solvers -- there is no ``fans:``
+    section, hence no ``forbidden_pwm``, without ``topology``. The snap is on
+    the demand, not on the last word: a channel that has just become free
+    starts from the bumpless-transfer offset (exactly its previous output on
+    that tick, then a decaying bias), which can sit inside a band until it
+    decays away.
     """
 
     model: str
