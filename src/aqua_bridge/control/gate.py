@@ -118,7 +118,7 @@ string -> list of ``{"t": temps, "p": pwm}``) with the dense sample counter
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -193,6 +193,8 @@ class GateResult:
 
 
 def _finite_or_none(value: object) -> float | None:
+    if type(value) is float:  # the common case, checked first (hot path, item 73)
+        return value if math.isfinite(value) else None
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -243,11 +245,28 @@ def _window_series(window: Sequence[WindowSample], name: str) -> list[float | No
     return [_finite_or_none(w.raw_temps.get(name)) for w in window]
 
 
+def _filtered_stream(raw: Iterable[float | None], median3: bool) -> Iterator[float | None]:
+    """:func:`_filtered_series` one value at a time, so a caller can stop early (item 73).
+
+    ``median3_of(raw[: i + 1])`` reads only the last three entries of that
+    prefix and its length, so carrying the last three raw values is enough.
+    """
+    if not median3:
+        yield from raw
+        return
+    tail: list[float | None] = []
+    for value in raw:
+        tail.append(value)
+        if len(tail) > 3:
+            del tail[0]
+        yield median3_of(tail)
+
+
 def _filtered_series(raw: Sequence[float | None], median3: bool) -> list[float | None]:
     """Filtered value at every index of ``raw`` (each uses only its own past)."""
     if not median3:
         return list(raw)
-    return [median3_of(raw[: i + 1]) for i in range(len(raw))]
+    return list(_filtered_stream(raw, True))
 
 
 def push_window(
@@ -321,6 +340,25 @@ def advance_slow_windows(
     return out
 
 
+def _band_reference(
+    series: Iterator[float | None], current: float | None, eps_c: float
+) -> float | None:
+    """The oldest sample when it and every later one, ``current`` included, are within ``eps_c``.
+
+    ``None`` as soon as a sample is unusable or outside the band, so a moving
+    sensor costs a couple of samples instead of a whole window (item 73).
+    """
+    first = next(series, None)
+    if first is None:
+        return None
+    for v in series:
+        if v is None or abs(v - first) > eps_c:
+            return None
+    if current is None or abs(current - first) > eps_c:
+        return None
+    return first
+
+
 def _stuck(
     name: str,
     cfg: MpcConfig,
@@ -336,7 +374,7 @@ def _stuck(
     ``cfg.stuck_params(name)`` (legacy mode: the global rule).
     """
     params = cfg.stuck_params(name)
-    series_of: Callable[[str], list[float | None]]
+    stream_of: Callable[[str], Iterator[float | None]]
     if params.decimate == 1:
         n = params.ticks
         if len(window) < n:
@@ -346,8 +384,10 @@ def _stuck(
         if current is None:
             return None
 
-        def series_of(other: str) -> list[float | None]:
-            return _filtered_series(_window_series(recent, other), cfg.median3)
+        def stream_of(other: str) -> Iterator[float | None]:
+            return _filtered_stream(
+                (_finite_or_none(w.raw_temps.get(other)) for w in recent), cfg.median3
+            )
 
         commands: list[Mapping[str, Any]] = [w.cmd_pwm for w in recent]
         step_limit = cfg.dT_max_tick
@@ -361,19 +401,20 @@ def _stuck(
         if current is None:
             return None
 
-        def series_of(other: str) -> list[float | None]:
-            return [_finite_or_none(sample["t"].get(other)) for sample in slow]
+        def stream_of(other: str) -> Iterator[float | None]:
+            return (_finite_or_none(sample["t"].get(other)) for sample in slow)
 
         commands = [sample["p"] for sample in slow]
         step_limit = cfg.dT_max_tick * params.decimate
 
-    series = series_of(name)
-    first = series[0]
+    def series_of(other: str) -> list[float | None]:
+        return list(stream_of(other))
+
+    # Band check first and lazily: a sensor that is moving leaves the band within a few
+    # samples, and then nothing else of its window has to be sanitised at all (item 73).
+    first = _band_reference(stream_of(name), current, params.eps_c)
     if first is None:
         return None
-    for v in [*series[1:], current]:
-        if v is None or abs(v - first) > params.eps_c:
-            return None
 
     # Frozen. Did anything that should have moved it actually move?
     pwm_moves: list[tuple[float | None, float]]
@@ -552,11 +593,14 @@ def evaluate_gate(
 
     filtered: dict[str, float | None] = {}
     prev_ref: dict[str, float | None] = {}
+    # Both the median3 filter and the previous filtered value read at most the newest
+    # three window samples, so the whole window never has to be sanitised here (item 73).
+    tail = window[-3:] if cfg.median3 else window[-1:]
     for name in cfg.temps:
-        history = _window_series(window, name)
+        history = _window_series(tail, name)
         filtered[name] = filtered_value(history, raw[name], cfg.median3)
         if history:
-            prev_ref[name] = _filtered_series(history, cfg.median3)[-1]
+            prev_ref[name] = median3_of(history) if cfg.median3 else history[-1]
         elif last_raw_temps is not None:
             prev_ref[name] = _finite_or_none(last_raw_temps.get(name))
         else:
