@@ -143,6 +143,83 @@ def test_a_fresh_daemon_reads_unknown_but_is_not_a_problem(cfg: MpcConfig) -> No
     assert any("'obs' is null" in w for w in report.warnings)
 
 
+def _das_healthy_state(cfg: MpcConfig, blob: dict[str, Any]) -> dict[str, Any]:
+    """The state blob of a healthy DAS tick with the shipped ``model_shadow: false``:
+    obs and cmd filled, ``cmd.diagnostics`` carrying zones, bays, estimates and noise
+    but **no** ``thermal`` branch -- control/mpc.py only adds that one when the shadow
+    model runs (config.example-das.yaml ships it off)."""
+    bays = cfg.topology.bays
+    return {
+        **blob,
+        "obs": {
+            "temps": dict.fromkeys(cfg.temps, 30.0),
+            "rpm": dict.fromkeys(cfg.channels, 900.0),
+        },
+        "cmd": {
+            "pwm": dict.fromkeys(cfg.channels, 0.4),
+            "diagnostics": {
+                "zones": {zone: {"policy": "quiet"} for zone in cfg.topology.zones},
+                "bays": {bay: {"occupancy": "occupied"} for bay in bays},
+                "estimates": {
+                    bay: {"t_c": 38.0, "limit_margin_c": 6.0, "sigma_c": 1.0} for bay in bays
+                },
+                "noise": {"db_index": 31.0},
+            },
+        },
+    }
+
+
+def test_a_das_without_the_shadow_model_is_not_unknown_anywhere(
+    das_example_cfg: MpcConfig,
+) -> None:
+    """`model_shadow: false` is what config.example-das.yaml ships, so a healthy live
+    DAS has no `cmd.diagnostics.thermal` at all -- and `model_status`'s template says to
+    read `off` then (section 7). A path with a `| default(...)` behind it is not an
+    entity reading 'unknown', or `--strict` would fail a healthy deployment."""
+    messages = _daemon_messages(das_example_cfg, Supervisor(das_example_cfg))
+    topic = f"{NODE_ID}/state"
+    published = json.loads(next(m for m in messages if m.topic == topic).payload)
+    blob = _das_healthy_state(das_example_cfg, published)
+    patched = [
+        *_without(messages, topic),
+        ha.Message(topic, json.dumps(blob).encode(), True),
+        ha.Message(
+            f"{NODE_ID}/in/smart/S1",
+            json.dumps(
+                {"serial": "S1", "model": "m", "temp_c": 38.0, "ts_wall": 1_700_000_000.0}
+            ).encode(),
+            True,
+        ),
+    ]
+    report = _report(das_example_cfg, patched)
+    assert report.problems == []
+    assert report.warnings == []
+    text = report.text()
+    assert "cmd.diagnostics.thermal.status -> off" in text
+    assert "read their template's | default(...)" in text
+
+
+def test_a_template_default_is_read_instead_of_a_missing_path(das_example_cfg: MpcConfig) -> None:
+    """The unit behind it: `entity_state` renders the Jinja fallback rather than calling
+    the entity unknown, and says which path it fell back for."""
+    entities = ha.expected_entities(
+        das_example_cfg,
+        node_id=NODE_ID,
+        discovery_prefix=PREFIX,
+        control_mode=ControlMode.AUTO,
+    )
+    model_status = next(e for e in entities.values() if e.object_id == "model_status")
+    blob = {"cmd": {"diagnostics": {"noise": {"db_index": 30.0}}}}
+    assert ha.entity_state(model_status, blob) == (
+        "off",
+        [],
+        ["cmd.diagnostics.thermal.status -> off"],
+    )
+    rpm = next(e for e in entities.values() if e.object_id.startswith("rpm_"))
+    shown, missing, defaulted = ha.entity_state(rpm, blob)
+    assert shown == "unknown" and missing and defaulted == []
+
+
 def test_the_das_entity_set_is_complete(das_example_cfg: MpcConfig) -> None:
     sup = Supervisor(das_example_cfg)
     messages = _daemon_messages(das_example_cfg, sup)
@@ -250,6 +327,30 @@ def test_template_paths_reads_every_path_a_template_names() -> None:
     assert ha.template_paths("nothing here") == []
 
 
+def test_template_path_defaults_reads_the_jinja_fallback_of_each_path() -> None:
+    assert ha.template_path_defaults("{{ value_json.obs.temps.coolant }}") == {
+        "obs.temps.coolant": None
+    }
+    assert ha.template_path_defaults(
+        "{{ value_json.cmd.diagnostics.thermal.status | default('off') }}"
+    ) == {"cmd.diagnostics.thermal.status": "'off'"}
+    assert ha.template_path_defaults(
+        "{{ 'OFF' if value_json.cmd.diagnostics.bays.b01.occupancy "
+        "| default('unknown') == 'empty' else 'ON' }}"
+    ) == {"cmd.diagnostics.bays.b01.occupancy": "'unknown'"}
+    assert ha.template_path_defaults("{{ value_json.device_health | default({}) | tojson }}") == {
+        "device_health": "{}"
+    }
+
+
+@pytest.mark.parametrize(
+    ("literal", "shown"),
+    [("'off'", "off"), ('"off"', "off"), ("None", "None"), ("true", "true"), ("{}", "{}")],
+)
+def test_render_default(literal: str, shown: str) -> None:
+    assert ha.render_default(literal) == shown
+
+
 @pytest.mark.parametrize(
     ("path", "expected"),
     [
@@ -351,6 +452,30 @@ def test_the_credentials_are_never_printed(cfg: MpcConfig, config_file: Path) ->
     assert "username set" in text
 
 
+def test_the_broker_host_is_printed_only_under_verbose(cfg: MpcConfig, config_file: Path) -> None:
+    """The output of this tool is what gets pasted into an issue or a commit message;
+    the owner's broker host lives in private.md, not in the repo."""
+    broker = _Broker(_daemon_messages(cfg, _ticked_supervisor(cfg)))
+    _code, quiet = _run(config_file, broker, "--wait", "0")
+    assert "broker.example" not in quiet
+    assert str(config_file) in quiet
+    _code, loud = _run(config_file, broker, "--wait", "0", "--verbose")
+    assert "broker.example:1883" in loud
+
+
+@pytest.mark.parametrize("flag", ["--wait", "--send-wait"])
+def test_a_negative_wait_is_an_argument_error_not_a_broker_error(
+    config_file: Path, flag: str
+) -> None:
+    """time.sleep(-1) would otherwise surface through main's broad except as
+    'broker: ValueError', blaming the broker for a typo."""
+    broker = _Broker([])
+    with pytest.raises(SystemExit) as excinfo:
+        _run(config_file, broker, flag, "-1")
+    assert excinfo.value.code == 2
+    assert broker.collected == []
+
+
 def test_it_never_uses_the_daemons_client_id(cfg: MpcConfig, config_file: Path) -> None:
     """A second session with the daemon's client id would make the broker drop the
     daemon -- a read-only check must never do that."""
@@ -429,6 +554,29 @@ def test_send_refuses_a_topic_the_daemon_does_not_subscribe_to(
     assert "is not a command topic" in text
 
 
+@pytest.mark.parametrize(
+    ("given", "caution"),
+    [
+        ("cmd/mode", "changes the daemon's control mode until it is changed back"),
+        ("cmd/pwm/radiator", "overrides the solver on that channel until it is cleared"),
+        ("cmd/setpoint/coolant", None),
+    ],
+)
+def test_send_says_what_outlives_the_message(
+    cfg: MpcConfig, config_file: Path, given: str, caution: str | None
+) -> None:
+    """`cmd/mode manual` and a PWM override stand until something clears them: a
+    declined or forgotten `cmd/mode auto` leaves the daemon out of auto, so the
+    confirmation has to say so before the typed yes, not after."""
+    broker = _Broker(_daemon_messages(cfg, _ticked_supervisor(cfg)))
+    _code, text = _run(config_file, broker, "--wait", "0", "--send", given, "manual", stdin="no\n")
+    if caution is None:
+        assert "NOTE:" not in text
+    else:
+        assert caution in text
+        assert "clears every override" in text
+
+
 def test_the_subscriptions_are_the_daemons_topics_only(cfg: MpcConfig, config_file: Path) -> None:
     broker = _Broker(_daemon_messages(cfg, _ticked_supervisor(cfg)))
     _run(config_file, broker, "--wait", "0")
@@ -436,6 +584,184 @@ def test_the_subscriptions_are_the_daemons_topics_only(cfg: MpcConfig, config_fi
         f"{PREFIX}/+/{NODE_ID}/+/config",
         f"{NODE_ID}/#",
     ]
+
+
+# --- the broker layer, with a fake paho client -------------------------------------------
+
+
+class _PahoMsg:
+    def __init__(self, topic: str, payload: bytes, retain: bool) -> None:
+        self.topic = topic
+        self.payload = payload
+        self.retain = retain
+
+
+def _fake_paho(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    connack: Any = 0,
+    suback: Any = 1,
+    answer_connect: bool = True,
+    deliver: tuple[tuple[str, bytes, bool], ...] = (),
+) -> list[Any]:
+    """Replace ``paho.mqtt.client.Client`` with one that answers CONNECT and SUBSCRIBE
+    the way a broker would. Returns the list of clients the tool built."""
+    mqtt = pytest.importorskip("paho.mqtt.client")
+    made: list[Any] = []
+
+    class _Info:
+        def __init__(self) -> None:
+            self.waited: list[float | None] = []
+
+        def wait_for_publish(self, timeout: float | None = None) -> None:
+            self.waited.append(timeout)
+
+    class _Client:
+        def __init__(self, *_args: Any, **kwargs: Any) -> None:
+            self.client_id = kwargs.get("client_id")
+            self.endpoint: tuple[Any, ...] = ()
+            self.subscribed: list[tuple[str, int]] = []
+            self.published: list[tuple[str, str, int, bool]] = []
+            self.infos: list[_Info] = []
+            self.loops: list[str] = []
+            self.disconnected = 0
+            self._mid = 0
+            made.append(self)
+
+        def username_pw_set(self, username: str, password: str | None = None) -> None:
+            self.auth = (username, password)
+
+        def connect(self, host: str, port: int, keepalive: int = 60) -> None:
+            self.endpoint = (host, port, keepalive)
+
+        def loop_start(self) -> None:
+            self.loops.append("start")
+            if not answer_connect:
+                return
+            self.on_connect(self, None, {}, connack)
+            for topic, payload, retain in deliver:
+                self.on_message(self, None, _PahoMsg(topic, payload, retain))
+
+        def subscribe(self, topic_filter: str, qos: int = 0) -> tuple[int, int]:
+            self._mid += 1
+            self.subscribed.append((topic_filter, qos))
+            if suback is not None:
+                self.on_subscribe(self, None, self._mid, [suback])
+            return 0, self._mid
+
+        def publish(self, topic: str, payload: str = "", qos: int = 0, retain: bool = False):
+            self.published.append((topic, payload, qos, retain))
+            info = _Info()
+            self.infos.append(info)
+            return info
+
+        def loop_stop(self) -> None:
+            self.loops.append("stop")
+
+        def disconnect(self) -> None:
+            self.disconnected += 1
+
+    monkeypatch.setattr(mqtt, "Client", _Client)
+    return made
+
+
+_COLLECT = {
+    "host": "broker.example",
+    "port": 1883,
+    "username": "u",
+    "password": "p",
+    "filters": ["a/#"],
+    "client_id": "ha-check-test",
+}
+
+
+def test_collect_messages_returns_what_the_broker_delivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    made = _fake_paho(monkeypatch, deliver=(("a/state", b"{}", True),))
+    slept: list[float] = []
+    messages = ha.collect_messages(**_COLLECT, wait_s=7.0, sleep=slept.append)
+    assert [(m.topic, m.payload, m.retain) for m in messages] == [("a/state", b"{}", True)]
+    assert slept == [7.0]
+    client = made[0]
+    assert client.client_id == "ha-check-test"
+    assert client.endpoint == ("broker.example", 1883, ha.KEEPALIVE_S)
+    assert client.subscribed == [("a/#", 1)]
+    assert client.published == []  # read-only
+    assert client.disconnected == 1
+
+
+def test_collect_messages_does_not_charge_the_connect_round_trip_to_the_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broker that never answers CONNECT is diagnosed as that, and at the connect
+    budget -- not read out of an empty collection window as "wrong port"."""
+    _fake_paho(monkeypatch, answer_connect=False)
+    slept: list[float] = []
+    with pytest.raises(ConnectionError, match="did not answer CONNECT within 0.01s"):
+        ha.collect_messages(**_COLLECT, wait_s=900.0, sleep=slept.append, timeout_s=0.01)
+    assert slept == []
+
+
+def test_collect_messages_reports_a_refusal_before_the_collection_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bad password is known at CONNACK; waiting out --wait first only delays it."""
+    _fake_paho(monkeypatch, connack=5)
+    slept: list[float] = []
+    with pytest.raises(ConnectionError, match="refused the connection: 5"):
+        ha.collect_messages(**_COLLECT, wait_s=900.0, sleep=slept.append)
+    assert slept == []
+
+
+def test_a_refused_subscription_is_not_read_as_a_silent_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Section 7 asks for an ACL granting *publish* on the daemon's topics. A
+    publish-only account connects fine and is subscribed to nothing; without the SUBACK
+    the tool would blame the daemon for the silence and report every entity missing."""
+    _fake_paho(monkeypatch, suback=128)
+    slept: list[float] = []
+    with pytest.raises(ConnectionError, match="refused the subscription to a/# "):
+        ha.collect_messages(**_COLLECT, wait_s=900.0, sleep=slept.append)
+    assert slept == []
+
+
+def test_publish_command_sends_one_unretained_message_on_the_connect_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    made = _fake_paho(monkeypatch)
+    ha.publish_command(
+        host="broker.example",
+        port=1883,
+        username="u",
+        password="p",
+        topic="a/cmd/mode",
+        payload="auto",
+        client_id="ha-check-test",
+    )
+    client = made[0]
+    assert client.published == [("a/cmd/mode", "auto", 0, False)]
+    assert client.infos[0].waited == [ha.CONNECT_TIMEOUT_S]
+    assert client.subscribed == []
+    assert client.disconnected == 1
+
+
+def test_publish_command_publishes_nothing_when_the_broker_refuses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    made = _fake_paho(monkeypatch, connack=5)
+    with pytest.raises(ConnectionError, match="refused the connection"):
+        ha.publish_command(
+            host="broker.example",
+            port=1883,
+            username="u",
+            password="p",
+            topic="a/cmd/mode",
+            payload="auto",
+            client_id="ha-check-test",
+        )
+    assert made[0].published == []
 
 
 def test_the_tool_reads_the_broker_from_the_config_section(

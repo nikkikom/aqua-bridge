@@ -24,11 +24,16 @@ blob within one tick) and prints a checklist:
 * the state topic: retained, JSON, mode, solver, uptime, host metrics;
 * Discovery: which entities were announced, which expected ones are **missing**,
   which were announced but are **not expected** (a stale retained config, e.g. the
-  PWM numbers left behind after a mode change), and which differ from the payload
+  PWM numbers left behind after a mode change, or an entity dropped from an older
+  ``config.yaml`` -- the daemon deletes only the other modes' configs of the config
+  it is running, so that one is cleared by hand), and which differ from the payload
   this build would publish;
 * what Home Assistant would make of it: the state value every entity's own
-  ``value_template`` reads out of the retained state blob (``unknown`` when that path
-  is absent or null; a template that transforms the value, such as PWM in %, is not
+  ``value_template`` reads out of the retained state blob (``unknown`` only when the
+  path is absent and the template has no ``| default(...)`` fallback; a path that is
+  absent but does have one -- ``model_status`` with ``model_shadow: false``, the
+  per-bay sensors before the first tick -- reads that default and is listed as such,
+  not as a problem; a template that transforms the value, such as PWM in %, is not
   rendered -- the raw value is what tells you the blob and the templates agree);
 * the SMART inbox topics and the age of each sample against the estimator's
   ``smart_max_age_s``;
@@ -40,8 +45,10 @@ wrong, ``2`` it could not run at all (bad config, MQTT disabled, no ``paho-mqtt`
 broker unreachable). ``--strict`` also fails on the warnings.
 
 **It publishes nothing** unless ``--send`` is given, and even then it names the exact
-topic and payload and waits for a typed ``yes``. It never prints the broker
-credentials.
+topic and payload, says what stands after the message (a mode change, a PWM override)
+and waits for a typed ``yes``. It never prints the broker credentials, and it prints
+the broker host only under ``--verbose`` -- the host belongs in ``private.md``, and
+this output ends up in issues and commit messages.
 """
 
 from __future__ import annotations
@@ -80,6 +87,7 @@ __all__ = [
     "DEFAULT_CONFIG",
     "DEFAULT_SEND_WAIT_S",
     "DEFAULT_WAIT_S",
+    "KEEPALIVE_S",
     "Message",
     "Report",
     "build_parser",
@@ -92,7 +100,9 @@ __all__ = [
     "expected_entities",
     "latest_by_topic",
     "main",
+    "render_default",
     "resolve_path",
+    "template_path_defaults",
     "template_paths",
 ]
 
@@ -104,8 +114,11 @@ DEFAULT_WAIT_S = 20.0
 #: ``--send-wait`` default, seconds: how long to re-read the state topic after a sent
 #: command before printing what changed.
 DEFAULT_SEND_WAIT_S = 10.0
-#: How long ``--send`` waits for the broker's CONNACK before giving up, seconds.
+#: How long to wait for the broker's CONNACK, its SUBACKs and a ``--send`` PUBACK before
+#: giving up, seconds. One budget for every round trip this tool makes.
 CONNECT_TIMEOUT_S = 10.0
+#: MQTT keepalive for this tool's own short-lived sessions, seconds.
+KEEPALIVE_S = 60
 
 
 # ---------------------------------------------------------------------------
@@ -162,12 +175,41 @@ def expected_entities(
     }
 
 
-_TEMPLATE_PATH = re.compile(r"value_json((?:\.[A-Za-z_][A-Za-z0-9_]*)+)")
+_TEMPLATE_PATH = re.compile(
+    r"value_json((?:\.[A-Za-z_][A-Za-z0-9_]*)+)(?:\s*\|\s*default\(\s*([^)]*?)\s*\))?"
+)
 
 
 def template_paths(value_template: str) -> list[str]:
     """Every ``value_json.a.b.c`` path a Discovery template reads, without the prefix."""
-    return sorted({match.group(1)[1:] for match in _TEMPLATE_PATH.finditer(value_template)})
+    return sorted(template_path_defaults(value_template))
+
+
+def template_path_defaults(value_template: str) -> dict[str, str | None]:
+    """``path -> the literal of the Jinja ``| default(...)`` applied to it``, or ``None``
+    where the template reads the path bare.
+
+    A path the state blob does not carry makes the entity read ``unknown`` in Home
+    Assistant only when there is no fallback. With one, Home Assistant renders the
+    default and the entity has a perfectly good value: ``model_status``'s
+    ``{{ value_json.cmd.diagnostics.thermal.status | default('off') }}`` reads ``off``
+    on a healthy daemon shipping ``model_shadow: false`` (section 7), and the per-bay
+    sensors read their default until the first DAS tick fills ``diagnostics``.
+    """
+    out: dict[str, str | None] = {}
+    for match in _TEMPLATE_PATH.finditer(value_template):
+        path = match.group(1)[1:]
+        if out.get(path) is None:
+            out[path] = match.group(2)
+    return out
+
+
+def render_default(literal: str) -> str:
+    """What Home Assistant renders for a ``| default(<literal>)`` fallback."""
+    text = literal.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        return text[1:-1]
+    return text
 
 
 def resolve_path(blob: Any, path: str) -> tuple[str, Any]:
@@ -188,30 +230,45 @@ def entity_id(entity: MqttEntity) -> str:
     return f"{entity.component}.{slug}"
 
 
-def entity_state(entity: MqttEntity, state: Any) -> tuple[str, list[str]]:
-    """``(what Home Assistant would show, template paths absent from the state blob)``.
+def entity_state(entity: MqttEntity, state: Any) -> tuple[str, list[str], list[str]]:
+    """``(what Home Assistant would show, paths absent with no fallback, paths absent
+    that fall back to their template's ``| default(...)``)``.
 
-    Both templates count for the missing paths: the value and, where an entity has
-    one, the JSON attributes (the ``device_problem`` sensor's detail, item 83).
+    Both templates count: the value and, where an entity has one, the JSON attributes
+    (the ``device_problem`` sensor's detail, item 83). Only the first list means the
+    entity reads ``unknown``; the second is the normal shape of a state blob that does
+    not carry an optional diagnostics branch.
     """
     missing: list[str] = []
+    defaulted: list[str] = []
     values: list[str] = []
-    for path in template_paths(entity.payload.get("value_template", "")):
+    for path, default in sorted(
+        template_path_defaults(entity.payload.get("value_template", "")).items()
+    ):
         status, value = resolve_path(state, path)
         if status == "missing":
-            missing.append(path)
+            if default is None:
+                missing.append(path)
+            else:
+                defaulted.append(f"{path} -> {render_default(default)}")
+                values.append(render_default(default))
         elif status == "null":
             values.append("null")
         else:
             values.append(json.dumps(value, ensure_ascii=False))
-    for path in template_paths(entity.payload.get("json_attributes_template", "")):
-        if resolve_path(state, path)[0] == "missing":
+    attributes = template_path_defaults(entity.payload.get("json_attributes_template", ""))
+    for path, default in sorted(attributes.items()):
+        if resolve_path(state, path)[0] != "missing":
+            continue
+        if default is None:
             missing.append(path)
+        else:
+            defaulted.append(f"{path} (attributes) -> {render_default(default)}")
     if missing or not values:
-        return "unknown", missing
+        return "unknown", missing, defaulted
     unit = entity.payload.get("unit_of_measurement")
     shown = " ".join(values)
-    return f"{shown} {unit}" if unit else shown, missing
+    return (f"{shown} {unit}" if unit else shown), missing, defaulted
 
 
 # ---------------------------------------------------------------------------
@@ -360,9 +417,16 @@ def _check_discovery(
     for topic in sorted(set(wanted) - set(announced)):
         report.fail(f"missing: {topic}")
     for topic in sorted(set(announced) - set(wanted)):
+        # The daemon deletes the configs of the *other* control modes of the config it
+        # is running (publish_discovery), so a leftover under the current config means
+        # either the daemon is another build, or the entity was in an older config.yaml
+        # -- a bay, zone, channel, temp or drive class since removed. Nothing deletes
+        # that one; it has to be cleared by hand, and only after checking the entity
+        # really is gone from the config (item 21's failure list).
         report.fail(
-            f"announced but not expected: {topic} "
-            "(a stale retained config from another mode or an older config)"
+            f"announced but not expected: {topic} (a retained config for an entity this "
+            "config does not have -- another build, or an entity removed from "
+            f"config.yaml; clear it with: mosquitto_pub -r -n -t {topic})"
         )
     for topic in present:
         parsed, payload = announced[topic].json()
@@ -383,15 +447,18 @@ def _check_discovery(
         "(PWM in %, the problem sensor's ON/OFF) is not rendered here"
     )
     unknown: list[str] = []
+    defaulted: list[str] = []
     for topic in present:
         entity = wanted[topic]
-        shown, missing = entity_state(entity, state)
+        shown, missing, fallbacks = entity_state(entity, state)
         line = f"{entity_id(entity):<44} {shown}"
         command = entity.payload.get("command_topic")
         if command:
             line = f"{line}   <- {command}"
         if missing:
             unknown.append(f"{entity_id(entity)}: {', '.join(missing)} not in the state blob")
+        if fallbacks:
+            defaulted.append(f"{entity_id(entity)}: {', '.join(fallbacks)}")
         if verbose:
             report.note(line)
     if not unknown:
@@ -400,6 +467,16 @@ def _check_discovery(
         report.warn(f"{len(unknown)} entities would read 'unknown':")
         for line in unknown:
             report.note(line)
+    if defaulted:
+        # Not a warning and not a problem: the template says what to show when the path
+        # is absent, so Home Assistant shows that. A daemon with model_shadow: false or
+        # one that has not ticked yet is here, and both are healthy.
+        report.note(
+            f"{len(defaulted)} entities read their template's | default(...) instead "
+            "(the state blob does not carry that path; normal, not a problem):"
+        )
+        for line in defaulted:
+            report.note(f"  {line}")
     if not verbose:
         report.note("--verbose prints every entity with its value")
     return wanted
@@ -491,6 +568,17 @@ def build_report(
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class _Session:
+    """What the network thread records about one connection."""
+
+    reason_codes: list[Any] = field(default_factory=list)
+    #: topic filter -> the SUBACK reason code the broker returned for it
+    granted: dict[str, Any] = field(default_factory=dict)
+    answered: threading.Event = field(default_factory=threading.Event)
+    subscribed: threading.Event = field(default_factory=threading.Event)
+
+
 def _build_client(
     *,
     client_id: str,
@@ -498,20 +586,36 @@ def _build_client(
     password: str,
     filters: Sequence[str] = (),
     on_message: Callable[[Message], None] | None = None,
-) -> tuple[Any, list[Any], threading.Event]:
-    """``(client, connect_reason_codes, answered)``: a paho 2.x client that subscribes
-    to ``filters`` on connect. No last will, no retained anything -- this tool is a
-    listener."""
+) -> tuple[Any, _Session]:
+    """``(client, session)``: a paho 2.x client that subscribes to ``filters`` on
+    connect. No last will, no retained anything -- this tool is a listener."""
     import paho.mqtt.client as mqtt
 
-    reason_codes: list[Any] = []
-    answered = threading.Event()
+    session = _Session()
+    # One SUBSCRIBE per filter, in order, so the nth SUBACK answers the nth filter --
+    # no need to track paho's message ids, which the SUBACK callback may see before
+    # the subscribe() call that produced them has returned.
+    subacks: list[Any] = []
 
     def _on_connect(client, userdata, flags, reason_code, properties=None) -> None:
-        reason_codes.append(reason_code)
-        answered.set()
+        session.reason_codes.append(reason_code)
+        session.answered.set()
+        if not filters:
+            session.subscribed.set()
         for topic_filter in filters:
             client.subscribe(topic_filter, qos=1)
+
+    def _on_subscribe(client, userdata, mid, reason_code_list, properties=None) -> None:
+        # A SUBACK can carry a failure (0x80, "not authorized"): a publish-only broker
+        # account subscribes to nothing and the tool would otherwise read the resulting
+        # silence as "the daemon publishes nothing".
+        codes = reason_code_list if isinstance(reason_code_list, list) else [reason_code_list]
+        for code in codes:
+            index = len(subacks)
+            subacks.append(code)
+            session.granted[filters[index] if index < len(filters) else f"mid {mid}"] = code
+        if len(subacks) >= len(filters):
+            session.subscribed.set()
 
     def _on_message(client, userdata, msg) -> None:
         if on_message is not None:
@@ -521,18 +625,45 @@ def _build_client(
     if username:
         client.username_pw_set(username, password or None)
     client.on_connect = _on_connect
+    client.on_subscribe = _on_subscribe
     client.on_message = _on_message
-    return client, reason_codes, answered
+    return client, session
 
 
 def _refused(reason_codes: Sequence[Any]) -> str | None:
     """The broker's refusal, or ``None`` when it accepted the connection."""
     if not reason_codes:
-        return "the broker never answered CONNECT (wrong port, or a TLS-only listener)"
+        return None
     code = reason_codes[-1]
     if getattr(code, "is_failure", False) or (isinstance(code, int) and code != 0):
         return f"the broker refused the connection: {code}"
     return None
+
+
+def _await_connack(session: _Session, timeout_s: float) -> None:
+    """Block until the broker has accepted the connection, or raise ``ConnectionError``.
+
+    The connect round trip is a step of its own, not something to charge against
+    ``--wait``: an unanswered CONNECT and a refused one are different diagnoses, and a
+    refusal should be reported at once rather than after the whole collection window.
+    """
+    if not session.answered.wait(timeout_s):
+        raise ConnectionError(
+            f"the broker did not answer CONNECT within {timeout_s:g}s "
+            "(wrong host or port, a TLS-only listener, or a firewall in between)"
+        )
+    refused = _refused(session.reason_codes)
+    if refused is not None:
+        raise ConnectionError(refused)
+
+
+def _subscription_failures(session: _Session) -> list[str]:
+    """The topic filters the broker refused to subscribe us to."""
+    failures = []
+    for topic_filter, code in sorted(session.granted.items()):
+        if getattr(code, "is_failure", False) or (isinstance(code, int) and code > 2):
+            failures.append(f"{topic_filter} ({code})")
+    return failures
 
 
 def collect_messages(
@@ -545,28 +676,35 @@ def collect_messages(
     wait_s: float,
     client_id: str,
     sleep: Callable[[float], None] = time.sleep,
+    timeout_s: float = CONNECT_TIMEOUT_S,
 ) -> list[Message]:
     """Subscribe to ``filters`` and collect for ``wait_s`` seconds. Publishes nothing."""
     messages: list[Message] = []
-    client, reason_codes, _answered = _build_client(
+    client, session = _build_client(
         client_id=client_id,
         username=username,
         password=password,
         filters=filters,
         on_message=messages.append,
     )
-    client.connect(host, port, keepalive=60)
+    client.connect(host, port, keepalive=KEEPALIVE_S)
     client.loop_start()
     try:
+        _await_connack(session, timeout_s)
+        session.subscribed.wait(timeout_s)
+        failures = _subscription_failures(session)
+        if failures:
+            raise ConnectionError(
+                f"the broker refused the subscription to {', '.join(failures)}: this "
+                "account may be publish-only (section 7 asks for publish rights; the "
+                "check also needs to subscribe)"
+            )
         sleep(wait_s)
     finally:
         client.loop_stop()
         # Nothing left to do about a failed disconnect; the broker times the session out.
         with contextlib.suppress(Exception):
             client.disconnect()
-    refused = _refused(reason_codes)
-    if refused is not None:
-        raise ConnectionError(refused)
     return messages
 
 
@@ -579,20 +717,16 @@ def publish_command(
     topic: str,
     payload: str,
     client_id: str,
+    timeout_s: float = CONNECT_TIMEOUT_S,
 ) -> None:
     """Publish exactly one command, qos 0, **not** retained (section 7)."""
-    client, reason_codes, answered = _build_client(
-        client_id=client_id, username=username, password=password
-    )
-    client.connect(host, port, keepalive=60)
+    client, session = _build_client(client_id=client_id, username=username, password=password)
+    client.connect(host, port, keepalive=KEEPALIVE_S)
     client.loop_start()
     try:
-        answered.wait(CONNECT_TIMEOUT_S)
-        refused = _refused(reason_codes)
-        if refused is not None:
-            raise ConnectionError(refused)
+        _await_connack(session, timeout_s)
         info = client.publish(topic, payload=payload, qos=0, retain=False)
-        info.wait_for_publish(timeout=10.0)
+        info.wait_for_publish(timeout=timeout_s)
     finally:
         client.loop_stop()
         with contextlib.suppress(Exception):
@@ -614,6 +748,25 @@ def command_topic_for(node_id: str, cfg: MpcConfig, given: str) -> str | None:
     return None
 
 
+#: Command tails whose effect outlives the one message, and what to say about them
+#: before publishing. ``cmd/mode manual`` and a raw PWM override both stand until
+#: something clears them (``Supervisor.compose``), so a declined or forgotten third
+#: command leaves the daemon out of auto.
+_SEND_CAUTIONS = (
+    (
+        "mode",
+        "this changes the daemon's control mode until it is changed back; in manual "
+        "the solver no longer drives the fans. 'cmd/mode auto' puts it back and clears "
+        "every override.",
+    ),
+    (
+        "pwm/",
+        "this overrides the solver on that channel until it is cleared; the override "
+        "stands through restarts of this tool. 'cmd/mode auto' clears every override.",
+    ),
+)
+
+
 def confirm_send(topic: str, payload: str, *, out: TextIO, stdin: TextIO) -> bool:
     """Name exactly what is about to be published and require a typed ``yes``."""
     print("", file=out)
@@ -625,6 +778,9 @@ def confirm_send(topic: str, payload: str, *, out: TextIO, stdin: TextIO) -> boo
         "The daemon acts on it immediately and Home Assistant will show the result.",
         file=out,
     )
+    for tail, caution in _SEND_CAUTIONS:
+        if f"/cmd/{tail}" in topic:
+            print(f"    NOTE: {caution}", file=out)
     print('Type "yes" to send, anything else to abort: ', end="", file=out)
     out.flush()
     answer = stdin.readline().strip().lower()
@@ -671,8 +827,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="print every entity with its value, not only the "
-        "ones Home Assistant would show as unknown",
+        help="print every entity with its value (not only the ones Home Assistant "
+        "would show as unknown) and the broker host in the header",
     )
     parser.add_argument("--strict", action="store_true", help="also exit non-zero on the warnings")
     parser.add_argument(
@@ -701,7 +857,15 @@ def main(
     collect: Callable[..., list[Message]] | None = None,
     publish: Callable[..., None] | None = None,
 ) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    # A bad number here would otherwise surface as "broker: ValueError" out of
+    # time.sleep, i.e. a bad argument reported as a broker fault (tools/smart_agent.py
+    # validates its own timeout the same way).
+    if args.wait < 0:
+        parser.error(f"--wait must be >= 0 seconds, not {args.wait:g}")
+    if args.send_wait < 0:
+        parser.error(f"--send-wait must be >= 0 seconds, not {args.send_wait:g}")
     out = sys.stdout if out is None else out
     stdin = sys.stdin if stdin is None else stdin
     collect = collect_messages if collect is None else collect
@@ -728,7 +892,13 @@ def main(
     client_id = f"aqua-bridge-ha-check-{os.getpid()}"
     filters = [discovery_filter(discovery_prefix, node_id), f"{node_id}/#"]
 
-    print(f"broker:    {mqtt_cfg['host']}:{mqtt_cfg['port']}", file=out)
+    # The broker host is the owner's, and this output gets pasted into issues and
+    # commit messages; it lives in private.md, not in the repo. The config path
+    # already identifies the broker for whoever is running the tool.
+    if args.verbose:
+        print(f"broker:    {mqtt_cfg['host']}:{mqtt_cfg['port']}", file=out)
+    else:
+        print(f"broker:    port {mqtt_cfg['port']}, host from {args.config}", file=out)
     print(
         f"           username {'set' if mqtt_cfg['username'] else 'not set'} "
         f"(the password is never printed)",
