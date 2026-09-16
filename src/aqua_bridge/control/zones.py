@@ -67,7 +67,12 @@ status is ``first`` / ``ok``, ``obs.temps`` has no key outside
     occupancy change the filter widens that bay on purpose, which is it
     *following* a swap, not losing sight of it; the margin still carries the
     widening, so the fans rise either way. A bay without a trusted proximal
-    member this tick is never exempt, so a blind bay still faults its zone.
+    member this tick is never exempt, so a blind bay still faults its zone. The
+    exemption is also bounded in wall-clock: one bay's windows may suspend the
+    check for at most ``estimator.bay_settle_max_s`` before the bay has to run
+    that long without one, so a sensor that keeps jumping -- its sigma falls back
+    within a tick or two of each jump, at any cadence -- spends that budget and
+    then faults its zone on every tick it is over, as it did before item 69.
   - ``sigma_air_fault_c`` alone cannot see a zone that has lost its air
     sensors: every proximal sensor reads ``(1 - s) T_a`` beside its drive, and
     the inlet and the fan command pin the rest, so the air variance stays small
@@ -245,7 +250,9 @@ def sigma_reasons(zone: str, cfg: MpcConfig, estimator: EstimatorUpdate) -> list
     fast-swap rule or of an occupancy change, both of which widen its variance on purpose)
     **and** ``observed`` (a trusted proximal member this tick) carries no sigma check: that
     widening is the filter following a swap, not a loss of observability. A bay that is not
-    observed on this tick is never exempt, so a blind bay still faults its zone.
+    observed on this tick is never exempt, so a blind bay still faults its zone, and the
+    estimator stops reporting ``settling`` once the bay's windows have totalled
+    ``estimator.bay_settle_max_s`` of suspended check (module docstring).
     """
     topo = cfg.topology
     spec = cfg.estimator

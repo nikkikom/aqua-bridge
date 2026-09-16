@@ -1265,6 +1265,7 @@ ESTIMATOR_DEFAULTS: dict[str, float] = {
     "empty_dT_c": 0.7,
     "empty_confirm_s": 300.0,
     "bay_settle_s": 600.0,
+    "bay_settle_max_s": 1800.0,
     "calibration_max_age_days": 30.0,
     "associate_window_s": 3600.0,
     "associate_min_corr": 0.8,
@@ -1301,6 +1302,10 @@ class EstimatorSpec:
     * ``empty_confirm_s``          -- low evidence must last this long before a bay is
       empty (``>= 2 dt``)
     * ``bay_settle_s``             -- settling time after an occupancy change (``>= 0``)
+    * ``bay_settle_max_s``         -- the most settling exemption one bay may draw from
+      the ``sigma`` trust rule before it has to run this long without one, seconds
+      (``>= bay_settle_s``; 0 grants none at all): a hot swap opens a window or two,
+      a sensor that keeps jumping cannot stay exempt for ever
     * ``calibration_max_age_days`` -- a SMART calibration without an accepted sample for
       this long is no longer trusted (> 0)
     * ``associate_window_s`` / ``associate_min_corr`` / ``associate_margin`` -- serial
@@ -1325,6 +1330,7 @@ class EstimatorSpec:
     empty_dT_c: float = ESTIMATOR_DEFAULTS["empty_dT_c"]  # noqa: N815 - YAML key
     empty_confirm_s: float = ESTIMATOR_DEFAULTS["empty_confirm_s"]
     bay_settle_s: float = ESTIMATOR_DEFAULTS["bay_settle_s"]
+    bay_settle_max_s: float = ESTIMATOR_DEFAULTS["bay_settle_max_s"]
     calibration_max_age_days: float = ESTIMATOR_DEFAULTS["calibration_max_age_days"]
     associate_window_s: float = ESTIMATOR_DEFAULTS["associate_window_s"]
     associate_min_corr: float = ESTIMATOR_DEFAULTS["associate_min_corr"]
@@ -1374,6 +1380,11 @@ class EstimatorSpec:
             )
         if self.bay_settle_s < 0:
             raise ConfigError(f"{where}.bay_settle_s must be >= 0, got {self.bay_settle_s}")
+        if self.bay_settle_max_s < self.bay_settle_s:
+            raise ConfigError(
+                f"{where}.bay_settle_max_s must be >= bay_settle_s "
+                f"({self.bay_settle_s}), got {self.bay_settle_max_s}"
+            )
         if self.calibration_max_age_days <= 0:
             raise ConfigError(
                 f"{where}.calibration_max_age_days must be > 0, got {self.calibration_max_age_days}"
