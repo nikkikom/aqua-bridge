@@ -405,7 +405,11 @@ mpc:
   fan_curve_refit_s: 600.0     # shortest interval between two fits per fan model, seconds
   fan_curve_max_rmse_frac: 0.05  # a fit whose relative RMSE is worse than this is refused
   fan_curve_max_age_s: 3600.0  # a fit nothing re-confirms for this long goes stale: it leaves
-                               # fan_curves and its readers fall back to the configured curve
+                               # fan_curves and its readers fall back to the curve in force
+                               # before it (the model store's, else the configured one).
+                               # Re-confirmed by an accepted refit and by a tachometer
+                               # reading -- any reading, not only a settled sample, so a
+                               # regulator that never holds a duty keeps its fit
                                # (>= fan_curve_refit_s, or a fit could never be re-confirmed)
   # DAS MPC (solver: mpc; control/solver_das.py): least modelled fan noise with every drive
   # under its targets, planned over horizon steps of mpc_pred_dt_s. It acts only on a model
