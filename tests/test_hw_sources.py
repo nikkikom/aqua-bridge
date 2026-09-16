@@ -716,14 +716,15 @@ def test_an_absent_aquabus_slot_contributes_no_fan_reading() -> None:
         sleep=FakeSleep(clock),
         opener=FakeBus(FakeController(AQUAERO, clock)),  # nothing on aquabus
     )
-    with pytest.raises(DeviceUnavailable, match="no device behind pwm7"):
-        adapter.read()
+    obs = adapter.read()  # item 90: an absent slot faults only its own channel
+    assert obs.pwm["qd3"] is None and obs.pwm["radiator"] is not None
+    assert adapter.absent_channels == ("qd3",)
     assert set(adapter.fan_readings()) == {"radiator"}
 
 
-def test_device_health_lists_the_absent_channels_after_a_failed_read() -> None:
-    """The tick that most needs the diagnosis is the one whose read() raised, so the
-    device health does not ride the observation (PROJECT.md section 8 item 83)."""
+def test_device_health_lists_the_absent_channels() -> None:
+    """An absent aquabus slot no longer fails the read (item 90), so the health
+    endpoint is where it shows (PROJECT.md section 8 item 83)."""
     clock = FakeClock()
     adapter = AquacomputerAdapter(
         DeviceBinding(kind=AQUAERO, pwm_map={"qd3": 7}, serial="12345-54321"),
@@ -731,8 +732,7 @@ def test_device_health_lists_the_absent_channels_after_a_failed_read() -> None:
         sleep=FakeSleep(clock),
         opener=FakeBus(FakeController(AQUAERO, clock)),
     )
-    with pytest.raises(DeviceUnavailable):
-        adapter.read()
+    adapter.read()  # item 90: the read succeeds, the channel is listed as absent
     health = adapter.device_health()
     assert health["absent_channels"] == ["qd3"] and health["stuck_channels"] == []
     assert health["device"] == "aquaero" and health["open"] is True
@@ -754,7 +754,7 @@ def test_device_health_reports_an_active_profile_once_one_exists() -> None:
     """Read defensively: this change does not depend on the one that publishes it."""
     a, _q, _aquaero, _quadro, _clock = _fleet()
     a.read()
-    a.active_profile = 2
+    a._profile = 2  # the adapter reads it from control-report byte 0x06 (item 84)
     assert a.device_health()["active_profile"] == 2
 
 
