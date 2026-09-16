@@ -1255,7 +1255,10 @@ ESTIMATOR_DEFAULTS: dict[str, float] = {
     "q_t_drive": 1e-5,
     "q_t_sensor": 1e-4,
     "q_heat": 4e-7,
+    "q_offset": 1e-4,
     "sensor_noise_c": 0.03,
+    "proximal_offset_c": 3.0,
+    "air_blind_fault_s": 900.0,
     "smart_max_age_s": 300.0,
     "smart_reject_c": 8.0,
     "occupied_dT_c": 2.0,
@@ -1278,10 +1281,18 @@ class EstimatorSpec:
       rule, degC (> 0): a zone is untrusted while a constrained bay's drive sigma or its
       air sigma is above them; with ``zones.trust_rule: sigma``, ``sigma_fault_c`` must
       exceed :data:`SIGMA_UNCALIBRATED_C`
-    * ``q_t_air`` / ``q_d_air`` / ``q_t_drive`` / ``q_t_sensor`` / ``q_heat`` -- process
-      noise per tick of the filter states ``T_a``, ``d_a``, ``T_d``, ``T_s``, ``q`` (> 0)
+    * ``air_blind_fault_s``        -- the ``sigma`` rule's air observability window,
+      seconds (``>= 0``): a zone whose air node has had no trusted ``zone_air`` reading
+      fused for longer than this is untrusted (the air sigma itself barely grows, so it
+      cannot decide; ``aqua_bridge.control.zones``)
+    * ``q_t_air`` / ``q_d_air`` / ``q_t_drive`` / ``q_t_sensor`` / ``q_heat`` /
+      ``q_offset`` -- process noise per tick of the filter states ``T_a``, ``d_a``,
+      ``T_d``, ``T_s``, ``q`` and a proximal sensor's placement offset (> 0)
     * ``sensor_noise_c``           -- white noise of a temperature sensor, degC (>= 0);
       the measurement variance is ``sensor_noise_c ** 2 + quant_c ** 2 / 12``
+    * ``proximal_offset_c``        -- prior standard deviation of the placement offset
+      the estimator carries for every proximal sensor of a bay beyond the first, degC
+      (``>= 0``; 0 fuses them all on one node, as before this key existed)
     * ``smart_max_age_s``          -- a SMART sample older than this is ignored and an
       association whose serial stays silent this long is dropped (``>= dt``)
     * ``smart_reject_c``           -- a SMART value this far from the estimate is dropped
@@ -1304,7 +1315,10 @@ class EstimatorSpec:
     q_t_drive: float = ESTIMATOR_DEFAULTS["q_t_drive"]
     q_t_sensor: float = ESTIMATOR_DEFAULTS["q_t_sensor"]
     q_heat: float = ESTIMATOR_DEFAULTS["q_heat"]
+    q_offset: float = ESTIMATOR_DEFAULTS["q_offset"]
     sensor_noise_c: float = ESTIMATOR_DEFAULTS["sensor_noise_c"]
+    proximal_offset_c: float = ESTIMATOR_DEFAULTS["proximal_offset_c"]
+    air_blind_fault_s: float = ESTIMATOR_DEFAULTS["air_blind_fault_s"]
     smart_max_age_s: float = ESTIMATOR_DEFAULTS["smart_max_age_s"]
     smart_reject_c: float = ESTIMATOR_DEFAULTS["smart_reject_c"]
     occupied_dT_c: float = ESTIMATOR_DEFAULTS["occupied_dT_c"]  # noqa: N815 - YAML key
@@ -1339,11 +1353,12 @@ class EstimatorSpec:
         for key in ("sigma_fault_c", "sigma_air_fault_c", "smart_reject_c"):
             if getattr(self, key) <= 0:
                 raise ConfigError(f"{where}.{key} must be > 0, got {getattr(self, key)}")
-        for key in ("q_t_air", "q_d_air", "q_t_drive", "q_t_sensor", "q_heat"):
+        for key in ("q_t_air", "q_d_air", "q_t_drive", "q_t_sensor", "q_heat", "q_offset"):
             if getattr(self, key) <= 0:
                 raise ConfigError(f"{where}.{key} must be > 0, got {getattr(self, key)}")
-        if self.sensor_noise_c < 0:
-            raise ConfigError(f"{where}.sensor_noise_c must be >= 0, got {self.sensor_noise_c}")
+        for key in ("sensor_noise_c", "proximal_offset_c", "air_blind_fault_s"):
+            if getattr(self, key) < 0:
+                raise ConfigError(f"{where}.{key} must be >= 0, got {getattr(self, key)}")
         if self.smart_max_age_s < dt:
             raise ConfigError(
                 f"{where}.smart_max_age_s must be >= dt ({dt}), got {self.smart_max_age_s}"

@@ -255,12 +255,20 @@ mpc:
     k_sigma: 2.0         # margin = k_sigma * sigma; sigma >= 1.5 degC until SMART calibrates a bay
     sigma_fault_c: 4.0   # zones.trust_rule: sigma faults a zone past these (degC; > 1.5 with sigma)
     sigma_air_fault_c: 2.0
-    q_t_air: 1.0e-4      # process noise per tick: air, air disturbance, drive, sensor node, heat
-    q_d_air: 4.0e-7
+    air_blind_fault_s: 900  # zones.trust_rule: sigma faults a zone whose air node has had no
+                         # trusted zone_air reading for this long (the air sigma barely grows,
+                         # so it cannot decide on its own); 0 faults on the first blind tick
+    q_t_air: 1.0e-4      # process noise per tick: air, air disturbance, drive, sensor node,
+    q_d_air: 4.0e-7      # heat, and a proximal sensor's placement offset
     q_t_drive: 1.0e-5
     q_t_sensor: 1.0e-4
     q_heat: 4.0e-7
+    q_offset: 1.0e-4
     sensor_noise_c: 0.03 # sensor white noise; variance adds quant_c^2 / 12
+    proximal_offset_c: 3.0  # prior sigma of the placement offset the filter carries for every
+                         # proximal sensor of a bay beyond the first (degC): two sensors on one
+                         # bay sit differently and disagree by degrees, which is an offset to
+                         # estimate, not a drive swap. 0: one node for all of them, as before
     smart_max_age_s: 300 # older SMART samples are ignored; a silent serial loses its bay
     smart_reject_c: 8.0  # a SMART value this far from the estimate is dropped
     occupied_dT_c: 2.0   # proximal minus zone air above this: a drive is there
