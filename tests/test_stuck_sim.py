@@ -241,14 +241,57 @@ def test_a_frozen_reading_is_flagged_by_its_zone_air_while_the_airflow_stays_put
     assert not any(r.cmd.diagnostics["gate"]["stuck"][sensor] for r in without.records)
 
 
+#: Drift injected on one zone-air sensor below, and when it starts (section 4.4 Drift).
+DRIFT_C_PER_MIN = 0.3
+DRIFT_S = 300.0
+
+
+def test_a_drifting_zone_air_sensor_never_brands_its_zones_readings_stuck(das_example_cfg):
+    """Section 4.4 Drift on a zone-air sensor, the false positive item 58's evidence could
+    have invented: air_z0 walks away from the truth while the enclosure is healthy, so every
+    proximal reading of z0 is correctly still. Only the drifting sensor's own rules may
+    answer it -- the zone-air move is evidence against a reading only once another bay's
+    reading has followed it, and here none does."""
+    cfg = das_example_cfg
+    plant = build_das_plant(topology_from_config(cfg), preset="basic", dt=cfg.dt, initial_pwm=0.5)
+
+    def drift(i: int, obs: PlantObservation) -> PlantObservation:
+        if obs.ts < DRIFT_S or obs.temps.get("air_z0") is None:
+            return obs
+        temps = dict(obs.temps)
+        temps["air_z0"] += DRIFT_C_PER_MIN * (obs.ts - DRIFT_S) / 60.0
+        return dataclasses.replace(obs, temps=temps)
+
+    run = run_das_closed_loop(plant, cfg, step, 3000, observe_hook=drift)
+    # the lie really is far past the threshold the rule reads
+    assert DRIFT_C_PER_MIN * cfg.stuck_params("prox_b01").ticks * cfg.dt / 60.0 > (
+        cfg.stuck_zone_air_dT_c
+    )
+    proximals = {t for t in cfg.temps if cfg.sensors[t].role == "drive_proximal"}
+    flagged = sorted(
+        {
+            name
+            for r in run.records
+            for name, stuck in r.cmd.diagnostics["gate"]["stuck"].items()
+            if stuck and name in proximals
+        }
+    )
+    assert flagged == [], f"healthy proximal readings flagged Stuck: {flagged}"
+    assert {z for r in run.records for z in r.cmd.diagnostics["zones_in_fault"]} == set()
+    assert {r.cmd.mode for r in run.records} == {Mode.AUTO}
+
+
 #: Freeze point and length of the coverage runs below: 20 minutes into 2.5 hours.
 RICH_FREEZE_S = 1200.0
 RICH_TICKS = 1800
 #: Proximal readings the rules flag per seed, of the 17 the example config has. With the
-#: airflow move as the only zoned evidence (before item 58) the counts were 6, 7 and 4:
-#: seed 0's drawn inlet drifts, so every zone's air moves past stuck_zone_air_dT_c inside
-#: a window; seeds 1 and 2 have a flat ambient and gain nothing, which is the point of the
-#: rule -- it adds evidence where the fans give none and takes none away.
+#: airflow move as the only zoned evidence (before item 58) the counts were 6, 7 and 4, so
+#: the whole gain is seed 0's: its drawn inlet drifts far enough that every zone's air
+#: moves past stuck_zone_air_dT_c inside a window. Seed 1's zone air does move, but stays
+#: under 1.5 degC within a window -- at stuck_zone_air_dT_c=1.25 this sweep gives 17, 16, 4
+#: (37 of 51), so seed 1 is entirely a question of that margin, not of a flat ambient (item
+#: 96 asks the owner to measure it on the enclosure). Seed 2 gains nothing. The rule only
+#: adds evidence and takes none away.
 RICH_FROZEN_FLAGGED = {0: 17, 1: 7, 2: 4}
 
 
