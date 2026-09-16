@@ -3,7 +3,7 @@
 ``load_config(path)`` returns an :class:`AppConfig`. Only the ``mpc``
 section is typed and validated (:class:`aqua_bridge.model.MpcConfig`);
 the other sections (``mqtt``, ``host``, ``xt6``, ``http``, ``digole``,
-``onewire``) are handed to their owners as plain dicts. Unknown keys
+``onewire``, ``fan_health``) are handed to their owners as plain dicts. Unknown keys
 *inside* ``mpc`` are an error; unknown top-level sections are kept in
 ``AppConfig.extra`` so a typo there is visible without being fatal.
 
@@ -16,7 +16,10 @@ every reader compares against, and must not silently behave like
 each raises naming the key, at the point that section is actually used (config
 load for ``onewire`` since a DAS temperature source cannot start without it;
 service start for ``http``/``mqtt`` so a typo in one optional publisher's
-section never stops the daemon from controlling the fans). ``digole:`` has no
+section never stops the daemon from controlling the fans), and ``fan_health:``
+in :meth:`~aqua_bridge.health.FanHealthConfig.from_section` at startup (a bad
+drift threshold is a configuration error, exit 2, like a bad ``mpc`` key: the
+operator asked for a rule the daemon cannot run). ``digole:`` has no
 owner yet (section 5, "after Command is stable"), so ``_warn_bad_digole_enabled``
 below only logs a warning at config load -- nothing reads the section, so there
 is nowhere yet to raise.
@@ -50,7 +53,15 @@ __all__ = ["AppConfig", "ConfigError", "KNOWN_SECTIONS", "load_config"]
 _LOG = logging.getLogger(__name__)
 
 # Top-level sections with a dedicated attribute on AppConfig (besides "mpc").
-KNOWN_SECTIONS: tuple[str, ...] = ("mqtt", "host", "xt6", "http", "digole", "onewire")
+KNOWN_SECTIONS: tuple[str, ...] = (
+    "mqtt",
+    "host",
+    "xt6",
+    "http",
+    "digole",
+    "onewire",
+    "fan_health",
+)
 
 
 def _section(name: str, value: object) -> dict[str, Any]:
@@ -115,6 +126,7 @@ class AppConfig:
     http: dict[str, Any] = field(default_factory=dict)
     digole: dict[str, Any] = field(default_factory=dict)
     onewire: dict[str, Any] = field(default_factory=dict)
+    fan_health: dict[str, Any] = field(default_factory=dict)
     aquacomputer: tuple[dict[str, Any], ...] = field(default_factory=tuple)
     extra: dict[str, Any] = field(default_factory=dict)
     source: str | None = None

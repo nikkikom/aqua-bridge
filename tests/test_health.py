@@ -1,0 +1,400 @@
+"""Fan-health drift rules and device health (PROJECT.md section 8 items 79, 83).
+
+The readings the rules judge come from the captured status reports in
+``tests/fixtures/aquacomputer/``, decoded by the real adapter against the real
+device layouts, so a rule is exercised on the numbers the owner's hardware
+actually produced: the aquaero reporting 0 mA and 0 W for its own outputs in PWM
+mode, the Quadro on aquabus reporting 27 mA / 0.32 W at 100 % duty, and an empty
+aquabus slot reading rpm 0xFFFF, 0 V.
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from aqua_bridge.config import load_config
+from aqua_bridge.health import FANHEALTH_KEYS, FanHealthConfig, HealthMonitor, expected_rpm
+from aqua_bridge.hw.aquacomputer import AQUAERO, QUADRO, decode_status
+from aqua_bridge.model import ConfigError, FanModel, FanSpec, MpcConfig, PlantObservation
+from aquacomputer_fakes import fixture_bytes
+
+# --- config ---------------------------------------------------------------------------
+
+
+def test_every_threshold_is_a_key_with_one_default() -> None:
+    """Item 79's thresholds are config keys, declared once in FanHealthConfig."""
+    defaults = FanHealthConfig()
+    assert set(FANHEALTH_KEYS) == {
+        "enabled",
+        "min_duty",
+        "settle_s",
+        "settle_duty",
+        "rpm_tolerance_frac",
+        "rpm_fault_s",
+        "rail_min_v",
+        "rail_max_v",
+        "rail_fault_s",
+        "power_tolerance_frac",
+        "power_exponent",
+        "power_min_w",
+        "power_fault_s",
+        "log_interval_s",
+    }
+    assert defaults.enabled is True
+    assert (defaults.rail_min_v, defaults.rail_max_v) == (11.0, 13.0)
+    assert FanHealthConfig.from_section(None) == defaults
+    assert FanHealthConfig.from_section({}) == defaults
+
+
+def test_from_section_overrides_and_keeps_the_other_defaults() -> None:
+    settings = FanHealthConfig.from_section({"rpm_fault_s": 30.0, "enabled": False})
+    assert settings.rpm_fault_s == 30.0 and settings.enabled is False
+    assert settings.rail_max_v == FanHealthConfig().rail_max_v
+
+
+@pytest.mark.parametrize(
+    ("section", "match"),
+    [
+        ({"rpm_fault_sec": 5}, r"unknown key\(s\) \['rpm_fault_sec'\]"),
+        ({"enabled": "true"}, "fan_health.enabled must be true or false"),
+        ({"min_duty": 1.5}, "fan_health.min_duty must be <= 1"),
+        ({"min_duty": "0.3"}, "fan_health.min_duty must be a number"),
+        ({"rpm_fault_s": 0}, "fan_health.rpm_fault_s must be >="),
+        ({"rail_min_v": 13.0, "rail_max_v": 12.0}, "must be above fan_health.rail_min_v"),
+        ({"power_exponent": 0}, "fan_health.power_exponent must be >="),
+        ({"settle_s": float("inf")}, "fan_health.settle_s must be finite"),
+    ],
+)
+def test_a_bad_fan_health_key_is_a_config_error(section: dict[str, Any], match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        FanHealthConfig.from_section(section)
+
+
+def test_power_w_at_max_is_optional_and_must_be_positive(das_example_cfg: MpcConfig) -> None:
+    """Without it the power rule is off for that model; a bad value is a config error."""
+    assert das_example_cfg.fan_models["case120"].power_w_at_max is None
+    raw = das_example_cfg.to_dict()
+    raw["fan_models"]["case120"]["power_w_at_max"] = 1.9
+    assert MpcConfig.from_mapping(raw).fan_models["case120"].power_w_at_max == 1.9
+    raw["fan_models"]["case120"]["power_w_at_max"] = 0
+    with pytest.raises(ConfigError, match="power_w_at_max must be a finite number > 0"):
+        MpcConfig.from_mapping(raw)
+
+
+# --- the curve ------------------------------------------------------------------------
+
+
+def _cfg(**models: FanModel) -> Any:
+    """A minimal stand-in for MpcConfig with just what the rules read."""
+
+    class _Cfg:
+        fans = {"qd3": FanSpec(model="case120"), "xt2": FanSpec(model="case120")}
+        fan_models = dict(models or {"case120": FanModel(rpm_max=1200.0, deadband=0.1)})
+
+    return _Cfg()
+
+
+def test_expected_rpm_follows_the_fitted_curve_and_is_none_without_a_model() -> None:
+    cfg = _cfg(case120=FanModel(rpm_max=1200.0, deadband=0.1, exponent=1.0))
+    assert expected_rpm(cfg, "qd3", 1.0) == pytest.approx(1200.0)
+    assert expected_rpm(cfg, "qd3", 0.1) == pytest.approx(0.0)  # inside the deadband
+    assert expected_rpm(cfg, "qd3", 0.55) == pytest.approx(600.0)
+    assert expected_rpm(cfg, "nowhere", 1.0) is None
+
+
+def test_expected_rpm_is_none_for_a_legacy_config(cfg: MpcConfig) -> None:
+    """A legacy config has no mpc.fans / fan_models, so the rpm rule is simply off."""
+    assert not cfg.fans and not cfg.fan_models
+    assert expected_rpm(cfg, "radiator", 1.0) is None
+
+
+# --- the rules ------------------------------------------------------------------------
+
+
+def _reading(**over: Any) -> dict[str, Any]:
+    base = {
+        "device": "aquaero",
+        "output": "pwm7",
+        "rpm": 1100.0,
+        "duty": 1.0,
+        "voltage_v": 12.1,
+        "current_ma": 27.0,
+        "power_w": 0.32,
+        "power_reported": True,
+        "aquabus": True,
+    }
+    base.update(over)
+    return base
+
+
+def _monitor(settings: FanHealthConfig | None = None, **models: FanModel) -> HealthMonitor:
+    return HealthMonitor(_cfg(**models), settings or FanHealthConfig())
+
+
+def _settle(mon: HealthMonitor, reading: dict[str, Any], t: float) -> float:
+    """Feed one reading and wait out settle_s, so the next check is judged."""
+    mon.check_channel("qd3", reading, t)
+    return t + mon.settings.settle_s + 1.0
+
+
+def test_a_healthy_fan_at_full_duty_has_no_problem() -> None:
+    mon = _monitor(case120=FanModel(rpm_max=1100.0, deadband=0.1))
+    t = _settle(mon, _reading(), 0.0)
+    verdict = mon.check_channel("qd3", _reading(), t + 600.0)
+    assert verdict["problems"] == []
+    assert verdict["expected_rpm"] == pytest.approx(1100.0)
+
+
+def test_rpm_far_below_the_curve_is_reported_only_after_rpm_fault_s() -> None:
+    mon = _monitor(case120=FanModel(rpm_max=1100.0, deadband=0.1))
+    t = _settle(mon, _reading(rpm=0.0), 0.0)
+    assert mon.check_channel("qd3", _reading(rpm=0.0), t)["problems"] == []
+    held = mon.settings.rpm_fault_s
+    assert mon.check_channel("qd3", _reading(rpm=0.0), t + held - 1.0)["problems"] == []
+    problems = mon.check_channel("qd3", _reading(rpm=0.0), t + held)["problems"]
+    assert len(problems) == 1
+    assert "0 rpm at 100 % duty" in problems[0] and "1100 rpm expected" in problems[0]
+
+
+def test_a_recovering_fan_clears_the_deviation() -> None:
+    mon = _monitor(case120=FanModel(rpm_max=1100.0, deadband=0.1))
+    t = _settle(mon, _reading(rpm=0.0), 0.0)
+    mon.check_channel("qd3", _reading(rpm=0.0), t + mon.settings.rpm_fault_s)
+    assert mon.check_channel("qd3", _reading(), t + mon.settings.rpm_fault_s + 1)["problems"] == []
+    # ... and the window starts again from scratch
+    later = t + 2 * mon.settings.rpm_fault_s
+    assert mon.check_channel("qd3", _reading(rpm=0.0), later)["problems"] == []
+
+
+def test_a_duty_change_restarts_the_settle_window_so_the_aquabus_lag_never_fires() -> None:
+    """An aquabus fan's rpm in the aquaero's status report lags its own report by
+    several seconds (PROJECT.md section 2): the step to 100 % must not read as drift."""
+    settings = FanHealthConfig(settle_s=10.0, rpm_fault_s=5.0)
+    mon = _monitor(settings, case120=FanModel(rpm_max=1100.0, deadband=0.1))
+    mon.check_channel("qd3", _reading(duty=0.3, rpm=330.0), 0.0)
+    t = 20.0  # settled at 30 %
+    assert mon.check_channel("qd3", _reading(duty=0.3, rpm=330.0), t)["problems"] == []
+    # the duty steps to 100 % and the reported rpm has not caught up yet
+    for dt in (0.0, 2.0, 4.0, 6.0, 8.0, 9.9):
+        assert mon.check_channel("qd3", _reading(rpm=330.0), t + dt)["problems"] == []
+    # once settled, the same stale speed does become a deviation after rpm_fault_s
+    assert mon.check_channel("qd3", _reading(rpm=330.0), t + 11.0)["problems"] == []
+    assert mon.check_channel("qd3", _reading(rpm=330.0), t + 17.0)["problems"]
+
+
+def test_below_min_duty_no_rpm_rule_fires() -> None:
+    """At 9.02 % duty the captured aquabus fan reported 128 rpm: inside the deadband
+    region the curve says nothing, so nothing is judged there."""
+    settings = FanHealthConfig(min_duty=0.25, settle_s=0.0)
+    mon = _monitor(settings, case120=FanModel(rpm_max=1100.0, deadband=0.1))
+    t = 0.0
+    for step in range(20):
+        verdict = mon.check_channel("qd3", _reading(duty=0.0902, rpm=128.0), t + 30.0 * step)
+        assert verdict["problems"] == []
+
+
+def test_a_sagging_rail_is_reported_after_rail_fault_s_at_any_duty() -> None:
+    mon = _monitor()
+    t = _settle(mon, _reading(voltage_v=10.2, duty=0.1), 0.0)
+    assert mon.check_channel("qd3", _reading(voltage_v=10.2, duty=0.1), t)["problems"] == []
+    problems = mon.check_channel(
+        "qd3", _reading(voltage_v=10.2, duty=0.1), t + mon.settings.rail_fault_s
+    )["problems"]
+    assert len(problems) == 1 and "10.20 V, outside 11..13 V" in problems[0]
+
+
+def test_an_empty_aquabus_slot_reading_0_v_is_no_rail_fault() -> None:
+    """An aquaero's empty aquabus slot reads 0 V, which is absence, not a dead rail."""
+    mon = _monitor()
+    t = _settle(mon, _reading(voltage_v=0.0), 0.0)
+    for step in range(10):
+        assert mon.check_channel("qd3", _reading(voltage_v=0.0), t + 60.0 * step)["problems"] == []
+
+
+def test_zero_power_on_an_aquaero_own_output_is_not_a_fault() -> None:
+    """The aquaero reports 0 mA and 0 W for its own outputs in PWM mode however fast
+    the fan turns (PROJECT.md section 8 item 79), so power_reported gates the rule."""
+    mon = _monitor(case120=FanModel(rpm_max=1100.0, deadband=0.1, power_w_at_max=1.5))
+    own = _reading(power_reported=False, aquabus=False, current_ma=0.0, power_w=0.0)
+    t = _settle(mon, own, 0.0)
+    for step in range(10):
+        assert mon.check_channel("qd3", own, t + 60.0 * step)["problems"] == []
+
+
+def test_power_out_of_line_with_the_duty_is_reported_where_power_is_reported() -> None:
+    mon = _monitor(case120=FanModel(rpm_max=1100.0, deadband=0.1, power_w_at_max=1.5))
+    dead = _reading(current_ma=0.0, power_w=0.0)
+    t = _settle(mon, dead, 0.0)
+    verdict = mon.check_channel("qd3", dead, t)
+    assert verdict["expected_power_w"] == pytest.approx(1.5)
+    assert verdict["problems"] == []
+    problems = mon.check_channel("qd3", dead, t + mon.settings.power_fault_s)["problems"]
+    assert len(problems) == 1 and "0.00 W at 100 % duty, 1.50 W expected" in problems[0]
+
+
+def test_without_power_w_at_max_the_power_rule_is_off() -> None:
+    mon = _monitor(case120=FanModel(rpm_max=1100.0, deadband=0.1))
+    dead = _reading(current_ma=0.0, power_w=0.0)
+    t = _settle(mon, dead, 0.0)
+    verdict = mon.check_channel("qd3", dead, t + 10 * mon.settings.power_fault_s)
+    assert verdict["expected_power_w"] is None and verdict["problems"] == []
+
+
+def test_expected_power_follows_the_fan_law_and_the_fan_count() -> None:
+    mon = HealthMonitor(_cfg(case120=FanModel(rpm_max=1100.0, deadband=0.0)), FanHealthConfig())
+    mon.cfg.fans["qd3"] = FanSpec(model="case120", count=2)
+    mon.cfg.fan_models["case120"] = FanModel(rpm_max=1100.0, deadband=0.0, power_w_at_max=1.0)
+    assert mon._expected_power("qd3", 1.0) == pytest.approx(2.0)
+    assert mon._expected_power("qd3", 0.5) == pytest.approx(2.0 * 0.5**3)
+
+
+# --- the tick -------------------------------------------------------------------------
+
+
+class _FakeSource:
+    def __init__(self, health: dict[str, Any]) -> None:
+        self.health = health
+        self.calls = 0
+
+    def device_health(self) -> dict[str, Any]:
+        self.calls += 1
+        return self.health
+
+
+def _tick(obs: PlantObservation) -> Any:
+    class _Result:
+        pass
+
+    result = _Result()
+    result.obs = obs  # type: ignore[attr-defined]
+    return result
+
+
+def test_on_tick_publishes_the_fan_verdicts_and_the_device_health() -> None:
+    source = _FakeSource(
+        {
+            "devices": [{"label": "aquaero", "stuck_channels": ["qd3"]}],
+            "problems": ["aquaero: qd3 do not follow the written duty"],
+            "ok": False,
+        }
+    )
+    published: list[dict[str, Any]] = []
+    mon = HealthMonitor(
+        _cfg(case120=FanModel(rpm_max=1100.0, deadband=0.1)),
+        FanHealthConfig(settle_s=0.0, rpm_fault_s=0.001),
+        source=source,
+        publish=published.append,
+    )
+
+    def obs(ts: float) -> PlantObservation:
+        return PlantObservation(
+            temps={}, rpm={}, pwm={"qd3": 1.0}, ts=ts, inputs={"fans": {"qd3": _reading(rpm=0.0)}}
+        )
+
+    for ts in (5.0, 10.0, 15.0):  # the observation clock is the rules' clock
+        mon.on_tick(_tick(obs(ts)))
+    payload = published[-1]
+    assert payload["devices"][0]["label"] == "aquaero"
+    assert payload["fans"]["qd3"]["rpm"] == 0.0
+    assert payload["ok"] is False
+    assert payload["problems"][0].startswith("aquaero: qd3")  # device problems come first
+    assert any("rpm at 100 % duty" in p for p in payload["problems"])
+    assert source.calls == 3
+
+
+def test_on_tick_without_a_device_health_source_still_publishes_the_fan_verdicts() -> None:
+    published: list[dict[str, Any]] = []
+    mon = HealthMonitor(_cfg(), FanHealthConfig(), source=object(), publish=published.append)
+    obs = PlantObservation(temps={}, rpm={}, pwm={}, ts=1.0, inputs={"fans": {"qd3": _reading()}})
+    mon.on_tick(_tick(obs))
+    assert published[-1] == {
+        "devices": [],
+        "fans": published[-1]["fans"],
+        "problems": [],
+        "ok": True,
+    }
+    assert published[-1]["fans"]["qd3"]["power_w"] == pytest.approx(0.32)
+
+
+def test_disabled_still_publishes_device_health_but_runs_no_rule() -> None:
+    source = _FakeSource({"devices": [{"label": "aquaero"}], "problems": [], "ok": True})
+    mon = HealthMonitor(
+        _cfg(case120=FanModel(rpm_max=1100.0, deadband=0.1)),
+        FanHealthConfig(enabled=False),
+        source=source,
+    )
+    payload = mon.update({"qd3": _reading(rpm=0.0)}, 10_000.0)
+    assert payload["fans"] == {} and payload["devices"][0]["label"] == "aquaero"
+
+
+def test_on_tick_never_raises_on_a_broken_result_or_a_broken_source() -> None:
+    class _Angry:
+        def device_health(self) -> dict[str, Any]:
+            raise RuntimeError("no")
+
+    mon = HealthMonitor(_cfg(), FanHealthConfig(), source=_Angry(), publish=lambda _p: None)
+    mon.on_tick(None)
+    mon.on_tick(_tick(PlantObservation(temps={}, rpm={}, pwm={}, ts=0.0)))
+    assert mon.last["ok"] is True
+
+    def boom(_payload: dict[str, Any]) -> None:
+        raise RuntimeError("publisher")
+
+    HealthMonitor(_cfg(), FanHealthConfig(), publish=boom).on_tick(
+        _tick(PlantObservation(temps={}, rpm={}, pwm={}, ts=0.0))
+    )
+
+
+def test_a_repeated_problem_is_logged_at_most_once_per_log_interval_s(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mon = _monitor(
+        FanHealthConfig(settle_s=0.0, rpm_fault_s=0.0001, log_interval_s=100.0),
+        case120=FanModel(rpm_max=1100.0, deadband=0.1),
+    )
+    with caplog.at_level(logging.WARNING, logger="aqua_bridge.health"):
+        for step in range(6):  # 6 ticks, 10 s apart: one line
+            mon.update({"qd3": _reading(rpm=0.0)}, 10.0 * step)
+        assert len(caplog.records) == 1
+        mon.update({"qd3": _reading(rpm=0.0)}, 200.0)
+        assert len(caplog.records) == 2
+
+
+# --- against the captured reports -----------------------------------------------------
+
+
+def test_the_captured_aquaero_own_outputs_report_no_power_and_the_aquabus_one_does() -> None:
+    status = decode_status(AQUAERO, fixture_bytes("aquaero-status-aquabus-fan7-100.bin"))
+    assert not AQUAERO.reports_power(1) and AQUAERO.reports_power(7)
+    assert (status.fans[0].current_ma, status.fans[0].power_cw) == (0, 0)  # own output, 349 rpm
+    assert (status.fans[6].current_ma, status.fans[6].power_w) == (27, pytest.approx(0.32))
+    assert QUADRO.reports_power(1)
+
+
+def test_the_captured_rails_sit_inside_the_default_window() -> None:
+    defaults = FanHealthConfig()
+    for name, kind in (
+        ("aquaero-status.bin", AQUAERO),
+        ("aquaero-status-aquabus-fan7-100.bin", AQUAERO),
+        ("quadro-status.bin", QUADRO),
+    ):
+        for fan in decode_status(kind, fixture_bytes(name)).fans:
+            if fan.present and fan.voltage_v > 0.0:
+                assert defaults.rail_min_v <= fan.voltage_v <= defaults.rail_max_v, name
+
+
+# --- the example configs --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["config.example.yaml", "config.example-das.yaml"])
+def test_both_example_configs_show_every_key_at_its_default(name: str) -> None:
+    """Every operator tunable is a documented key with one default: both examples must
+    list all of them, and list the values the code actually uses."""
+    app = load_config(Path(__file__).resolve().parent.parent / name)
+    section = app.section("fan_health")
+    assert set(section) == set(FANHEALTH_KEYS), name
+    assert FanHealthConfig.from_section(section) == FanHealthConfig(), name
