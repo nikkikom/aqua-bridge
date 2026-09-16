@@ -1,18 +1,29 @@
-"""Tests for aqua_bridge.hostinfo against fake sysfs/procfs trees."""
+"""Tests for aqua_bridge.hostinfo against fake sysfs/procfs trees.
+
+Including the board's ``get_throttled`` word (PROJECT.md section 8 item 97): every
+bit of both halves, the sysfs attribute preferred over ``vcgencmd``, and every way
+neither source reads. No test here shells out to ``vcgencmd``.
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from aqua_bridge import hostinfo
 from aqua_bridge.hostinfo import (
+    THROTTLED_BITS,
+    THROTTLED_SINCE_BOOT_SHIFT,
     CachedHostInfo,
     collect_hostinfo,
+    decode_throttled,
     read_cpu_temp_c,
     read_disk,
     read_loadavg,
     read_memory,
+    read_throttled,
     read_uptime_s,
     read_wifi_rssi,
 )
@@ -160,6 +171,96 @@ def test_wifi_rssi_no_interfaces_is_none(tmp_path: Path) -> None:
     assert read_wifi_rssi(p) is None
 
 
+# --- read_throttled (PROJECT.md section 8 item 97) ----------------------------
+
+
+def test_decode_throttled_names_every_bit_both_halves() -> None:
+    """Each of the four conditions, alone, in its "now" and its "since boot" bit."""
+    for bit, name in THROTTLED_BITS:
+        now = decode_throttled(1 << bit)
+        assert now[f"{name}_now"] is True, name
+        assert now[f"{name}_since_boot"] is False, name
+        assert now["now"] is True and now["since_boot"] is False, name
+        assert [n for _, n in THROTTLED_BITS if now[f"{n}_now"]] == [name]
+
+        ever = decode_throttled(1 << (bit + THROTTLED_SINCE_BOOT_SHIFT))
+        assert ever[f"{name}_since_boot"] is True, name
+        assert ever[f"{name}_now"] is False, name
+        assert ever["now"] is False and ever["since_boot"] is True, name
+
+
+def test_decode_throttled_zero_is_the_owner_s_idle_board() -> None:
+    """The Zero 2 W read 0x0 at idle: nothing now, nothing since boot."""
+    decoded = decode_throttled(0)
+    assert decoded["raw"] == 0 and decoded["hex"] == "0x0"
+    assert decoded["now"] is False and decoded["since_boot"] is False
+    assert not any(v for k, v in decoded.items() if k.endswith(("_now", "_since_boot")))
+
+
+def test_decode_throttled_under_voltage_now_and_ever() -> None:
+    decoded = decode_throttled(0x50005)
+    assert decoded["hex"] == "0x50005"
+    assert decoded["under_voltage_now"] is True and decoded["under_voltage_since_boot"] is True
+    assert decoded["throttled_now"] is True and decoded["throttled_since_boot"] is True
+    assert decoded["freq_capped_now"] is False and decoded["soft_temp_limit_now"] is False
+
+
+def test_read_throttled_prefers_the_sysfs_attribute(tmp_path: Path) -> None:
+    """The sysfs path is read and vcgencmd is never called when it is there."""
+    p = tmp_path / "get_throttled"
+    _write(p, "0x80008\n")
+    calls = {"n": 0}
+
+    def never() -> str | None:
+        calls["n"] += 1
+        return "throttled=0x0"
+
+    decoded = read_throttled(p, vcgencmd=never)
+    assert decoded is not None
+    assert decoded["soft_temp_limit_now"] is True and decoded["soft_temp_limit_since_boot"] is True
+    assert calls["n"] == 0
+
+
+def test_read_throttled_falls_back_to_vcgencmd_output(tmp_path: Path) -> None:
+    decoded = read_throttled(tmp_path / "absent", vcgencmd=lambda: "throttled=0x4\n")
+    assert decoded is not None and decoded["throttled_now"] is True
+
+
+def test_read_throttled_without_the_binary_is_none(tmp_path: Path) -> None:
+    """No sysfs attribute and no vcgencmd (every machine that is not a Pi)."""
+    assert read_throttled(tmp_path / "absent", vcgencmd=lambda: None) is None
+    assert read_throttled(tmp_path / "absent", vcgencmd=None) is None
+
+
+def test_read_throttled_unreadable_source_is_none(tmp_path: Path) -> None:
+    """A directory where the attribute should be: an OSError, not an exception out."""
+    (tmp_path / "get_throttled").mkdir()
+    assert read_throttled(tmp_path / "get_throttled", vcgencmd=None) is None
+
+
+@pytest.mark.parametrize("text", ["", "   ", "garbage\n", "throttled=\n", "throttled=oops\n"])
+def test_read_throttled_malformed_is_none(tmp_path: Path, text: str) -> None:
+    p = tmp_path / "get_throttled"
+    _write(p, text)
+    assert read_throttled(p, vcgencmd=None) is None
+
+
+def test_read_throttled_a_raising_runner_is_none_not_an_exception(tmp_path: Path) -> None:
+    def boom() -> str | None:
+        raise RuntimeError("no")
+
+    assert read_throttled(tmp_path / "absent", vcgencmd=boom) is None
+
+
+def test_run_vcgencmd_starts_no_process_without_the_binary(monkeypatch: Any) -> None:
+    """The default fallback short-circuits on PATH, so a test machine never shells out."""
+    monkeypatch.setattr(hostinfo.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        hostinfo.subprocess, "run", lambda *a, **k: pytest.fail("no process may be started")
+    )
+    assert hostinfo.run_vcgencmd() is None
+
+
 # --- collect_hostinfo --------------------------------------------------------
 
 
@@ -171,6 +272,8 @@ def test_collect_hostinfo_all_missing_is_all_none(tmp_path: Path) -> None:
         uptime_path=tmp_path / "uptime",
         disk_path=tmp_path / "no" / "such" / "path",
         wireless_path=tmp_path / "wireless",
+        throttled_path=tmp_path / "get_throttled",
+        vcgencmd=None,
     )
     assert info == {
         "cpu_temp_c": None,
@@ -183,6 +286,7 @@ def test_collect_hostinfo_all_missing_is_all_none(tmp_path: Path) -> None:
         "disk_free_gb": None,
         "wifi_rssi_dbm": None,
         "uptime_s": None,
+        "throttled": None,
     }
 
 
@@ -196,6 +300,7 @@ def test_collect_hostinfo_all_present(tmp_path: Path) -> None:
     )
     _write(tmp_path / "uptime", "100.0 0.0\n")
     _write(tmp_path / "wireless", _WIRELESS_SAMPLE)
+    _write(tmp_path / "get_throttled", "0x50005\n")
 
     info = collect_hostinfo(
         thermal_root=tmp_path / "thermal",
@@ -204,6 +309,8 @@ def test_collect_hostinfo_all_present(tmp_path: Path) -> None:
         uptime_path=tmp_path / "uptime",
         disk_path="/",
         wireless_path=tmp_path / "wireless",
+        throttled_path=tmp_path / "get_throttled",
+        vcgencmd=None,
     )
     assert info["cpu_temp_c"] == pytest.approx(45.0)
     assert info["load1"] == pytest.approx(1.0)
@@ -213,6 +320,8 @@ def test_collect_hostinfo_all_present(tmp_path: Path) -> None:
     assert info["uptime_s"] == pytest.approx(100.0)
     assert info["wifi_rssi_dbm"] == pytest.approx(-60.0)
     assert info["disk_used_pct"] is not None
+    assert info["throttled"]["hex"] == "0x50005"
+    assert info["throttled"]["under_voltage_now"] is True
 
 
 # --- CachedHostInfo ----------------------------------------------------------
