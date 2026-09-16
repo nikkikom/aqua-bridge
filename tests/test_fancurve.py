@@ -74,7 +74,8 @@ def test_fan_curve_keys_have_defaults_and_rules(das_example_cfg: MpcConfig, cfg:
         das_example_cfg.fan_curve_settle_s,
         das_example_cfg.fan_curve_refit_s,
         das_example_cfg.fan_curve_max_rmse_frac,
-    ) == (30.0, 600.0, 0.05)
+        das_example_cfg.fan_curve_max_age_s,
+    ) == (30.0, 600.0, 0.05, 3600.0)
     with pytest.raises(ConfigError, match="requires mpc.topology"):
         dataclasses.replace(cfg, fan_curve_online=True)
     for key, bad in (
@@ -82,6 +83,7 @@ def test_fan_curve_keys_have_defaults_and_rules(das_example_cfg: MpcConfig, cfg:
         ("fan_curve_refit_s", 0.0),
         ("fan_curve_max_rmse_frac", 0.0),
         ("fan_curve_max_rmse_frac", 1.5),
+        ("fan_curve_max_age_s", 599.0),  # below fan_curve_refit_s: never re-confirmable
     ):
         with pytest.raises(ConfigError, match=key):
             dataclasses.replace(das_example_cfg, **{key: bad})
@@ -154,8 +156,8 @@ def test_the_memory_is_plain_json_and_survives_a_round_trip() -> None:
     assert again == memory
     u = dict.fromkeys(cfg.channels, 0.5)
     assert (
-        fancurve.update(again, cfg, u=u, rpm={}, ts=1e4).curves
-        == fancurve.update(memory, cfg, u=u, rpm={}, ts=1e4).curves
+        fancurve.update(again, cfg, u=u, rpm={}, ts=1000.0).curves
+        == fancurve.update(memory, cfg, u=u, rpm={}, ts=1000.0).curves
     )
 
 
@@ -181,14 +183,14 @@ def test_a_changed_fan_model_map_starts_over() -> None:
     cfg = online_cfg()
     memory, curves = feed(cfg, [0.2, 0.5, 0.8, 1.0])
     assert curves
-    kept = fancurve.update(memory, cfg, u=dict.fromkeys(cfg.channels, 0.5), rpm={}, ts=1e4)
+    kept = fancurve.update(memory, cfg, u=dict.fromkeys(cfg.channels, 0.5), rpm={}, ts=1000.0)
     assert set(kept.curves) == set(curves)
 
     fans = das_mapping()["fans"]
     fans["fb1"]["model"] = "p12"
     swapped = online_cfg(fans=fans)
     started_over = fancurve.update(
-        memory, swapped, u=dict.fromkeys(swapped.channels, 0.5), rpm={}, ts=1e4
+        memory, swapped, u=dict.fromkeys(swapped.channels, 0.5), rpm={}, ts=1000.0
     )
     assert started_over.curves == {}
 
@@ -306,3 +308,246 @@ def test_step_without_the_switch_keeps_no_accumulator_and_reports_nothing() -> N
         cmd, state = step(obs, cfg, state)
     assert "fan_fit" not in state.solver_memory
     assert "fan_curves" not in cmd.diagnostics
+
+
+# ---------------------------------------------------------------------------
+# the readers the fit reaches, and the ones it deliberately does not (item 107)
+# ---------------------------------------------------------------------------
+
+#: A fit far from the fixture's ``fan_models`` on every axis, so any reader that follows
+#: it is visible in the arithmetic.
+FITTED = {
+    "p12": {"rpm_max": 2100.0, "deadband": 0.35, "exponent": 0.6},
+    "p14": {"rpm_max": 1400.0, "deadband": 0.0, "exponent": 1.4},
+}
+
+
+def test_every_reader_of_the_fan_curve_data_has_a_decision() -> None:
+    """The table is item 107's decision list: a reader added later without a decision (or
+    with one that is neither ``curve`` nor ``config``) fails here and in review."""
+    assert set(fancurve.READERS) == {
+        "thermal_model",
+        "mpc_prediction",
+        "estimator_airflow",
+        "noise_u0",
+        "noise_rpm_max",
+        "noise_db_at_max",
+        "model_use_rpm",
+        "fan_health",
+        "stuck_airflow",
+    }
+    assert set(fancurve.READERS.values()) == {"curve", "config"}
+
+
+def test_the_estimator_airflow_follows_a_fitted_curve_and_falls_back_without_one() -> None:
+    """``Q_z`` and ``Qn_z`` must come from the curve the thermal model plans on, or the
+    MPC's prediction-error guard reads the difference as a bad model (item 107)."""
+    from aqua_bridge.control import estimator
+
+    cfg = online_cfg()
+    temps = {k: v for k, v in default_temps(cfg).items() if v is not None}
+    u = dict.fromkeys(cfg.channels, 0.5)
+
+    def airflow(curves: Any) -> tuple[float, str]:
+        up = estimator.update(None, cfg, temps=temps, u=u, ts=0.0, curves=curves)
+        zone = up.zones["za"]
+        return zone["airflow_w_per_k"], zone["airflow_curve"]
+
+    configured, source = airflow(None)
+    assert source == "config"
+    # the same arithmetic by hand, from the fitted pair rather than fan_models'
+    e_total = sum(cfg.fans[ch].count for ch in ("fa1", "fa2")) * 33.0
+    assert configured == pytest.approx(e_total * thermal.phi(0.5, 0.1, 1.0))
+    fitted, source = airflow(FITTED)
+    assert source == "fit"
+    assert fitted == pytest.approx(e_total * thermal.phi(0.5, 0.35, 0.6))
+    assert abs(fitted - configured) > 1.0  # the two curves really do disagree
+
+    # nothing usable for that model: back to the configured curve
+    for curves in ({}, {"p12": {"deadband": 0.9, "exponent": 1.0, "rpm_max": 10.0}}):
+        value, source = airflow(curves)
+        assert value == pytest.approx(configured) and source == "config"
+
+
+def test_the_noise_objective_u0_follows_the_fit_and_rpm_max_never_does() -> None:
+    """The dead band is the objective's own model of where a fan starts to turn, so it
+    follows the fit; ``rpm_max`` and ``noise_db_at_max`` do not (item 107)."""
+    from aqua_bridge.control import noise
+
+    cfg = online_cfg()
+    u = dict.fromkeys(cfg.channels, 0.5)
+    assert noise.channel_deadband(cfg, "fa1") == cfg.fan_models["p12"].deadband
+    assert noise.channel_deadband(cfg, "fa1", FITTED) == 0.35
+    assert noise.channel_deadband(cfg, "fa1", {}) == cfg.fan_models["p12"].deadband
+
+    # a fan that only starts at 0.35 makes almost no noise at 0.5: the surrogate must not
+    # charge the solver for noise the fan does not make
+    plain = noise.surrogate(cfg, u)
+    fitted = noise.surrogate(cfg, u, FITTED)
+    assert fitted.value["fa1"] < 0.5 * plain.value["fa1"]
+    assert noise.surrogate(cfg, u, {}).value["fa1"] == pytest.approx(plain.value["fa1"])
+
+    # rpm_max stays the commissioned one: at full duty the modelled speed is unchanged
+    assert noise.rpm_model(cfg, "fa1", 1.0, FITTED) == cfg.fan_models["p12"].rpm_max
+    assert noise.rpm_model(cfg, "fa1", 1.0) == cfg.fan_models["p12"].rpm_max
+    # so is P_ref, which is count and noise_db_at_max only
+    assert noise.reference_power(cfg) == pytest.approx(
+        sum(
+            cfg.fans[ch].count * 10.0 ** (cfg.fan_models[cfg.fans[ch].model].noise_db_at_max / 10.0)
+            for ch in cfg.channels
+        )
+    )
+
+
+def test_the_noise_diagnostics_name_the_curve_behind_the_index() -> None:
+    from aqua_bridge.control import noise
+
+    cfg = online_cfg()
+    prev = dict.fromkeys(cfg.channels, 0.5)
+    rpm: dict[str, float | None] = {"fa1": 900.0, "fa2": None, "fb1": None, "fc1": None}
+    plain = noise.noise_diagnostics(cfg, prev=prev, pwm=prev, rpm=rpm)
+    fitted = noise.noise_diagnostics(cfg, prev=prev, pwm=prev, rpm=rpm, curves=FITTED)
+    assert plain["channels"]["fa1"]["curve"] == "config"
+    assert plain["channels"]["fa1"]["u0"] == cfg.fan_models["p12"].deadband
+    assert fitted["channels"]["fa1"]["curve"] == "fit"
+    assert fitted["channels"]["fa1"]["u0"] == 0.35
+    # the tach branch is untouched: a measured speed normalised by the commissioned
+    # rpm_max is the same number whatever was fitted
+    assert fitted["channels"]["fa1"]["rpm"] == plain["channels"]["fa1"]["rpm"] == 900.0
+    # the modelled channels move, and the index with them
+    assert fitted["channels"]["fa2"]["rpm"] < plain["channels"]["fa2"]["rpm"]
+    assert fitted["db_index"] != plain["db_index"]
+
+
+def test_fan_health_judges_a_fan_against_the_configured_curve_not_the_fit() -> None:
+    """A rule derived from the configured curve must not drift with a fit: the fit is made
+    from the very readings the rule judges, so a fan that slows down would take the curve
+    with it and the deviation would never show (item 107)."""
+    from aqua_bridge.health import FanHealthConfig, HealthMonitor, expected_rpm
+
+    cfg = online_cfg()
+    spec = cfg.fan_models["p12"]
+    assert fancurve.READERS["fan_health"] == "config"
+    assert expected_rpm(cfg, "fa1", 1.0) == pytest.approx(spec.rpm_max)
+
+    # the fan turns at half the commissioned speed, which is what a fit would follow
+    mon = HealthMonitor(cfg, FanHealthConfig())
+    reading = {
+        "device": "aquaero",
+        "output": "pwm1",
+        "rpm": 0.5 * spec.rpm_max,
+        "duty": 1.0,
+        "voltage_v": 12.1,
+        "power_reported": False,
+        "aquabus": True,
+    }
+    mon.check_channel("fa1", reading, 0.0)
+    t = mon.settings.settle_s + 1.0
+    mon.check_channel("fa1", reading, t)
+    verdict = mon.check_channel("fa1", reading, t + mon.settings.rpm_fault_s)
+    assert verdict["expected_rpm"] == pytest.approx(spec.rpm_max)
+    assert verdict["problems"], "a fan at half speed must still be a deviation"
+
+
+def test_the_stuck_airflow_evidence_stays_on_the_configured_curve() -> None:
+    """Gate rule 3's airflow evidence is derived from the config once at load
+    (``StuckParams.airflow``), and no fit reaches it (item 107)."""
+    cfg = online_cfg()
+    memory, curves = feed(cfg, [0.2, 0.4, 0.6, 0.8, 1.0])
+    state = MpcState(solver_memory={"fan_fit": memory})
+    _, state = step(das_obs(cfg, 0.0, pwm=0.5), cfg, state)
+    assert state.solver_memory["fan_curves"] == curves  # a fit is in force
+
+    for channel, weight, deadband, exponent in cfg.stuck_params("prox_a1").airflow:
+        model = cfg.fan_models[cfg.fans[channel].model]
+        assert (deadband, exponent) == (model.deadband, model.exponent)
+        assert weight > 0.0
+
+
+def test_a_fit_nothing_re_confirms_goes_stale_and_every_reader_falls_back() -> None:
+    """``fan_curve_max_age_s``: the curve leaves ``solver_memory["fan_curves"]``, so the
+    readers that follow it are back on the configured curve, and the diagnostics say the
+    fit went stale rather than quietly reporting the config (item 107)."""
+    cfg = online_cfg(fan_curve_max_age_s=60.0)
+    memory, curves = feed(cfg, [0.2, 0.4, 0.6, 0.8, 1.0])
+    assert set(curves) == {"p12", "p14"}
+    state = MpcState(solver_memory={"fan_fit": memory})
+    cmd, state = step(das_obs(cfg, 0.0, pwm=0.5), cfg, state)
+    assert set(state.solver_memory["fan_curves"]) == {"p12", "p14"}
+    assert cmd.diagnostics["fan_curves"]["models"]["p12"]["stale"] is False
+
+    # the tachometer stops reporting: no new samples, every refit refused, and the
+    # accepted fit ages past fan_curve_max_age_s
+    blind = {ch: None for ch in cfg.channels}
+    ts = 0.0
+    for i in range(1, 12):
+        ts = float(i) * 20.0
+        cmd, state = step(das_obs(cfg, ts, pwm=0.5, rpm=blind), cfg, state)
+    assert state.solver_memory["fan_curves"] == {}
+    row = cmd.diagnostics["fan_curves"]["models"]["p12"]
+    assert row["stale"] is True and row["source"] == "config"
+    # the bins still carry the old sweep, so a refit keeps passing; what has aged out is
+    # the evidence under it, and that is what the diagnostics show
+    assert row["sample_age_s"] > cfg.fan_curve_max_age_s
+    assert row["deadband"] == cfg.fan_models["p12"].deadband
+    assert row["exponent"] == cfg.fan_models["p12"].exponent
+
+    # and the readers that followed it are back on fan_models
+    assert cmd.diagnostics["noise"]["channels"]["fa1"]["curve"] == "config"
+    assert cmd.diagnostics["estimator"]["zones"]["za"]["airflow_curve"] == "config"
+    params = thermal.model_params(cfg, curves=state.solver_memory["fan_curves"])
+    assert params.fan["fa1"] == (cfg.fan_models["p12"].deadband, cfg.fan_models["p12"].exponent)
+
+
+def test_a_fit_that_keeps_being_re_confirmed_never_goes_stale() -> None:
+    """Ordinary regulation with a live tachometer: both stamps keep moving, however many
+    times the age window passes."""
+    cfg = online_cfg(fan_curve_max_age_s=60.0)
+    memory, curves = feed(cfg, [0.2, 0.4, 0.6, 0.8, 1.0])
+    assert set(curves) == {"p12", "p14"}
+    # 400 ticks more, ten age windows, every one of them sampled and refitted
+    memory, curves = feed(cfg, [0.4, 0.8] * 25, memory=memory, t0=100.0)
+    assert set(curves) == {"p12", "p14"}
+    out = fancurve.update(
+        memory,
+        cfg,
+        u=dict.fromkeys(cfg.channels, 0.8),
+        rpm={ch: truth_rpm(cfg, ch, 0.8) for ch in cfg.channels},
+        ts=500.0,
+    )
+    assert set(out.curves) == {"p12", "p14"} and out.stale == ()
+
+
+def test_the_diagnostics_carry_the_reader_table_and_the_curve_in_force() -> None:
+    """Nobody should have to guess which curve produced a number: the summary names the
+    source per fan model and reports the decision per reader (item 107)."""
+    cfg = online_cfg()
+    memory, curves = feed(cfg, [0.2, 0.4, 0.6, 0.8, 1.0])
+    state = MpcState(solver_memory={"fan_fit": memory})
+    cmd, state = step(das_obs(cfg, 0.0, pwm=0.5), cfg, state)
+    summary = cmd.diagnostics["fan_curves"]
+    assert summary["readers"] == fancurve.READERS
+    assert summary["models"]["p12"]["source"] == "fit"
+    assert summary["models"]["p12"]["stale"] is False
+    assert summary["models"]["p12"]["age_s"] == pytest.approx(0.0, abs=1e-6)
+    assert cmd.diagnostics["noise"]["channels"]["fa1"]["curve"] == "fit"
+    assert cmd.diagnostics["noise"]["channels"]["fa1"]["u0"] == curves["p12"]["deadband"]
+    assert cmd.diagnostics["estimator"]["zones"]["za"]["airflow_curve"] == "fit"
+
+
+def test_a_curve_from_the_store_is_in_force_until_a_fit_replaces_it() -> None:
+    """A seeded curve has no fit of this run behind it, so the stale rule has nothing to
+    measure: it stays in force (the store's own age rule judged it at load) and reports
+    ``store``."""
+    cfg = online_cfg(fan_curve_max_age_s=60.0)
+    state = MpcState(solver_memory={"fan_curves": {"p12": dict(FITTED["p12"])}})
+    cmd, state = step(das_obs(cfg, 1e6, pwm=0.5), cfg, state)
+    row = cmd.diagnostics["fan_curves"]["models"]["p12"]
+    assert row["source"] == "store" and row["stale"] is False and row["age_s"] is None
+    assert state.solver_memory["fan_curves"]["p12"] == FITTED["p12"]
+    assert cmd.diagnostics["estimator"]["zones"]["za"]["airflow_curve"] == "fit"
+
+
+def test_the_max_age_must_leave_room_for_one_refit() -> None:
+    with pytest.raises(ConfigError, match="fan_curve_max_age_s"):
+        online_cfg(fan_curve_refit_s=600.0, fan_curve_max_age_s=599.0)
