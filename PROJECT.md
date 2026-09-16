@@ -5177,7 +5177,9 @@ Owner decision (2026-09-16):
     - record a run that sweeps each channel over its duty range, fit it with
       `tools/fit_fans.py` and put the result in `mpc.fan_models` — the rpm
       rule is only as good as that curve, and with the DAS example's
-      placeholder `rpm_max: 1500` it would fire on healthy fans;
+      placeholder `rpm_max: 1500` it would fire on healthy fans (the online
+      fit of item 14 feeds the thermal model, not `fan_health`, so the
+      configured curve still has to be right here);
     - measure each fan model's power at full speed and set
       `fan_models.<m>.power_w_at_max` (the power rule is off without it).
       The one measurement so far is the Quadro's aquabus fan 7: 27 mA and
@@ -6452,7 +6454,7 @@ blob in the log.
    | Stage | Config | Decide by | Watch |
    |-------|--------|-----------|-------|
    | 0 commission + record | `solver: pi` (PI-like DAS), `zones.trust_rule: strict`, `record_path` | zero zone faults from sensors, bulk cycle time, every bay `occupied` / `empty` as physically true, no drive over its soft target | `/api/estimate`, `/api/bays`, `/api/health`, journal |
-   | 1 offline fit + fan curves | – | `tools/fit_model.py`: `E` per group and per-bay `k` pinned (relative SE under `model_converged_rel_se`); `tools/fit_fans.py` RMS < 5 % rpm, copied into `fan_models`; spare thermistors moved to the bays the fit ranks tightest | fit and replay reports |
+   | 1 offline fit + fan curves | – | `tools/fit_model.py`: `E` per group and per-bay `k` pinned (relative SE under `model_converged_rel_se`), `--store-out` seeding the model store (item 15); `tools/fit_fans.py` RMS < 5 % rpm, copied into `fan_models` (or `fan_curve_online` fitting them live, item 14); spare thermistors moved to the bays the fit ranks tightest | fit and replay reports |
    | 2 SMART calibration (if used) | agent on the PC | most bays `calibrated`, `σ_cal` ≤ 0.7 °C, calibrated estimates within 2 °C of SMART, associations match the physical bays | HA `drive_sigma_*`, `/api/model` calibration, `/api/bays` |
    | 3 shadow + experiments | `model_shadow: true`, `ident_enabled: true`, store on; experiments one group at a time under PI-DAS | every zone `converged`, prediction error < 0.5 °C, no experiment abort on the envelope | HA `model_status`, `model_pred_err_c`, `ident_running`, `/api/model` |
    | 4 MPC | `solver: mpc` | the validity gate keeps `active: mpc` (no model fallbacks), no `degraded`, `noise_db` lower than stage 0 at equal or better `drive_margin_*`, step p99 under budget | `/api/health`, `solver_diag.model` (its `checks`, `air_dist_c_per_min` for §8 item 98), `noise_db`, `drive_margin_*` |
