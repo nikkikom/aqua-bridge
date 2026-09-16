@@ -392,6 +392,24 @@ def test_settling_expires_after_bay_settle_s():
     assert [up.bays["b1"]["settling"] for up in later][-1] is False
 
 
+def test_repeated_jumps_never_renew_the_settling_window():
+    """The window runs from the first widening of an episode, so a sensor that jumps on
+    every tick cannot keep its bay exempt from the sigma trust rule for ever."""
+    cfg = lcfg(bay_settle_s=10.0)
+    mem = run_ticks(cfg, 30)[-1].memory
+    flags, sigmas = [], []
+    for i in range(20):
+        up = run_ticks(
+            cfg, 1, mem=mem, t0=30.0 + i, prox_b1=PROX_C + (10.0 if i % 2 else -10.0)
+        )[-1]
+        mem = up.memory
+        flags.append(up.bays["b1"]["settling"])
+        sigmas.append(up.estimates["b1"]["sigma"])
+    assert flags[0] is True and flags[9] is True and flags[10] is False
+    assert not any(flags[10:]), flags
+    assert min(sigmas[10:]) > est.SIGMA_UNCALIBRATED_C  # the jumps did keep firing
+
+
 def test_air_blind_s_counts_the_time_without_a_trusted_zone_air_reading():
     cfg = lcfg()
     ups = run_ticks(cfg, 5)

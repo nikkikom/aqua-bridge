@@ -127,7 +127,9 @@ metric for the DAS MPC milestone). ``sigma_cal`` is 1.5 degC uncalibrated and
 Per bay the block also carries ``observed`` (a trusted proximal member this tick),
 ``seeded`` (the bay has had a reading of its own; see *Per bay* above),
 ``settling`` (within ``bay_settle_s`` of a fast-swap jump or of an occupancy change
-into or out of ``empty``, both of which widen the bay's variance on purpose) and
+into or out of ``empty``, both of which widen the bay's variance on purpose; a window
+opens only on a bay whose sigma had come back within ``sigma_fault_c``, so readings that
+keep tripping the fast-swap rule cannot renew it for ever) and
 ``offsets_c`` (the placement offset the filter carries per further member); per
 zone ``air_blind_s``, the time since a trusted ``zone_air`` reading was last fused.
 ``zones.trust_rule: sigma`` reads all four (``aqua_bridge.control.zones``).
@@ -214,7 +216,8 @@ Memory (plain JSON)::
 
     {"v": 1, "fp": <structure fingerprint>, "ts": last ts,
      "zones": {zone: {"x": [...], "P": [[...]], "t_in": float | None, "blind": s}},
-     "bays": {bay: {"occ", "low", "rise", "since", "assoc", "map", "init", "disturb"}},
+     "bays": {bay: {"occ", "low", "rise", "since", "assoc", "map", "init",
+                    "disturb", "over"}},
      "cal": {bay: {serial: {"th", "P", "n", "fresh", "rms2", "ts", "used"
                             [, "inflate", "confirm"]}}},
      "smart": {serial: {"ts", "t", "model", "hist"}},
@@ -603,6 +606,7 @@ def _fresh_bay() -> dict[str, Any]:
         "map": None,
         "init": False,
         "disturb": None,
+        "over": False,
     }
 
 
@@ -675,6 +679,7 @@ def _parse(memory: object, st: _Structure) -> dict[str, Any]:
             # of an initialised zone seeded, which is what ``True`` says.
             "init": bool(raw.get("init", True)),
             "disturb": _opt_num(raw.get("disturb")),
+            "over": bool(raw.get("over", False)),
         }
     for b, per_serial in dict(memory.get("cal") or {}).items():
         if b not in st.bays:
@@ -862,6 +867,25 @@ def _drive_class(
 
 def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
+
+
+def _settling(bm: Mapping[str, Any], ts: float, window: float) -> bool:
+    """The bay is inside the settling window its last deliberate widening opened."""
+    mark = bm["disturb"]
+    return mark is not None and 0.0 <= float(ts) - float(mark) < window
+
+
+def _mark_disturbed(bm: dict[str, Any], ts: float) -> None:
+    """Open a settling window on a deliberate widening (a fast-swap jump, an occupancy
+    change into or out of ``empty``).
+
+    Only a bay whose sigma was back within ``sigma_fault_c`` at the end of the previous
+    tick opens one, so an episode gets **one** window: readings that keep tripping the
+    fast-swap rule cannot renew it, and the bay is exempt from the sigma trust rule for at
+    most ``bay_settle_s`` however long they go on.
+    """
+    if not bm["over"]:
+        bm["disturb"] = float(ts)
 
 
 def _seed_sensor(bay: _Bay, temps: Mapping[str, float]) -> float:
@@ -1165,8 +1189,8 @@ def update(
     observed: dict[str, bool] = {}
     for b, bay in st.bays.items():
         bm = mem["bays"][b]
-        if jumped.get(b):
-            bm["disturb"] = float(ts)  # the fast-swap rule widened this bay on purpose
+        if jumped.get(b):  # the fast-swap rule widened this bay on purpose
+            _mark_disturbed(bm, float(ts))
         before = bm["occ"]
         declared_occ = topo.bays[b].occupied
         zone_ready = bay.zone in arrays
@@ -1229,7 +1253,7 @@ def update(
                     p[i_q, :], p[:, i_q] = 0.0, 0.0
                     p[i_q, i_q] = P0_HEAT
                 if before == EMPTY or after == EMPTY:  # a deliberate widening, as a jump
-                    bm["disturb"] = float(ts)
+                    _mark_disturbed(bm, float(ts))
             if (before == EMPTY) != (after == EMPTY):
                 bm["assoc"] = None
                 if b in assoc and assoc[b][1] == "correlation":
@@ -1357,8 +1381,7 @@ def update(
             "pending_occupied_ticks": int(bm["rise"]),
             "observed": observed.get(b, False),
             "seeded": bool(bm["init"]),
-            "settling": bm["disturb"] is not None
-            and 0.0 <= float(ts) - float(bm["disturb"]) < spec.bay_settle_s,
+            "settling": _settling(bm, float(ts), spec.bay_settle_s),
             "offsets_c": {
                 name: float(arrays[bay.zone][0][2 + 3 * len(st.zones[bay.zone].bays) + k])
                 for name, k in bay.offsets.items()
@@ -1389,11 +1412,15 @@ def update(
             info["delta_t_c"], info["heat_w"] = evidence[b]
         bays_out[b] = info
         if bay.zone not in arrays or bm["occ"] == EMPTY:
+            bm["over"] = False
             continue
         x, p = arrays[bay.zone]
         n = len(st.zones[bay.zone].bays)
         i_d, i_s, i_q = 2 + bay.index, 2 + n + bay.index, 2 + 2 * n + bay.index
         sigma = math.sqrt(max(float(p[i_d, i_d]), 0.0) + sigma_cal * sigma_cal)
+        # A settling window opens only on a bay whose sigma had come back within its
+        # threshold (:func:`_mark_disturbed`).
+        bm["over"] = sigma > spec.sigma_fault_c
         limit = cfg.drive_classes[cls].limit_c
         own = topo.bays[b].limit_c
         estimates_out[b] = estimate_entry(
