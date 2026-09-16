@@ -171,15 +171,29 @@ hardware.
    For the aquaero's own watchdog, configure a software sensor on the
    controller (enabled, a timeout of a few tens of seconds, a fallback
    temperature above every alarm threshold) with an alarm that selects a
-   safe profile, save that configuration once, then set
-   `heartbeat_sensor` to that sensor: the daemon writes it on every tick
-   whose duties reached the controller (and on no other), so a daemon or
-   Pi that stops — or one that runs but can no longer write — leaves the
-   controller to run the safe profile
+   safe profile, in aquasuite, then set `heartbeat_sensor` to that
+   sensor: the daemon writes it on every tick whose duties reached the
+   controller (and on no other), so a daemon or Pi that stops — or one
+   that runs but can no longer write — leaves the controller to run the
+   safe profile
    (PROJECT.md §2 "Software-sensor heartbeat and profiles", §8 item 84).
    Set the key in the same step as the sensor: a sensor enabled on the
    device with `heartbeat_sensor: 0` falls back and fires the alarm one
-   timeout after boot, for good. As the
+   timeout after boot, for good. Once the daemon has run a tick and its
+   duties look right, with the service **stopped**, commission that
+   configuration so a power cycle brings it back instead of falling to
+   whatever aquasuite last saved:
+
+   ```bash
+   .venv/bin/python tools/aquacomputer_commission.py \
+     --config /etc/aqua-bridge/config.yaml --device aquaero
+   ```
+
+   shows every output's duty, source and limits and the active profile
+   without writing anything; add `--save` to store it, after a typed
+   confirmation (PROJECT.md §8 item 88; run once per controller, so
+   `--device quadro` too when one is configured — its save report is not
+   verified to persist, unlike the aquaero's). As the
    service user:
    `HYPOTHESIS_PROFILE=pi .venv/bin/python -m pytest -m hardware`. Warm
    each mapped thermistor and confirm the right `obs.temps` key moves (a
