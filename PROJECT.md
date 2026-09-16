@@ -715,6 +715,8 @@ long `dt`):
 | `ident_seed` | 1 | int ≥ 0 |
 | `stuck_airflow_net` | 0.15 | `(0, 1]`: net move of a zone's relative airflow (block means over the Stuck window, below) that is Stuck evidence for the zone's sensors |
 | `stuck_air_oppose_c` | 0.3 | > 0, °C: a zone-air move against that airflow move by more than this voids it for the zone's `drive_proximal` sensors |
+| `stuck_air_oppose_max_c` | 3.0 | > `stuck_air_oppose_c`, °C: an opposing zone-air move larger than this no longer voids the airflow evidence |
+| `stuck_zone_air_dT_c` | 1.5 | > 0, °C: a zone-air move larger than this is Stuck evidence for a `drive_proximal` reading of the zone once another of the zone's proximal readings moved with it by more than `stuck_sibling_dT_c` |
 
 `budget_ms` / `budget_alarm_ms` (600 ms / 750 ms default, at `dt = 5 s` in the
 DAS example) gate both the benchmark (`tools/bench_step.py`,
@@ -1198,14 +1200,28 @@ number of rule 3 comes from `MpcConfig.stuck_params(name)`:
   air move kept a dead sensor trusted for as long as it lasted (§8 item 59).
   A zone-air sensor without a plausible path (dropout, Spike) does not vote;
   one that did not move (a frozen one included) keeps the evidence;
-- for a `drive_proximal` sensor whose zone airflow stayed **inside**
-  `stuck_airflow_net` over the window (fans pinned at `pwm_max`, a slow
-  trim: nothing to measure), the evidence is instead a zone-air sensor of
-  its zone whose plausible net move over the window exceeds
-  `stuck_zone_air_dT_c`. At constant airflow the drive-to-air difference
-  moves only with the bay's own power, so an air move that much larger than
-  the band the reading sits in had to reach a healthy sensor; one zone-air
-  sensor is enough, and the direction does not matter (§8 item 58);
+- for a `drive_proximal` sensor whose zone airflow was computable but gave
+  no evidence — it stayed **inside** `stuck_airflow_net` (fans pinned at
+  `pwm_max`, a slow trim: nothing to measure), or it moved and the zone air
+  excused it by the rule above — the evidence is instead a zone-air sensor
+  of its zone whose plausible net move over the window exceeds
+  `stuck_zone_air_dT_c` **while another `drive_proximal` reading of the same
+  zone, of any bay, moved plausibly by more than `stuck_sibling_dT_c` over
+  that window**. At constant airflow the drive-to-air difference moves only
+  with the bay's own power, so an air move that much larger than the band
+  the reading sits in had to reach a healthy sensor; one zone-air sensor is
+  enough, and the direction does not matter (§8 item 58). The second half is
+  what makes the air move *real*: without it the rule cannot tell "the air
+  moved and this one reading did not follow" from "this zone-air sensor is
+  drifting and every reading of the zone is correctly still", and a single
+  lying air sensor would brand every proximal reading of its zone Stuck and
+  fault the zone (§4.4). The other bay's reading is the corroboration and not
+  evidence on its own: a neighbour's drive heat never reaches this sensor
+  (the sibling rule below), the zone air they share does. Because this check
+  also runs after an excused airflow move, the excuse is effective only up to
+  whichever of `stuck_air_oppose_max_c` / `stuck_zone_air_dT_c` is met first:
+  a zone whose fans happen to move must not hide a dead sensor that a still
+  zone catches;
 - the sibling evidence counts only other sensors of the same zone **and**
   role, and for a `drive_proximal` sensor only those of its own **bay**:
   another bay's reading follows that bay's drive heat, which does not
@@ -1243,26 +1259,35 @@ quarter window that precedes it (`tests/test_gate.py`). A same-bay sibling
 that moves plausibly by more than `stuck_sibling_dT_c` flags it as well.
 A reading frozen while the airflow stays inside `stuck_airflow_net` is
 flagged once a zone-air sensor of its zone has moved past
-`stuck_zone_air_dT_c` within one window (§8 item 58), and one whose
-airflow move was opposed is flagged as soon as that opposition passes
-`stuck_air_oppose_max_c` (§8 item 59).
+`stuck_zone_air_dT_c` within one window and another bay's proximal reading
+of that zone has followed it (§8 item 58), and one whose airflow move was
+opposed is flagged as soon as that opposition passes
+`stuck_air_oppose_max_c`, or passes `stuck_zone_air_dT_c` with the same
+corroboration (§8 item 59).
 
 **Coverage on the simulator** (§8 items 3, 58). Each of the example
 config's 17 proximal readings frozen 20 minutes into a 2.5-hour `rich`
 PI-like DAS run, seeds 0–2 (51 runs, `tests/test_stuck_sim.py`): 17 of 51
 flagged with the airflow move as the only zoned evidence, **28 of 51**
-with the zone-air rule as well (per seed 6 → 17, 7 → 7, 4 → 4; seed 0's
-drawn inlet drifts, so every zone's air crosses `stuck_zone_air_dT_c`
-inside a window, while a flat ambient gives the rule nothing to see). The
-global rule before item 3 flagged all 51, at the price of the false zone
-faults above. False flags: **none**, in those 51 runs (no sensor but the
-frozen one) and in 256 healthy 2.5-hour PI-like runs (seeds 0–255) and
-120 DAS MPC runs (seeds 0–119). The defaults come from the same runs: on a
+with the zone-air rule as well (per seed 6 → 17, 7 → 7, 4 → 4). The gain
+is seed 0's, whose drawn inlet drifts far enough that every zone's air
+crosses `stuck_zone_air_dT_c` inside a window; seed 1's zone air does move
+but stays **under** 1.5 °C within a window, so the rule misses it on margin
+rather than on flatness, and seed 2's gains nothing. Corroboration costs
+nothing here: the same 28 are flagged with and without it, because on a
+real air move every other bay of the zone follows. The global rule before
+item 3 flagged all 51, at the price of the false zone faults above. False
+flags: **none**, in those 51 runs (no sensor but the frozen one) and in 256
+healthy 2.5-hour PI-like runs (seeds 0–255) and 120 DAS MPC runs (seeds
+0–119); a zone-air sensor drifting 0.3 °C/min for 45 minutes on an
+otherwise healthy enclosure flags no proximal reading and faults no zone
+(`tests/test_stuck_sim.py`). The defaults come from the same runs: on a
 healthy reading sitting inside its band the largest zone-air move at
 steady airflow was 1.20 °C, so `stuck_zone_air_dT_c` is 1.5; the largest
 opposing move that voided an airflow move was 1.19 °C, so
 `stuck_air_oppose_max_c` is 3.0. Lowering `stuck_zone_air_dT_c` to 1.25
-would flag 38 of the 51 but leaves no margin over that 1.20 °C.
+would flag 37 of the 51 (seed 1 alone goes 7 → 16: all of its windows sit
+in that 1.25–1.5 °C band) but leaves no margin over that 1.20 °C.
 Rejected as evidence: SMART diverging from the proximal reading — the
 serial-to-bay map is identified online by the estimator, so the gate's
 verdict would depend on an identification that has its own confirmation
@@ -2954,8 +2979,9 @@ Inject on top of an otherwise nominal closed-loop:
 | DS18B20 plateau (DAS) | a proximal DS18B20 on one 1/16 °C code for minutes while its zone's fans move | stays trusted: its window is `stuck_s` 1800 s decimated, its band `1.5 × 0.0625 °C`, its evidence only its zone's relative airflow and same-bay siblings (`tests/test_gate.py`) |
 | Idle bay beside a busy bay (DAS) | an idle bay's DS18B20 on one code for longer than `stuck_s` while a neighbouring bay's reading climbs 3 °C and the fans answer a little; zone air warming against more airflow; zone channels moved apart; a one-tick fan dip | stays trusted, no zone fault (`tests/test_gate.py`; `rich` truth-sim runs in `tests/test_stuck_sim.py`, §3 Stuck sizing) |
 | Frozen sensor (DAS) | a sensor frozen for its whole (decimated) window while its zone's relative airflow moved net by more than `stuck_airflow_net` | Stuck within `max(t0 + stuck_s, t1 + stuck_s / 2)` plus two decimation intervals, DS18B20 and thermistor alike; **only its zone** faults (hold, then high on its reach), other zones keep regulating (`degraded`); a redundant member's flag faults nothing; a frozen value hidden behind median3 glitches is still flagged (`tests/test_gate.py`, `tests/test_stuck_sim.py`) |
-| Frozen proximal, fans pinned (DAS) | a proximal reading frozen while the zone's airflow never moves past `stuck_airflow_net` (at `pwm_max`, or a rate limit that cannot cross a window) and the ambient steps, so the zone air rises | Stuck once a zone-air sensor of its zone has moved past `stuck_zone_air_dT_c` within one window; no other sensor of the run is flagged; only its zone faults (§8 item 58, `tests/test_gate.py`, `tests/test_stuck_sim.py`) |
+| Frozen proximal, fans pinned (DAS) | a proximal reading frozen while the zone's airflow never moves past `stuck_airflow_net` (at `pwm_max`, or a rate limit that cannot cross a window) and the ambient steps, so the zone air rises and the zone's other bays follow it | Stuck once a zone-air sensor of its zone has moved past `stuck_zone_air_dT_c` within one window **and** another proximal reading of the zone has moved by more than `stuck_sibling_dT_c`; no other sensor of the run is flagged; only its zone faults (§8 item 58, `tests/test_gate.py`, `tests/test_stuck_sim.py`) |
 | Frozen proximal, air swinging against the fans (DAS) | the zone air moves against an airflow move by more than `stuck_air_oppose_max_c` | the opposition no longer excuses the reading: Stuck, since a swing that large cannot be cancelled by the drive-to-air difference (§8 item 59, `tests/test_gate.py`) |
+| Drift on a zone-air sensor (DAS) | one `zone_air` sensor biased +0.3 °C/min for 45 minutes while the enclosure is healthy and every proximal reading of the zone is correctly still | **no** proximal reading of that zone is Stuck and no zone faults: the zone-air evidence needs another bay's reading to have followed the air, and a lying air sensor moves alone. The drifting sensor itself is followed like any Drift, and flagged by its own rules only (§8 item 58, `tests/test_gate.py`, `tests/test_stuck_sim.py`) |
 | Lie in one zone (DAS) | any row above on a sensor of one zone | only that zone (and its declared neighbours' channels) under fallback policy; a Flicker there never resets another zone's streak; a dropout inside a redundant group is no fault (`tests/test_mpc_zone_fallback.py`) |
 | Jump on a redundant member (DAS) | a second proximal sensor on a bay, a second zone-air sensor or an inlet steps +15 °C and stays | no zone fault; the member is excluded from the estimator, the solver and `last_good_obs` until its `confirm_ticks`-th trusted tick, then fused; a sole member still confirms in `confirm_ticks`; losing the confirmed member while the other confirms faults the zone (`tests/test_sensor_confirm.py`) |
 | Swapped proximal sensors (DAS) | ROM ids of two bays exchanged | a Jump on both at onset (their zones hold), confirmed like any Jump; caught at commissioning, not by the gate (§3) |
@@ -3343,7 +3369,7 @@ tests carry the `nightly` marker.
 | `tests/test_pi_das.py`, `tests/test_estimates.py`, `tests/test_das_config.py` | the margin-deficit PI (served zones, unconstrained channels, fixed channels, occupancy), the estimates block and prior map, `noise` / `limit_c` / served-zone config | PR |
 | `tests/test_estimator.py` | exact discretisation and Joseph form (random sequences keep P symmetric PSD); first tick and constant readings; σ grows while a bay is unobserved and shrinks back; redundant members; the occupancy machine incl. "never empty while zone air is unobserved"; SMART calibration acceptance, rejection, serial change and expiry after `calibration_max_age_days`; a guessed serial never relaxes a class; determinism, JSON round trip, malformed memory | PR |
 | `tests/test_associate.py` | detrended correlation, greedy assignment with margins, confirmation, full-window history, drops on silence / jump / empty, a declared serial wins; on the truth sim the right bays are found and indistinguishable bays refused | PR |
-| `tests/test_stuck_sim.py` | Stuck evidence on the truth sim (§3 Stuck sizing, §8 items 3 and 58): healthy `rich` runs flag no sensor and fault no zone; a frozen DS18B20 or thermistor proximal reading is flagged once its zone's airflow moves, or, with the fans held by the rate limit, once its zone air has risen past `stuck_zone_air_dT_c`; only a bay's last proximal sensor faults its zone | PR: 2 seeds, 3 frozen runs; nightly: 48 seeds, 2.5-hour runs of both DAS solvers, and the per-seed coverage sweep (each proximal reading frozen in turn) |
+| `tests/test_stuck_sim.py` | Stuck evidence on the truth sim (§3 Stuck sizing, §8 items 3 and 58): healthy `rich` runs flag no sensor and fault no zone; a frozen DS18B20 or thermistor proximal reading is flagged once its zone's airflow moves, or, with the fans held by the rate limit, once its zone air has risen past `stuck_zone_air_dT_c` and another bay has followed it; a zone-air sensor drifting on a healthy enclosure flags no proximal reading; only a bay's last proximal sensor faults its zone | PR: 2 seeds, 3 frozen runs, 1 drifting-air run; nightly: 48 seeds, 2.5-hour runs of both DAS solvers, and the per-seed coverage sweep (each proximal reading frozen in turn) |
 | `tests/test_hotswap.py` | slow swap, quick swap (never through `empty`, margin widens, class follows the new drive) and empty-at-boot on the truth sim: no limit violation, no zone fault, fans rise, constraints removed on empty | PR |
 | `tests/test_thermal_model.py` | structure, fan groups, parameter table, Jacobians vs finite differences, `eig` vs matrix exponential and the Euler fallback, windows, lag correction, RLS safeguards, status machine, never raising in `step`, shadow never changes the command | PR |
 | `tests/test_thermal_ident.py` | identifiability with group experiments on the truth sim: in-zone `E` within 15 % (PR seed), per-bay `k` within 25 %, `leak` / `κ` at prior, convergence; regulation only never converges; the seed sweep (bound 25 %), sensor offsets, the rich preset | PR: 4 cases; nightly: sweeps |
@@ -4162,15 +4188,22 @@ Owner decision (2026-09-16):
     `onewire.enabled` is type-checked at config load; `digole.enabled` has
     no owner module yet and only logs a warning.
 58. **Done** (2026-09-16): a `drive_proximal` reading frozen while its
-    zone's airflow stays inside `stuck_airflow_net` is now flagged once a
-    zone-air sensor of its zone has moved past the new
-    `mpc.stuck_zone_air_dT_c` (default 1.5 °C) over one window — at
-    constant airflow the drive-to-air difference moves only with the bay's
-    own power, so an air move that much larger than the band had to reach
-    the sensor (§3). Coverage on the `rich` sim, each of the 17 proximal
-    readings frozen 20 minutes into a 2.5-hour PI-like run, seeds 0–2:
-    **28 of 51** against 17 of 51 before, with no healthy sensor flagged in
-    those runs, in 256 healthy PI-like runs or in 120 DAS MPC runs. The
+    zone's airflow gives no evidence (it stayed inside `stuck_airflow_net`,
+    or it moved and the zone air excused it) is now flagged once a zone-air
+    sensor of its zone has moved past the new `mpc.stuck_zone_air_dT_c`
+    (default 1.5 °C) over one window **and** another `drive_proximal`
+    reading of the same zone, of any bay, has moved with it by more than
+    `stuck_sibling_dT_c` — at constant airflow the drive-to-air difference
+    moves only with the bay's own power, so an air move that much larger
+    than the band had to reach the sensor (§3). The corroboration is what
+    separates a real air move from a drifting zone-air sensor: without it
+    one lying air sensor branded every healthy proximal reading of its zone
+    Stuck and faulted the zone (§4.4, `tests/test_stuck_sim.py`). Coverage
+    on the `rich` sim, each of the 17 proximal readings frozen 20 minutes
+    into a 2.5-hour PI-like run, seeds 0–2: **28 of 51** against 17 of 51
+    before — the same 28 with and without the corroboration, since on a real
+    air move the zone's other bays follow — with no healthy sensor flagged
+    in those runs, in 256 healthy PI-like runs or in 120 DAS MPC runs. The
     default sits above the largest zone-air move seen at steady airflow on
     a healthy in-band reading (1.20 °C) in those 256 runs. The original
     gap (21 of 48) was measured on a different seed grid; the numbers here
@@ -4184,7 +4217,11 @@ Owner decision (2026-09-16):
     cannot excuse a reading that did not move at all, and the airflow
     evidence stands. The default is above the largest opposing move that
     voided an airflow move on a healthy reading (1.19 °C) in the 256
-    healthy runs above.
+    healthy runs above. An excused airflow move also falls through to the
+    item 58 check, so the excuse in fact ends at whichever of
+    `stuck_air_oppose_max_c` / `stuck_zone_air_dT_c` is met first: a zone
+    whose fans happen to move must not hide a dead sensor that the same air
+    swing would expose in a zone whose fans sit still.
 60. The Stuck rule's quarter-window lag is hardcoded as `stuck_ticks //
     4` in `control/gate.py` (legacy too); make it a config key (for
     example a lag fraction, default 0.25, legacy bit for bit).
@@ -4834,9 +4871,13 @@ Owner decision (2026-09-16):
     should sit above the largest such move with room to spare; if the real
     spread is much tighter than the simulator's, lowering it catches a dead
     sensor sooner (on the sim, 1.25 raised the coverage from 28 of 51 frozen
-    readings to 38). Same measurement for `mpc.stuck_air_oppose_max_c`
-    (item 59, default 3.0 °C against 1.19 °C on the sim), from the windows
-    where the zone air moved against the airflow.
+    readings to 37, almost all of it on one seed whose air moves sit in the
+    1.25–1.5 °C band — the margin is what this measurement decides). Same
+    measurement for `mpc.stuck_air_oppose_max_c` (item 59, default 3.0 °C
+    against 1.19 °C on the sim), from the windows where the zone air moved
+    against the airflow. Both keys only ever *add* evidence, and only where
+    another bay's reading followed the air, so a wrong value costs coverage,
+    not false faults.
 
 ### 8.4 Open — Zero 2 W upgrade
 
