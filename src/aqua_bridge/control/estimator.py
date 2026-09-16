@@ -532,7 +532,8 @@ class EstimatorUpdate:
     * ``estimates`` -- the estimates block (constrained bays of initialised zones)
     * ``memory``    -- the next ``solver_memory["estimator"]``
     * ``zones``     -- per zone: air estimate, its sigma, disturbance, drift, inlet,
-      airflow and the curve that produced it (``airflow_curve``: ``fit`` | ``config``)
+      airflow and the curve that produced it (``airflow_curve``: ``fit`` | ``config``
+      | ``mixed``, when only some of the zone's fan models have a fitted curve)
     * ``bays``      -- per bay: occupancy, class, association, calibration, candidates
     * ``summary``   -- SMART counters and unassigned serials
     """
@@ -714,8 +715,8 @@ def _airflow(
     zone: _Zone,
     u: Mapping[str, float],
     curves: Mapping[str, Any] | None = None,
-) -> tuple[float, float, bool]:
-    """``(Q_z, Qn_z, followed a fitted curve)`` at command ``u``.
+) -> tuple[float, float, str]:
+    """``(Q_z, Qn_z, the curve behind them)`` at command ``u``.
 
     ``curves`` is ``solver_memory["fan_curves"]`` (the online fit,
     :mod:`aqua_bridge.control.fancurve`): a usable entry replaces its fan model's
@@ -724,25 +725,38 @@ def _airflow(
     one airflow while the model plans on another is a disagreement the MPC's
     prediction-error guard answers with a fallback, which is safe but louder than it needs
     to be (PROJECT.md section 8 item 107).
+
+    The third value is ``fit``, ``config`` or -- for a zone whose channels are of several
+    fan models and only some of them have a usable curve -- ``mixed``, so nobody reads
+    "the estimator is on the fit" off a zone most of whose airflow is still the
+    configured curve (item 107: which curve produced which number).
     """
     q = 0.0
     total = 0.0
-    fitted = False
+    fitted = 0
+    channels = 0
     for ch, e in zone.e_w_per_k.items():
         name = cfg.fans[ch].model
         model = cfg.fan_models[name]
         deadband, exponent = float(model.deadband), float(model.exponent)
+        channels += 1
         if curves is not None:
             deadband, exponent, _ = fancurve.curve_pair(
                 curves.get(name), deadband, exponent, model.rpm_max
             )
-            fitted = fitted or fancurve.usable(curves.get(name))
+            fitted += 1 if fancurve.usable(curves.get(name)) else 0
         value = u.get(ch)
         pwm = float(value) if _finite(value) else 0.0
         frac = min(1.0, max(0.0, (pwm - deadband) / (1.0 - deadband)))
         q += e * frac**exponent
         total += e
-    return q, (q / total if total > 0 else 0.0), fitted
+    if fitted == 0:
+        source = "config"
+    elif fitted == channels:
+        source = "fit"
+    else:
+        source = "mixed"
+    return q, (q / total if total > 0 else 0.0), source
 
 
 # ---------------------------------------------------------------------------
@@ -1797,7 +1811,7 @@ def update(
     stepped: dict[str, bool] = {}
     arrays: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     # zone -> (Q, Qn, t_in, the airflow followed a fitted fan curve)
-    geometry: dict[str, tuple[float, float, float, bool]] = {}
+    geometry: dict[str, tuple[float, float, float, str]] = {}
 
     q_scale = h_pred / cfg.dt if cfg.dt > 0 else 0.0
     offset_var = spec.proximal_offset_c**2
@@ -1810,7 +1824,7 @@ def update(
         dim = zone.dim
         inlet_vals = [temps[t] for t in zone.inlet if t in temps]
         zm = mem["zones"].get(z)
-        q_flow, qn, fan_fitted = _airflow(cfg, zone, u, curves)
+        q_flow, qn, fan_curve = _airflow(cfg, zone, u, curves)
 
         if zm is None:
             air0 = _mean(trusted_air[z])
@@ -1853,7 +1867,7 @@ def update(
             x[1] = -f_air / C_AIR_J_PER_K
             p = np.diag(p_diag)
             arrays[z] = (x, p)
-            geometry[z] = (q_flow, qn, t_in, fan_fitted)
+            geometry[z] = (q_flow, qn, t_in, fan_curve)
             mem["zones"][z] = {"x": x, "P": p, "t_in": t_in, "blind": 0.0}
             continue
 
@@ -2039,7 +2053,7 @@ def update(
                 else:
                     _pair_update(x, p, idx, i_off + k_off, value, r)
         arrays[z] = (x, p)
-        geometry[z] = (q_flow, qn, t_in, fan_fitted)
+        geometry[z] = (q_flow, qn, t_in, fan_curve)
         mem["zones"][z]["t_in"] = t_in
         # The wall clock, not the occupancy horizon: a tick gap longer than 3 dt must not
         # under-count the time the air node has run unmeasured (it delays the fault).
@@ -2337,8 +2351,9 @@ def update(
             "d_air_c_per_s": float(x[1]),
             "t_in_c": geometry[z][2],
             "airflow_w_per_k": geometry[z][0],
-            # which curve produced that airflow (item 107): the online fit, or fan_models
-            "airflow_curve": "fit" if geometry[z][3] else "config",
+            # which curve produced that airflow (item 107): the online fit, fan_models,
+            # or mixed when only some of the zone's fan models have a fitted curve
+            "airflow_curve": geometry[z][3],
             "drift_c_per_min": drift,
         }
     for b, bay in st.bays.items():
