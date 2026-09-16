@@ -25,6 +25,7 @@ from aqua_bridge.hw.aquacomputer import (
     control_duty,
     finalize_control_report,
     patch_duties,
+    software_sensor_report,
 )
 from aqua_bridge.hw.aquacomputer_adapter import (
     AquacomputerAdapter,
@@ -1042,6 +1043,190 @@ def test_nothing_the_daemon_does_sends_the_save_report() -> None:
     _tick(adapter, device, clock, QUADRO_T.ctrl_refresh_s, qd1=0.7, qd2=0.6)
     adapter.release()
     assert len(device.sets()) >= 3 and device.saves() == []
+
+
+# --- software-sensor heartbeat and the active profile (item 84) ------------------------------
+
+#: The owner's configuration: software sensor 1, a heartbeat well below its alarm.
+HEARTBEAT = {"heartbeat_sensor": 1, "heartbeat_value_c": 20.0}
+
+
+def _heartbeat_aquaero(**timing):
+    binding = DeviceBinding(
+        kind=AQUAERO,
+        pwm_map={"xt1": 1, "xt2": 2},
+        temp_map={"beat": "soft1"},
+        timing=_timing(AQUAERO, **{**HEARTBEAT, **timing}),
+    )
+    return _setup(binding)
+
+
+def test_the_heartbeat_report_carries_the_configured_sensor_only(caplog) -> None:
+    """Report 0x07, 17 bytes: the id then eight centi-degC values, the configured
+    sensor's own and 0x7FFF ("no data") for the other seven, so the device keeps
+    using its own values for them (PROJECT.md section 8 item 84)."""
+    adapter, device, _bus, clock, _ = _heartbeat_aquaero()
+    assert adapter.heartbeat_on and adapter.heartbeat_ok is None
+    adapter.read()
+    with caplog.at_level("INFO", logger=LOGGER):
+        adapter.apply(_cmd(xt1=0.5, xt2=0.5))
+    (write,) = device.writes()
+    assert write.data == software_sensor_report(AQUAERO, {1: 20.0})
+    assert len(write.data) == 17 and write.data[0] == 0x07
+    assert write.data[1:3] == b"\x07\xd0"  # 20.00 degC, big-endian centi-degC
+    assert write.data[3:] == b"\x7f\xff" * 7
+    assert [op.what for op in device.ops] == ["write", "get", "set"]  # the heartbeat first
+    assert adapter.heartbeat_ok is True
+    assert device.soft_sensors == {1: 20.0}  # and the device reports it back
+    clock.advance(1.0)
+    device.emit()
+    assert adapter.read().temps == {"beat": pytest.approx(20.0)}
+    assert [m for m in _messages(caplog, "INFO") if "heartbeat" in m] == [
+        "aquaero: writing the software-sensor heartbeat of 20.00 degC to soft1 every write"
+    ]
+
+
+def test_the_heartbeat_goes_out_every_tick_and_adds_no_control_report_read() -> None:
+    """One heartbeat per apply(), whether or not a duty changed, and no GET per tick:
+    a profile switch is found by the periodic refresh and the duty verification."""
+    adapter, device, _bus, clock, _ = _heartbeat_aquaero()
+    for _ in range(10):
+        adapter.read()
+        adapter.apply(_cmd(xt1=0.5, xt2=0.5))
+        clock.advance(1.0)
+        device.emit()
+    assert len(device.writes()) == 10  # every tick, although only the first changed a duty
+    assert len(device.sets()) == 1 and len(device.gets()) == 1
+
+
+def test_the_heartbeat_is_off_by_default() -> None:
+    adapter, device, _bus, _clock, _ = _setup(_aquaero_binding())
+    assert not adapter.heartbeat_on and adapter.heartbeat_ok is None
+    adapter.read()
+    adapter.apply(_cmd(xt1=0.5, xt2=0.5))
+    assert device.writes() == [] and len(device.sets()) == 1
+    assert adapter.heartbeat_ok is None
+
+
+def test_the_heartbeat_waits_the_control_gap_and_is_not_repeated_on_a_retry() -> None:
+    adapter, device, _bus, _clock, _ = _heartbeat_aquaero()
+    device.failures = [FeatureReportError("ETIMEDOUT")]  # the first GET fails and is retried
+    adapter.apply(_cmd(xt1=0.5, xt2=0.5))
+    assert len(device.writes()) == 1 and len(device.gets()) == 2 and len(device.sets()) == 1
+    write, first_get = device.writes()[0], device.gets()[0]
+    assert first_get.t - write.t == pytest.approx(AQUAERO_GAP_S)
+
+
+def test_a_failed_heartbeat_does_not_fail_the_tick_and_is_logged_once(caplog) -> None:
+    adapter, device, _bus, clock, _ = _heartbeat_aquaero()
+    with caplog.at_level("INFO", logger=LOGGER):
+        adapter.read()
+        adapter.apply(_cmd(xt1=0.5, xt2=0.5))
+        device.write_failures = [FeatureReportError("EPIPE") for _ in range(3)]
+        for duty in (0.6, 0.7, 0.8):
+            clock.advance(1.0)
+            device.emit()
+            adapter.read()
+            adapter.apply(_cmd(xt1=duty, xt2=0.5))  # the duties still go out
+        assert len(device.sets()) == 4 and adapter.heartbeat_ok is False
+        clock.advance(1.0)
+        device.emit()
+        adapter.read()
+        adapter.apply(_cmd(xt1=0.9, xt2=0.5))
+    assert adapter.heartbeat_ok is True
+    (error,) = [m for m in _messages(caplog, "ERROR") if "heartbeat" in m]
+    assert "soft1" in error and "EPIPE" in error and "falls back" in error
+    assert [m for m in _messages(caplog, "INFO") if "heartbeat" in m] == [
+        "aquaero: writing the software-sensor heartbeat of 20.00 degC to soft1 every write",
+        "aquaero: writing the software-sensor heartbeat of 20.00 degC to soft1 again",
+    ]
+
+
+def test_a_heartbeat_that_spends_the_budget_leaves_the_write_to_fail_normally() -> None:
+    """The heartbeat is one device operation inside ctrl_budget_s, so the worst case
+    per tick is unchanged; a heartbeat that eats the budget costs the tick's write,
+    which is the loop's ordinary fallback path."""
+    timing = _timing(AQUAERO, **HEARTBEAT, ctrl_budget_s=2.0)
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1}, timing=timing)
+    adapter, device, _bus, clock, _ = _setup(binding, op_delay_s=2.5)
+    with pytest.raises(DeviceUnavailable, match="ctrl_budget_s"):
+        adapter.apply(_cmd(xt1=0.5))
+    assert len(device.writes()) == 1 and device.gets() == []
+    assert clock() - 100.0 <= timing.worst_case_tick_s()
+
+
+def test_the_heartbeat_stops_when_the_serial_does_not_match() -> None:
+    """Nothing is written to a device that is not the configured one -- the heartbeat
+    included, so the controller's own watchdog takes over (the safe direction)."""
+    binding = DeviceBinding(
+        kind=AQUAERO,
+        pwm_map={"xt1": 1},
+        serial="12345-54321",
+        timing=_timing(AQUAERO, **HEARTBEAT),
+    )
+    adapter, device, _bus, _clock, _ = _setup(binding, status_serial="54321-12345")
+    with pytest.raises(DeviceUnavailable, match="not the configured serial"):
+        adapter.read()
+    with pytest.raises(DeviceUnavailable, match="nothing is written"):
+        adapter.apply(_cmd(xt1=0.5))
+    assert device.writes() == [] and device.sets() == []
+
+
+def _profile_switch(device: FakeController, profile: int, duty: int) -> None:
+    """The alarm selects another profile: byte 0x06 changes and the saved profile's
+    duties come back (every live write is gone)."""
+    device.ctrl[0x06] = profile - 1
+    patch_duties(AQUAERO, device.ctrl, dict.fromkeys(range(AQUAERO.pwm_count), duty))
+
+
+def test_a_changed_profile_byte_makes_the_next_write_send_every_channel(caplog) -> None:
+    adapter, device, _bus, clock, _ = _setup(
+        DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1, "xt2": 2})
+    )
+    adapter.read()
+    adapter.apply(_cmd(xt1=0.5, xt2=0.6))
+    assert adapter.active_profile == 1 and len(device.sets()) == 1
+    with caplog.at_level("WARNING", logger=LOGGER):
+        _profile_switch(device, 2, 10000)  # profile 2: every output at 100 %
+        _tick(adapter, device, clock, 1.0, xt1=0.5, xt2=0.6)  # the mismatch starts
+        assert len(device.gets()) == 1  # still no control read per tick
+        _tick(adapter, device, clock, AQUAERO_T.duty_mismatch_s + 0.5, xt1=0.5, xt2=0.6)
+    assert len(device.gets()) == 2 and len(device.sets()) == 2
+    assert device.last_set_duties()[:2] == [5000, 6000]  # every configured channel again
+    assert adapter.active_profile == 2
+    assert [m for m in _messages(caplog, "WARNING") if "profile" in m] == [
+        "aquaero: the active profile changed from profile 1 to profile 2; the switch reloads "
+        "the saved profile, so every duty written live is gone: writing every configured "
+        "channel again (PROJECT.md section 8 item 84)"
+    ]
+
+
+def test_a_profile_switch_the_duties_do_not_betray_is_found_by_the_periodic_refresh(
+    caplog,
+) -> None:
+    """The reloaded profile happens to drive the same duty, so no duty verification
+    fires; ctrl_refresh_s finds it, and until then the fans run the profile the alarm
+    chose, which is the safe one."""
+    refresh = AQUAERO_T.ctrl_refresh_s
+    adapter, device, _bus, clock, _ = _setup(
+        DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1, "xt2": 2})
+    )
+    adapter.read()
+    adapter.apply(_cmd(xt1=0.5, xt2=0.5))
+    _profile_switch(device, 2, 5000)
+    with caplog.at_level("WARNING", logger=LOGGER):
+        _tick(adapter, device, clock, refresh / 2, xt1=0.5, xt2=0.5)
+        assert len(device.gets()) == 1 and [m for m in _messages(caplog, "WARNING")] == []
+        _tick(adapter, device, clock, refresh / 2 + 1.0, xt1=0.5, xt2=0.5)
+    assert len(device.gets()) == 2 and adapter.active_profile == 2
+    assert len(device.sets()) == 2 and device.last_set_duties()[:2] == [5000, 5000]
+    assert len([m for m in _messages(caplog, "WARNING") if "profile" in m]) == 1
+
+
+def test_the_profile_is_only_read_where_the_kind_has_one() -> None:
+    adapter, device, _bus, _clock, _ = _setup(_quadro_binding())
+    adapter.apply(_cmd(qd1=0.5, qd3=0.5))
+    assert adapter.active_profile is None and len(device.gets()) == 1
 
 
 # --- aquabus outputs 5-8 (item 85) ----------------------------------------------------------
