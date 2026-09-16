@@ -298,14 +298,29 @@ mpc:
   rho_soft: 40.0         # penalty per degC^2 above a drive's soft target (limit - comfort - k sigma)
   rho_hard: 4000.0       # penalty per degC^2 above its hard target (limit - k sigma)
   solver_outer_max: 4    # active-piece iterations per solve
-  model_max_drift_c_per_min: 0.5  # validity gate: the model's drive drift at the estimate
+  # Validity gate, drift: the model's own rate for each drive against the rate the
+  # estimator observes, both through the low-pass model_drift_rate_tau_s, so a load step or
+  # a command move the model predicts is not a fault and the drives' physical warm-up is
+  # not either. It has to keep failing for model_drift_dwell_s before the MPC gives way to
+  # the PI-like DAS form (section 8 items 64 and 65).
+  model_max_drift_c_per_min: 0.5
+  model_drift_rate_tau_s: 120.0
+  model_drift_dwell_s: 120.0
+  # Validity gate, air disturbance: the fan gains E only move the air node, whose model the
+  # estimator's per-zone air disturbance re-balances at any one operating point, so airflow
+  # the enclosure no longer has (a blocked filter, a dust mat) leaves the drive rows clean.
+  # What it cannot hide is the move: the check is that disturbance against its own slow
+  # level (model_air_dist_tau_s), under model_drift_dwell_s like the drift. The default is
+  # set above what the truth simulator's drawn physics produce on a healthy enclosure;
+  # section 8 items 66 and 96 have the measurements and the tuning on the real enclosure.
+  model_max_air_dist_c_per_min: 8.0
+  model_air_dist_tau_s: 900.0
   # Back from the model fallback (PI-like DAS) to the MPC: the gate's numeric limits scaled
-  # by model_return_factor must hold for model_return_dwell_s. The return's drift check
-  # subtracts the drives' observed warming or cooling rate (low-passed with
-  # model_drift_rate_tau_s), so a load step the model predicts does not hold the fallback.
+  # by model_return_factor must hold for model_return_dwell_s. The air-disturbance limit is
+  # not scaled (it is a move, not a level), and the return's drift compares the model's
+  # rate as it is, since in the fallback that rate is not answering a move of its own.
   model_return_factor: 0.5
   model_return_dwell_s: 300.0
-  model_drift_rate_tau_s: 120.0
   model_accept_prior: false  # true: act on the prior model (or what shadow learning has so far)
   # Model store: the daemon keeps the thermal model, the SMART calibrations and the last
   # bay view in $STATE_DIRECTORY/model.json (systemd StateDirectory=aqua-bridge) or
