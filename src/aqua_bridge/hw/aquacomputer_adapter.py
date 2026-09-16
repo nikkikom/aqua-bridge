@@ -136,11 +136,22 @@ The active profile
     ``ctrl_refresh_s`` worst case is reached only when the reloaded profile
     happens to drive the outputs exactly as the daemon last wrote them, i.e.
     when there is nothing to lose by waiting.
+Diagnostics
+    Speed, duty, voltage, current and power arrive in every status report.
+    :meth:`AquacomputerAdapter.fan_readings` hands them out per commanded channel
+    and ``read()`` puts them in ``PlantObservation.inputs["fans"]``, so they are
+    recorded and published without entering ``temps``/``rpm``/``pwm`` and so
+    without changing what ``mpc.step`` sees (PROJECT.md section 8 item 79); the
+    drift rules over them live in :mod:`aqua_bridge.health`.
+    :meth:`AquacomputerAdapter.device_health` is the controller's own state --
+    ``stuck_channels``, ``absent_channels``, the commanded outputs not in PWM
+    mode, unconfigured blocks and the flow sensors -- on a path that survives a
+    failed ``read()``, since that is exactly when it matters (item 83).
 
 Keeping the cache honest
-    Speed, duty, voltage, current and power arrive in every status report, so
-    drift of the fans themselves is visible without a control read. What a
-    one-time read misses is a configuration changed behind the daemon's back
+    Because the fans' own drift is visible in every status report, it needs no
+    control read. What a one-time read misses is a configuration changed behind
+    the daemon's back
     (front panel, aquasuite, liquidctl, a controller reset or power cycle, which
     brings back the saved configuration):
 
@@ -191,6 +202,7 @@ from typing import Any, TypeVar
 from aqua_bridge.hw.aquacomputer import (
     DUTY_MAX,
     KINDS,
+    SENSOR_NOT_CONNECTED,
     TEMP_MAX_C,
     TEMP_MIN_C,
     ChannelSnapshot,
@@ -562,6 +574,10 @@ class AquacomputerAdapter:
         self._ever_written: set[int] = set()
         #: The output modes were checked on this open's first control report.
         self._modes_checked = False
+        #: Commanded own outputs found in DC (or an unknown) mode, and commanded
+        #: unconfigured blocks, on this open's first control report (item 83).
+        self._not_pwm_channels: tuple[str, ...] = ()
+        self._unconfigured_channels: tuple[str, ...] = ()
         #: Unconfigured aquaero blocks already reported (once per adapter).
         self._unconfigured_reported: set[int] = set()
         #: Output numbers that belong to a device on the aquaero's aquabus.
@@ -632,6 +648,114 @@ class AquacomputerAdapter:
         (PROJECT.md section 8 item 93)."""
         return self._heartbeat_ok
 
+    def not_pwm_channels(self) -> tuple[str, ...]:
+        """Commanded outputs of the aquaero's own that the control report showed in DC
+        voltage (or an unknown) mode instead of PWM; empty until a control report has
+        been read, and on the Quadro, whose mode field is unknown."""
+        return self._not_pwm_channels
+
+    @property
+    def unconfigured_channels(self) -> tuple[str, ...]:
+        """Commanded outputs whose aquaero controller block read unconfigured (source
+        ``0xFFFF``, mode word 0); writing them is not verified on hardware."""
+        return self._unconfigured_channels
+
+    def fan_readings(self, status: StatusReport | None = None) -> dict[str, dict[str, Any]]:
+        """Per commanded channel, its output's electrical readings from ``status``
+        (default: the newest status report), for ``PlantObservation.inputs['fans']``
+        and the fan-health rules (:mod:`aqua_bridge.health`, PROJECT.md section 8
+        item 79).
+
+        ``duty`` is the output duty the device drives, in 0..1 like ``obs.pwm``;
+        ``rpm`` the tachometer of that output (not only the ones ``fans.<ch>.rpm``
+        binds, since every output has a block); ``voltage_v`` the 12 V rail as the
+        block reports it; ``current_ma`` and ``power_w`` the electrical draw, which
+        is meaningful only where ``power_reported`` is true (an aquaero reports 0 mA
+        and 0 W for its own outputs in PWM mode). An aquabus slot with no device
+        behind it is left out entirely: its whole block is meaningless.
+        """
+        if status is None:
+            status = self._status
+        if status is None:
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for ch, number in sorted(self.binding.pwm_map.items(), key=lambda item: item[1]):
+            if self._empty_slot(status, number):
+                continue
+            fan = status.fans[number - 1]
+            out[ch] = {
+                "device": self.kind.name,
+                "output": f"pwm{number}",
+                "rpm": float(fan.rpm),
+                "duty": fan.duty / DUTY_MAX,
+                "voltage_v": fan.voltage_v,
+                "current_ma": float(fan.current_ma),
+                "power_w": fan.power_w,
+                "power_reported": self.kind.reports_power(number),
+                "aquabus": number in self._aquabus,
+            }
+        return out
+
+    def device_health(self) -> dict[str, Any]:
+        """What this controller looks like right now, for ``/api/state``, ``/api/health``,
+        the MQTT state blob and the page (PROJECT.md section 8 item 83).
+
+        Never raises and never does I/O: it reports the newest status report and what
+        the last control report showed, so it still answers while the device is gone.
+        ``problems`` is the human-readable list the Home Assistant problem sensor and
+        the page show; it is empty exactly when nothing is wrong. ``active_profile``
+        is read defensively -- the aquaero's active profile is another change's
+        (PROJECT.md section 8 item 84) and is simply absent until that lands.
+        """
+        status = self._status
+        label = self.binding.label
+        age: float | None = None
+        if self._status_t is not None:
+            age = max(0.0, self._clock() - self._status_t)
+        stuck = list(self.stuck_channels)
+        health: dict[str, Any] = {
+            "label": label,
+            "device": self.kind.name,
+            "serial": self.binding.serial if status is None else status.serial,
+            "firmware": None if status is None else status.firmware,
+            "power_cycles": None if status is None else status.power_cycles,
+            "open": self.is_open,
+            "status_age_s": age,
+            "stuck_channels": stuck,
+            "absent_channels": list(self._absent_channels),
+            "not_pwm_channels": list(self._not_pwm_channels),
+            "unconfigured_channels": list(self._unconfigured_channels),
+            "flows": (
+                {}
+                if status is None
+                else {
+                    f"flow{j}": (None if raw == SENSOR_NOT_CONNECTED else raw)
+                    for j, raw in enumerate(status.flows, start=1)
+                }
+            ),
+        }
+        profile = getattr(self, "active_profile", None)  # another change adds it (item 84)
+        if profile is not None:
+            health["active_profile"] = profile
+        problems: list[str] = []
+        if stuck:
+            problems.append(f"{label}: {', '.join(stuck)} do not follow the written duty")
+        if self._absent_channels:
+            problems.append(
+                f"{label}: no device on aquabus behind {', '.join(self._absent_channels)}"
+            )
+        if self._not_pwm_channels:
+            problems.append(f"{label}: {', '.join(self._not_pwm_channels)} are not in PWM mode")
+        if self._unconfigured_channels:
+            problems.append(
+                f"{label}: the controller block of {', '.join(self._unconfigured_channels)} "
+                "is unconfigured"
+            )
+        if self._serial_rejected is not None:
+            problems.append(self._serial_rejected)
+        health["problems"] = problems
+        return health
+
     def close(self) -> None:
         """Closes the device node (the next call opens it again)."""
         if self._transport is not None:
@@ -663,6 +787,8 @@ class AquacomputerAdapter:
         self._ctrl = None
         self._mismatch_since.clear()
         self._modes_checked = False
+        self._not_pwm_channels = ()
+        self._unconfigured_channels = ()
         _LOG.info("%s: opened %s", self.binding.label, transport.info.node)
         return transport
 
@@ -800,6 +926,7 @@ class AquacomputerAdapter:
             self._verify_duties(status, received)
         absent_pwm, absent_rpm = self._check_absent(status)
         b = self.binding
+        readings = self.fan_readings(status)
         return PlantObservation(
             temps={name: status.temp(input_name) for name, input_name in b.temp_map.items()},
             rpm={
@@ -811,6 +938,7 @@ class AquacomputerAdapter:
                 for ch, n in b.pwm_map.items()
             },
             ts=now,
+            inputs={"fans": readings} if readings else {},
         )
 
     def _invalidate(self, *, rewrite: bool) -> None:
@@ -1129,14 +1257,18 @@ class AquacomputerAdapter:
     def _warn_about_modes(self, ctrl: bytes) -> None:
         """One warning per open for every commanded output of the aquaero's own not in
         PWM mode, and one per adapter for every commanded unconfigured block. The mode
-        is only reported, never changed (PROJECT.md section 8 items 81, 85)."""
+        is only reported, never changed (PROJECT.md section 8 items 81, 85). Both lists
+        are also kept for :meth:`device_health` (item 83)."""
         self._modes_checked = True
+        not_pwm: list[str] = []
+        unconfigured: list[str] = []
         for k in sorted(self._names):
             state = channel_state(self.kind, ctrl, k)
             mode = state.mode
             if mode is None:
                 continue
             if state.unconfigured:
+                unconfigured.append(self._names[k])
                 if k not in self._unconfigured_reported:
                     self._unconfigured_reported.add(k)
                     _LOG.warning(
@@ -1153,6 +1285,7 @@ class AquacomputerAdapter:
                 continue
             if state.aquabus or mode.is_pwm:
                 continue  # an aquabus output's mode word is not interpreted
+            not_pwm.append(self._names[k])
             _LOG.warning(
                 "%s: pwm%d (%s) is in %s mode (mode word 0x%04X), not PWM; the daemon does not "
                 "change the mode, set it with the controller's own software",
@@ -1162,6 +1295,8 @@ class AquacomputerAdapter:
                 "DC voltage" if mode.name == "dc" else "an unknown",
                 mode.raw,
             )
+        self._not_pwm_channels = tuple(sorted(not_pwm))
+        self._unconfigured_channels = tuple(sorted(unconfigured))
 
     def _falls_may_be_written(self) -> bool:
         last = self._last_write_t
@@ -1355,17 +1490,24 @@ def _output_number(where: str, value: Any, kind: DeviceKind) -> int:
     if number is None or not 1 <= number <= kind.pwm_count:
         raise ConfigError(
             f"{where} must be one of the {kind.name}'s outputs pwm1..pwm{kind.pwm_count}, "
-            f"got {value!r}"
+            f"got {value!r}{_flow_hint(value)}"
         )
     return number
 
 
 def _flow_hint(value: Any) -> str:
-    """The hint for a flow sensor name where a tachometer or temperature is expected."""
+    """The hint for a flow sensor name where an output, tachometer or temperature is
+    expected. Flow stays out of :class:`~aqua_bridge.model.PlantObservation` (owner
+    decision 2026-09-16, PROJECT.md section 8.1): it is decoded, shown by
+    ``tools/aquacomputer_probe.py`` and published with the device health, but no
+    config key binds it."""
     if isinstance(value, str) and re.fullmatch(r"flow[1-9][0-9]*", value):
         return (
             f"; {value!r} is a flow sensor, and flow sensors cannot be bound in the config "
-            "(PROJECT.md section 8 item 91)"
+            "(PROJECT.md section 8 item 91): the daemon decodes them and publishes them with "
+            "the device health, but nothing in a device entry takes a 'flowN' name. The "
+            "hwmon driver's aquaero 'fan5'/'fan6' were flow sensors; here fan5..fan8 are the "
+            "aquaero's aquabus tachometers (a Quadro's outputs 1-4)"
         )
     return ""
 
@@ -1379,7 +1521,9 @@ def _tachometer_number(where: str, value: Any, kind: DeviceKind) -> int:
         raise ConfigError(
             f"{where}: {value!r} was the hwmon driver's name of the {kind.name}'s flow sensor "
             f"flow{flow}, which is not a tachometer ({kind.name}: fan1..fan{kind.fan_count}); "
-            "flow sensors cannot be bound in the config (PROJECT.md section 8 item 91)"
+            "flow sensors cannot be bound in the config (PROJECT.md section 8 item 91). On an "
+            "aquaero the driver's flow 'fan5'/'fan6' are aquabus tachometers now (a Quadro's "
+            "outputs 1-2 on its aquabus), so the same name means another input there"
         )
     raise ConfigError(
         f"{where} must be one of the {kind.name}'s tachometers fan1..fan{kind.fan_count}, "

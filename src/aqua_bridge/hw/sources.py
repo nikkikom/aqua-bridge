@@ -95,6 +95,10 @@ class CompositeSource:
     optional SMART inbox (:class:`~aqua_bridge.publishers.inputs.SmartInbox`,
     duck-typed as :class:`SmartSource`) into one :class:`PlantObservation`;
     applies a command by writing each channel to whichever device claims it.
+
+    :meth:`device_health` merges the controllers' own diagnostics on a path that
+    does not go through the observation, so it answers after a failed ``read()``
+    too (PROJECT.md section 8 item 83).
     """
 
     def __init__(
@@ -167,16 +171,42 @@ class CompositeSource:
         temps: dict[str, float | None] = {}
         rpm: dict[str, float | None] = {}
         pwm: dict[str, float | None] = {}
+        fans: dict[str, Any] = {}
         for obs in observations:
             temps.update(obs.temps)
             rpm.update(obs.rpm)
             pwm.update(obs.pwm)
+            fans.update(obs.inputs.get("fans") or {})
         if self.onewire is not None:
             temps.update(self.onewire.read())
         inputs: dict[str, Any] = {}
+        if fans:
+            inputs["fans"] = fans
         if self.smart is not None:
             inputs["smart"] = dict(self.smart.snapshot())
         return PlantObservation(temps=temps, rpm=rpm, pwm=pwm, ts=self._clock(), inputs=inputs)
+
+    def device_health(self) -> dict[str, Any]:
+        """Every controller's :meth:`~aqua_bridge.hw.aquacomputer_adapter.
+        AquacomputerAdapter.device_health`, merged (PROJECT.md section 8 item 83).
+
+        ``devices`` is one entry per controller in config order, ``problems`` every
+        controller's problems concatenated and ``ok`` whether that list is empty.
+        Never raises and never does I/O: a controller that is gone still reports what
+        its last status report said, which is what an operator needs in exactly that
+        case.
+        """
+        devices: list[dict[str, Any]] = []
+        problems: list[str] = []
+        for device in self.devices:
+            try:
+                health = device.device_health()
+            except Exception:  # a diagnostics path must never break a tick
+                _LOG.exception("%s: device_health failed", device.binding.label)
+                continue
+            devices.append(health)
+            problems.extend(str(p) for p in health.get("problems") or ())
+        return {"devices": devices, "problems": problems, "ok": not problems}
 
     def apply(self, cmd: MpcCommand) -> None:
         """Writes ``cmd`` to every controller.
