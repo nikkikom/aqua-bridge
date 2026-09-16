@@ -2,16 +2,21 @@
 
 Pure machine: groups and served zones, the seeded two-level sequence, every start
 precondition with its reason, the envelope at its thresholds and the abort list.
-Levels re-planned from the live solver demand (item 52): the anchor follows a rising
-demand and only a rising one, a held sibling follows it too, the levels stay inside the
-band, ``symmetric`` dips at most ``ident_amplitude`` below the demand, no abort moves,
-and ``ident_replan: false`` keeps the frozen plan of the Zero W.
+Levels re-planned from the live solver demand (item 52): the anchor follows a rise at
+once and a fall only at a switch, the echo of the experiment's own level is taken out of
+the want first (so no ratchet builds up) while a fan the solver's own floor lifted still
+reads as demand, a held sibling follows it too, the levels stay inside the band,
+``symmetric`` dips at most ``ident_amplitude`` below the demand, no abort of a tick
+moves, the dip and the floor come from the running experiment's own plan, and
+``ident_replan: false`` keeps the frozen plan of the Zero W at its old cost.
 
 Through ``Supervisor`` + ``Loop`` on the small DAS fixture: the experiment is a
 composed override (``d_pwm_max``, clamp, fallback beats it), the control mode stays
-``auto``, a warming zone is followed instead of held back, every human intent aborts,
-the release is bumpless, a frozen sensor during a symmetric run faults its zone and
-aborts, and a restart never resumes.
+``auto``, a warming zone is followed instead of held back, a spent excursion is released
+instead of pinning the fans at its peak, an experiment that follows the demand ends later
+than the frozen one and never earlier, every human intent aborts, the release is
+bumpless, a frozen sensor during a symmetric run faults its zone and aborts, and a
+restart never resumes.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ import copy
 import dataclasses
 import json
 import math
+import statistics
 from collections.abc import Mapping
 from typing import Any
 
@@ -29,6 +35,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from aqua_bridge.control import ident
+from aqua_bridge.control import supervisor as supervisor_mod
 from aqua_bridge.control.intents import (
     ClearOverride,
     ControlMode,
@@ -163,6 +170,7 @@ def good_facts(cfg: MpcConfig, ts: float = 1000.0, pwm: float = 0.5, **changes: 
         applied=True,
         pwm=dict.fromkeys(cfg.channels, pwm),
         demand=dict.fromkeys(cfg.channels, pwm),
+        prev=dict.fromkeys(cfg.channels, pwm),
         zones=zones,
         estimates=estimates,
         bays=bays,
@@ -561,10 +569,29 @@ def test_two_consecutive_apply_failures_abort():
 # ---------------------------------------------------------------------------
 
 
-def _tick(cfg: MpcConfig, exp: dict[str, Any], ts: float, **demand: float) -> ident.Advance:
-    """One :func:`ident.advance` on a good tick whose solver demand is ``demand``."""
+def _tick(
+    cfg: MpcConfig,
+    exp: dict[str, Any],
+    ts: float,
+    *,
+    ran: dict[str, float] | None = None,
+    prev: dict[str, float] | None = None,
+    **demand: float,
+) -> ident.Advance:
+    """One :func:`ident.advance` on a good tick whose solver demand is ``demand``.
+
+    ``ran`` is the override the experiment itself had in force on the tick the want was
+    computed against, and defaults to its anchor -- a low tick under ``above``, where
+    nothing is taken out of the want. ``prev`` is what was actually on the fan then and
+    defaults to ``ran``; pass it higher to model the supervisor's floor lifting the fan
+    above the experiment's own level."""
     facts = good_facts(cfg, ts=ts)
-    return ident.advance(exp, cfg, dataclasses.replace(facts, demand={**facts.demand, **demand}))
+    ran = dict(exp["plan_base"]) if ran is None else ran
+    prev_pwm = {**facts.prev, **(ran if prev is None else prev)}
+    exp = {**exp, "prev_overrides": {**dict(exp.get("prev_overrides") or {}), **ran}}
+    return ident.advance(
+        exp, cfg, dataclasses.replace(facts, demand={**facts.demand, **demand}, prev=prev_pwm)
+    )
 
 
 def test_a_rise_in_the_demand_wins_over_the_experiment_plan():
@@ -581,16 +608,97 @@ def test_a_rise_in_the_demand_wins_over_the_experiment_plan():
     assert e["plan_base"]["fa2"] == pytest.approx(0.5)  # a channel of its own
 
 
-def test_the_anchor_only_rises_and_a_missing_demand_keeps_it():
+def test_the_experiments_own_level_is_taken_out_of_the_want_before_it_is_followed():
+    """The DAS MPC's move penalty pulls its want toward what is on the fan, which during
+    an experiment is the experiment's own level; following that raw would ratchet."""
+    cfg = ident_cfg()  # above, amplitude 0.15, base 0.5
+    exp = _running(cfg)
+    high = {"fa1": 0.65, "fa2": 0.65}  # the level the tick actually ran at
+    echo = _tick(cfg, exp, 1001.0, ran=high, fa1=0.62).experiment
+    assert echo is not None
+    assert echo["plan_base"]["fa1"] == pytest.approx(0.5)  # 0.62 - (0.65 - 0.5) < 0.5: the echo
+    real = _tick(cfg, exp, 1001.0, ran=high, fa1=0.9).experiment
+    assert real is not None  # a want above the level is a real need, minus the same echo
+    assert real["plan_base"]["fa1"] == pytest.approx(0.75)
+    # and the very next low tick follows the want exactly, nothing subtracted
+    clean = _tick(cfg, echo, 1002.0, fa1=0.62).experiment
+    assert clean is not None and clean["plan_base"]["fa1"] == pytest.approx(0.62)
+
+
+def test_a_fan_the_solver_itself_floored_up_is_demand_and_not_an_echo():
+    """The echo is bounded by the experiment's own level, so a fan lifted above it by the
+    supervisor's floor still reads as demand -- otherwise the anchor would stick where the
+    floor found it and the plan would stop tracking the solver at all."""
+    cfg = ident_cfg()  # above, amplitude 0.15, base 0.5
+    exp = _running(cfg)
+    low, on_fan = {"fa1": 0.5, "fa2": 0.5}, {"fa1": 0.7, "fa2": 0.7}
+    out = _tick(cfg, exp, 1001.0, ran=low, prev=on_fan, fa1=0.7).experiment
+    assert out is not None and out["plan_base"]["fa1"] == pytest.approx(0.7)
+    # the same from a high level: only the level's own 0.15 comes off, not the floor's
+    high, up = {"fa1": 0.65, "fa2": 0.65}, {"fa1": 0.8, "fa2": 0.8}
+    out = _tick(cfg, exp, 1001.0, ran=high, prev=up, fa1=0.8).experiment
+    assert out is not None and out["plan_base"]["fa1"] == pytest.approx(0.65)
+
+
+def test_a_ratchet_cannot_build_up_over_a_run_of_high_ticks():
+    """The want of every tick echoes the fan (slope 1, the worst case): the anchor holds."""
+    cfg = ident_cfg()
+    exp = _running(cfg)
+    ts = 1000.0
+    for _ in range(40):
+        ts += cfg.dt
+        ran = dict(exp["overrides"])  # what the tick ran at
+        out = _tick(cfg, exp, ts, ran=ran, **{ch: ran[ch] for ch in exp["channels"]})
+        assert out.experiment is not None
+        exp = out.experiment
+        assert exp["plan_base"] == pytest.approx(dict.fromkeys(("fa1", "fa2"), 0.5))
+
+
+def test_the_anchor_rises_at_once_and_falls_only_at_a_switch():
     cfg = ident_cfg()
     exp = _running(cfg)
     up = _tick(cfg, exp, 1001.0, fa1=0.62).experiment
     assert up is not None
-    down = _tick(cfg, up, 1002.0, fa1=0.30).experiment
-    assert down is not None and down["plan_base"]["fa1"] == pytest.approx(0.62)
+    # inside the hold the level stays put, so the excitation of that hold is preserved
+    ts, held = 1001.0, up
+    while True:
+        ts += cfg.dt
+        out = _tick(cfg, held, ts, fa1=0.30).experiment
+        assert out is not None
+        if (out["phase"], out["level"]) != (held["phase"], held["level"]):
+            break
+        assert out["plan_base"]["fa1"] == pytest.approx(0.62)
+        held = out
+    assert out["plan_base"]["fa1"] == pytest.approx(0.62 - cfg.d_pwm_max)  # at most that, at once
+    assert out["plan_base"]["fa1"] > 0.30  # and it walks down, it does not jump
+
+
+def test_a_stale_peak_is_released_but_never_below_the_frozen_base():
+    cfg = ident_cfg()
+    exp = _running(cfg)  # base 0.5
+    peaked = _tick(cfg, exp, 1001.0, fa1=0.9, fa2=0.9).experiment
+    assert peaked is not None and peaked["plan_base"]["fa1"] == pytest.approx(0.9)
+    ts = 1001.0
+    for _ in range(80):  # the burst is over: the demand is back at the start base
+        ts += cfg.dt
+        out = _tick(cfg, peaked, ts, fa1=0.5, fa2=0.5)
+        if out.experiment is None:
+            break
+        peaked = out.experiment
+        assert peaked["plan_base"]["fa1"] >= 0.5 - TOL  # never below the frozen start base
+    assert peaked["plan_base"]["fa1"] == pytest.approx(0.5)  # released, not pinned at the peak
+
+
+def test_a_missing_demand_or_prev_keeps_the_anchor():
+    cfg = ident_cfg()
+    exp = _running(cfg)
+    up = _tick(cfg, exp, 1001.0, fa1=0.62).experiment
+    assert up is not None
     facts = good_facts(cfg, ts=1003.0)
-    blind = ident.advance(down, cfg, dataclasses.replace(facts, demand={})).experiment
+    blind = ident.advance(up, cfg, dataclasses.replace(facts, demand={})).experiment
     assert blind is not None and blind["plan_base"]["fa1"] == pytest.approx(0.62)
+    deaf = ident.advance(up, cfg, dataclasses.replace(facts, prev={})).experiment
+    assert deaf is not None and deaf["plan_base"]["fa1"] == pytest.approx(0.62)
 
 
 def test_a_held_sibling_follows_the_demand_too():
@@ -693,6 +801,8 @@ _facts_strategy = st.fixed_dictionaries(
         "applied": st.booleans(),
         "t_c": st.floats(30.0, 52.0),
         "pwm": st.floats(0.0, 1.5),
+        "demand": st.floats(0.0, 1.5),
+        "prev": st.floats(0.0, 1.5),
         "trusted": st.booleans(),
     }
 )
@@ -708,14 +818,21 @@ def test_random_tick_sequences_never_raise_and_keep_levels_in_bounds(seq, levels
     cfg = ident_cfg(ident_levels=levels, ident_amplitude=0.2, ident_replan=replan)
     exp: dict[str, Any] | None = ident.start(cfg, good_facts(cfg, pwm=0.5), "group", "front")
     ts = 1000.0
-    anchor = 0.5  # the running maximum of the demand, clamped into the band
+    anchor = 0.5  # the model of the anchor: the de-biased demand up at once, down at a switch
     for item in seq:
         if exp is None:
             break
         ts += item["dt"]
         facts = good_facts(cfg, ts=ts, pwm=item["pwm"], mode=item["mode"], applied=item["applied"])
+        facts = dataclasses.replace(
+            facts,
+            demand=dict.fromkeys(cfg.channels, item["demand"]),
+            prev=dict.fromkeys(cfg.channels, item["prev"]),
+        )
         facts = _patched(facts, "estimates", "a1", item["t_c"], "t_c")
         facts = _patched(facts, "zones", "za", item["trusted"], "trusted")
+        was = (exp["phase"], exp["level"])
+        ran = dict(exp["prev_overrides"])  # the level the want of this tick was seen at
         out = ident.advance(exp, cfg, facts)
         if out.experiment is None:
             assert out.result in (ident.RESULT_ABORTED, ident.RESULT_COMPLETED)
@@ -724,18 +841,27 @@ def test_random_tick_sequences_never_raise_and_keep_levels_in_bounds(seq, levels
             break
         exp = out.experiment
         if replan:
-            anchor = max(anchor, min(max(item["pwm"], cfg.pwm_min), cfg.pwm_max))
+            own = ran.get("fa1")
+            echo = 0.0 if own is None else max(0.0, min(item["prev"], own) - anchor)
+            wanted = min(max(item["demand"] - echo, cfg.pwm_min), cfg.pwm_max)
+            if wanted > anchor:
+                anchor = wanted
+            elif (exp["phase"], exp["level"]) != was:  # a switch: down by at most d_pwm_max
+                anchor = max(wanted, 0.5, anchor - cfg.d_pwm_max)
         assert item["mode"] in ("auto", "saturated")
         assert item["t_c"] <= 45.0 + cfg.ident_max_over_c + TOL  # soft envelope
         assert item["t_c"] + 2.0 < 50.0 - cfg.ident_abort_below_limit_c + TOL  # absolute
         json.dumps(exp, allow_nan=False)
-        assert exp["plan_base"] == dict.fromkeys(("fa1", "fa2"), anchor)
+        assert exp["plan_base"] == pytest.approx(dict.fromkeys(("fa1", "fa2"), anchor))
+        assert anchor >= 0.5 - TOL  # never below the frozen base of the start
         for u in exp["overrides"].values():
             assert cfg.pwm_min <= u <= cfg.pwm_max
             lo = anchor - 0.2 if levels == "symmetric" else anchor
             assert lo - TOL <= u <= min(anchor + 0.2, cfg.pwm_max) + TOL
-            if replan:  # never held below the solver's demand (symmetric: by at most A)
-                assert u >= min(item["pwm"], cfg.pwm_max) - ident.dip_below_solver(cfg) - TOL
+            # a tick the experiment ran at its anchor carries an honest want: the plan
+            # follows it whole (symmetric: to within the owner-accepted dip)
+            if replan and min(item["prev"], ran.get("fa1", item["prev"])) <= anchor + TOL:
+                assert u >= min(item["demand"], cfg.pwm_max) - ident.dip_below_solver(cfg) - TOL
 
 
 # ---------------------------------------------------------------------------
@@ -910,6 +1036,131 @@ def test_without_replan_the_experiment_holds_the_channel_below_the_solver():
     rig, held, anchors = _warming_run(replan=False)
     assert set(anchors) == {0.5}  # the base stayed frozen at the start
     assert held > 50  # and the fans ran below what the solver wanted, tick after tick
+
+
+def _load_run(replan: bool) -> tuple[Rig, list[float], list[float]]:
+    """Zone air the front group actually cools, with a heat load that comes and goes: the
+    solver wants more while it lasts and no more than before once it is gone. Returns the
+    anchors the experiment planned around and what it commanded on fa1."""
+    cfg = ident_cfg(ident_replan=replan, ident_max_duration_s=900.0)
+    rig = Rig(cfg)
+    rig.ticks(8)
+    rig.sup.submit(Ident("start", group="front"))
+    air, anchors, cmds = 35.0, [], []
+    for i in range(300):
+        (r,) = rig.ticks(1)
+        if not rig.status["running"]:
+            break
+        anchors.append(rig.status["plan_base"]["fa1"])
+        cmds.append(r.cmd.pwm["fa1"])
+        fans = (r.cmd.pwm["fa1"] + r.cmd.pwm["fa2"]) / 2.0
+        air = max(33.0, air + (0.06 if 20 <= i < 70 else 0.0) - 0.15 * (fans - 0.5))
+        for name in ("air_a", "air_a2"):
+            rig.temps[name] = air
+    return rig, anchors, cmds
+
+
+def test_a_transient_peak_does_not_pin_the_channel_for_the_rest_of_the_experiment():
+    """The anchor follows a load up at once and walks back down once it is gone, so the
+    fans do not run at the peak of a spent excursion for the rest of the duration."""
+    rig, anchors, cmds = _load_run(replan=True)
+    assert rig.status["running"]
+    base = rig.status["base"]["fa1"]
+    assert max(anchors) > base + 0.15  # the load was followed up
+    assert min(anchors) >= base - TOL  # never below the frozen base of the start
+    assert anchors[-1] == pytest.approx(base)  # and released again, not pinned at the peak
+    frozen_rig, frozen_anchors, frozen_cmds = _load_run(replan=False)
+    assert set(frozen_anchors) == {0.5}  # the frozen plan never moved at all
+    # so the noise the following cost is paid back: with the load gone the re-planned run
+    # commands no more than the frozen one
+    assert statistics.fmean(cmds[-50:]) <= statistics.fmean(frozen_cmds[-50:]) + TOL
+
+
+def _abort_run(replan: bool) -> tuple[int, str | None] | None:
+    """Zone air that keeps warming (so the solver keeps wanting more of the front group)
+    over drives that only cool with the PWM that actually reaches the fans. Returns the
+    tick the experiment ended on and why, or ``None`` if it ran the whole way."""
+    cfg = ident_cfg(ident_replan=replan, ident_max_duration_s=900.0)
+    rig = Rig(cfg)
+    rig.ticks(8)
+    rig.sup.submit(Ident("start", group="front"))
+    air, drive = 35.0, 37.5
+    for i in range(400):
+        (r,) = rig.ticks(1)
+        if not rig.status["running"]:
+            return i, rig.status["last_abort_reason"]
+        fans = (r.cmd.pwm["fa1"] + r.cmd.pwm["fa2"]) / 2.0
+        air += 0.03
+        drive = max(30.0, drive + 0.03 - 0.12 * (fans - 0.5))
+        for name in ("air_a", "air_a2"):
+            rig.temps[name] = air
+        for name in ("prox_a1", "prox_a1b", "prox_a2"):
+            rig.temps[name] = drive
+    return None
+
+
+def test_an_experiment_that_follows_the_demand_ends_later_or_not_at_all_never_earlier():
+    """The abort decision of a tick does not move (test_replanning_moves_no_abort pins that
+    on the tick itself). Across ticks it does, and in one direction only: the channel the
+    experiment followed up cools its own bay, so an excursion the frozen plan ended on the
+    envelope runs to completion instead. Fewer envelope aborts are the intended outcome."""
+    frozen = _abort_run(replan=False)
+    assert frozen is not None and frozen[1] == "envelope:a1"
+    live = _abort_run(replan=True)
+    assert live is None or live[0] > frozen[0]
+
+
+def test_the_floor_follows_the_running_experiment_not_a_config_rebuilt_under_it():
+    """``ident_replan`` of the running experiment decides, so a config change cannot take
+    the floor away from an experiment that was planned with it (or add one to a frozen
+    plan): the rule holds for the whole of the experiment that is running."""
+    rig = started_rig(ident_cfg(ident_replan=True))
+    rig.ticks(3)
+    plan = rig.sup.plan_tick()
+    assert plan.experiment is not None and plan.experiment["replan"] is True
+    frozen_cfg = ident_cfg(ident_replan=False)
+    mpc_cmd = rig.results[-1].mpc_cmd
+    floor = supervisor_mod._experiment_floor(mpc_cmd, plan, frozen_cfg)
+    assert set(floor) == set(plan.experiment["overrides"])
+    for ch, value in floor.items():
+        assert value == pytest.approx(mpc_cmd.pwm[ch])  # above: the dip is nothing
+    stale = dataclasses.replace(plan, experiment={**plan.experiment, "replan": False})
+    assert supervisor_mod._experiment_floor(mpc_cmd, stale, ident_cfg()) == {}
+
+
+def test_the_dip_of_a_running_experiment_comes_from_its_own_levels():
+    cfg = ident_cfg(ident_levels="symmetric", ident_amplitude=0.2)
+    exp = ident.start(cfg, good_facts(cfg, pwm=0.5), "channel", "fb1")
+    assert ident.planned_dip(exp, "fb1", cfg) == pytest.approx(0.2)
+    # the live config says above, the running experiment still dips: its own plan decides
+    assert ident.planned_dip(exp, "fb1", ident_cfg()) == pytest.approx(0.2)
+    # a level clamped at pwm_min shortens the dip, which only raises the floor
+    low = ident.start(cfg, good_facts(cfg, pwm=0.25), "channel", "fb1")
+    low["levels"]["fb1"][0] = cfg.pwm_min
+    assert ident.planned_dip(low, "fb1", cfg) == pytest.approx(0.25 - cfg.pwm_min)
+    assert ident.planned_dip(None, "fb1", cfg) == pytest.approx(0.2)  # no plan: the config
+    assert ident.planned_dip({"levels": {}}, "fb1", ident_cfg()) == 0.0
+
+
+def test_the_demand_is_read_out_of_the_diagnostics_only_for_a_running_experiment():
+    """The two maps only a running experiment reads are not copied on every DAS tick."""
+    rig = Rig(ident_cfg())
+    (r,) = rig.ticks(1)
+    idle = ident.facts_from_tick(r.mpc_cmd, ts=1.0, applied=True)
+    assert idle.demand == {} and idle.prev == {}
+    live = ident.facts_from_tick(r.mpc_cmd, ts=1.0, applied=True, with_demand=True)
+    assert live.demand == r.mpc_cmd.diagnostics["target_pwm"]
+    assert live.prev == r.mpc_cmd.diagnostics["prev_pwm"]
+    rig.ticks(7)
+    rig.sup.submit(Ident("start", group="front"))
+    rig.ticks(2)
+    assert rig.sup._ident_facts.demand  # the supervisor asks for them on experiment ticks
+    frozen = Rig(ident_cfg(ident_replan=False))
+    frozen.ticks(8)
+    frozen.sup.submit(Ident("start", group="front"))
+    frozen.ticks(2)
+    assert frozen.status["running"]  # a frozen plan never reads them, so never copies
+    assert frozen.sup._ident_facts.demand == {} and frozen.sup._ident_facts.prev == {}
 
 
 def _all_intents(cfg: MpcConfig) -> list[Any]:
