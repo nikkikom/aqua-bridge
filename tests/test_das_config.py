@@ -110,3 +110,28 @@ def test_topology_from_config_empty_bay_and_legacy(cfg):
     assert topo["bays"]["c1"] == {"zone": "zc", "occupied": False, "class": "hdd", "serial": "SN1"}
     with pytest.raises(ValueError):
         topology_from_config(cfg)
+
+
+def test_a_narrow_gate_never_makes_the_calibrate_defaults_a_config_error(cfg):
+    """Item 23: ``calibrate_min_c`` / ``calibrate_max_c`` have one default each (5 /
+    80 degC). A config written before they existed, whose gate stops at 80 degC, must
+    still load -- a daemon that refuses to start names a key the owner never wrote and
+    leaves the fans uncontrolled meanwhile. The range the API accepts is the
+    intersection of the two keys with the gate."""
+    m = das_mapping()
+    assert "calibrate_min_c" not in (m.get("estimator") or {})
+    m["temp_max_c"] = 80.0
+    at_the_edge = MpcConfig.from_mapping(m)
+    assert at_the_edge.estimator.calibrate_max_c == 80.0  # the default, untouched
+    assert at_the_edge.calibrate_range == (5.0, 80.0)
+
+    m["temp_min_c"], m["temp_max_c"] = 10.0, 75.0
+    narrow = MpcConfig.from_mapping(m)
+    assert narrow.calibrate_range == (10.0, 75.0)  # narrowed to the gate, not refused
+
+    m["estimator"] = {"calibrate_min_c": 20.0, "calibrate_max_c": 50.0}
+    assert MpcConfig.from_mapping(m).calibrate_range == (20.0, 50.0)
+    m["estimator"] = {"calibrate_min_c": 50.0, "calibrate_max_c": 20.0}
+    with pytest.raises(ConfigError, match="calibrate_min_c < calibrate_max_c"):
+        MpcConfig.from_mapping(m)
+    assert cfg.calibrate_range is None  # legacy: no estimator, nothing to calibrate
