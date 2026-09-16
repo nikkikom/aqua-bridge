@@ -354,11 +354,18 @@ def build_model_store(
     *,
     env: Mapping[str, str] | None = None,
     wall: Callable[[], float] = time.time,
+    ident_settle: Callable[[], Mapping[str, Any] | None] | None = None,
 ) -> tuple[MpcState | None, ModelPersister | None]:
     """``(initial state, persister)`` for the model store, or ``(None, None)`` without one
     (module docstring). Raises :class:`ConfigError` for ``--model-store`` with a legacy
     config; a missing or unusable file is not an error (the controller starts on its
-    prior and the reason is logged)."""
+    prior and the reason is logged).
+
+    ``ident_settle`` is handed straight to :class:`~aqua_bridge.modelstore.ModelPersister`:
+    the experiments' settle timers live in the supervisor, which does not exist yet at
+    this point, so :func:`main` passes a callable that reaches it once it does (section 8
+    item 20). Leaving it out writes an empty ``ident_settle`` section, and a restart then
+    starts every zone's settle timer over."""
     path = store_path(cfg, cli_path, os.environ if env is None else env)
     if path is None:
         return None, None
@@ -368,7 +375,7 @@ def build_model_store(
     else:
         age = "unknown" if result.age_s is None else f"{result.age_s / 86400.0:.2f} days"
         _LOG.info("model store: %s is %s (age %s)", path, result.source, age)
-    return initial_state(result), ModelPersister(cfg, path, wall=wall)
+    return initial_state(result), ModelPersister(cfg, path, wall=wall, ident_settle=ident_settle)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -440,12 +447,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.sim_plant is not None and args.source != "sim":
         parser.error("--sim-plant needs --source sim")
 
+    # The experiments' settle timers live in the supervisor, built below, and ride along
+    # in model.json so a restart does not start them over (section 8 item 20). The store
+    # is built first (it carries the initial state), so it reads them through this holder.
+    supervisors: list[Supervisor] = []
+
     try:
         app = load_config(args.config)
         cfg = app.mpc
         recorder = build_recorder(app, cfg, args.record)
         FanHealthConfig.from_section(app.section("fan_health"))  # fail before anything opens
-        initial, persister = build_model_store(cfg, args.model_store)
+        initial, persister = build_model_store(
+            cfg,
+            args.model_store,
+            ident_settle=lambda: supervisors[0].ident_settle_snapshot() if supervisors else None,
+        )
     except ConfigError as exc:
         _LOG.error("config: %s", exc)
         return 2
@@ -473,10 +489,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     notifier = SdNotifier()
     supervisor = Supervisor(cfg, version=VERSION)
-    if persister is not None:
-        # The experiments' settle timers live in the supervisor and ride along in
-        # model.json, so a restart does not start them over (section 8 item 20).
-        persister.ident_settle = supervisor.ident_settle_snapshot
+    supervisors.append(supervisor)  # arms the ident_settle callable handed to the store
     sleep = _make_sleep(args.sim_speed) if args.source == "sim" else None
     loop = Loop(
         source,
