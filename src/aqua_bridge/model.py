@@ -1267,6 +1267,8 @@ ESTIMATOR_DEFAULTS: dict[str, float] = {
     "bay_settle_s": 600.0,
     "bay_settle_max_s": 1800.0,
     "calibration_max_age_days": 30.0,
+    "calibrate_min_c": 5.0,
+    "calibrate_max_c": 80.0,
     "associate_window_s": 3600.0,
     "associate_min_corr": 0.8,
     "associate_margin": 0.15,
@@ -1363,6 +1365,13 @@ class EstimatorSpec:
       a sensor that keeps jumping cannot stay exempt for ever
     * ``calibration_max_age_days`` -- a SMART calibration without an accepted sample for
       this long is no longer trusted (> 0)
+    * ``calibrate_min_c`` / ``calibrate_max_c`` -- the drive temperature a manual
+      calibration (``POST /api/calibrate``, PROJECT.md section 8 item 23) may report,
+      degC: the value must lie in ``[calibrate_min_c, calibrate_max_c]``, which must be
+      a non-empty range inside the gate's ``(temp_min_c, temp_max_c)``. A handheld
+      reading is typed in by a human, so the range is narrower than the gate's on
+      purpose: a typo (``450`` for ``45``) is refused instead of fitting the bay's
+      sensor-to-drive map to nonsense
     * ``associate_window_s`` / ``associate_min_corr`` / ``associate_margin`` -- serial
       -> bay association by correlation (``>= 600``, ``(0, 1)``, ``(0, 1)``)
     """
@@ -1387,6 +1396,8 @@ class EstimatorSpec:
     bay_settle_s: float = ESTIMATOR_DEFAULTS["bay_settle_s"]
     bay_settle_max_s: float = ESTIMATOR_DEFAULTS["bay_settle_max_s"]
     calibration_max_age_days: float = ESTIMATOR_DEFAULTS["calibration_max_age_days"]
+    calibrate_min_c: float = ESTIMATOR_DEFAULTS["calibrate_min_c"]
+    calibrate_max_c: float = ESTIMATOR_DEFAULTS["calibrate_max_c"]
     associate_window_s: float = ESTIMATOR_DEFAULTS["associate_window_s"]
     associate_min_corr: float = ESTIMATOR_DEFAULTS["associate_min_corr"]
     associate_margin: float = ESTIMATOR_DEFAULTS["associate_margin"]
@@ -1484,6 +1495,11 @@ class EstimatorSpec:
         if self.calibration_max_age_days <= 0:
             raise ConfigError(
                 f"{where}.calibration_max_age_days must be > 0, got {self.calibration_max_age_days}"
+            )
+        if not self.calibrate_min_c < self.calibrate_max_c:
+            raise ConfigError(
+                f"{where}: calibrate_min_c < calibrate_max_c is required, got "
+                f"{self.calibrate_min_c} and {self.calibrate_max_c}"
             )
         if self.associate_window_s < 600:
             raise ConfigError(
@@ -2605,6 +2621,15 @@ class MpcConfig:
         if not isinstance(self.estimator, EstimatorSpec):
             raise ConfigError("mpc.estimator must be an estimator entry")
         self.estimator.validate(dt)
+        # The manual-calibration range is a drive temperature like any other, so it must
+        # lie inside the gate's absolute range (item 23).
+        for key in ("calibrate_min_c", "calibrate_max_c"):
+            value = getattr(self.estimator, key)
+            if not self.temp_min_c < value < self.temp_max_c:
+                raise ConfigError(
+                    f"mpc.estimator.{key} ({value}) must lie in "
+                    f"({self.temp_min_c}, {self.temp_max_c})"
+                )
 
     def _derive(self) -> _Derived:
         """Zone layout and per-temperature Stuck parameters (validated config only)."""
