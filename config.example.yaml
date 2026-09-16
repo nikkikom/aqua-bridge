@@ -93,6 +93,8 @@ mpc:
   model_converged_rel_se: 0.25 # relative standard error of every fan gain for "converged", (0, 1)
   model_max_pred_err_c: 1.0    # one-window prediction error allowed for "converged", degC, > 0
   model_use_rpm: false   # true (needs topology): airflow from the tachometer where one reports
+  model_reset_on_swap: true  # DAS only (inert here): a hot-swapped bay's identified g0, k, q_s
+                             # start over from the prior (they described the drive that left)
   # DAS MPC (control/solver_das.py: solver "mpc" with topology and no setpoints); inert in legacy mode.
   mpc_pred_dt_s: 30.0    # prediction step, seconds (> 0; >= dt with topology); horizon counts these steps
   mpc_blocks: []         # move blocks summing to horizon; [] = [1, 1, 2, 4, 6, 6] cut to horizon

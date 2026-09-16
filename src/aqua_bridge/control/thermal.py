@@ -218,6 +218,19 @@ Status machine per zone (the model's status is the least advanced zone, with
   ``learning``. A stored zone that had not converged keeps its status (conservative:
   a fresh file does not make a model that never converged act).
 
+Hot swap (plan section 8 item 12): ``update`` takes ``reset_bays``, the bays the
+estimator reported as ``swapped`` this tick (the occupancy crossed the ``empty``
+boundary, or the fast-swap rule tripped). With ``model_reset_on_swap`` (default
+``true``) each of them starts over from its prior -- ``g0``, ``k``, ``q_s``, the
+covariance, the counters, the PE monitor and the window in progress -- because those
+coefficients describe the drive that left, and the MPC's ``bay_settle_s`` exclusion
+only covers the transient. The zone air block's window in progress goes too: it
+anchors on the bay's heat through those very coefficients. The zone's *status* is
+left alone; demoting it would park the DAS MPC in its PI-like fallback until the
+next identification experiment, while the bay simply relearns like a new one. A
+``frozen`` zone is skipped: it never moves its coefficients, so a reset there would
+strand the bay at the prior.
+
 Stale hold (model store, the owner's stale rule): a model restored from a file older
 than ``model_store_max_age_days`` (or one saved while such a hold was still pending)
 carries ``"hold": {"since": ts | None}``. Its zones restart at ``learning`` (a zone that
@@ -1556,6 +1569,7 @@ def update(
     maps: Mapping[str, tuple[float, float]] | None = None,
     classes: Mapping[str, str] | None = None,
     rpm: Mapping[str, Any] | None = None,
+    reset_bays: Collection[str] = (),
     learn: bool = True,
 ) -> ThermalUpdate:
     """One identification tick (module docstring).
@@ -1568,6 +1582,10 @@ def update(
     only on a numerical failure (non-finite RLS state), which ``step`` turns into
     ``status: error``.
 
+    ``reset_bays`` are the bays the estimator reported a hot swap on this tick
+    (``swapped``); with ``model_reset_on_swap`` their blocks start over from the prior
+    before anything else (module docstring, *Hot swap*).
+
     ``learn=False`` (used offline by ``tools/replay.py`` and ``tools/fit_model.py``'s
     hold-out pass, never by ``mpc.step``) still tracks windows, excitation and the
     PE monitor, and still returns a genuine a-priori residual per closing window, but
@@ -1577,6 +1595,7 @@ def update(
     d = _derived(cfg)
     st, zone_specs, bay_specs = d.st, d.zone_specs, d.bay_specs
     mem = _load(memory, cfg, st)
+    _reset_swapped_bays(mem, cfg, st, bay_specs, reset_bays)
     maps = dict(maps or {})
     ts = float(ts)
     last_ts = mem["ts"]
@@ -1762,6 +1781,36 @@ def update(
     _advance_hold(mem, cfg, ts)
     mem["ts"] = ts
     return ThermalUpdate(memory=mem, summary=summary(mem, cfg, st=st, occupancy=occupancy))
+
+
+def _reset_swapped_bays(
+    mem: dict[str, Any],
+    cfg: MpcConfig,
+    st: Structure,
+    bay_specs: Mapping[str, _BlockSpec],
+    reset_bays: Collection[str],
+) -> None:
+    """Start a hot-swapped bay's block over from the prior (plan section 8 item 12).
+
+    ``g0``, ``k`` and ``q_s`` describe the drive that was in the bay; a different one
+    has its own. The window in progress goes with them, and so does the zone air block's
+    window, which anchors on this bay's heat through those very coefficients. The zone's
+    status is left alone: the bay relearns like a new one, and demoting the zone would
+    park the DAS MPC in its fallback until the next identification experiment.
+
+    A ``frozen`` zone never moves its coefficients (a model loaded converged from a fresh
+    store file), so resetting one of its bays would strand it at the prior: it is skipped.
+    """
+    if not reset_bays or not cfg.model_reset_on_swap:
+        return
+    for b in reset_bays:
+        if b not in st.bays:
+            continue
+        z = st.bays[b].zone
+        if mem["zones"][z]["status"] == "frozen":
+            continue
+        mem["bays"][b] = _fresh_block(bay_specs[b], 1)
+        mem["zones"][z]["air"]["acc"] = None
 
 
 def _zone_blocks_converged(

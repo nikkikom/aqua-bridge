@@ -185,6 +185,19 @@ an empty bay has no case-to-drive offset, so with the prior ``b`` its plain
 ``unknown`` and ``occupied`` bays both carry constraints. The estimator never faults
 a zone over a removed drive; the zone trust groups stay those of the declared config.
 
+A bay whose occupancy crosses the ``empty`` boundary in either direction, or whose
+**mean** trusted proximal reading steps away from the predicted sensor node by the
+fast-swap rule's own thresholds, reports ``swapped: true`` for that one tick: the
+drive in it may be a different one from now on. The mean is the point. The per-sensor
+test above runs sequentially, so with two members one of them jumps whenever the two
+disagree -- which is placement, not a swap, and happens on almost every tick of a
+bay with a redundant sensor under fan excitation (5689 of 5760 ticks measured on the
+truth simulator, the same pathology plan section 3 records for the ``rich`` preset).
+The mean of a disagreeing pair sits where the node already is, and a drive that is
+pulled or pushed in moves both. ``mpc.step`` hands those
+bays to :func:`aqua_bridge.control.thermal.update`, which resets their identified
+coefficients to the prior (plan section 8 item 12).
+
 The per-bay output shows a change in progress: ``pending_empty_s`` (seconds of
 evidence toward ``empty`` counted so far), ``pending_occupied_ticks`` (ticks of
 evidence toward ``occupied`` on an empty bay) and ``pending_unknown_s`` (seconds
@@ -1083,6 +1096,9 @@ def update(
     trusted_air = {z: [temps[t] for t in zone.air if t in temps] for z, zone in st.zones.items()}
     smart_arrived: dict[str, bool] = {}
     jumped: dict[str, bool] = {}
+    # Bays whose *mean* trusted proximal reading stepped away from the predicted sensor
+    # node (item 12): the drive in them may be a different one from now on.
+    stepped: dict[str, bool] = {}
     arrays: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     geometry: dict[str, tuple[float, float, float]] = {}  # zone -> (Q, Qn, t_in)
 
@@ -1222,6 +1238,19 @@ def update(
                     _reset_state(x, p, i_d + j, t_d, spec.p0_t_drive)
                     _reset_state(x, p, i_q + j, g_seed * (t_d - air_now) / cd_seed, spec.p0_heat)
                 bm["init"] = True
+            if present and occ != EMPTY:
+                # The bay-level test, before any of this tick's updates: the mean of the
+                # bay's trusted readings against the predicted node and the variance of
+                # that mean. Per-sensor jumps below are sequential, so with two sensors
+                # one of them jumps whenever the two disagree, which is placement, not a
+                # swap; the mean of a pair that disagrees sits where the node already is.
+                mean_v = sum(float(temps[name]) for name in present) / len(present)
+                mean_r = sum(_sensor_var(cfg, name) for name in present) / len(present) ** 2
+                nu_bay = mean_v - x[i_s + j]
+                if abs(nu_bay) > spec.jump_min_c and nu_bay * nu_bay > jump_var * (
+                    p[i_s + j, i_s + j] + mean_r
+                ):
+                    stepped[b] = True
             for name in present:
                 value = float(temps[name])
                 r = _sensor_var(cfg, name)
@@ -1287,6 +1316,9 @@ def update(
     # -- occupancy -----------------------------------------------------------------------
     evidence: dict[str, tuple[float, float]] = {}
     observed: dict[str, bool] = {}
+    # Bays whose drive may be a different one from this tick on (item 12): the thermal
+    # model's coefficients for them describe a drive that is no longer there.
+    swapped: dict[str, bool] = dict(stepped)
     for b, bay in st.bays.items():
         bm = mem["bays"][b]
         if jumped.get(b):  # the fast-swap rule widened this bay on purpose
@@ -1366,6 +1398,7 @@ def update(
                 if before == EMPTY or after == EMPTY:  # a deliberate widening, as a jump
                     _mark_disturbed(bm, float(ts), spec.bay_settle_max_s)
             if (before == EMPTY) != (after == EMPTY):
+                swapped[b] = True
                 _forget_pair(mem, b, bm["assoc"])
                 if b in assoc and assoc[b][1] == "correlation":
                     _forget_pair(mem, b, assoc[b][0])
@@ -1503,6 +1536,7 @@ def update(
             "pending_occupied_ticks": int(bm["rise"]),
             "pending_unknown_s": float(bm["blind"]),
             "assoc_check_fails": int(bm["rej"]),
+            "swapped": bool(swapped.get(b, False)),
             "observed": observed.get(b, False),
             "seeded": bool(bm["init"]),
             "settling": _settling(bm, float(ts), spec.bay_settle_s),

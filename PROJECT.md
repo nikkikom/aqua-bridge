@@ -883,9 +883,13 @@ holds:
   of the same question. **Soft sigma floor** (`zones.advance_sigma_floor`): the estimator
   cannot show the heat a lost sensor would have shown and `k·σ` grows slowly,
   so without a floor the DAS MPC, which had followed the measured warming,
-  lowers the fans on the tick of the loss (PWM −0.04, 21 % less zone airflow
-  than the run with the sensor within the first minute, closed loop) and over
-  65 minutes costs the bay 2.3–2.4 °C of true margin. When a zone-air or bay
+  lowers the fans within the first minutes of the loss (PWM −0.07 below the
+  level before it, 19 % less zone airflow than the run with the sensor, closed
+  loop) and over 65 minutes costs the bay 2.3–2.4 °C of true margin. (The drop
+  used to be −0.04 on the tick of the loss itself; §8 item 19's occupancy
+  debounce keeps the blind bay's state for `estimator.occupancy_hold_s`, so the
+  estimate changes a few ticks later. The worst drop and what the floor costs
+  are unchanged.) When a zone-air or bay
   group of a zone (a `strict` group the estimator replaces) has no
   gate-trusted, confirmed member, an episode opens for the zone: every channel
   of its reach keeps a floor at `prev` of that tick (the command before the
@@ -4182,8 +4186,39 @@ Owner decision (2026-09-16):
     trusted zone, not empty), so a drive in a faulted zone is no longer
     evidence about a model the solver never plans for it (§3, validity gate
     and model fallback).
-12. Reset a bay's thermal coefficients on a hot swap to a different drive
-    (kept today; the MPC's settle exclusion covers only the transient).
+12. **Done** (2026-09-16): a hot-swapped bay's identified coefficients start
+    over from the prior. The estimator reports `swapped: true` for one tick on a
+    bay whose occupancy crosses the `empty` boundary in either direction or whose
+    **mean** trusted proximal reading steps away from the predicted sensor node
+    by the fast-swap rule's own thresholds (`jump_min_c`, `jump_sigmas`);
+    `step` hands those bays to `thermal.update(reset_bays=...)`, which with
+    `model_reset_on_swap` (new flat key, default `true`) resets the bay's `g0`,
+    `k`, `q_s`, covariance, counters, PE monitor and window in progress, plus the
+    zone air block's window (it anchors on that bay's heat through those very
+    coefficients). The zone's *status* is left alone: demoting it would park the
+    DAS MPC in its PI-like fallback until the next experiment, while the bay
+    simply relearns like a new one. A `frozen` zone is skipped — it never moves
+    its coefficients, so a reset there would strand the bay at the prior.
+
+The **mean** is the point, not any one sensor. The per-sensor fast-swap test
+    is sequential, so with a redundant pair — two sensors at different placements,
+    disagreeing with the bay's one sensor node — one of them jumps on almost every
+    tick under fan excitation (measured: 5689 of 5760 ticks on b10, 5759 on b03,
+    the same pathology §3 records for the `rich` preset), and resetting on that
+    would leave such a bay permanently unidentifiable. The mean of a disagreeing
+    pair sits where the node already is, while a drive pulled or pushed in moves
+    both. The per-sensor rule itself is unchanged: it still inflates the
+    variances and drops a correlation association.
+
+    Measured on `sim/das.py` (the identifiability harness of
+    `tests/test_thermal_ident.py`: group experiments, `basic` physics, 8 h, the
+    drive in b06 swapped at 4 h for one with `k = 1.2` and `g0 = 0.6` against
+    the 0.5/0.3 that came out, seeds 2 and 3): the old behaviour ends at
+    `k = 0.57–0.63`, 47–52 % below the new drive's truth, because the window
+    forgetting has to walk the old drive's value across; the reset ends at
+    `k = 1.12–1.18`, within 2–6 %, from 119 windows in the 4 h after the swap.
+    No other bay is touched (`k.b05` moves by less than 0.01 between the two
+    runs), and one swap produced exactly one reset.
 13. Split a fan group's shared `E` into per-channel coefficients from the
     single-channel experiment phases.
 14. Online fan-curve fit: `fan_curves` in the store is validated but

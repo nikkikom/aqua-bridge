@@ -257,3 +257,66 @@ def test_regulation_only_never_converges_on_the_rich_preset(das_example_cfg, see
     run, statuses = _regulation_run(cfg, preset="rich", seed=seed, hours=4.0)
     assert statuses["converged"] == 0, statuses
     assert statuses["error"] == 0
+
+
+# ---------------------------------------------------------------------------
+# hot swap: the bay's coefficients start over (item 12)
+# ---------------------------------------------------------------------------
+
+
+def _example(**replace: Any) -> MpcConfig:
+    from aqua_bridge.config import load_config
+    from conftest import EXAMPLE_DAS_CONFIG
+
+    return dataclasses.replace(_config(load_config(EXAMPLE_DAS_CONFIG).mpc), **replace)
+
+
+def _reset_tick(cfg: MpcConfig, memory, bays: set[str]):
+    return thermal.update(
+        memory,
+        cfg,
+        temps={},
+        u=dict.fromkeys(cfg.channels, 0.5),
+        ts=10.0,
+        zones_ok=(),
+        reset_bays=bays,
+    ).memory
+
+
+def test_a_reset_bay_starts_over_and_leaves_every_other_block_alone():
+    """``reset_bays`` restores one bay's prior; the zone's status and the other blocks
+    (including the air block) are untouched."""
+    cfg = _example()
+    memory = thermal.fresh_memory(cfg)
+    memory["zones"]["z1"]["status"] = "converged"
+    for b in ("b06", "b05"):
+        block = memory["bays"][b]
+        block["theta"] = [v + 0.2 for v in block["theta"]]
+        block["w"], block["n"], block["rel"] = 12, 9, [0.1] * len(block["theta"])
+    air = memory["zones"]["z1"]["air"]
+    air["w"] = 7
+    before_air = list(air["theta"])
+    prior = thermal.fresh_memory(cfg)["bays"]["b06"]["theta"]
+
+    mem = _reset_tick(cfg, memory, {"b06"})
+    assert mem["bays"]["b06"]["theta"] == prior
+    assert mem["bays"]["b06"]["w"] == 0 and mem["bays"]["b06"]["rel"] is None
+    assert mem["bays"]["b05"]["w"] == 12  # the other bay of the zone is untouched
+    assert mem["zones"]["z1"]["status"] == "converged"  # the zone is not demoted
+    assert mem["zones"]["z1"]["air"]["theta"] == before_air and mem["zones"]["z1"]["air"]["w"] == 7
+
+
+def test_model_reset_on_swap_false_keeps_the_coefficients():
+    cfg = _example(model_reset_on_swap=False)
+    memory = thermal.fresh_memory(cfg)
+    memory["bays"]["b06"]["w"] = 12
+    assert _reset_tick(cfg, memory, {"b06"})["bays"]["b06"]["w"] == 12
+
+
+def test_a_frozen_zone_is_never_reset():
+    """A frozen zone never moves its coefficients, so a reset would strand the bay."""
+    cfg = _example()
+    memory = thermal.fresh_memory(cfg)
+    memory["zones"]["z1"]["status"] = "frozen"
+    memory["bays"]["b06"]["w"] = 12
+    assert _reset_tick(cfg, memory, {"b06"})["bays"]["b06"]["w"] == 12

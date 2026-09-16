@@ -1655,6 +1655,10 @@ class MpcConfig:
       learning on/off, regression window, RLS forgetting per window, covariance trace
       bound, relative standard error and prediction error for ``converged``, and fan
       airflow from the tachometer instead of the PWM curve.
+    * ``model_reset_on_swap`` -- reset a bay's identified coefficients (``g0``, ``k``,
+      ``q_s``) to the prior when the estimator reports a hot swap on it (default
+      ``true``; they describe the drive that left). Validated always, inert in legacy
+      mode and in a ``frozen`` zone, which never adapts at all.
     * ``mpc_pred_dt_s`` / ``mpc_blocks`` / ``mpc_every_ticks`` / ``rho_soft`` / ``rho_hard``
       / ``solver_outer_max`` / ``model_max_drift_c_per_min`` / ``model_return_factor`` /
       ``model_return_dwell_s`` / ``model_drift_rate_tau_s`` / ``model_drift_dwell_s`` /
@@ -1744,6 +1748,7 @@ class MpcConfig:
     model_converged_rel_se: float = 0.25
     model_max_pred_err_c: float = 1.0
     model_use_rpm: bool = False
+    model_reset_on_swap: bool = True
     mpc_pred_dt_s: float = 30.0
     mpc_blocks: tuple[int, ...] = ()
     mpc_every_ticks: int = 1
@@ -1848,7 +1853,12 @@ class MpcConfig:
             "stuck_pwm_lag_fraction",
             _cfg_num("stuck_pwm_lag_fraction", self.stuck_pwm_lag_fraction),
         )
-        for name in ("model_shadow", "model_use_rpm", "model_accept_prior"):
+        for name in (
+            "model_shadow",
+            "model_use_rpm",
+            "model_accept_prior",
+            "model_reset_on_swap",
+        ):
             _cfg_bool(name, getattr(self, name))
         for name in (
             "model_window_s",
