@@ -2,8 +2,8 @@
 
 ``create_app`` wires GET ``/api/state``, GET ``/api/health``, GET ``/`` (the
 static single-page UI), the DAS views GET ``/api/estimate``, GET ``/api/bays``,
-GET ``/api/model`` and GET ``/api/zones``, and the eight ``POST /api/{mode,setpoint,
-pwm,preset,auto,limit,bay,ident}`` intents against a
+GET ``/api/model`` and GET ``/api/zones``, and the nine ``POST /api/{mode,setpoint,
+pwm,preset,auto,limit,bay,ident,calibrate}`` intents against a
 :class:`aqua_bridge.control.intents.ControlSurface`.
 
 ``GET /api/state`` carries a top-level ``device_health`` key (PROJECT.md section 8
@@ -83,7 +83,8 @@ DAS views (plan sections 1 and 7), read from the snapshot, never computed here:
   ``solver == "degraded"``. Both empty/false before the first tick.
 * ``GET /api/model`` -- ``{"thermal": {...}, "parameters": {kind: {unit, lo, hi, prior,
   identified_from}}, "calibration": {bay: {serial, calibrated, sigma_cal_c,
-  calibration}}, "store": {...}}``: the zoned thermal model's identification summary of the last
+  calibration_source, calibration}}, "manual_calibrations": {bay: {temp_c, ts}},
+  "store": {...}}``: the zoned thermal model's identification summary of the last
   command (``diagnostics["thermal"]``: status, prediction error, per zone and bay the
   coefficients with their relative standard errors, see
   :mod:`aqua_bridge.control.thermal`; ``{"status": "off"}`` without
@@ -107,6 +108,20 @@ while the global limit on those checks refuses (``http.auth_verify_max``,
 cached login waits for neither. An admitted check (PBKDF2) runs on the
 authenticator's one low-priority worker thread, so the event loop keeps
 serving.
+
+``POST /api/calibrate`` ``{"bay": ..., "drive_temp_c": ...}`` (DAS mode, PROJECT.md
+section 8 item 23) is the handheld-thermometer stand-in for SMART: one measured drive
+temperature for one bay, through the same auth, the same rate limit and the same intent
+path as every other command. 200 on success; 400 for a malformed body, an unknown bay,
+a temperature outside ``mpc.estimator.calibrate_min_c`` / ``calibrate_max_c`` or a
+legacy config; 409 when the reading would be meaningless or unsafe -- before the first
+tick, for a bay the estimator calls ``empty``, or while the bay's zone is untrusted or
+in fault (the ``error`` names which and why, e.g. ``untrusted:za``, ``empty:b03``,
+``no_tick``). The accepted reading shows up in ``GET /api/model`` under
+``manual_calibrations`` while it is still offered to the estimator (for
+``mpc.estimator.smart_max_age_s``; the estimator folds it in once, by sample time,
+exactly as it does a repeated SMART reading), and in ``GET /api/bays`` and
+``GET /api/model`` as the bay's ``calibration`` with ``calibration_source: "manual"``.
 
 ``POST /api/in/smart`` (the DAS plan, section 1 "SMART path") is the
 non-MQTT twin of the PC-side SMART agent: same JSON body
@@ -163,7 +178,17 @@ _HOST_KEY = web.AppKey("host_cache", CachedHostInfo)
 
 # URL tail -> intent kind (identical today, kept separate so the route table
 # and aqua_bridge.control.intents.INTENT_KINDS can diverge later).
-_POST_KINDS = ("mode", "setpoint", "pwm", "preset", "auto", "limit", "bay", "ident")
+_POST_KINDS = (
+    "mode",
+    "setpoint",
+    "pwm",
+    "preset",
+    "auto",
+    "limit",
+    "bay",
+    "ident",
+    "calibrate",
+)
 
 
 def _error(status: int, message: str) -> web.Response:
@@ -319,11 +344,13 @@ async def _get_model(request: web.Request) -> web.Response:
             "thermal": diag.get("thermal") or {"status": "off"},
             "parameters": {kind: spec.to_dict() for kind, spec in PARAMETERS.items()},
             "experiment": snapshot.extra.get("experiment"),
+            "manual_calibrations": snapshot.extra.get("calibrations") or {},
             "calibration": {
                 bay: {
                     "serial": info.get("serial"),
                     "calibrated": info.get("calibrated"),
                     "sigma_cal_c": info.get("sigma_cal_c"),
+                    "calibration_source": info.get("calibration_source"),
                     "calibration": info.get("calibration"),
                 }
                 for bay, info in seen.items()
