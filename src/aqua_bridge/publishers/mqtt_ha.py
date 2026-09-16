@@ -37,7 +37,7 @@ retained state topic -- per controller and per channel, with the flow sensors an
 is one tap away in Home Assistant without a second entity per output.
 
 The Raspberry Pi the daemon runs on has its own binary sensor, ``host_problem``
-(PROJECT.md section 8 item 97): on whenever ``value_json.device_health.host.ok``
+(PROJECT.md section 8 item 103): on whenever ``value_json.device_health.host.ok``
 is false, that is whenever the board has been above ``host_health.temp_limit_c``
 for ``temp_fault_s``, is throttling now, or (only while its CPU is idle) has sat
 further than ``divergence_c`` from the enclosure air for ``divergence_fault_s``.
@@ -421,7 +421,7 @@ def build_discovery_entities(
         )
     )
 
-    # The board itself (PROJECT.md section 8 item 97): its own problem sensor, so a hot
+    # The board itself (PROJECT.md section 8 item 103): its own problem sensor, so a hot
     # or throttling Pi is not read as a controller fault. Its attributes are the host
     # half of the same blob -- the board's temperature, the enclosure-air reference it
     # is compared against, the load average and the decoded get_throttled word.

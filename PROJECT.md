@@ -2759,7 +2759,7 @@ a model converges only with them.
   with one default declared once in `health.FanHealthConfig`, validated
   there (an unknown key or a bad value is a `ConfigError`, exit 2, checked
   before anything is opened) and shown in both example configs.
-- **The board itself** (`health.py`, item 97). The Raspberry Pi the daemon
+- **The board itself** (`health.py`, item 103). The Raspberry Pi the daemon
   runs on is a **health signal, never a model input** (owner decision,
   §8.1, 2026-09-16): about a watt against the drives' tens of watts, and
   its reading is dominated by its own self-heating, which moves with CPU
@@ -3620,7 +3620,7 @@ the board.
   or publisher, and rate-limiting its log. The captured reports supply the
   numbers: the aquaero's own outputs at 0 mA / 0 W, the Quadro's aquabus
   fan 7 at 27 mA / 0.32 W / 1105 rpm, every rail inside the default window.
-  The board's own rules (§8 item 97): the `host_health:` keys and their one
+  The board's own rules (§8 item 103): the `host_health:` keys and their one
   default, every rejection (`air_temps` included); the air reference and its
   `zone_air` → `inlet` → every temperature default; the hot-board and
   divergence rules firing only after their own window and clearing again;
@@ -3745,7 +3745,7 @@ runners allow it.
   `record_path`, `--model-store` and `STATE_DIRECTORY` (legacy: ignored /
   exit 2), publisher wiring and start failures, the
   SIGTERM stop path in-process, a SIGTERM delivered inside a stderr write,
-  a second SIGTERM during shutdown, and a real subprocess (`slow`). Item 97:
+  a second SIGTERM during shutdown, and a real subprocess (`slow`). Item 103:
   a `host_health.air_temps` typo exits 2 before anything opens; the tick's
   host reader runs `vcgencmd` once per `host_health.vcgencmd_interval_s` and
   not once per tick, honours `vcgencmd_timeout_s` and leaves the tick's
@@ -3809,7 +3809,7 @@ runners allow it.
   host refresh interval, swallowed publish errors.
 - `tests/test_hostinfo.py` — every host metric against fake procfs /
   sysfs files, `None` on missing or malformed input; the board's throttling
-  state (§8 item 97): every bit of both halves; the three sources in the
+  state (§8 item 103): every bit of both halves; the three sources in the
   order the chain tries them — the sysfs attribute preferred, `vcgencmd`
   where it is absent, the `rpi_volt` hwmon alarm where both are (found by
   `name` across several hwmon directories, with `rpi_volt` deliberately not
@@ -4091,7 +4091,7 @@ Config `http:` (parsed and validated by `HttpSettings` in
   `not_pwm_channels`, `unconfigured_channels`, `flows`, and
   `active_profile` once one is published), `fans` (per channel `duty`,
   `rpm`, `voltage_v`, `current_ma`, `power_w`, `expected_rpm`,
-  `expected_power_w`, `problems`), `host` (§8 item 97: the board's own
+  `expected_power_w`, `problems`), `host` (§8 item 103: the board's own
   `cpu_temp_c`, the `air_c` reference it is compared against with the
   `air_temps` it was averaged from, the signed `divergence_c`, `load1`,
   `idle`, the `throttled` reading and this board's own `faults`,
@@ -4108,7 +4108,7 @@ Config `http:` (parsed and validated by `HttpSettings` in
 - `host` — host machine metrics (`aqua_bridge.hostinfo.collect_hostinfo`:
   `cpu_temp_c`, `load1`, `load5`, `load15`, `mem_used_pct`, `mem_total_kb`,
   `disk_used_pct`, `disk_free_gb`, `wifi_rssi_dbm`, `uptime_s`, and
-  `throttled` — the board's throttling state, §8 item 97, the one nested
+  `throttled` — the board's throttling state, §8 item 103, the one nested
   value: the decoded word with its `source` and, for a cached `vcgencmd`
   word, its `age_s`, or a `partial` reading whose `unknown` conditions are
   `null`; `null` per key when unreadable), refreshed at most every `host.interval_s` seconds
@@ -4364,7 +4364,7 @@ availability topic and one device block. Entities:
   retained state topic, so the per-controller and per-channel detail (and
   the flow sensors) is one tap away without an entity per output.
 - binary sensor `host_problem` (`device_class: problem`, diagnostic,
-  §8 item 97): on whenever `device_health.host.ok` is false, that is
+  §8 item 103): on whenever `device_health.host.ok` is false, that is
   whenever the board has been above `host_health.temp_limit_c` for
   `temp_fault_s`, is throttling now, or — only while its CPU is idle — has
   sat further than `divergence_c` from the enclosure air for
@@ -4520,7 +4520,7 @@ Owner decision (2026-09-16):
   `inputs` is the place it would go, not `temps`/`rpm`.
 
 - **The Pi's own board is a health signal, never a model input**
-  (item 97). On the owner's Zero 2 W (64-bit trixie, kernel 6.18.50-v8)
+  (item 103). On the owner's Zero 2 W (64-bit trixie, kernel 6.18.50-v8)
   `/sys/class/thermal/thermal_zone0` is `cpu-thermal` and read 47.2 °C at
   idle, and `vcgencmd get_throttled` returned `0x0`. Measured there since:
   the firmware's `get_throttled` **sysfs attribute does not exist** on that
@@ -5709,7 +5709,7 @@ Owner decision (2026-09-16):
     runs, or `ident_max_duration_s` and the phase split reconsidered — or
     whether the open-loop evidence is enough and this is only a note.
 
-97. **Done** (2026-09-16): the Pi's own temperature and throttling as a
+103. **Done** (2026-09-16): the Pi's own temperature and throttling as a
     health signal (owner decision above, §8.1). `hostinfo.read_throttled()`
     reads the board's throttling state from whichever of three sources this
     kernel has — the sysfs attribute

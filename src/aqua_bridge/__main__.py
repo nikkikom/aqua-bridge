@@ -33,7 +33,7 @@ CI; ``--sim-plant`` picks it:
   exit code 2.
 
 Fan, device and host health (:mod:`aqua_bridge.health`, PROJECT.md section 8
-items 79, 83 and 97) is one more ``on_tick`` observer: it reads the tick's
+items 79, 83 and 103) is one more ``on_tick`` observer: it reads the tick's
 per-output readings from ``PlantObservation.inputs["fans"]``, the source's own
 ``device_health()`` and the board's own metrics (a
 :class:`~aqua_bridge.hostinfo.CachedHostInfo` on ``host.interval_s``), applies
@@ -347,7 +347,7 @@ def build_health_monitor(
     """The fan-, device- and host-health observer for ``on_tick``, or ``None`` when
     both ``fan_health.enabled`` and ``host_health.enabled`` are false and the source
     has no device health of its own to publish either (PROJECT.md section 8 items
-    79, 83 and 97).
+    79, 83 and 103).
 
     ``fan_health:`` and ``host_health:`` are validated here, so a bad threshold is a
     startup :class:`ConfigError` (exit 2) rather than a rule that silently never

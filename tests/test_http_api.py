@@ -230,7 +230,7 @@ def test_get_state_and_health_carry_the_device_health(surface: StubSurface) -> N
 
 
 def test_get_state_and_health_carry_the_board_s_own_health(surface: StubSurface) -> None:
-    """Item 97: the board's verdict is the device_health ``host`` key, and its problems
+    """Item 103: the board's verdict is the device_health ``host`` key, and its problems
     are in the one list /api/health shows -- and nowhere near the observation."""
     board = {
         "cpu_temp_c": 82.0,

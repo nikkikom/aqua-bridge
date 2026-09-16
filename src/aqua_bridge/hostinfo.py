@@ -14,7 +14,7 @@ Besides the metrics, :func:`read_throttled` reports the Raspberry Pi's throttlin
 state -- under-voltage, a capped ARM frequency, hard throttling and the soft
 temperature limit, each both *now* and *since boot*. It rides ``collect_hostinfo``'s
 ``throttled`` key and feeds the host-health rules (:mod:`aqua_bridge.health`,
-PROJECT.md section 8 item 97). Like the board's own temperature it is a health
+PROJECT.md section 8 item 103). Like the board's own temperature it is a health
 signal only: nothing here ever reaches the solver.
 
 Three sources, best first, because no single one is present everywhere:
@@ -207,7 +207,7 @@ def read_wifi_rssi(
 
 
 # ---------------------------------------------------------------------------
-# Throttling (PROJECT.md section 8 item 97)
+# Throttling (PROJECT.md section 8 item 103)
 # ---------------------------------------------------------------------------
 
 #: The Raspberry Pi firmware's ``get_throttled`` word, low half: ``(bit, name)``

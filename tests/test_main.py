@@ -316,7 +316,7 @@ def test_a_bad_fan_health_key_exits_2_before_anything_opens(tmp_path, example_co
 def test_a_host_health_air_temps_typo_exits_2_before_anything_opens(
     tmp_path, example_config_path, caplog
 ):
-    """Item 97: the one host_health check that needs mpc.temps runs in main() too.
+    """Item 103: the one host_health check that needs mpc.temps runs in main() too.
 
     Left to HealthMonitor.__init__ it would fire after build_io had opened the
     hardware and outside main's ConfigError handling: a raw traceback, exit 1 instead
@@ -333,7 +333,7 @@ def test_a_host_health_air_temps_typo_exits_2_before_anything_opens(
 
 
 def test_the_tick_reader_polls_vcgencmd_on_the_configured_cadence(example_config_path, monkeypatch):
-    """Item 97: the control tick reads the whole get_throttled word, on a cadence.
+    """Item 103: the control tick reads the whole get_throttled word, on a cadence.
 
     The board this daemon runs on exposes no get_throttled sysfs attribute (a Zero 2 W
     on kernel 6.18), so a tick reader without vcgencmd would leave the "throttling now"

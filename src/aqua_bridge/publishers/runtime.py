@@ -191,7 +191,7 @@ class MqttService:
         # Left None: collect_hostinfo with the default throttling source chain --
         # the get_throttled sysfs attribute, a vcgencmd rate limited to one run per
         # host_health.vcgencmd_interval_s, then the rpi_volt hwmon under-voltage bit
-        # (item 97). This publisher has its own reader and its own thread.
+        # (item 103). This publisher has its own reader and its own thread.
         self._hostinfo = hostinfo if hostinfo is not None else host_metrics_reader()
         self._clock = clock
         self._host: dict[str, Any] | None = None
@@ -222,7 +222,7 @@ class MqttService:
         mqtt_cfg = validate_mqtt_section(app_cfg.section("mqtt"))
         host_cfg = app_cfg.section("host")
         # The host reader's vcgencmd cadence and timeout come from documented keys,
-        # not from numbers in the source (item 97); a caller-supplied reader wins.
+        # not from numbers in the source (item 103); a caller-supplied reader wins.
         kwargs.setdefault(
             "hostinfo",
             host_metrics_reader(HostHealthConfig.from_section(app_cfg.section("host_health"))),
