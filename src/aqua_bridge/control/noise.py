@@ -12,10 +12,13 @@ with ``u0_m = fan_models.<m>.deadband``, ``L_max,m = fan_models.<m>.noise_db_at_
 and the fan affinity exponent ``n = noise.exponent`` (sound power ~ N^n). ``noise_db``
 is an index; it is absolute only when ``noise_db_at_max`` comes from datasheets at
 ``rpm_max``. A total of zero (every fan below its dead band) reads
-:data:`NOISE_FLOOR_DB` so the value stays finite. The plan fits ``rpm(u)`` per fan
-model from recorded ``(u, rpm)`` pairs (``tools/fit_fans.py``, a later milestone);
-until then the configured ``rpm_max`` and ``deadband`` are the curve, and a
-tach-less channel uses the curve of its model like any other.
+:data:`NOISE_FLOOR_DB` so the value stays finite. ``tools/fit_fans.py`` fits
+``rpm(u)`` per fan model from a recording's ``(u, rpm)`` pairs, offline; its
+output is copied into ``fan_models`` by hand (wiring the fitted curve into the
+model store automatically, ``fan_curves``, is still open, PROJECT.md section 8
+item 14). Until a channel's model is fitted, the configured ``rpm_max`` and
+``deadband`` are the curve, and a tach-less channel uses the curve of its
+model like any other.
 
 ``diagnostics["noise"]`` (:func:`noise_diagnostics`) reports the index from the
 speed the fans turn: a channel's measured rpm where its tachometer reports a finite
