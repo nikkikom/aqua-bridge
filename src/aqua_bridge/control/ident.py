@@ -63,9 +63,9 @@ refuses a second start while one runs. Here:
   and fault-free for ``ident_settle_s`` (tracked by :func:`track` from every tick; a
   restart starts the count over);
 * ``bay_unknown:<bay>`` / ``bay_transition:<bay>`` -- no bay of those zones is
-  ``unknown``, has an occupancy change pending (``pending_empty_s`` or
-  ``pending_occupied_ticks`` of the estimator) or changed occupancy less than
-  ``estimator.bay_settle_s`` ago;
+  ``unknown``, has an occupancy change pending (``pending_empty_s``,
+  ``pending_occupied_ticks`` or the occupancy debounce ``pending_unknown_s`` of the
+  estimator) or changed occupancy less than ``estimator.bay_settle_s`` ago;
 * ``calibrating:<bay>`` -- no bay of those zones has a SMART calibration still in its
   first 20 samples (:data:`~aqua_bridge.control.estimator.CAL_MIN_SAMPLES`);
 * ``start_band:<bay>`` -- every occupied or unknown bay of those zones has
@@ -436,7 +436,11 @@ def _bay_reasons(cfg: MpcConfig, facts: TickFacts, zones: tuple[str, ...]) -> li
         if info.get("occupancy") == UNKNOWN or info.get("occupancy") is None:
             reasons.append(f"bay_unknown:{bay}")
         since = info.get("since_ts")
-        pending = info.get("pending_empty_s", 0.0), info.get("pending_occupied_ticks", 0)
+        pending = (
+            info.get("pending_empty_s", 0.0),
+            info.get("pending_occupied_ticks", 0),
+            info.get("pending_unknown_s", 0.0),  # a blind bay: the debounce is counting
+        )
         if any(not _finite(v) or float(v) != 0.0 for v in pending) or (
             since is not None
             and (not _finite(since) or facts.ts is None or facts.ts - float(since) < settle)

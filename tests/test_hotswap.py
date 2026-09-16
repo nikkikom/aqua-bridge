@@ -31,8 +31,14 @@ from invariants import checked_step
 INSERT_TEMP_C = 45.0
 
 
-def base_cfg() -> MpcConfig:
-    return load_config(EXAMPLE_DAS_CONFIG).mpc
+def base_cfg(**estimator_keys: float) -> MpcConfig:
+    """The example DAS config, with ``estimator`` keys replaced through the config."""
+    cfg = load_config(EXAMPLE_DAS_CONFIG).mpc
+    if not estimator_keys:
+        return cfg
+    data = cfg.to_dict()
+    data["estimator"].update(estimator_keys)
+    return MpcConfig.from_mapping(data)
 
 
 def run(
@@ -41,6 +47,7 @@ def run(
     *,
     occupied: dict[str, bool] | None = None,
     controller: Callable = checked_step,
+    dropout: float = 0.0,
     **plant_kw,
 ) -> DasRun:
     topo = topology_from_config(cfg)
@@ -48,6 +55,8 @@ def run(
         topo["bays"][bay]["occupied"] = value
     for entry in topo["sensors"].values():
         entry["noise_sigma_c"] = SENSOR_TYPES[entry["type"]].noise_sigma_c
+        if dropout and entry["type"] == "ds18b20":
+            entry["dropout_prob"] = dropout
     plant = build_das_plant(topo, preset="basic", dt=cfg.dt, initial_pwm=0.5, **plant_kw)
     return run_das_closed_loop(plant, cfg, controller, ticks)
 
@@ -249,3 +258,47 @@ def test_empty_at_boot_insert_raises_the_fans(empty_at_boot):
     after = [r.cmd.diagnostics["bays"]["b03"]["occupancy"] for r in run_.records]
     assert after[-1] == "occupied"
     assert fans_rise_after(cfg, run_, "z0", BOOT_INSERT_S) > 0.05
+
+
+# ---------------------------------------------------------------------------
+# occupancy debounce through 1-Wire dropouts (item 19)
+# ---------------------------------------------------------------------------
+
+#: Per-tick dropout probability of every DS18B20 (CRC failures and the like).
+DROPOUT = 0.02
+
+
+def _empty_churn(run_: DasRun, bay: str) -> tuple[int, int]:
+    """(times the bay left ``empty``, ticks it was not ``empty``) after it first was."""
+    leaves = away = 0
+    prev = None
+    seen = False
+    for rec in run_.records:
+        occ = rec.cmd.diagnostics["bays"][bay]["occupancy"]
+        seen = seen or occ == "empty"
+        if seen:
+            leaves += prev == "empty" and occ != "empty"
+            away += occ != "empty"
+        prev = occ
+    return leaves, away
+
+
+@pytest.mark.parametrize("hold_s", [0.0, None])
+def test_dropouts_shake_an_empty_bay_loose_only_without_the_debounce(hold_s):
+    """Item 19: with ``occupancy_hold_s`` a one-tick dropout is not a loss of the bay."""
+    cfg = base_cfg() if hold_s is None else base_cfg(occupancy_hold_s=hold_s)
+    run_ = run(
+        cfg,
+        600,
+        seed=5,
+        dropout=DROPOUT,
+        heat_schedule={"b01": [(0.0, 0.7)], "b02": [(0.0, 1.0)], "b10": [(0.0, 1.0)]},
+        bay_schedule=[{"t_s": 60.0, "bay": "b06", "action": "remove"}],
+    )
+    leaves, away = _empty_churn(run_, "b06")
+    assert run_.violations() == 0  # neither rule is unsafe
+    if hold_s == 0.0:  # the old rule: a dropout costs the bay its state
+        assert leaves >= 2 and away > 100, (leaves, away)
+    else:
+        assert leaves == 0, (leaves, away)
+        assert away == 0

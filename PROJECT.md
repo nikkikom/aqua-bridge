@@ -1597,8 +1597,10 @@ diagnostics.
 `true` is always `occupied`, `false` always `empty`; `auto` runs a machine
 on `ΔT = T̂_s − T̂_a` and the heat the filter attributes to the drive:
 
-- `unknown` at start and after a tick without any trusted proximal member
-  of the bay (a redundant member keeps the state);
+- `unknown` at start and after `occupancy_hold_s` (30 s) without any trusted
+  proximal member of the bay (a redundant member keeps the state); a shorter
+  dropout keeps the state and the pending counts (item 19), `0` is the
+  undebounced rule;
 - `unknown → occupied` at once when `ΔT > occupied_dT_c` or a SMART sample
   of the bay's associated serial arrives;
 - `occupied | unknown → empty` after `empty_confirm_s` with
@@ -4187,9 +4189,25 @@ Owner decision (2026-09-16):
 18. Serial → bay association: a wrong correlation pair can still feed
     another drive's SMART into a bay's calibration (bounded by
     `smart_reject_c`); tighten acceptance.
-19. Occupancy debounce: a one-tick proximal dropout on an empty bay (CRC
-    failure, clock glitch) moves it to `unknown` with drive variance
-    25 °C² (louder, not unsafe).
+19. **Done** (2026-09-16): occupancy debounce. A bay whose proximal members
+    all go untrusted keeps its occupancy state, its `pending_empty_s` and its
+    `pending_occupied_ticks` until the blindness has lasted
+    `estimator.occupancy_hold_s` (new key, 30 s = 6 ticks at `dt = 5`); only
+    then does it fall back to `unknown` with the `reset_drive_var` insert
+    variance, exactly as before. The count runs on every blind tick and
+    restarts when any member reports again, so `occupancy_hold_s: 0` is the
+    old rule bit-for-bit. The per-bay diagnostics show `pending_unknown_s`,
+    and `control/ident.py` counts it as a pending transition, so an
+    experiment does not start into a dropout. A zone with no filter state at
+    all is still `unknown` at once. Measured on `sim/das.py` (example config,
+    `basic` physics with sensor noise, 2 % per-tick dropouts on every
+    DS18B20, three bays pulled at t = 60 s, 900 ticks, seeds 1-3, both DAS
+    solvers): those bays leave `empty` 4-9 times per run without the
+    debounce and 0 times with it (once on `pi` seed 3, a dropout longer than
+    the hold), which is 879-1225 ticks of a bay wrongly constrained at the
+    insert variance against 0-105. Nothing else moves: 0 limit violations
+    either way, the same hottest drive to 0.01 °C, and the mean noise index
+    equal or 0.16 dB lower. It is a loudness fix, as the item said.
 20. Experiments: settle timers are not persisted (after a restart a start
     waits `ident_settle_s` + `bay_settle_s`); a start that arrives between
     `plan_tick` and `record_tick` shifts the levels by one tick.
