@@ -15,14 +15,23 @@ and changes nothing about it first (PROJECT.md section 8 items 84, 86).
 Without ``--save`` this is the whole run: nothing is written. With ``--save``
 the same report is shown, then a typed confirmation (``yes``) is required
 before the save report actually goes out -- ``--save`` alone is not enough,
-so a scripted run never saves by accident. On the Quadro the save report is
-only known from the identical report on the Farbwerk 360: it is *not*
-verified to persist a configuration over a power cycle the way the aquaero's
-is (item 86), and this tool says so before asking to send it.
+so a scripted run never saves by accident. The device stays open across the
+prompt and the control report is read once more right before the save: the
+controller can change while the prompt waits (the aquaero's own alarm selects
+another profile when the heartbeat times out, and a profile switch reloads
+that profile's saved settings; aquasuite on the PC; the front panel), and
+``save()`` would store whatever it holds *then*. A report that no longer
+matches the one shown aborts the run without saving.
 
-Refuses to run at all while systemd reports ``--unit`` (default
-``aqua-bridge.service``) active, activating or reloading, or when it cannot
-tell: the running daemon owns the controller's control report, and a
+On the Quadro the save report is only known from the identical report on the
+Farbwerk 360: it is *not* verified to persist a configuration over a power
+cycle the way the aquaero's is (items 86, 96), and this tool says so before
+asking to send it.
+
+Refuses to run at all unless systemd reports ``--unit`` (default
+``aqua-bridge.service``) ``inactive`` or ``failed``: every other answer,
+``deactivating`` and an undeterminable state included, counts as running.
+The running daemon owns the controller's control report, and a
 commissioning run racing it for the bus -- or saving a report the daemon is
 about to change again -- is exactly the failure the daemon's own watchdog
 guards against (PROJECT.md section 8 item 84). Stop the service first
@@ -37,7 +46,8 @@ a saved bad configuration is what a power cycle brings back.
 Exit codes: 0 shown (and saved, if asked and confirmed); 2 a config or
 ``--device``/``--serial`` selection error; 3 refused because the service
 might be running; 4 a hardware/read error; 5 ``--save`` was given but the
-confirmation prompt was declined.
+confirmation prompt was declined; 6 the control report changed between the
+report and the confirmation, so nothing was saved.
 """
 
 from __future__ import annotations
@@ -51,7 +61,12 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TextIO
 
 from aqua_bridge.config import AppConfig, ConfigError, load_config
-from aqua_bridge.hw.aquacomputer import KINDS, active_profile, channel_state
+from aqua_bridge.hw.aquacomputer import (
+    KINDS,
+    active_profile,
+    channel_state,
+    format_channel_state,
+)
 from aqua_bridge.hw.aquacomputer_adapter import (
     AquacomputerAdapter,
     DeviceBinding,
@@ -74,8 +89,10 @@ _LOG = logging.getLogger("aqua_bridge.tools.aquacomputer_commission")
 
 DEFAULT_UNIT = "aqua-bridge.service"
 DEFAULT_SYSTEMCTL = "systemctl"
-#: systemd states that mean the unit's process might be running.
-_RUNNING_STATES = frozenset({"active", "activating", "reloading"})
+#: The only systemd states in which the unit certainly holds no controller;
+#: every other answer (``active``, ``activating``, ``reloading``,
+#: ``deactivating``, a blank line, anything unrecognised) means it might.
+_STOPPED_STATES = frozenset({"inactive", "failed"})
 _STATE_TIMEOUT_S = 5.0
 _CONFIRM = "yes"
 
@@ -87,12 +104,21 @@ def unit_is_running(
     timeout_s: float = _STATE_TIMEOUT_S,
     runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
 ) -> bool:
-    """True when systemd reports ``unit`` active, activating or reloading, or
-    when its state cannot be determined at all (a missing ``systemctl``, a
-    timeout, an answer this function does not recognise): refusing to
-    commission is always safe, guessing that the daemon is stopped is not.
-    ``systemctl is-active`` on a unit that does not exist answers "inactive",
-    the same as a normal stopped unit, so it is not special-cased here.
+    """True unless systemd reports ``unit`` in one of the two states that mean
+    it holds nothing: ``inactive`` or ``failed``.
+
+    Everything else is "might be running" -- ``active``, ``activating`` and
+    ``reloading``, but also ``deactivating``, a stop that has returned while
+    the daemon's own shutdown writes (the ``fallback_pwm`` write, then the
+    ``release()`` control report SET) are still in flight -- and so is every
+    answer this function cannot make sense of: a missing ``systemctl``, a
+    timeout, a blank line, an unrecognised state. Refusing to commission is
+    always safe, guessing that the daemon is stopped is not.
+
+    The exit status is deliberately not consulted: ``systemctl is-active``
+    exits non-zero for exactly the stopped states, so the printed state alone
+    decides. A unit that does not exist answers "inactive", the same as a
+    normal stopped unit, and is not special-cased either.
     """
     try:
         proc = runner(
@@ -102,7 +128,10 @@ def unit_is_running(
         _LOG.warning("%s is-active %s failed to run: %s", systemctl, unit, exc)
         return True
     state = (proc.stdout or "").strip()
-    return state in _RUNNING_STATES or state == ""
+    if state in _STOPPED_STATES:
+        return False
+    _LOG.debug("%s is-active %s answered %r: treating it as running", systemctl, unit, state)
+    return True
 
 
 def _device_specs(app: AppConfig) -> list[tuple[str, Mapping[str, Any]]]:
@@ -139,10 +168,6 @@ def select_binding(app: AppConfig, *, device: str, serial: str | None = None) ->
     return parse_device_section(spec, label=label, ignored_keys=ignored)
 
 
-def _percent(centi: int) -> str:
-    return f"{centi / 100:.2f} %"
-
-
 def _print_report(binding: DeviceBinding, ctrl: bytes, out: TextIO) -> None:
     kind = binding.kind
     names = {number - 1: name for name, number in binding.pwm_map.items()}
@@ -152,28 +177,14 @@ def _print_report(binding: DeviceBinding, ctrl: bytes, out: TextIO) -> None:
         print(f"  active profile: {profile}", file=out)
     print("  outputs:", file=out)
     for k in range(kind.pwm_count):
-        state = channel_state(kind, ctrl, k)
         name = f" ({names[k]})" if k in names else " (not commanded by this config entry)"
-        line = f"    pwm{k + 1}{name}  duty {_percent(state.duty)}"
-        if state.source is not None:
-            assert state.min_power is not None and state.max_power is not None
-            follows = "follows its preset" if state.on_duty else "does not follow its preset"
-            line += (
-                f"  source 0x{state.source:02X}  min {_percent(state.min_power)}"
-                f"  max {_percent(state.max_power)}  ({follows})"
-            )
-        if state.unconfigured:
-            line += "  (unconfigured)"
-        elif state.aquabus and state.mode is not None:
-            line += f"  mode 0x{state.mode.raw:04X} (aquabus, not interpreted)"
-        elif state.mode is not None:
-            line += f"  mode {state.mode.name} (0x{state.mode.raw:04X})"
-        print(line, file=out)
+        state = channel_state(kind, ctrl, k)
+        print(f"    {format_channel_state(state, k, name=name)}", file=out)
     if not kind.save_verified:
         print(
             f"  note: the {kind.name}'s save report is only known from the identical report on "
             "the Farbwerk 360; it is not verified to persist this over a power cycle "
-            "(PROJECT.md section 8 item 88).",
+            "(PROJECT.md section 8 items 86 and 96).",
             file=out,
         )
 
@@ -211,13 +222,27 @@ def commission(
 
     adapter = AquacomputerAdapter(binding, clock=clock, sleep=sleep, opener=opener)
     try:
+        return _show_and_save(adapter, binding, save=save, out=out, in_=in_)
+    finally:
+        # one open for the whole run: the report, the confirmation and the save
+        adapter.close()
+
+
+def _show_and_save(
+    adapter: AquacomputerAdapter,
+    binding: DeviceBinding,
+    *,
+    save: bool,
+    out: TextIO,
+    in_: TextIO | None,
+) -> int:
+    """The run against an open adapter: report, confirmation, re-read, save."""
+    try:
         adapter.read()  # opens the node and checks binding.serial against the status report
         ctrl = adapter.control_snapshot()
     except DeviceUnavailable as exc:
         print(f"device error: {exc}", file=out)
         return 4
-    finally:
-        adapter.close()
 
     _print_report(binding, ctrl, out)
     if not save:
@@ -238,13 +263,31 @@ def commission(
         print("aborted: nothing was saved", file=out)
         return 5
 
+    # The controller can change while the prompt waits -- a profile the aquaero's
+    # own alarm selects when its heartbeat times out, aquasuite on the PC, a hand
+    # on the front panel -- and save() stores whatever it holds at that moment.
+    # Read it once more and save only what was shown (PROJECT.md section 8 item 88).
+    try:
+        again = adapter.control_snapshot()
+    except DeviceUnavailable as exc:
+        print(f"device error: {exc}", file=out)
+        return 4
+    if again != ctrl:
+        print(
+            "refusing: the control report changed between the report above and the "
+            "confirmation, so saving now would store something you have not seen "
+            "(an alarm selecting another profile, aquasuite, the front panel). "
+            "Nothing was saved; run the tool again.",
+            file=out,
+        )
+        _print_report(binding, again, out)
+        return 6
+
     try:
         adapter.save()
     except DeviceUnavailable as exc:
         print(f"device error: {exc}", file=out)
         return 4
-    finally:
-        adapter.close()
     print("saved.", file=out)
     return 0
 
@@ -261,7 +304,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--save",
         action="store_true",
-        help="after a typed confirmation, send the save report (default: show only, write nothing)",
+        help=(
+            "after a typed confirmation, and only while the control report still reads as "
+            "shown, send the save report (default: show only, write nothing)"
+        ),
     )
     p.add_argument(
         "--unit",

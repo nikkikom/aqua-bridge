@@ -15,7 +15,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from aqua_bridge.hw.aquacomputer import AQUAERO, QUADRO
+from aqua_bridge.hw.aquacomputer import (
+    AQUAERO,
+    QUADRO,
+    finalize_control_report,
+    patch_duties,
+)
+from aqua_bridge.hw.hidraw import FeatureReportError
 from aqua_bridge.model import ConfigError
 from aquacomputer_fakes import FakeBus, FakeClock, FakeSleep, aquabus_aquaero
 from aquacomputer_fakes import FakeController as _FC
@@ -95,10 +101,18 @@ def test_refuses_while_the_unit_might_be_running(config_path, rig) -> None:
     assert bus.opened == []  # refused before ever touching a device
 
 
-@pytest.mark.parametrize("state", ["activating\n", "reloading\n"])
-def test_refuses_for_every_running_like_state(config_path, rig, state) -> None:
+@pytest.mark.parametrize(
+    "state", ["activating\n", "reloading\n", "deactivating\n", "unknown\n", "maintenance\n"]
+)
+def test_refuses_for_every_state_that_is_not_certainly_stopped(config_path, rig, state) -> None:
+    """Only ``inactive`` and ``failed`` mean the daemon holds nothing. ``deactivating``
+    is a ``systemctl stop`` that returned while the daemon's own shutdown writes (the
+    ``fallback_pwm`` write, then the ``release()`` SET) are still in flight, and an
+    unrecognised answer is no answer at all: both fail closed."""
     code, _text = _run(config_path, rig, runner=_runner(state))
     assert code == 3
+    _clock, _sleep, _aquaero, _quadro, bus = rig
+    assert bus.opened == []
 
 
 def test_allows_when_inactive_or_failed(config_path, rig) -> None:
@@ -204,9 +218,11 @@ def test_save_with_no_typed_answer_at_all_is_declined(config_path, rig) -> None:
 def test_save_requires_both_the_flag_and_a_typed_yes(config_path, rig) -> None:
     code, text = _run(config_path, rig, save=True, in_text="yes\n")
     assert code == 0 and "saved." in text
-    _clock, _sleep, aquaero, _quadro, _bus = rig
-    assert [op.what for op in aquaero.ops] == ["get", "save"]
+    _clock, _sleep, aquaero, _quadro, bus = rig
+    # the report, the re-read that confirms nothing moved, then the save -- one open
+    assert [op.what for op in aquaero.ops] == ["get", "get", "save"]
     assert aquaero.saves()[0].data == AQUAERO.save_report
+    assert bus.opened == ["/dev/hidraw2"] and aquaero.open_count == 1
 
 
 def test_save_flag_alone_never_saves_without_a_confirmation_prompt(config_path, rig) -> None:
@@ -214,6 +230,76 @@ def test_save_flag_alone_never_saves_without_a_confirmation_prompt(config_path, 
     code, _text = _run(config_path, rig, save=True, in_text="")
     assert code == 5
     _clock, _sleep, aquaero, _quadro, _bus = rig
+    assert aquaero.saves() == []
+
+
+class _MutatingReader(io.StringIO):
+    """Answers the confirmation prompt and changes the controller while doing it:
+    the seconds the operator spends reading the report are exactly the window in
+    which the aquaero's own alarm can select another profile."""
+
+    def __init__(self, text: str, mutate) -> None:
+        super().__init__(text)
+        self._mutate = mutate
+
+    def readline(self, *args, **kwargs) -> str:  # type: ignore[override]
+        self._mutate()
+        return super().readline(*args, **kwargs)
+
+
+def _alarm_selects_profile_2(controller) -> None:
+    """The documented aquaero fallback (PROJECT.md section 2): the heartbeat times
+    out, the temperature alarm selects profile 2, and the switch reloads that
+    profile's saved settings -- every output at 100 %."""
+    buf = bytearray(controller.ctrl)
+    assert AQUAERO.profile_offset is not None
+    buf[AQUAERO.profile_offset] = 1  # 0 = profile 1
+    patch_duties(AQUAERO, buf, {0: 10000, 1: 10000})
+    finalize_control_report(AQUAERO, buf)
+    controller.ctrl = buf
+
+
+def test_a_controller_that_changes_during_the_prompt_is_never_saved(config_path, rig) -> None:
+    """What is saved is what was shown: the report is read again right before the
+    save report goes out, and a mismatch aborts the run."""
+    _clock, sleep, aquaero, _quadro, bus = rig
+    out = io.StringIO()
+    reader = _MutatingReader("yes\n", lambda: _alarm_selects_profile_2(aquaero))
+    code = tool.commission(
+        config_path=str(config_path),
+        device="aquaero",
+        save=True,
+        runner=_runner("inactive\n"),
+        opener=bus,
+        sleep=sleep,
+        out=out,
+        in_=reader,
+    )
+    text = out.getvalue()
+    assert code == 6
+    assert aquaero.saves() == []
+    assert [op.what for op in aquaero.ops] == ["get", "get"]  # no save between the two reads
+    assert "refusing" in text and "changed between the report above" in text
+    assert "active profile: 1" in text and "active profile: 2" in text  # what was shown, and now
+
+
+def test_a_failed_re_read_before_the_save_is_a_device_error(config_path, rig) -> None:
+    _clock, sleep, aquaero, _quadro, bus = rig
+    out = io.StringIO()
+    reader = _MutatingReader(
+        "yes\n", lambda: aquaero.failures.append(FeatureReportError("HIDIOCGFEATURE: EIO"))
+    )
+    code = tool.commission(
+        config_path=str(config_path),
+        device="aquaero",
+        save=True,
+        runner=_runner("inactive\n"),
+        opener=bus,
+        sleep=sleep,
+        out=out,
+        in_=reader,
+    )
+    assert code == 4 and "device error" in out.getvalue()
     assert aquaero.saves() == []
 
 
