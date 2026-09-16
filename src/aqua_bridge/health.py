@@ -437,7 +437,7 @@ def host_metrics_reader(
     now" rule can never fire where it matters -- which is a worse bargain than the
     cost it avoids. Measured on that board, one ``vcgencmd get_throttled`` is 3.3 ms
     median / 3.8 ms p95; at the default one poll per minute against ``dt = 5 s`` that
-    is 0.07 % of the tick it lands on, 0.5 % of ``mpc.budget_ms`` (600, alarm 750),
+    is 0.07 % of the tick it lands on, 1.3 % of ``mpc.budget_ms`` (250, alarm 350),
     and nothing at all on the other eleven ticks. ``vcgencmd_timeout_s`` bounds the
     one failure that could cost more than that -- a VideoCore mailbox that never
     answers -- and a failed poll waits out the interval before it is tried again, so

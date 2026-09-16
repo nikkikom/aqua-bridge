@@ -67,7 +67,8 @@ WARMUP = 20
 FALLBACK_TICKS = 140
 #: PROJECT.md section 8 item 73, the owner's fallback of 2026-09-14 for the Zero W: what
 #: goes into ``mpc:`` when the DAS MPC misses the budget there. Not a default -- the
-#: shipped configs keep 600 / 750 ms and ``mpc_every_ticks: 2``, and
+#: shipped configs keep 250 / 350 ms (re-derived on the Zero 2 W, item 73, 2026-09-17)
+#: and ``mpc_every_ticks: 2``, and
 #: :func:`test_the_documented_zero_w_fallback_loads_from_the_example_config` reads these
 #: same numbers back out of ``config.example-das.yaml`` and applies them to the file, so
 #: the literals here and the shipped documentation cannot drift apart.
@@ -235,7 +236,7 @@ def test_the_zero_w_fallback_is_a_config_the_model_accepts():
     raised = dataclasses.replace(cfg, **ZERO_W_FALLBACK)
     assert raised.budget_ms == 1000.0 and raised.budget_alarm_ms == 1250.0
     assert raised.mpc_every_ticks == 3
-    with pytest.raises(ConfigError) as exc:  # the stock alarm is 750 ms
+    with pytest.raises(ConfigError) as exc:  # the stock alarm is 350 ms
         dataclasses.replace(cfg, budget_ms=1000.0)
     assert "mpc.budget_ms" in str(exc.value) and "mpc.budget_alarm_ms" in str(exc.value)
 
@@ -265,7 +266,7 @@ def test_the_documented_zero_w_fallback_loads_from_the_example_config(tmp_path):
     edited.write_text("".join(lines), encoding="utf-8")
 
     stock = load_config(EXAMPLE_DAS_CONFIG).mpc  # the fallback is documentation, not a default
-    assert (stock.budget_ms, stock.budget_alarm_ms, stock.mpc_every_ticks) == (600.0, 750.0, 2)
+    assert (stock.budget_ms, stock.budget_alarm_ms, stock.mpc_every_ticks) == (250.0, 350.0, 2)
     mpc = load_config(edited).mpc
     assert (mpc.budget_ms, mpc.budget_alarm_ms, mpc.mpc_every_ticks) == (1000.0, 1250.0, 3)
 

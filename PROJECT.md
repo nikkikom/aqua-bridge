@@ -544,6 +544,32 @@ USB ports, the DKMS module removed (§8 item 82), run as a non-root user in
   one read at the start. The rpm of an aquabus fan in the aquaero's status
   report lags the Quadro's own report by several seconds (aquabus polling);
   the duty shows within 1–2 reports.
+- **Quadro `ctrl_gap_ms` of 0, and why it stays 0 (2026-09-17).** On a board
+  fast enough to issue a control-report GET and SET almost back to back, the
+  first hidraw control-report write to the Quadro over its own USB port
+  failed and wedged its control endpoint until a physical replug -- the same
+  failure the "Supported topology" note above records for a Quadro reachable
+  both on aquabus and on its own USB at once: `SET feature report 0x03:
+  [Errno 110] Connection timed out`, then `GET ...: [Errno 32] Broken pipe`
+  on every attempt after, a USB-level reset that completed but left the
+  kernel unable to reconfigure the device (`error -32`), and only a physical
+  replug recovered it. Status reports and the fan the Quadro was already
+  driving kept working throughout. This is not evidence that `ctrl_gap_ms:
+  0` is wrong for the Quadro: the attempt was against the unsupported
+  two-access-path setup (§8 item 106), not against a Quadro on its own USB
+  as the daemon's sole path to it, and a gap scan run correctly needs a
+  Quadro reachable only that one way. It is not a problem in the supported
+  topology (owner decision 2026-09-16: one controlling controller, slaves
+  behind it -- the daemon never writes the Quadro's control report when the
+  Quadro is a slave on the aquaero's aquabus, so this failure mode cannot
+  occur there). It would be one if a Quadro were ever driven directly over
+  its own USB as a controlling device, which is exactly the config shape
+  §8 item 106's startup check does not yet refuse. So the Quadro's timing
+  defaults are unchanged, and the action this observation points at is
+  already tracked: land item 106's startup check before a Quadro-on-its-own-
+  USB config ships, and when one does, re-run the gap scan (§2 "Gap between
+  writes") against the Quadro alone before trusting `ctrl_gap_ms: 0` on that
+  path.
 
 ---
 
@@ -644,8 +670,8 @@ Lists become tuples; ints are accepted for floats.
 | `mpc_tau_s` | `120.0` | legacy MPC model time constant, seconds; > 0 |
 | `mpc_gain_c_per_pwm` | `8.0` | legacy MPC model: steady-state °C drop per +1.0 PWM on one channel; > 0 |
 | `mpc_estimator_gain` | `0.1` | legacy MPC disturbance estimator gain per tick; in `(0, 1]` |
-| `budget_ms` | `600.0` | runtime alarm (`control/loop.py`) and CI/Pi bench gate: `step()` wall time past this logs a warning, ms; > 0 and < `budget_alarm_ms` |
-| `budget_alarm_ms` | `750.0` | as above, logs an error instead, ms; > 0 |
+| `budget_ms` | `250.0` | runtime alarm (`control/loop.py`) and CI/Pi bench gate: `step()` wall time past this logs a warning, ms; > 0 and < `budget_alarm_ms` |
+| `budget_alarm_ms` | `350.0` | as above, logs an error instead, ms; > 0 |
 | `budget_log_interval_s` | `60.0` | rate limit for both budget log lines, seconds; > 0 |
 
 With `solver: mpc` in legacy mode the config also needs `weight_pwm +
@@ -759,8 +785,9 @@ long `dt`):
 | `stuck_air_oppose_max_c` | 3.0 | > `stuck_air_oppose_c`, °C: an opposing zone-air move larger than this no longer voids the airflow evidence |
 | `stuck_zone_air_dT_c` | 1.5 | > 0, °C: a zone-air move larger than this is Stuck evidence for a `drive_proximal` reading of the zone once another of the zone's proximal readings moved with it by more than `stuck_sibling_dT_c` |
 
-`budget_ms` / `budget_alarm_ms` (600 ms / 750 ms default, at `dt = 5 s` in the
-DAS example) gate both the benchmark (`tools/bench_step.py`,
+`budget_ms` / `budget_alarm_ms` (250 ms / 350 ms default, re-derived on the
+Zero 2 W against a measured DAS MPC step p99 of 85.96 ms at `dt = 5 s` in the
+DAS example, §8 item 73) gate both the benchmark (`tools/bench_step.py`,
 `tests/test_bench_budget.py`) and the runtime alarm (`control/loop.py`, §4.3
 "Loop / glue"); both read the config, never a hardcoded literal. They move
 together: `budget_ms` must stay strictly below `budget_alarm_ms`, so raising
@@ -1994,24 +2021,40 @@ demand` so the first output equals `prev`; the offset decays with 15 s
 when more cooling is wanted and 60 s when less. `integrator` holds the
 first block per driven channel.
 
-**Budget at `dt = 5 s`.** Hard gate per tick 600 ms (12 % of `dt`; raised
-from 500 ms by the owner after the Zero W measured a DAS MPC p99 of
-507–552 ms), alarm 750 ms. Measured with `tools/bench_step.py` on the
-development machine (`--sim-plant das` for the DAS rows). The Zero W
-column is measured, not extrapolated. The factor between the two machines
-is **not** the single 100× the plan first assumed: the legacy MPC scales
-by about 100× (0.3–0.4 ms against 34.5 ms), the DAS MPC by about 180×
-(3.3–3.6 ms against 609–615 ms) and the PI-like DAS form by about 220×
-(1.5 ms against 322 ms). The more of a step is small numpy calls and
-Python bookkeeping rather than the few large matrix operations the ×100
-was measured on, the worse the Zero W does — so an extrapolation from
-this machine is a lower bound on the Pi, never a promise.
+**Budget at `dt = 5 s`.** Hard gate per tick 250 ms (5 % of `dt`; raised from
+500 ms to 600 ms by the owner after the Zero W measured a DAS MPC p99 of
+507–552 ms, then 609–615 ms after items 3, 8, 9 and 10 -- item 73;
+**re-derived to 250 ms on the Zero 2 W, item 73, 2026-09-17**: measured
+DAS MPC step p99 85.96 ms, max 92.61 ms, over 600 ticks against
+`config.example-das.yaml`, `tools/bench_step.py --sim-plant das` --
+2.9× the measured p99 and 2.7× the measured max, so a regression that
+tripled the solver's cost would still trip the gate. Not chased lower:
+at 200 ms (2.3× the measured p99) the first garbage-collection pause on a
+loaded board would false-alarm), alarm 350 ms (a 1.4× warn-to-alarm
+ratio, up from the old pair's 1.25×; §8 items 73, 95). Measured with
+`tools/bench_step.py` on the development machine (`--sim-plant das` for
+the DAS rows) and, for the Zero W and Zero 2 W columns, on the Pi itself.
+The Zero W column is measured, not extrapolated; so is the Zero 2 W
+column, on a Raspberry Pi Zero 2 W (4 cores at 1.0 GHz, 64-bit trixie,
+kernel 6.18, no throttling -- `get_throttled` 0x0 throughout, board
+temperature 41.9→49.4 °C over the run). The factor between the
+development machine and the Zero W is **not** the single 100× the plan
+first assumed: the legacy MPC scales by about 100× (0.3–0.4 ms against
+34.5 ms), the DAS MPC by about 180× (3.3–3.6 ms against 609–615 ms) and
+the PI-like DAS form by about 220× (1.5 ms against 322 ms). The more of a
+step is small numpy calls and Python bookkeeping rather than the few
+large matrix operations the ×100 was measured on, the worse the Zero W
+does — so an extrapolation from this machine is a lower bound on the Pi,
+never a promise. The Zero 2 W's four cores at 1.0 GHz cut the Zero W's
+single 1.0 GHz core's numbers by roughly 7×, well past what core count
+alone would predict for this single-threaded step -- the newer core is
+also simply faster per cycle.
 
-| Configuration | Step p99 (dev machine) | Zero W | Verdict |
-|---------------|------------------------|--------|---------|
-| Legacy MPC, 2 temps × 2 channels, `dt = 2` | 0.3–0.4 ms | 34.5 ms measured (×100) | legacy reference |
-| DAS MPC, 25 sensors, 15 bays, 8 channels, N = 20 × 30 s, blocks `[1, 1, 2, 4, 6, 6]`, estimator every tick | 2.8–2.9 ms after item 73, 3.3–3.4 before (9–11× the legacy MPC) | 609–615 ms measured before item 73 (×180) | over the 600 ms gate before item 73; to be re-measured (§8 item 73) |
-| PI-like DAS form + estimator, same layout | ~1.5 ms | 322 ms measured (×220) | always available |
+| Configuration | Step p99 (dev machine) | Zero W | Zero 2 W | Verdict |
+|---------------|------------------------|--------|----------|---------|
+| Legacy MPC, 2 temps × 2 channels, `dt = 2` | 0.3–0.4 ms | 34.5 ms measured (×100) | 7.14 ms measured | legacy reference |
+| DAS MPC, 25 sensors, 15 bays, 8 channels, N = 20 × 30 s, blocks `[1, 1, 2, 4, 6, 6]`, estimator every tick | 2.8–2.9 ms after item 73, 3.3–3.4 before (9–11× the legacy MPC) | 609–615 ms measured before item 73 (×180) | **85.96 ms measured, max 92.61 ms** (item 73, 2026-09-17); solve_p99_ms 87.22 ms over 300 solve ticks; model_active_fraction 1.0; modes auto 562 / saturated 38 / degraded 0 / fallback 0 | under the 250 ms gate (2.9× headroom); item 73 done |
+| PI-like DAS form + estimator, same layout | ~1.5 ms | 322 ms measured (×220) | 25.36 ms mean, 26.93 ms p99, max 27.56 ms measured | always available |
 
 Where the DAS MPC's step goes after item 73 (development machine,
 `config.example-das.yaml` against the DAS truth plant, 240 ticks with 20
@@ -2033,7 +2076,9 @@ proximal sensor of a bay beyond the first: the example has two, in two of its
 four zones). Measured the same way on the development machine, 400 ticks,
 two repeats each: DAS MPC mean 1.93–1.95 ms before against 1.97–1.99 after and
 a solve-tick p99 of 3.41–3.44 ms before against 3.34–3.41 after; PI-like DAS
-1.03 against 1.04–1.06 mean. The Zero W column is re-measured with item 73.
+1.03 against 1.04–1.06 mean. The Zero W column is not re-measured: the
+owner has since moved to the Zero 2 W, and item 73's re-measurement above
+is against that board.
 
 CI checks the ratio (DAS MPC p99 ≤ 12× legacy MPC p99 in the same
 process, `tests/test_bench_budget.py`); the absolute `mpc.budget_ms` gate
@@ -2908,8 +2953,8 @@ a model converges only with them.
   never fire on the one thread that matters, while the HTTP and MQTT readers
   quietly do see it. So the cost is spent knowingly and bounded by two
   documented keys instead: one 3.3 ms fork per `vcgencmd_interval_s` is
-  0.07 % of the one `dt = 5 s` tick it lands on, 0.5 % of `mpc.budget_ms`
-  (600, alarm 750), and nothing on the other eleven ticks of that minute;
+  0.07 % of the one `dt = 5 s` tick it lands on, 1.3 % of `mpc.budget_ms`
+  (250, alarm 350), and nothing on the other eleven ticks of that minute;
   `vcgencmd_timeout_s` guards the one failure that could cost more — a
   VideoCore mailbox that never answers — and a failed poll drops the stale
   word, falls through to the hwmon bit and still waits out the interval, so
@@ -5448,6 +5493,51 @@ Owner decision (2026-09-16):
     (`budget_warn_count` / `budget_alarm_count` in the health payload; the
     earlier 20-minute run used the PI-like DAS form) and record the
     numbers here.
+
+    **Re-measured on a Raspberry Pi Zero 2 W (2026-09-17), the owner's
+    faster board.** 4 cores at 1.0 GHz, 64-bit trixie, kernel 6.18, no
+    throttling during the run (`get_throttled` 0x0 throughout; board
+    temperature 41.9 → 49.4 °C). `tools/bench_step.py --sim-plant das`,
+    `config.example-das.yaml`, `dt = 5 s`, 600 ticks: DAS MPC `step()`
+    mean 51.08 ms, p50 49.42 ms, **p99 85.96 ms**, max 92.61 ms;
+    `solve_p99_ms` 87.22 ms over the 300 solve ticks; `model_active_fraction`
+    1.0 (the MPC drove the fans on every tick, so this times the MPC path,
+    not the PI-like fallback); modes `auto` 562 / `saturated` 38 /
+    `degraded` 0 / `fallback` 0. PI-like DAS `step()` mean 25.36 ms, p99
+    26.93 ms, max 27.56 ms. Legacy config (`dt = 2 s`): MPC p99 7.14 ms, PI
+    p99 1.79 ms. For comparison, the single-core Zero W these budgets were
+    set for had an MPC step p99 of 609–615 ms.
+
+    Against the shipped `budget_ms` 600 / `budget_alarm_ms` 750 the
+    measured DAS MPC p99 is **7.0× and 8.7× under** -- so far below that a
+    regression tripling the solver's own cost would still pass unnoticed.
+    **Re-derived: `budget_ms` 250, `budget_alarm_ms` 350** -- 2.9× the
+    measured p99 and 2.7× the measured max, an alarm 1.4× above the
+    warning (the old pair's ratio was 1.25×). What else shares the 5 s
+    tick and could still make `step()` late without the solver itself
+    regressing: the sensor gate and the estimator update inside `step`
+    (already in the p99 above), the hidraw I/O and 1-Wire bulk read the
+    loop does *outside* `step` (§2 "hidraw check", not gated by
+    `budget_ms` at all), and GC pauses on a loaded board. That last one
+    sets the floor: not chased below roughly 200 ms, because 200 ms is
+    only 2.3× the measured p99 and the first garbage-collection pause on a
+    board under load would false-alarm at that margin. Changed in the
+    config model's default (`MpcConfig.budget_ms` / `budget_alarm_ms`),
+    both example configs, and everywhere else in this document that quoted
+    600 / 750 as the shipped value (§3 "Budget at `dt = 5 s`" and its key
+    table, §6, `health.py`'s `vcgencmd` percentage). `mpc_every_ticks`
+    stays 2 in both example configs -- nowhere near needed. The Zero W
+    fallback (`budget_ms: 1000.0` / `budget_alarm_ms: 1250.0` /
+    `mpc_every_ticks: 3`, documented on the live keys of
+    `config.example-das.yaml`) is untouched: it is for a board this one is
+    not, and stays exactly as it was for whichever board needs it next.
+
+    **Still open:** the runtime alarm has not been run live against the
+    DAS MPC for 20 minutes on the Zero 2 W (`budget_warn_count` /
+    `budget_alarm_count` in the health payload) -- only the bench tool was
+    run. With 2.9× headroom over the measured p99 that run is expected to
+    show zero warnings, but it has not been performed and the counts are
+    not recorded here.
 79. Fan-health drift monitoring. Every status report carries each
     output's rpm, output duty, voltage (the 12 V rail) and current and
     power (the Quadro reports both; the aquaero reports 0 in PWM mode).
@@ -5729,6 +5819,25 @@ Owner decision (2026-09-16):
     revisions agree, not that the controller is unchanged, so the golden
     diff has to be read). If no, close this item and leave both phases as
     they are.
+
+    **On the Zero 2 W (2026-09-17), what item 73's re-measurement adds.**
+    `tools/bench_step.py --sim-plant das` against `config.example-das.yaml`,
+    600 ticks, reports `solve_p99_ms` **87.22 ms** over the 300 solve ticks
+    (against the DAS MPC's own overall step p99 of 85.96 ms -- the solve
+    ticks are the ones near that p99, as expected with `mpc_every_ticks: 2`)
+    and the tick-mode counts: `auto` 562, `saturated` 38, `degraded` 0,
+    `fallback` 0, with `model_active_fraction` 1.0 -- the run never left the
+    MPC path, so every number above times the MPC, not the PI-like
+    fallback. That is the whole breakdown the bench tool gives on the Pi:
+    one p99 over the solve ticks and the mode counts, not the per-phase
+    split (SQP and its box QPs, the estimator's Kalman update, the
+    prediction, the operating-point and model checks, ...) that only the
+    development-machine profiling above has. Getting that same per-phase
+    split on the Pi is not a numerics change and would not move the
+    goldens, but nothing in `bench_step.py` or `control/solver_das.py`
+    currently times the sub-phases -- it is unmeasured, not merely
+    un-transcribed here. The owner decision above (regenerate the goldens
+    for cheaper arithmetic) is unaffected by this and still open.
 98. Tune `model_max_air_dist_c_per_min` on the real enclosure (item 66).
     The shipped 8.0 °C/min is set above what the `rich` truth simulator's
     *drawn* physics produce on a healthy enclosure, where the prior's air
@@ -6048,15 +6157,35 @@ Owner decision (2026-09-16):
     (linux-hwmon), then drop the patch once a Raspberry Pi OS kernel
     carries it. Only relevant if the DKMS driver path is revived: the
     daemon uses hidraw (§8.1, 2026-09-15).
-80. Time a full tick over hidraw on the Pi with both controllers.
-    Measured 2026-09-15 (§2 "hidraw check"): status read 2 ms, first open
-    0.1–0.9 s, `apply()` 1 ms without a write and 9–13 ms with one, one SET
-    with all four outputs 16 ms (aquaero) / 26 ms (Quadro); the gap scan
-    that set `ctrl_gap_ms` to 100 ms (aquaero) and 0 (Quadro), all with the
-    save report after every SET (item 87 measures without it). Still open: a
-    full daemon tick with both controllers and the 1-Wire buses, a periodic
-    refresh tick, the reopen after a re-plug, and how often a control read
-    fails in long operation (about one in 60 in the hwmon spike).
+80. **Done** (2026-09-17, on the Zero 2 W): timed
+    `AquacomputerAdapter.read()`, the full hidraw round trip of one daemon
+    tick, with both controllers configured. Measured 2026-09-15 (§2
+    "hidraw check"): status read 2 ms, first open 0.1–0.9 s, `apply()` 1 ms
+    without a write and 9–13 ms with one, one SET with all four outputs
+    16 ms (aquaero) / 26 ms (Quadro); the gap scan that set `ctrl_gap_ms`
+    to 100 ms (aquaero) and 0 (Quadro), all with the save report after
+    every SET (item 87 measures without it). Measured 2026-09-17 (min /
+    median / p95 ms, Zero 2 W, no save report since item 86):
+
+    | Operation | min | median | p95 |
+    |---|---|---|---|
+    | aquaero status read + decode | 0.70 | 1.23 | 1.28 |
+    | Quadro status read + decode | 0.55 | 0.88 | 0.90 |
+    | `AquacomputerAdapter.read()`, aquaero | 1.95 | 3.05 | 3.12 |
+    | `AquacomputerAdapter.read()`, Quadro | 1.03 | 1.67 | 1.70 |
+    | `AquacomputerAdapter.read()`, **both devices together** | 2.99 | **4.73** | **4.82** |
+
+    That last row is the I/O of one daemon tick with both controllers
+    configured -- the question this item asked. On the old Zero W the
+    same operations cost about 2 ms, 1 ms and 9–26 ms (§2 "hidraw check");
+    the Zero 2 W is roughly 2–5× faster on hidraw I/O, well short of the
+    ~7× seen on the pure-CPU `step()` path (item 73), which fits: hidraw
+    I/O is bounded by the USB control-transfer round trip, not by core
+    speed. Still open, and not part of this item's own question: the
+    1-Wire buses' timing on this board, a periodic refresh tick, the
+    reopen after a re-plug, and how often a control read fails in long
+    operation (about one in 60 in the hwmon spike) -- none of those were
+    measured here.
 81. Outputs that do not follow the written duty. On the Pi (§2 "hidraw
     check") one SET wrote all outputs, but aquaero outputs 3 and 4 and
     Quadro outputs 1, 2 and 4, all without a fan, kept reporting 100 %. The
@@ -6076,12 +6205,24 @@ Owner decision (2026-09-16):
     a DC output without a load reports 100 %. A Quadro whose outputs stay at
     100 % because it sits on the aquaero's aquabus is named as such in the
     stuck error when the aquaero reports the aquabus device (item 85).
-87. The aquaero's `ctrl_gap_ms` of 100 ms comes from back-to-back writes
-    that were a SET followed by the save report (§2 "hidraw check": `EPIPE`
-    at 0 and 25 ms). Repeat the gap scan with SETs alone (item 86) and, if
-    the aquaero no longer needs the gap, decide a new default; time
-    `apply()` with a changed duty again (9–13 ms included the save report,
-    item 80).
+87. **Done** (2026-09-17, on the Zero 2 W): the aquaero's `ctrl_gap_ms` of
+    100 ms comes from back-to-back writes that were a SET followed by the
+    save report (§2 "hidraw check": `EPIPE` at 0 and 25 ms). Repeated with
+    SETs alone (item 86, no save report), min / median / p95 ms:
+    `apply()` with a changed duty, the gap already waited out: 3.68 / 4.22
+    / 4.97; the first write of a back-to-back pair: 3.66 / 3.74 / 5.97;
+    the **second** write of that pair, issued right after the first with
+    no deliberate wait: **103.17 / 103.33 / 105.59**. That confirms the
+    SET itself costs about 3.7 ms and `ctrl_gap_ms`'s 100 ms is the entire
+    remaining cost of a second write -- not the bus, not the CPU (a
+    Zero 2 W core is markedly faster than the Zero W's and the number did
+    not move). So the aquaero still needs the gap even with the save
+    report gone (the thing item 86 removed was never what the gap was
+    paying for), and the default stays 100 ms -- no new default to decide.
+    This also answers this item's second ask: `apply()` with a changed
+    duty, gap already waited out, is 3.68–4.97 ms, well under the 9–13 ms
+    that included the save report (item 80). Nothing else this item asked
+    for is open.
 89. Aquabus details the adapter writes or decodes without verification:
     writing the unconfigured aquaero control block 8 (source `0xFFFF`, mode
     `0x0000`; the Quadro's output 4 on aquabus) with a fan on that output,

@@ -1777,8 +1777,8 @@ class MpcConfig:
     mpc_tau_s: float = 120.0
     mpc_gain_c_per_pwm: float = 8.0
     mpc_estimator_gain: float = 0.1
-    budget_ms: float = 600.0
-    budget_alarm_ms: float = 750.0
+    budget_ms: float = 250.0
+    budget_alarm_ms: float = 350.0
     budget_log_interval_s: float = 60.0
     stuck_airflow_net: float = 0.15
     stuck_air_oppose_c: float = 0.3
