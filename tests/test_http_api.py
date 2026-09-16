@@ -229,6 +229,44 @@ def test_get_state_and_health_carry_the_device_health(surface: StubSurface) -> N
     _run(scenario())
 
 
+def test_get_state_and_health_carry_the_board_s_own_health(surface: StubSurface) -> None:
+    """Item 97: the board's verdict is the device_health ``host`` key, and its problems
+    are in the one list /api/health shows -- and nowhere near the observation."""
+    board = {
+        "cpu_temp_c": 82.0,
+        "air_c": 27.0,
+        "air_temps": ["air_z1"],
+        "divergence_c": 55.0,
+        "load1": 0.1,
+        "idle": True,
+        "throttled": {"hex": "0x4", "now": True, "throttled_now": True},
+        "problems": ["host: the board is throttling now (throttled, get_throttled 0x4)"],
+        "ok": False,
+    }
+    health = {
+        "devices": [],
+        "fans": {},
+        "host": board,
+        "problems": list(board["problems"]),
+        "ok": False,
+    }
+
+    async def scenario() -> None:
+        surface.device_health = health
+        client = await _client(surface)
+        try:
+            state = await (await client.get("/api/state")).json()
+            api_health = await (await client.get("/api/health")).json()
+        finally:
+            await client.close()
+        assert state["device_health"]["host"] == board
+        assert api_health["device_health"] == {"ok": False, "problems": board["problems"]}
+        # a health signal only: never in the observation the solver reads
+        assert state["obs"] is None or "cpu_temp_c" not in (state["obs"].get("temps") or {})
+
+    _run(scenario())
+
+
 def test_device_health_is_empty_and_ok_before_the_first_tick(surface: StubSurface) -> None:
     async def scenario() -> None:
         client = await _client(surface)

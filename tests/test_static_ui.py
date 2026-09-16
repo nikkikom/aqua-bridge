@@ -45,6 +45,7 @@ _INDEX_HTML = (
 _JS_BUILTINS = {
     "all",
     "className",
+    "concat",
     "filter",
     "getElementById",
     "hidden",
@@ -63,7 +64,7 @@ _JS_BUILTINS = {
     "toFixed",
 }
 
-#: What a live `HealthMonitor` publishes (PROJECT.md section 8 items 79, 83). The
+#: What a live `HealthMonitor` publishes (PROJECT.md section 8 items 79, 83, 97). The
 #: supervisor holds it verbatim, so the page's Controllers section reads exactly these
 #: keys; built here rather than run through the hardware adapter, which the HTTP tests
 #: do not have.
@@ -97,6 +98,30 @@ _DEVICE_HEALTH: dict[str, Any] = {
             "expected_power_w": None,
             "problems": [],
         }
+    },
+    "host": {
+        "cpu_temp_c": 47.2,
+        "air_c": 27.0,
+        "air_temps": ["air_z1"],
+        "divergence_c": 20.2,
+        "load1": 0.1,
+        "idle": True,
+        "throttled": {
+            "raw": 0,
+            "hex": "0x0",
+            "under_voltage_now": False,
+            "under_voltage_since_boot": False,
+            "freq_capped_now": False,
+            "freq_capped_since_boot": False,
+            "throttled_now": False,
+            "throttled_since_boot": False,
+            "soft_temp_limit_now": False,
+            "soft_temp_limit_since_boot": False,
+            "now": False,
+            "since_boot": False,
+        },
+        "problems": [],
+        "ok": True,
     },
     "problems": ["aquaero: no device on aquabus behind qd1"],
     "ok": False,

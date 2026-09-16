@@ -66,7 +66,8 @@ def test_discovery_has_host_sensors(cfg: MpcConfig) -> None:
     )
     host_ids = {oid for oid, *_ in host_sensor_specs()}
     found = {e.object_id for e in entities if e.object_id.startswith("host_")}
-    assert found == {f"host_{oid}" for oid in host_ids}
+    # "host_problem" is the board's own health binary sensor (item 97), not a metric
+    assert found == {f"host_{oid}" for oid in host_ids} | {"host_problem"}
 
 
 def test_discovery_has_a_sensor_per_temp_and_fan(cfg: MpcConfig) -> None:
@@ -129,6 +130,77 @@ def test_the_device_problem_template_reads_the_published_state_blob(cfg: MpcConf
     blob = state_payload(snapshot.to_dict(), {})
     assert blob["health"]["device_health"] == {"ok": False, "problems": ["x"]}
     assert blob["device_health"]["problems"] == ["x"]
+
+
+def test_discovery_has_one_host_problem_sensor_in_both_modes(
+    cfg: MpcConfig, das_example_cfg: MpcConfig
+) -> None:
+    """Item 97: the board gets its own problem entity, so a hot or throttling Pi is not
+    read as a controller fault; its attributes are the host half of the same blob."""
+    for config in (cfg, das_example_cfg):
+        entities = build_discovery_entities(
+            config, node_id=NODE_ID, discovery_prefix=PREFIX, control_mode=ControlMode.AUTO
+        )
+        found = [e for e in entities if e.object_id == "host_problem"]
+        assert len(found) == 1
+        entity = found[0]
+        assert entity.component == "binary_sensor"
+        assert entity.config_topic == f"{PREFIX}/binary_sensor/{NODE_ID}/host_problem/config"
+        assert entity.payload["device_class"] == "problem"
+        assert entity.payload["entity_category"] == "diagnostic"
+        assert "value_json.device_health.host.ok" in entity.payload["value_template"]
+        assert entity.payload["json_attributes_topic"] == f"{NODE_ID}/state"
+        assert "value_json.device_health.host" in entity.payload["json_attributes_template"]
+
+
+def test_the_host_problem_template_and_the_host_key_read_the_published_state_blob(
+    cfg: MpcConfig,
+) -> None:
+    """Every key item 97's entity names must exist in the blob the daemon publishes: the
+    board's verdict under ``device_health.host``, its metrics under ``host``."""
+    from aqua_bridge.control.intents import ControlSnapshot, Preset, SolverStatus
+
+    board = {
+        "cpu_temp_c": 82.0,
+        "air_c": 27.0,
+        "divergence_c": 55.0,
+        "load1": 0.1,
+        "idle": True,
+        "throttled": {"hex": "0x4", "now": True, "throttled_now": True},
+        "problems": ["host: the board is throttling now (throttled, get_throttled 0x4)"],
+        "ok": False,
+    }
+    snapshot = ControlSnapshot(
+        obs=None,
+        last_cmd=None,
+        control_mode=ControlMode.AUTO,
+        setpoints={},
+        overrides={},
+        preset=Preset.NORMAL,
+        channels=cfg.channels,
+        temps=cfg.temps,
+        pwm_min=cfg.pwm_min,
+        pwm_max=cfg.pwm_max,
+        solver_status=SolverStatus.FAULT,
+        fault_reason=None,
+        fault_since_ts=None,
+        usb_present=False,
+        mqtt_connected=None,
+        uptime_s=0.0,
+        device_health={
+            "devices": [],
+            "fans": {},
+            "host": board,
+            "problems": list(board["problems"]),
+            "ok": False,
+        },
+    )
+    blob = state_payload(snapshot.to_dict(), {"cpu_temp_c": 82.0, "throttled": {"hex": "0x4"}})
+    assert blob["device_health"]["host"]["ok"] is False
+    assert blob["device_health"]["host"]["throttled"]["hex"] == "0x4"
+    # the board's problems are in the one list the daemon-wide sensor reads too
+    assert blob["health"]["device_health"] == {"ok": False, "problems": list(board["problems"])}
+    assert blob["host"]["throttled"]["hex"] == "0x4"
 
 
 def test_discovery_has_a_setpoint_number_per_setpoint(cfg: MpcConfig) -> None:
@@ -649,6 +721,7 @@ def _expected_entity_table(
         table[f"rpm_{ch}"] = ("sensor", "rpm", None, "measurement")
         table[f"pwm_{ch}"] = ("sensor", "%", None, "measurement")
     table["device_problem"] = ("binary_sensor", None, "problem", None)
+    table["host_problem"] = ("binary_sensor", None, "problem", None)
     for temp in config.setpoints:
         table[f"setpoint_{temp}"] = ("number", "°C", None, None)
     for drive_class in config.drive_classes:

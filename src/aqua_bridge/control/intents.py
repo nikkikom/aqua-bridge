@@ -406,7 +406,10 @@ class ControlSnapshot:
     outputs, absent aquabus slots, outputs not in PWM mode, flow sensors, and the
     active profile once another change publishes one), ``fans`` (per channel the
     rpm, duty, rail voltage, current and power with the curve's expected rpm and
-    power and any drift found), ``problems`` and ``ok``. :meth:`state_payload`
+    power and any drift found), ``host`` (item 97: the board's own temperature, the
+    enclosure-air reference, the load average and the decoded ``get_throttled``
+    word, with its own ``problems`` and ``ok`` -- a health signal only, never a
+    solver input), ``problems`` and ``ok``. :meth:`state_payload`
     carries all of it; :meth:`health_payload` only ``ok`` and ``problems``, the two
     a Home Assistant problem sensor needs. It is empty (``ok`` true) before the
     first tick and with a source that has no device health, such as the simulator.
