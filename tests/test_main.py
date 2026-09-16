@@ -332,40 +332,84 @@ def test_a_host_health_air_temps_typo_exits_2_before_anything_opens(
     assert "host_health.air_temps" in caplog.text and "nope_typo" in caplog.text
 
 
-def test_the_tick_reader_never_starts_a_vcgencmd_process(example_config_path, monkeypatch):
-    """Item 97: HealthMonitor.on_tick runs on the loop thread, so its host reader has
-    the vcgencmd fallback off -- a fork/exec there would stretch the tick and the
-    watchdog ping behind it, invisibly to the step budget (measured before on_tick)."""
+def test_the_tick_reader_polls_vcgencmd_on_the_configured_cadence(example_config_path, monkeypatch):
+    """Item 97: the control tick reads the whole get_throttled word, on a cadence.
+
+    The board this daemon runs on exposes no get_throttled sysfs attribute (a Zero 2 W
+    on kernel 6.18), so a tick reader without vcgencmd would leave the "throttling now"
+    rule unable to fire on the one thread that matters. It runs on the loop thread, so
+    the process is rate limited by host_health.vcgencmd_interval_s and bounded by
+    host_health.vcgencmd_timeout_s: one 3.3 ms fork a minute, not one per 5 s tick.
+    """
     from aqua_bridge.control.supervisor import Supervisor
-    from aqua_bridge.health import HostHealthConfig, host_metrics_reader
 
     spawned: list[tuple[list[str], float]] = []
+
+    class _Proc:
+        returncode = 0
+        stdout = "throttled=0x50000\n"
+
+    def fake_run(argv, **kwargs):
+        spawned.append((list(argv), kwargs.get("timeout")))
+        return _Proc()
+
+    # A machine that does have vcgencmd -- no process is started either way: the run
+    # itself is faked, so this test never shells out.
+    monkeypatch.setattr(hostinfo_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(hostinfo_mod.subprocess, "run", fake_run)
+
+    raw = yaml.safe_load(example_config_path.read_text())
+    raw["host_health"]["vcgencmd_interval_s"] = 60.0
+    raw["host_health"]["vcgencmd_timeout_s"] = 0.25
+    raw["host"] = {**raw.get("host", {}), "interval_s": 0.0}  # every tick refreshes
+    path = example_config_path.parent / "_host_health_cadence.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    try:
+        app = load_config(path)
+    finally:
+        path.unlink()
+    sup = Supervisor(app.mpc)
+    src, _sink, _release = main_mod.build_io(app, "sim")
+    monitor = main_mod.build_health_monitor(app, sup, src)
+    assert monitor is not None
+
+    for _ in range(12):  # a minute of dt = 5 s ticks
+        monitor.on_tick(None)
+    assert [(argv[1], timeout) for argv, timeout in spawned] == [("get_throttled", 0.25)], (
+        "the tick must run vcgencmd once per vcgencmd_interval_s, not once per tick"
+    )
+    throttled = sup.snapshot().device_health["host"]["throttled"]
+    assert throttled is not None, "the rule's source must not be null on the tick path"
+    assert throttled["source"] == "vcgencmd" and throttled["under_voltage_since_boot"] is True
+
+
+def test_the_publishers_reader_shares_the_documented_cadence(monkeypatch):
+    """The HTTP and MQTT readers are built the same way, from the same keys, and each
+    keeps its own cache -- they are on their own threads, not the loop's."""
+    from aqua_bridge.health import HostHealthConfig, host_metrics_reader
+
+    spawned: list[float] = []
 
     class _Proc:
         returncode = 0
         stdout = "throttled=0x0\n"
 
     def fake_run(argv, **kwargs):
-        spawned.append((list(argv), kwargs.get("timeout")))
+        spawned.append(kwargs.get("timeout"))
         return _Proc()
 
-    # A machine that does have vcgencmd: without the fallback switched off, the reader
-    # below would fork one process per refresh.
     monkeypatch.setattr(hostinfo_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(hostinfo_mod.subprocess, "run", fake_run)
 
-    app = load_config(example_config_path)
-    sup = Supervisor(app.mpc)
-    src, _sink, _release = main_mod.build_io(app, "sim")
-    monitor = main_mod.build_health_monitor(app, sup, src)
-    assert monitor is not None
-    monitor.on_tick(None)
-    assert spawned == [], "the control tick must start no process"
-    assert sup.snapshot().device_health["host"]["throttled"] is None
-
-    # The publishers' reader does keep the fallback, bounded by the documented key.
-    host_metrics_reader(HostHealthConfig(vcgencmd_timeout_s=0.25))()
-    assert [(argv[1], timeout) for argv, timeout in spawned] == [("get_throttled", 0.25)]
+    now = [0.0]
+    reader = host_metrics_reader(
+        HostHealthConfig(vcgencmd_timeout_s=0.25, vcgencmd_interval_s=60.0),
+        clock=lambda: now[0],
+    )
+    for tick in range(0, 120, 5):
+        now[0] = float(tick)
+        assert reader()["throttled"]["source"] == "vcgencmd"
+    assert spawned == [0.25, 0.25]
 
 
 def test_build_io_sim_and_unknown(example_config_path):

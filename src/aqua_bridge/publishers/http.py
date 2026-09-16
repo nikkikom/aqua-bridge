@@ -379,11 +379,13 @@ def create_app(
     ``None`` that route answers 404, never a 5xx. ``hostinfo`` is the reader
     :class:`~aqua_bridge.hostinfo.CachedHostInfo` wraps for ``GET /api/state``'s
     ``host`` key; left ``None`` it is
-    :func:`aqua_bridge.hostinfo.collect_hostinfo` with its ``vcgencmd
-    get_throttled`` fallback bounded by ``host_health.vcgencmd_timeout_s``
-    (:func:`aqua_bridge.health.host_metrics_reader`) -- this server runs on its own
-    thread, so that fallback costs the control loop nothing. Tests inject a fixed
-    dict.
+    :func:`aqua_bridge.hostinfo.collect_hostinfo` with the throttling source chain
+    this config asks for (:func:`aqua_bridge.health.host_metrics_reader`): the
+    ``get_throttled`` sysfs attribute where the kernel has one, else a ``vcgencmd``
+    run at most every ``host_health.vcgencmd_interval_s`` and bounded by
+    ``host_health.vcgencmd_timeout_s``, else the ``rpi_volt`` hwmon under-voltage
+    bit. This server has its own thread and its own reader, so its polling is
+    independent of the control loop's. Tests inject a fixed dict.
     """
     if not isinstance(auth, BasicAuthenticator):
         raise TypeError("create_app needs a BasicAuthenticator")

@@ -99,9 +99,16 @@ declared once in :class:`HostHealthConfig` under the same rules.
 The two rules that report a fact -- the board is hot, the board is throttling --
 join the payload's daemon-wide ``problems``; the divergence rule, which is a hint
 about where to look, does not, and shows only on the board's own published
-verdict and its Home Assistant ``host_problem`` sensor. The reader the control
-loop uses never starts a process (:func:`host_metrics_reader`): a ``vcgencmd``
-fallback belongs to the publishers' readers, off the loop thread.
+verdict and its Home Assistant ``host_problem`` sensor.
+
+The throttling rule needs a source, and on the board this daemon runs on the
+cheapest one is not there: kernel 6.18 exposes no ``get_throttled`` sysfs
+attribute, so ``vcgencmd`` is the only thing that knows the whole word.
+:func:`host_metrics_reader` therefore gives every reader -- the control loop's
+included -- the full source chain (:class:`~aqua_bridge.hostinfo.ThrottledReader`),
+with the process rate limited to one run per ``host_health.vcgencmd_interval_s``
+and bounded by ``host_health.vcgencmd_timeout_s``. See that function for why 3.3 ms
+a minute is affordable on the loop thread and a per-tick fork was not.
 """
 
 from __future__ import annotations
@@ -110,13 +117,19 @@ import dataclasses
 import functools
 import logging
 import math
+import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from aqua_bridge.control.thermal import phi
-from aqua_bridge.hostinfo import THROTTLED_BITS, collect_hostinfo, run_vcgencmd
+from aqua_bridge.hostinfo import (
+    THROTTLED_BITS,
+    ThrottledReader,
+    collect_hostinfo,
+    run_vcgencmd,
+)
 from aqua_bridge.model import ConfigError, MpcConfig
 
 __all__ = [
@@ -310,12 +323,22 @@ class HostHealthConfig:
     air_temps: tuple[str, ...] = ()
     #: One log line for the board at most this often, seconds (> 0).
     log_interval_s: float = 300.0
-    #: How long a ``vcgencmd get_throttled`` fallback may take, seconds (> 0). Only
-    #: the publishers' host-metrics readers ever start that process, and only on a
-    #: board whose firmware exposes no sysfs attribute; the control tick's reader has
-    #: the fallback switched off outright (:func:`host_metrics_reader`), so nothing
-    #: here can block the loop. Two seconds is a mailbox round trip with room for a
-    #: busy VideoCore, and a timeout is simply ``None``.
+    #: How often a host-metrics reader may run ``vcgencmd get_throttled``, seconds
+    #: (> 0). On a kernel that exposes no ``get_throttled`` sysfs attribute -- which
+    #: is the case on a Raspberry Pi Zero 2 W running kernel 6.18 -- that process is
+    #: the only source of the whole word, so it runs on the control-loop thread too;
+    #: this is what keeps it to one fork per minute instead of one per 5 s tick. The
+    #: last word read is served in between, tagged with its age. One minute is far
+    #: below the rate at which any of these conditions comes and goes (the firmware
+    #: latches the since-boot half regardless) and costs 3.3 ms of one tick in 60 s.
+    #: Lower it to notice throttling sooner, at one 3.3 ms fork per interval.
+    vcgencmd_interval_s: float = 60.0
+    #: How long one ``vcgencmd get_throttled`` may take, seconds (> 0). It guards the
+    #: one way that call can hurt the loop: a VideoCore mailbox that does not answer,
+    #: which would otherwise block the thread indefinitely. Two seconds is a round
+    #: trip with room for a busy VideoCore; a timeout is simply ``None``, and the
+    #: chain falls through to the hwmon under-voltage bit. A board where the call
+    #: times out pays that once per ``vcgencmd_interval_s``, not once per tick.
     vcgencmd_timeout_s: float = 2.0
 
     def __post_init__(self) -> None:
@@ -324,7 +347,13 @@ class HostHealthConfig:
         _number("host_health.temp_limit_c", self.temp_limit_c, minimum=0.0, maximum=None)
         _number("host_health.divergence_c", self.divergence_c, minimum=1e-9, maximum=None)
         _number("host_health.idle_load1_max", self.idle_load1_max, minimum=0.0, maximum=None)
-        for name in ("temp_fault_s", "divergence_fault_s", "log_interval_s", "vcgencmd_timeout_s"):
+        for name in (
+            "temp_fault_s",
+            "divergence_fault_s",
+            "log_interval_s",
+            "vcgencmd_interval_s",
+            "vcgencmd_timeout_s",
+        ):
             _number(f"host_health.{name}", getattr(self, name), minimum=1e-9, maximum=None)
         if isinstance(self.air_temps, str) or not isinstance(self.air_temps, list | tuple):
             raise ConfigError(
@@ -393,24 +422,65 @@ def validate_host_health(cfg: MpcConfig, settings: HostHealthConfig) -> tuple[st
 
 
 def host_metrics_reader(
-    settings: HostHealthConfig | None = None, *, subprocess_fallback: bool = True
+    settings: HostHealthConfig | None = None,
+    *,
+    subprocess_fallback: bool = True,
+    clock: Callable[[], float] = time.monotonic,
 ) -> Callable[[], dict[str, Any]]:
-    """:func:`~aqua_bridge.hostinfo.collect_hostinfo` bound to this config's fallback.
+    """:func:`~aqua_bridge.hostinfo.collect_hostinfo` with this config's throttling
+    source chain: one :class:`~aqua_bridge.hostinfo.ThrottledReader` per caller.
 
-    ``subprocess_fallback=False`` switches the ``vcgencmd get_throttled`` fallback
-    off entirely: the reader then does file reads only, which is what the control
-    loop's own reader wants -- ``HealthMonitor.on_tick`` runs on the loop thread, and
-    a fork/exec there would stretch the tick (and the watchdog ping behind it) by
-    however long the VideoCore mailbox takes, invisibly to the step budget, which is
-    measured before the tick's observers run. The publishers' readers keep the
-    fallback, bounded by ``host_health.vcgencmd_timeout_s``.
+    Every caller gets the same chain, the control loop's reader included, because the
+    board this daemon runs on has no cheaper complete source: on a Raspberry Pi Zero 2
+    W running kernel 6.18 the ``get_throttled`` sysfs attribute does not exist, so a
+    reader without ``vcgencmd`` sees ``throttled: null`` forever and the "throttling
+    now" rule can never fire where it matters -- which is a worse bargain than the
+    cost it avoids. Measured on that board, one ``vcgencmd get_throttled`` is 3.3 ms
+    median / 3.8 ms p95; at the default one poll per minute against ``dt = 5 s`` that
+    is 0.07 % of the tick it lands on, 0.5 % of ``mpc.budget_ms`` (600, alarm 750),
+    and nothing at all on the other eleven ticks. ``vcgencmd_timeout_s`` bounds the
+    one failure that could cost more than that -- a VideoCore mailbox that never
+    answers -- and a failed poll waits out the interval before it is tried again, so
+    a board where the call hangs pays one timeout a minute and reads the hwmon
+    under-voltage bit in between.
+
+    ``subprocess_fallback=False`` drops ``vcgencmd`` from the chain: the reader then
+    does file reads only -- the sysfs attribute where a kernel has it, and the
+    ``rpi_volt`` hwmon under-voltage bit -- and starts no process at all.
     """
-    if not subprocess_fallback:
-        return functools.partial(collect_hostinfo, vcgencmd=None)
-    timeout_s = (settings or HostHealthConfig()).vcgencmd_timeout_s
-    return functools.partial(
-        collect_hostinfo, vcgencmd=functools.partial(run_vcgencmd, timeout_s=timeout_s)
+    s = settings or HostHealthConfig()
+    runner = (
+        functools.partial(run_vcgencmd, timeout_s=s.vcgencmd_timeout_s)
+        if subprocess_fallback
+        else None
     )
+    throttled = ThrottledReader(vcgencmd=runner, poll_interval_s=s.vcgencmd_interval_s, clock=clock)
+    return functools.partial(collect_hostinfo, throttled=throttled)
+
+
+def _throttled_detail(throttled: Mapping[str, Any]) -> str:
+    """What the "throttling now" message says after the conditions it found.
+
+    Always which source the reading came from, so a message can be read against the
+    board it came from; the raw word where one was read; how old it is where it was
+    served from :class:`~aqua_bridge.hostinfo.ThrottledReader`'s cache rather than
+    read this tick; and which conditions the source could not see, so a partial
+    reading never looks like a whole one.
+    """
+    flags = [name for _, name in THROTTLED_BITS if throttled.get(f"{name}_now") is True]
+    parts = [", ".join(flags) or "unknown bit"]
+    if throttled.get("hex") is not None:
+        parts.append(f"get_throttled {throttled['hex']}")
+    source = throttled.get("source")
+    if source:
+        parts.append(f"source {source}")
+    age_s = throttled.get("age_s")
+    if isinstance(age_s, int | float) and age_s > 0.0:
+        parts.append(f"read {float(age_s):.0f} s ago")
+    unknown = throttled.get("unknown") or []
+    if unknown:
+        parts.append(f"{', '.join(str(name) for name in unknown)} not read")
+    return "; ".join(parts)
 
 
 class HostHealth:
@@ -427,7 +497,11 @@ class HostHealth:
         seen, with no window: the firmware has already latched the condition, and a
         sustained window would only delay a fact. The latched *since boot* half is
         published next to it but never warns on its own -- an under-voltage during
-        boot is history, not a live problem.
+        boot is history, not a live problem. It fires on whatever source the board
+        has: the whole word, or the ``rpi_volt`` hwmon alarm on its own, which is
+        enough to report an under-voltage and says plainly that it saw nothing of
+        the other three conditions. A condition nobody read is never a condition
+        read as absent, so a partial source can raise this rule but never silence it.
     ``the board diverges from the enclosure air``
         Its temperature further than ``divergence_c`` from the mean of the air
         reference for ``divergence_fault_s``, **and only while the CPU is idle**
@@ -519,12 +593,12 @@ class HostHealth:
                 f"{s.temp_limit_c:g} degC limit, for {held:.0f} s"
             )
 
-        if throttled is not None and throttled.get("now"):
-            flags = [name for _, name in THROTTLED_BITS if throttled.get(f"{name}_now")]
-            faults.append(
-                f"host: the board is throttling now ({', '.join(flags) or 'unknown bit'}, "
-                f"get_throttled {throttled.get('hex')})"
-            )
+        # ``now`` is True only where a condition was actually read as in force: a
+        # source that saw fewer conditions leaves the ones it could not read None and
+        # summarises to None, never to False (hostinfo._summary). So this fires on the
+        # hwmon under-voltage bit alone, and an unknown bit is never read as a fine one.
+        if throttled is not None and throttled.get("now") is True:
+            faults.append(f"host: the board is throttling now ({_throttled_detail(throttled)})")
 
         hints: list[str] = []
         diverging = idle is True and divergence is not None and abs(divergence) > s.divergence_c

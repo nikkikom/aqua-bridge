@@ -109,6 +109,10 @@ _DEVICE_HEALTH: dict[str, Any] = {
         "throttled": {
             "raw": 0,
             "hex": "0x0",
+            "source": "vcgencmd",
+            "age_s": 12.0,
+            "unknown": [],
+            "partial": False,
             "under_voltage_now": False,
             "under_voltage_since_boot": False,
             "freq_capped_now": False,

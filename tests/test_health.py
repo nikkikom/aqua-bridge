@@ -29,7 +29,7 @@ from aqua_bridge.health import (
     default_air_temps,
     expected_rpm,
 )
-from aqua_bridge.hostinfo import decode_throttled
+from aqua_bridge.hostinfo import decode_throttled, read_rpi_volt_hwmon
 from aqua_bridge.hw.aquacomputer import AQUAERO, QUADRO, decode_status
 from aqua_bridge.model import ConfigError, FanModel, FanSpec, MpcConfig, PlantObservation
 from aquacomputer_fakes import fixture_bytes
@@ -529,11 +529,12 @@ def test_every_host_threshold_is_a_key_with_one_default() -> None:
         "idle_load1_max",
         "air_temps",
         "log_interval_s",
+        "vcgencmd_interval_s",
         "vcgencmd_timeout_s",
     }
     assert defaults.enabled is True and defaults.air_temps == ()
     assert defaults.temp_limit_c == 75.0 and defaults.divergence_c == 40.0
-    assert defaults.vcgencmd_timeout_s == 2.0
+    assert defaults.vcgencmd_timeout_s == 2.0 and defaults.vcgencmd_interval_s == 60.0
     assert HostHealthConfig.from_section(None) == defaults
     assert HostHealthConfig.from_section({}) == defaults
 
@@ -555,6 +556,8 @@ def test_host_from_section_overrides_and_keeps_the_other_defaults() -> None:
         ({"idle_load1_max": -1.0}, "host_health.idle_load1_max must be >="),
         ({"divergence_fault_s": float("nan")}, "host_health.divergence_fault_s must be finite"),
         ({"vcgencmd_timeout_s": 0}, "host_health.vcgencmd_timeout_s must be >="),
+        ({"vcgencmd_interval_s": 0}, "host_health.vcgencmd_interval_s must be >="),
+        ({"vcgencmd_interval_s": "60"}, "host_health.vcgencmd_interval_s must be a number"),
         ({"air_temps": "inlet_a"}, "host_health.air_temps must be a list"),
         ({"air_temps": [""]}, "air_temps entries must be non-empty strings"),
         ({"air_temps": [3]}, "air_temps entries must be non-empty strings"),
@@ -601,6 +604,21 @@ def test_default_air_temps_falls_back_to_inlet_then_to_every_temperature(
     assert inlets and all(das_example_cfg.sensors[n].role == "inlet" for n in inlets)
     # a legacy config declares no roles at all: every configured temperature
     assert default_air_temps(cfg) == cfg.temps
+
+
+def _hwmon(root: Path, devices: dict[str, dict[str, str]]) -> Path:
+    """A fake ``/sys/class/hwmon`` tree, read back by the real reader.
+
+    The board's under-voltage-only source (item 97): built here rather than
+    hand-writing the partial reading it produces, so these rules are exercised on
+    exactly what ``hostinfo`` hands them.
+    """
+    for entry, files in devices.items():
+        for name, text in files.items():
+            path = root / "hwmon" / entry / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+    return root / "hwmon"
 
 
 def _host_info(**over: Any) -> dict[str, Any]:
@@ -669,6 +687,46 @@ def test_throttling_now_is_reported_the_tick_it_is_seen_and_clears() -> None:
     assert "throttling now (throttled" in verdict["problems"][0]
     assert verdict["ok"] is False
     assert board.check(_host_info(), {}, 1.0)["problems"] == []
+
+
+def test_the_under_voltage_alarm_alone_raises_the_rule(tmp_path: Path) -> None:
+    """The hwmon source sees one condition, and that is enough to report it.
+
+    On a board with no ``get_throttled`` sysfs attribute and no ``vcgencmd`` this
+    partial reading is the whole evidence there is; the rule must fire on it, and
+    say plainly which conditions it could not see.
+    """
+    board = _board()
+    partial = read_rpi_volt_hwmon(
+        _hwmon(tmp_path, {"hwmon2": {"name": "rpi_volt\n", "in0_lcrit_alarm": "1\n"}})
+    )
+    verdict = board.check(_host_info(throttled=partial), {}, 0.0)
+    assert len(verdict["problems"]) == 1 and verdict["ok"] is False
+    message = verdict["problems"][0]
+    assert "throttling now (under_voltage" in message
+    assert "source hwmon" in message
+    assert "freq_capped, throttled, soft_temp_limit not read" in message
+
+
+def test_a_condition_nobody_read_is_never_reported_as_absent(tmp_path: Path) -> None:
+    """An unknown bit must not read as false: the same partial source, alarm clear."""
+    board = _board()
+    partial = read_rpi_volt_hwmon(
+        _hwmon(tmp_path, {"hwmon2": {"name": "rpi_volt\n", "in0_lcrit_alarm": "0\n"}})
+    )
+    verdict = board.check(_host_info(throttled=partial), {}, 0.0)
+    assert verdict["problems"] == [], "one clear bit is not evidence that the rest are clear"
+    published = verdict["throttled"]
+    assert published["now"] is None, "not False -- three conditions were not read"
+    assert published["throttled_now"] is None and published["partial"] is True
+
+
+def test_a_cached_vcgencmd_word_says_how_old_it_is(tmp_path: Path) -> None:
+    """The word may be up to vcgencmd_interval_s old; the message says so."""
+    board = _board()
+    aged = decode_throttled(0x1, source="vcgencmd", age_s=45.0)
+    message = board.check(_host_info(throttled=aged), {}, 0.0)["problems"][0]
+    assert "source vcgencmd" in message and "read 45 s ago" in message
 
 
 def test_the_since_boot_half_alone_never_warns() -> None:
