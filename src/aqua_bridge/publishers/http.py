@@ -18,7 +18,7 @@ expected rpm and power and any drift found; plus ``problems`` and ``ok``.
 and ``ok`` before the first tick and with a source that has no device health
 (the simulator).
 
-``device_health`` also carries a ``host`` key (PROJECT.md section 8 item 97): the
+``device_health`` also carries a ``host`` key (PROJECT.md section 8 item 103): the
 board's own temperature, the enclosure-air reference it is compared against, the
 load average, the decoded ``get_throttled`` word and this board's own ``faults``,
 ``hints``, ``problems`` and ``ok``. Only its *faults* -- the board is hot, the board

@@ -1,5 +1,5 @@
 """Fan health, device health and the board's own health (PROJECT.md section 8 items
-79, 83 and 97).
+79, 83 and 103).
 
 Every status report of an aquaero or a Quadro carries, per output, the speed, the
 output duty the device drives, the 12 V rail voltage and the current and power the
@@ -83,7 +83,7 @@ described in PROJECT.md section 3.
 The board itself
 ----------------
 :class:`HostHealth` adds three rules about the Raspberry Pi the daemon runs on
-(item 97, and the owner decision of 2026-09-16 in PROJECT.md section 8.1): the
+(item 103, and the owner decision of 2026-09-16 in PROJECT.md section 8.1): the
 board is hot, the board is throttling now, and -- only while the CPU is idle --
 the board's temperature diverges from the enclosure air. Its inputs are
 :func:`aqua_bridge.hostinfo.collect_hostinfo`'s ``cpu_temp_c``, ``load1`` and
@@ -268,7 +268,7 @@ def _finite(value: Any) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# The board itself (PROJECT.md section 8 item 97)
+# The board itself (PROJECT.md section 8 item 103)
 # ---------------------------------------------------------------------------
 
 
@@ -625,7 +625,7 @@ class HostHealth:
             return
         self._logged_at = now
         for text in problems:
-            _LOG.warning("host health: %s (PROJECT.md section 8 item 97)", text)
+            _LOG.warning("host health: %s (PROJECT.md section 8 item 103)", text)
 
 
 @dataclass
@@ -667,7 +667,7 @@ class HealthMonitor:
     ``Supervisor.set_device_health`` in the daemon.
 
     ``hostinfo`` is the host-metrics reader the board's own rules judge
-    (:class:`HostHealth`, item 97): a
+    (:class:`HostHealth`, item 103): a
     :class:`~aqua_bridge.hostinfo.CachedHostInfo` bound to ``host.interval_s`` in
     the daemon, ``None`` in a test or a run that wants no host health. Its verdict
     is the payload's ``host`` key and its problems join the payload's ``problems``,
@@ -880,7 +880,7 @@ class HealthMonitor:
 
         ``host`` is the tick's host metrics (:func:`aqua_bridge.hostinfo.collect_hostinfo`)
         and ``temps`` the observation's temperatures, the two the board's own rules
-        need (item 97). They are judged and published here and nowhere else: neither
+        need (item 103). They are judged and published here and nowhere else: neither
         reaches ``PlantObservation`` or the solver's ``diagnostics``.
         """
         self._tick += 1

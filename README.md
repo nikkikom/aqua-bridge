@@ -281,7 +281,7 @@ hardware.
     without which it stays off.
 
     The Raspberry Pi itself is watched the same way (`host_health:`, §8
-    item 97): `/api/state`'s `device_health.host` and the page's **Host**
+    item 103): `/api/state`'s `device_health.host` and the page's **Host**
     section show the board's temperature against the enclosure air, whether
     its CPU was idle when that was judged, and the decoded
     `get_throttled` word (throttling now, and what has occurred since boot);

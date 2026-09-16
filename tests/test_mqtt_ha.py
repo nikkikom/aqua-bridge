@@ -66,7 +66,7 @@ def test_discovery_has_host_sensors(cfg: MpcConfig) -> None:
     )
     host_ids = {oid for oid, *_ in host_sensor_specs()}
     found = {e.object_id for e in entities if e.object_id.startswith("host_")}
-    # "host_problem" is the board's own health binary sensor (item 97), not a metric
+    # "host_problem" is the board's own health binary sensor (item 103), not a metric
     assert found == {f"host_{oid}" for oid in host_ids} | {"host_problem"}
 
 
@@ -135,7 +135,7 @@ def test_the_device_problem_template_reads_the_published_state_blob(cfg: MpcConf
 def test_discovery_has_one_host_problem_sensor_in_both_modes(
     cfg: MpcConfig, das_example_cfg: MpcConfig
 ) -> None:
-    """Item 97: the board gets its own problem entity, so a hot or throttling Pi is not
+    """Item 103: the board gets its own problem entity, so a hot or throttling Pi is not
     read as a controller fault; its attributes are the host half of the same blob."""
     for config in (cfg, das_example_cfg):
         entities = build_discovery_entities(
@@ -156,7 +156,7 @@ def test_discovery_has_one_host_problem_sensor_in_both_modes(
 def test_the_host_problem_template_and_the_host_key_read_the_published_state_blob(
     cfg: MpcConfig,
 ) -> None:
-    """Every key item 97's entity names must exist in the blob the daemon publishes: the
+    """Every key item 103's entity names must exist in the blob the daemon publishes: the
     board's verdict under ``device_health.host``, its metrics under ``host``."""
     from aqua_bridge.control.intents import ControlSnapshot, Preset, SolverStatus
 

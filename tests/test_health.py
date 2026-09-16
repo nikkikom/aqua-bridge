@@ -1,5 +1,5 @@
 """Fan health, device health and the board's own health (PROJECT.md section 8 items
-79, 83 and 97).
+79, 83 and 103).
 
 The readings the rules judge come from the captured status reports in
 ``tests/fixtures/aquacomputer/``, decoded by the real adapter against the real
@@ -514,11 +514,11 @@ def test_the_captured_rails_sit_inside_the_default_window() -> None:
                 assert defaults.rail_min_v <= fan.voltage_v <= defaults.rail_max_v, name
 
 
-# --- the board itself (item 97) ---------------------------------------------------------
+# --- the board itself (item 103) ---------------------------------------------------------
 
 
 def test_every_host_threshold_is_a_key_with_one_default() -> None:
-    """Item 97's thresholds are config keys, declared once in HostHealthConfig."""
+    """Item 103's thresholds are config keys, declared once in HostHealthConfig."""
     defaults = HostHealthConfig()
     assert set(HOSTHEALTH_KEYS) == {
         "enabled",
@@ -609,7 +609,7 @@ def test_default_air_temps_falls_back_to_inlet_then_to_every_temperature(
 def _hwmon(root: Path, devices: dict[str, dict[str, str]]) -> Path:
     """A fake ``/sys/class/hwmon`` tree, read back by the real reader.
 
-    The board's under-voltage-only source (item 97): built here rather than
+    The board's under-voltage-only source (item 103): built here rather than
     hand-writing the partial reading it produces, so these rules are exercised on
     exactly what ``hostinfo`` hands them.
     """
@@ -822,7 +822,7 @@ def test_a_repeated_board_problem_is_logged_at_most_once_per_log_interval_s(
             board.check(hot, {}, t)
     lines = [r for r in caplog.records if "host health" in r.getMessage()]
     assert len(lines) == 2
-    assert "item 97" in lines[0].getMessage()
+    assert "item 103" in lines[0].getMessage()
 
 
 def test_on_tick_publishes_the_board_verdict_next_to_the_fans() -> None:
@@ -902,7 +902,7 @@ def test_on_tick_survives_a_hostinfo_reader_that_raises() -> None:
 
 
 def test_the_board_never_reaches_the_observation_or_the_solver_diagnostics() -> None:
-    """Item 97: a health signal, never a model input. The observation the monitor was
+    """Item 103: a health signal, never a model input. The observation the monitor was
     given must come back untouched, and nothing the board reports may be in it."""
     obs = PlantObservation(temps={"air_z1": 26.0}, rpm={}, pwm={}, ts=0.0, inputs={})
     before = obs.to_dict()

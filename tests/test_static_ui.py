@@ -64,7 +64,7 @@ _JS_BUILTINS = {
     "toFixed",
 }
 
-#: What a live `HealthMonitor` publishes (PROJECT.md section 8 items 79, 83, 97). The
+#: What a live `HealthMonitor` publishes (PROJECT.md section 8 items 79, 83, 103). The
 #: supervisor holds it verbatim, so the page's Controllers section reads exactly these
 #: keys; built here rather than run through the hardware adapter, which the HTTP tests
 #: do not have.

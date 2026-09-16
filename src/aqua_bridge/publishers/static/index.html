@@ -140,7 +140,7 @@ function renderDevices(health) {
 // The board itself: /api/state's "device_health.host" -- its temperature against
 // the enclosure-air reference, whether the CPU was idle when that was judged, the
 // decoded get_throttled word, and the board's own problems. A health signal only:
-// nothing here is a solver input (§8 item 97).
+// nothing here is a solver input (§8 item 103).
 function hostHealthRows(health) {
   const h = (health || {}).host;
   if (!h) return [];
@@ -156,7 +156,7 @@ function hostHealthRows(health) {
     // A bit the source could not read is null, never false: it is shown as unknown,
     // and "unknown" names the conditions this source cannot see at all. The source
     // and the age of the word are shown too -- a vcgencmd word is polled on a cadence
-    // and served from cache in between (§8 item 97).
+    // and served from cache in between (§8 item 103).
     const now = names.filter(n => t[n + "_now"] === true);
     const ever = names.filter(n => t[n + "_since_boot"] === true);
     const where = [t.source || "unknown source"];

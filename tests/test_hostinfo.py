@@ -1,6 +1,6 @@
 """Tests for aqua_bridge.hostinfo against fake sysfs/procfs trees.
 
-Including the board's throttling state (PROJECT.md section 8 item 97): every bit of
+Including the board's throttling state (PROJECT.md section 8 item 103): every bit of
 both halves, each of the three sources on its own and in the order the chain tries
 them, the ``vcgencmd`` cadence that keeps that process off all but one tick a
 minute, and every way no source reads at all. No test here shells out to
@@ -175,7 +175,7 @@ def test_wifi_rssi_no_interfaces_is_none(tmp_path: Path) -> None:
     assert read_wifi_rssi(p) is None
 
 
-# --- read_throttled (PROJECT.md section 8 item 97) ----------------------------
+# --- read_throttled (PROJECT.md section 8 item 103) ----------------------------
 
 
 def test_decode_throttled_names_every_bit_both_halves() -> None:

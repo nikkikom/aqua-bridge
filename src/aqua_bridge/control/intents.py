@@ -406,7 +406,7 @@ class ControlSnapshot:
     outputs, absent aquabus slots, outputs not in PWM mode, flow sensors, and the
     active profile once another change publishes one), ``fans`` (per channel the
     rpm, duty, rail voltage, current and power with the curve's expected rpm and
-    power and any drift found), ``host`` (item 97: the board's own temperature, the
+    power and any drift found), ``host`` (item 103: the board's own temperature, the
     enclosure-air reference, the load average and the decoded ``get_throttled``
     word, with its own ``problems`` and ``ok`` -- a health signal only, never a
     solver input), ``problems`` and ``ok``. :meth:`state_payload`
