@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
 import pytest
 
 from aqua_bridge.control.intents import (
@@ -16,7 +19,9 @@ from aqua_bridge.control.intents import (
 )
 from aqua_bridge.control.supervisor import Supervisor
 from aqua_bridge.model import MpcConfig
+from aqua_bridge.publishers.inputs import SmartInbox, smart_topic_filter
 from aqua_bridge.publishers.mqtt_ha import (
+    MqttEntity,
     MqttSetupError,
     availability_topic,
     build_discovery_entities,
@@ -576,3 +581,316 @@ def test_validate_mqtt_section_null_string_falls_back_to_default() -> None:
 def test_validate_mqtt_section_rejects_bad_types(section: dict, match: str) -> None:
     with pytest.raises(MqttSetupError, match=match):
         validate_mqtt_section(section)
+
+
+# --- the whole Discovery contract, offline (item 21) ------------------------------------
+#
+# Item 21 confirms these against the owner's Home Assistant. Everything the live run
+# can be told in advance is pinned here, so the live half is a short confirmation:
+# the entity table (component, unit, device class, state class), the fixed keys of
+# every payload, which entities carry a command topic, that those commands reach the
+# supervisor, that a SMART message from the broker reaches the inbox, the qos/retain
+# flags of every publish, the availability transitions, and node_id / discovery_prefix
+# coming from the config section.
+
+
+class _FakePaho:
+    """Records everything the wrapper does to its paho client (no broker)."""
+
+    def __init__(self) -> None:
+        self.subscribed: list[str] = []
+        self.published: list[tuple[str, Any, int, bool]] = []
+        self.disconnected = 0
+        self.loops: list[str] = []
+
+    def subscribe(self, topic: str) -> None:
+        self.subscribed.append(topic)
+
+    def publish(self, topic: str, payload: Any = None, qos: int = 0, retain: bool = False) -> None:
+        self.published.append((topic, payload, qos, retain))
+
+    def disconnect(self) -> None:
+        self.disconnected += 1
+
+    def loop_start(self) -> None:
+        self.loops.append("start")
+
+    def loop_stop(self) -> None:
+        self.loops.append("stop")
+
+    @property
+    def topics(self) -> list[str]:
+        return [t for t, *_ in self.published]
+
+
+def _entities(
+    config: MpcConfig, *, mode: ControlMode, node_id: str = NODE_ID, prefix: str = PREFIX
+) -> dict[str, MqttEntity]:
+    return {
+        e.object_id: e
+        for e in build_discovery_entities(
+            config, node_id=node_id, discovery_prefix=prefix, control_mode=mode
+        )
+    }
+
+
+def _expected_entity_table(
+    config: MpcConfig,
+) -> dict[str, tuple[str, str | None, str | None, str | None]]:
+    """``object_id -> (component, unit, device_class, state_class)``: the table item 21
+    reads off Home Assistant's device page, written down so the live run only has to
+    agree with it."""
+    table: dict[str, tuple[str, str | None, str | None, str | None]] = {}
+    for object_id, _name, unit, device_class in host_sensor_specs():
+        table[f"host_{object_id}"] = ("sensor", unit, device_class, "measurement")
+    for temp in config.temps:
+        table[f"temp_{temp}"] = ("sensor", "°C", "temperature", "measurement")
+    for ch in config.channels:
+        table[f"rpm_{ch}"] = ("sensor", "rpm", None, "measurement")
+        table[f"pwm_{ch}"] = ("sensor", "%", None, "measurement")
+    table["device_problem"] = ("binary_sensor", None, "problem", None)
+    for temp in config.setpoints:
+        table[f"setpoint_{temp}"] = ("number", "°C", None, None)
+    for drive_class in config.drive_classes:
+        table[f"limit_{drive_class}"] = ("number", "°C", None, None)
+    if config.topology is not None:
+        table["model_status"] = ("sensor", None, None, None)
+        table["model_pred_err_c"] = ("sensor", "°C", None, "measurement")
+        table["noise_db"] = ("sensor", "dB", None, "measurement")
+        table["ident_running"] = ("binary_sensor", None, "running", None)
+        for zone in config.topology.zones:
+            table[f"zone_status_{zone}"] = ("sensor", None, None, None)
+        for bay in config.topology.bays:
+            table[f"drive_temp_{bay}"] = ("sensor", "°C", "temperature", "measurement")
+            table[f"drive_margin_{bay}"] = ("sensor", "°C", None, "measurement")
+            table[f"drive_sigma_{bay}"] = ("sensor", "°C", None, "measurement")
+            table[f"bay_occupied_{bay}"] = ("binary_sensor", None, "occupancy", None)
+    return table
+
+
+def test_the_announced_entities_are_exactly_the_table_home_assistant_shows(
+    cfg: MpcConfig, das_example_cfg: MpcConfig
+) -> None:
+    for config in (cfg, das_example_cfg):
+        table = _expected_entity_table(config)
+        pwm_cmd = {f"pwm_cmd_{ch}": ("number", None, None, None) for ch in config.channels}
+        for mode in ControlMode:
+            want = table | (pwm_cmd if mode is ControlMode.MANUAL else {})
+            got = _entities(config, mode=mode)
+            assert set(got) == set(want), mode
+            for object_id, (component, unit, device_class, state_class) in want.items():
+                payload = got[object_id].payload
+                assert got[object_id].component == component, object_id
+                assert payload.get("unit_of_measurement") == unit, object_id
+                assert payload.get("device_class") == device_class, object_id
+                assert payload.get("state_class") == state_class, object_id
+
+
+def test_every_discovery_payload_carries_topic_unique_id_device_and_availability(
+    cfg: MpcConfig, das_example_cfg: MpcConfig
+) -> None:
+    device = {
+        "identifiers": [NODE_ID],
+        "name": NODE_ID,
+        "manufacturer": "aqua-bridge",
+        "model": "aquaero 6 XT + Quadro",
+    }
+    for config in (cfg, das_example_cfg):
+        for mode in ControlMode:
+            for object_id, entity in _entities(config, mode=mode).items():
+                payload = entity.payload
+                assert entity.config_topic == (
+                    f"{PREFIX}/{entity.component}/{NODE_ID}/{object_id}/config"
+                )
+                assert payload["unique_id"] == f"{NODE_ID}_{object_id}" == payload["object_id"]
+                assert payload["state_topic"] == state_topic(NODE_ID)
+                assert payload["name"]
+                assert "value_json." in payload["value_template"]
+                assert payload["device"] == device
+                assert payload["availability_topic"] == availability_topic(NODE_ID)
+                assert payload["payload_available"] == "online"
+                assert payload["payload_not_available"] == "offline"
+                # It is published as JSON, so it has to survive a round trip unchanged.
+                assert json.loads(json.dumps(payload)) == payload
+
+
+def test_numbers_are_the_only_commandable_entities_and_their_topics_are_subscribed(
+    cfg: MpcConfig, das_example_cfg: MpcConfig
+) -> None:
+    for config in (cfg, das_example_cfg):
+        subscribed = set(command_topics(NODE_ID, config).values())
+        for mode in ControlMode:
+            for object_id, entity in _entities(config, mode=mode).items():
+                topic = entity.payload.get("command_topic")
+                if entity.component == "number":
+                    assert topic in subscribed, object_id
+                else:
+                    assert topic is None, object_id
+
+
+def test_number_entities_carry_the_range_and_step_section_7_documents(
+    cfg: MpcConfig, das_example_cfg: MpcConfig
+) -> None:
+    manual = _entities(cfg, mode=ControlMode.MANUAL)
+    for temp in cfg.setpoints:
+        payload = manual[f"setpoint_{temp}"].payload
+        assert (payload["min"], payload["max"], payload["step"]) == (
+            cfg.temp_min_c,
+            cfg.temp_max_c,
+            0.5,
+        )
+    for ch in cfg.channels:
+        payload = manual[f"pwm_cmd_{ch}"].payload
+        assert (payload["min"], payload["max"], payload["step"]) == (cfg.pwm_min, cfg.pwm_max, 0.01)
+    das = _entities(das_example_cfg, mode=ControlMode.AUTO)
+    for name, drive_class in das_example_cfg.drive_classes.items():
+        payload = das[f"limit_{name}"].payload
+        assert (payload["min"], payload["max"], payload["step"]) == (
+            das_example_cfg.temp_min_c,
+            drive_class.limit_c,
+            0.5,
+        )
+
+
+def test_a_setpoint_number_command_reaches_the_supervisor(cfg: MpcConfig) -> None:
+    sup = Supervisor(cfg)
+    client = _client(cfg, on_intent=sup.submit)
+    temp = next(iter(cfg.setpoints))
+    topic = _entities(cfg, mode=ControlMode.AUTO)[f"setpoint_{temp}"].payload["command_topic"]
+    client._on_message(client.client, None, _Msg(topic, b"31.5"))
+    assert sup.setpoints[temp] == 31.5
+
+
+def test_a_limit_number_command_reaches_the_supervisor(das_example_cfg: MpcConfig) -> None:
+    sup = Supervisor(das_example_cfg)
+    client = _client(das_example_cfg, on_intent=sup.submit)
+    name, drive_class = next(iter(das_example_cfg.drive_classes.items()))
+    entities = _entities(das_example_cfg, mode=ControlMode.AUTO)
+    topic = entities[f"limit_{name}"].payload["command_topic"]
+    tighter = drive_class.limit_c - 3.0
+    client._on_message(client.client, None, _Msg(topic, str(tighter).encode()))
+    assert sup.effective_config().drive_classes[name].limit_c == tighter
+
+
+def test_a_pwm_number_command_acts_only_in_manual(cfg: MpcConfig) -> None:
+    sup = Supervisor(cfg)
+    client = _client(cfg, on_intent=sup.submit)
+    ch = cfg.channels[0]
+    topic = _entities(cfg, mode=ControlMode.MANUAL)[f"pwm_cmd_{ch}"].payload["command_topic"]
+    client._on_message(client.client, None, _Msg(topic, b"0.42"))
+    assert sup.overrides == {}  # auto: refused like HTTP's 409, logged and dropped
+    sup.submit(SetMode(mode="manual"))
+    client._on_message(client.client, None, _Msg(topic, b"0.42"))
+    assert sup.overrides[ch] == 0.42
+
+
+def test_a_smart_message_from_the_broker_reaches_the_inbox(cfg: MpcConfig) -> None:
+    """The SMART half of item 21: the agent's retained message on the broker ends up in
+    the inbox the estimator reads, over the daemon's one connection."""
+    inbox = SmartInbox()
+    client = _client(cfg)
+    client.add_topic_handler(smart_topic_filter(NODE_ID), inbox.on_message)
+    paho = _FakePaho()
+    client.client = paho
+    client._on_connect(paho, None, {}, 0)
+    assert smart_topic_filter(NODE_ID) in paho.subscribed
+
+    sample = {"serial": "S1", "model": "WDC WD40", "temp_c": 38.5, "ts_wall": 1_700_000_000.0}
+    retained = _Msg(f"{NODE_ID}/in/smart/S1", json.dumps(sample).encode())
+    retained.retain = True  # type: ignore[attr-defined]
+    client._on_message(paho, None, retained)
+    snapshot = inbox.snapshot()
+    assert snapshot["S1"]["temp_c"] == 38.5
+    assert snapshot["S1"]["model"] == "WDC WD40"
+    assert inbox.accepted == 1
+
+    client._on_message(paho, None, _Msg(f"{NODE_ID}/in/smart/S2", b"not json"))
+    assert "S2" not in inbox.snapshot() and inbox.rejected == 1
+
+
+def test_every_publish_uses_the_qos_and_retain_flags_of_section_7(cfg: MpcConfig) -> None:
+    client = _client(cfg)
+    paho = _FakePaho()
+    client.client = paho
+
+    client._on_connect(paho, None, {}, 0)
+    assert paho.published == [(availability_topic(NODE_ID), "online", 1, True)]
+
+    paho.published.clear()
+    client.publish_discovery(control_mode=ControlMode.MANUAL)
+    assert paho.published
+    for topic, payload, qos, retain in paho.published:
+        assert topic.startswith(f"{PREFIX}/") and topic.endswith("/config")
+        assert (qos, retain) == (1, True)
+        assert json.loads(payload)["unique_id"]
+
+    paho.published.clear()
+    client.publish_discovery(control_mode=ControlMode.AUTO)
+    deleted = [entry for entry in paho.published if entry[1] == ""]
+    assert deleted and all((qos, retain) == (1, True) for _, _, qos, retain in deleted)
+
+    paho.published.clear()
+    client.publish_state({"mode": "auto"}, {"cpu_temp_c": 41.0})
+    topic, payload, qos, retain = paho.published[0]
+    assert (topic, qos, retain) == (state_topic(NODE_ID), 0, True)
+    assert json.loads(payload) == {"mode": "auto", "host": {"cpu_temp_c": 41.0}}
+
+    paho.published.clear()
+    client.disconnect()
+    assert paho.published == [(availability_topic(NODE_ID), "offline", 1, True)]
+    assert paho.disconnected == 1
+
+
+def test_the_last_will_is_a_retained_offline_on_the_availability_topic(cfg: MpcConfig) -> None:
+    """A daemon killed without a clean stop must still go unavailable in Home Assistant.
+    paho keeps the will on private attributes; there is no public reader for it."""
+    client = _client(cfg)
+    paho = client.client
+    assert paho._will is True
+    assert paho._will_topic == availability_topic(NODE_ID).encode()
+    assert paho._will_payload == b"offline"
+    assert paho._will_qos == 1 and paho._will_retain is True
+
+
+def test_the_publisher_lifecycle_and_the_node_id_and_prefix_from_the_config(
+    cfg: MpcConfig,
+) -> None:
+    """online -> Discovery -> state -> offline on one connection, with every topic under
+    the configured node_id / discovery_prefix (item 21 runs against a broker where both
+    differ from the defaults)."""
+    pytest.importorskip("paho.mqtt.client")
+    from aqua_bridge.config import AppConfig
+    from aqua_bridge.publishers.runtime import MqttService
+
+    node_id, prefix = "attic-bridge", "ha-test"
+    sup = Supervisor(cfg)
+    app = AppConfig(
+        mpc=cfg,
+        mqtt={
+            "enabled": True,
+            "host": "broker.example",
+            "node_id": node_id,
+            "discovery_prefix": prefix,
+        },
+        host={"interval_s": 5},
+    )
+    service = MqttService.from_config(app, sup, hostinfo=lambda: {"cpu_temp_c": 41.0})
+    client = service.client
+    paho = _FakePaho()
+    client.client = paho
+
+    client._on_connect(paho, None, {}, 0)  # what paho's network thread calls
+    assert sup.snapshot().mqtt_connected is True
+    assert set(paho.subscribed) == set(command_topics(node_id, cfg).values())
+    service.on_tick(None)
+
+    assert paho.topics[0] == f"{node_id}/status"
+    assert paho.topics[-1] == f"{node_id}/state"
+    assert all(t.startswith((f"{node_id}/", f"{prefix}/")) for t in paho.topics)
+    assert any(t.startswith(f"{prefix}/sensor/{node_id}/") for t in paho.topics)
+    state = json.loads(paho.published[-1][1])
+    assert state["mode"] == "auto" and state["host"] == {"cpu_temp_c": 41.0}
+
+    service.stop()
+    assert paho.published[-1] == (f"{node_id}/status", "offline", 1, True)
+    assert paho.loops[-1] == "stop"
