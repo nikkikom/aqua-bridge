@@ -1750,8 +1750,11 @@ PE monitor over ~30 windows and a one-window prediction error
 exception (memory reset to the prior), `frozen` for a zone whose
 coefficients are held (never moves them, goes `suspect` by the converged
 rule): one loaded converged from a fresh store file, or — with
-`model_freeze: true` — one that reaches the converged rule at all, so a
+`model_freeze: true` — one that reaches the converged rule at all, and
+one already `converged` when the switch is turned on (at its next closing
+window, so the switch needs neither a restart nor a store file), so a
 model the owner considers finished stops adapting online. The switch
+acts as soon as the converged rule holds; it has no dwell of its own. The switch
 freezes a good model only: a frozen zone whose prediction error goes bad
 still becomes `suspect` and learns again, and a stale file's hold counts
 `frozen` as re-confirmed. `converged` needs enough excited
@@ -4365,7 +4368,11 @@ Owner decision (2026-09-16):
     document at its first save, so keep the report elsewhere.
 16. **Done** (2026-09-16): `mpc.model_freeze` (needs `topology`, default
     `false`). With it on, a zone that reaches the `converged` rule is
-    entered `frozen` instead, which online identification never moves; the
+    entered `frozen` instead, and a zone that is already `converged` when
+    the switch is turned on freezes at its next closing window — so the
+    switch acts on a model that has already converged without a restart or
+    a store file, which is the case it exists for. Online identification
+    never moves a frozen zone; the
     DAS MPC's validity gate accepts `frozen` exactly as it accepts
     `converged`, and a stale store file's hold counts `frozen` as
     re-confirmed. It freezes a good model only: a frozen zone whose

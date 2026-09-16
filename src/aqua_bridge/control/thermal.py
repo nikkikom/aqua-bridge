@@ -244,8 +244,11 @@ Status machine per zone (the model's status is the least advanced zone, with
   zone that was ``converged`` or ``frozen`` when a file younger than
   ``model_store_max_age_days`` was saved loads ``frozen`` (:func:`restore`).
   (b) ``model_freeze: true``: a zone that reaches the ``converged`` rule is entered as
-  ``frozen`` instead, so a model the owner considers converged stops adapting online
-  (plan section 8 item 16). Either way the zone is accepted by the DAS MPC's validity
+  ``frozen`` instead, and a zone that is already ``converged`` when the switch is turned
+  on becomes ``frozen`` at its next closing window -- so a model the owner considers
+  converged stops adapting online however it got there, with no restart and no store file
+  needed (plan section 8 item 16). The switch acts as soon as the converged rule holds;
+  it has no dwell of its own. Either way the zone is accepted by the DAS MPC's validity
   gate like ``converged`` and its windows still close, score the prediction error and
   advance the PE monitor, but never move ``theta``/``P`` (``learn=False`` for its
   blocks). It becomes ``suspect`` by the same rule as ``converged`` and then learns
@@ -2098,6 +2101,10 @@ def _advance_status(
         zm["conv"] = max(pred_err, PRED_ERR_FLOOR_C)
         zm["bad"] = 0
     elif status in ("converged", "frozen"):
+        # a zone that converged before the switch was turned on freezes at its next
+        # window: the switch means "this model is finished", whenever it is set
+        if status == "converged" and cfg.model_freeze:
+            status = "frozen"
         level = max(float(zm["conv"] or PRED_ERR_FLOOR_C), PRED_ERR_FLOOR_C)
         zm["bad"] = int(zm["bad"]) + 1 if window_err > SUSPECT_FACTOR * level else 0
         if zm["bad"] >= SUSPECT_WINDOWS:
