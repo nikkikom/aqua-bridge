@@ -1367,11 +1367,13 @@ class EstimatorSpec:
       this long is no longer trusted (> 0)
     * ``calibrate_min_c`` / ``calibrate_max_c`` -- the drive temperature a manual
       calibration (``POST /api/calibrate``, PROJECT.md section 8 item 23) may report,
-      degC: the value must lie in ``[calibrate_min_c, calibrate_max_c]``, which must be
-      a non-empty range inside the gate's ``(temp_min_c, temp_max_c)``. A handheld
-      reading is typed in by a human, so the range is narrower than the gate's on
-      purpose: a typo (``450`` for ``45``) is refused instead of fitting the bay's
-      sensor-to-drive map to nonsense
+      degC: the value must lie in ``[calibrate_min_c, calibrate_max_c]``
+      (``calibrate_min_c < calibrate_max_c``), narrowed to the gate's absolute range
+      by :attr:`MpcConfig.calibrate_range` -- narrowing ``temp_min_c`` /
+      ``temp_max_c`` below these defaults is not a config error. A handheld reading is
+      typed in by a human, so the range is narrower than the gate's on purpose: a typo
+      (``450`` for ``45``) is refused instead of fitting the bay's sensor-to-drive map
+      to nonsense
     * ``associate_window_s`` / ``associate_min_corr`` / ``associate_margin`` -- serial
       -> bay association by correlation (``>= 600``, ``(0, 1)``, ``(0, 1)``)
     """
@@ -2621,15 +2623,6 @@ class MpcConfig:
         if not isinstance(self.estimator, EstimatorSpec):
             raise ConfigError("mpc.estimator must be an estimator entry")
         self.estimator.validate(dt)
-        # The manual-calibration range is a drive temperature like any other, so it must
-        # lie inside the gate's absolute range (item 23).
-        for key in ("calibrate_min_c", "calibrate_max_c"):
-            value = getattr(self.estimator, key)
-            if not self.temp_min_c < value < self.temp_max_c:
-                raise ConfigError(
-                    f"mpc.estimator.{key} ({value}) must lie in "
-                    f"({self.temp_min_c}, {self.temp_max_c})"
-                )
 
     def _derive(self) -> _Derived:
         """Zone layout and per-temperature Stuck parameters (validated config only)."""
@@ -2864,6 +2857,26 @@ class MpcConfig:
     def bay_comfort(self, bay: str) -> float:
         """Comfort band of ``bay``: its class ``comfort_c``."""
         return self.drive_classes[self.bay_class(bay)].comfort_c
+
+    @property
+    def calibrate_range(self) -> tuple[float, float] | None:
+        """Drive temperature ``POST /api/calibrate`` accepts, degC (item 23); ``None``
+        without an estimator.
+
+        ``estimator.calibrate_min_c`` / ``calibrate_max_c`` narrowed to the gate's
+        absolute range ``[temp_min_c, temp_max_c]``: a reading the gate itself would
+        throw away as implausible may not fit a bay's sensor-to-drive map either. The
+        two keys keep one documented default each (5 / 80 degC) and narrowing the gate
+        below them is not a config error -- an operator who never wrote the keys must
+        never find the daemon refusing to start over them.
+        """
+        spec = self.estimator
+        if not isinstance(spec, EstimatorSpec):
+            return None
+        return (
+            max(spec.calibrate_min_c, self.temp_min_c),
+            min(spec.calibrate_max_c, self.temp_max_c),
+        )
 
     def temps_for_channel(self, channel: str) -> tuple[str, ...]:
         """Temperatures (all with setpoints) that ``channel`` controls.
