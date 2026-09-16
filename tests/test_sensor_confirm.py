@@ -261,6 +261,42 @@ def test_a_never_referenced_first_reading_confirms_on_a_time_faulted_tick(ccfg):
     assert good is None or good.temps.get("prox_a1b") is None  # not fused while confirming
 
 
+def test_the_outward_gate_diagnostics_agree_about_a_confirming_sensor(ccfg):
+    """Item 63: ``per_temp``, ``reasons`` and the ``trusted`` summary of the outward
+    ``diagnostics["gate"]`` say the same thing about a confirming sensor, so a consumer
+    cannot pick the one key that still reads "trusted, no reason given". The top-level
+    ``diagnostics["trusted"]`` keeps its own meaning (the gate's own verdict on this
+    tick) and is not touched."""
+    base = settled(ccfg)
+    level = PROX_C + JUMP_C
+    rec = run(
+        ccfg,
+        lambda i: patched(ccfg, prox_a1b=level),
+        ccfg.confirm_ticks + 2,
+        state=base,
+        t0=SETTLE_TICKS,
+    )
+    seen_clean = False
+    for k, (cmd, _state) in enumerate(rec):
+        gate = cmd.diagnostics["gate"]
+        confirming = cmd.diagnostics["sensor_confirm"]
+        if "prox_a1b" in confirming:
+            assert gate["per_temp"]["prox_a1b"] is False, k
+            assert gate["trusted"] is False, k
+            if k == 0:  # the jump itself: the gate's own reason, nothing added
+                assert gate["reasons"]["prox_a1b"] == ["slew"], k
+            else:  # past it the raw reading passes cleanly, so "confirming" is the reason
+                assert gate["reasons"]["prox_a1b"] == ["confirming"], k
+                assert cmd.diagnostics["trusted"] is True, k  # the gate accepted the tick
+                seen_clean = True
+        else:
+            assert gate["per_temp"]["prox_a1b"] is True, k
+            assert "prox_a1b" not in gate["reasons"], k
+            assert gate["trusted"] is True, k
+    assert seen_clean  # the interesting case really occurred
+    assert json.dumps(rec[1][0].diagnostics, allow_nan=False)  # still serialisable
+
+
 def test_a_dropout_while_confirming_restarts_the_count(ccfg):
     base = settled(ccfg)
     level = PROX_C + JUMP_C
@@ -526,7 +562,8 @@ def test_no_unconfirmed_value_is_ever_used(events, offset, median3, repeated_ts)
             time_ok = cmd.diagnostics["time"]["status"] in ("ok", "first")
 
             def raw_trusted(name: str, gate: Mapping[str, Any] = gate) -> bool:
-                return not gate["reasons"].get(name)
+                # "confirming" is this tick's own outward annotation, not a gate verdict
+                return not set(gate["reasons"].get(name, ())) - {zones.REASON_CONFIRMING}
 
             for name in cfg.temps:
                 if set(gate["reasons"].get(name, ())) & {"range", "slew", "stuck"}:
@@ -549,8 +586,12 @@ def test_no_unconfirmed_value_is_ever_used(events, offset, median3, repeated_ts)
                 new = None if state.last_good_obs is None else state.last_good_obs.temps.get(name)
                 assert new == old, (k, name)
                 # item 63: the outward diagnostics never call a confirming sensor trusted,
-                # even though its raw reading may have passed the gate cleanly this tick
+                # even though its raw reading may have passed the gate cleanly this tick,
+                # and per_temp, reasons and the trusted summary all agree about it
                 assert gate["per_temp"][name] is False, (k, name)
+                assert gate["trusted"] is False, (k, name)
+                if raw_trusted(name):  # the gate accepted it: say why it is still not used
+                    assert gate["reasons"][name] == [zones.REASON_CONFIRMING], (k, name)
             # with every sole member trusted and a confirmed trusted member on bay a1, za is
             # trusted: a redundant member, confirming or not, never faults the zone by itself
             groups_ok = (

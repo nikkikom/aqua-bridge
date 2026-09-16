@@ -134,6 +134,7 @@ __all__ = [
     "FLOOR_HOLD",
     "FLOOR_RELEASE",
     "FLOOR_RELEASED",
+    "REASON_CONFIRMING",
     "SigmaFloor",
     "ZoneTrust",
     "advance_confirmation",
@@ -155,6 +156,10 @@ _TIME_OK = ("first", "ok")
 
 #: Gate reasons that reject a present value and start a sensor's confirmation.
 CONFIRM_REASONS = frozenset({REASON_RANGE, REASON_SLEW, REASON_STUCK})
+
+#: Not a gate reason: why a sensor whose raw reading passed the gate is still not used
+#: (a zone's reasons, and the outward ``diagnostics["gate"]["reasons"]``; item 63).
+REASON_CONFIRMING = "confirming"
 
 
 @dataclass(frozen=True)
@@ -350,7 +355,7 @@ def evaluate(
 def _member_detail(name: str, gate: GateResult, confirming: Mapping[str, int]) -> str:
     """Why a member does not count, for the zone's reasons."""
     if gate.per_temp.get(name, False) and name in confirming:
-        return "confirming"
+        return REASON_CONFIRMING
     return "/".join(gate.reasons.get(name, ())) or "untrusted"
 
 
