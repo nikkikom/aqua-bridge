@@ -6,6 +6,13 @@ lands in ``solver_memory["fan_curves"]`` -- the model store's own section, in th
 it already validates. From there the thermal model and the DAS MPC plan on it instead of
 the ``fan_models`` entry. Off by default: nothing reads a curve without
 ``mpc.fan_curve_online``.
+
+Item 107 adds the rest of the readers and the decision per reader
+(``fancurve.READERS``): each one with a fit and without, the two halves of the stale
+rule, the fallback to the stored curve, and two closed loops on the DAS truth plant
+through :func:`invariants.checked_step` -- one with a curve in force throughout, one
+where it goes stale mid-run -- because the fit moves the MPC's objective and the
+estimator's airflow, not only a reported number.
 """
 
 from __future__ import annotations
@@ -551,3 +558,237 @@ def test_a_curve_from_the_store_is_in_force_until_a_fit_replaces_it() -> None:
 def test_the_max_age_must_leave_room_for_one_refit() -> None:
     with pytest.raises(ConfigError, match="fan_curve_max_age_s"):
         online_cfg(fan_curve_refit_s=600.0, fan_curve_max_age_s=599.0)
+
+
+def test_a_regulator_that_never_settles_keeps_the_fit_its_tachometers_confirm() -> None:
+    """The stale rule's second stamp is a tachometer *reading*, not a settled sample.
+    The DAS QP moves the duty on nearly every solve, so settled samples can stop arriving
+    for hours on perfectly healthy hardware; a controller that is merely regulating must
+    not lose the curve its live tachometers keep confirming (item 107)."""
+    cfg = online_cfg(fan_curve_max_age_s=60.0)
+    memory, curves = feed(cfg, [0.2, 0.4, 0.6, 0.8, 1.0])
+    assert set(curves) == {"p12", "p14"}
+    ts = 5 * 8 * cfg.dt  # what feed advanced to
+    sampled = sum(row[0] for row in memory["models"]["p12"]["bins"])
+
+    out = None
+    for k in range(600):  # ten age windows of a duty that never holds still
+        duty = 0.55 + 0.05 * math.sin(k / 7.0)
+        out = fancurve.update(
+            memory,
+            cfg,
+            u=dict.fromkeys(cfg.channels, duty),
+            rpm={ch: truth_rpm(cfg, ch, duty) for ch in cfg.channels},
+            ts=ts,
+        )
+        memory = out.memory
+        ts += cfg.dt
+    assert out is not None
+    assert out.stale == () and set(out.curves) == {"p12", "p14"}
+    # not one of those ticks was settled: the bins are exactly where the sweep left them
+    assert sum(row[0] for row in memory["models"]["p12"]["bins"]) == sampled
+    assert memory["models"]["p12"]["sample_ts"] == pytest.approx(ts - cfg.dt)
+
+
+def test_a_fit_no_refit_re_accepts_ages_out_on_its_own_stamp() -> None:
+    """The other half of the rule: a tachometer that lies badly enough that every refit
+    is refused. Settled samples keep arriving, so ``sample_age_s`` stays small, and what
+    ages out is the accepted fit itself (item 107)."""
+    cfg = online_cfg(fan_curve_max_age_s=60.0)
+    memory, curves = feed(cfg, [0.2, 0.4, 0.6, 0.8, 1.0])
+    assert set(curves) == {"p12", "p14"}
+    ts = 5 * 8 * cfg.dt
+
+    # the same sweep, now read by a tachometer whose scatter no fit can carry
+    memory, curves = feed(
+        cfg, [0.2, 0.4, 0.6, 0.8, 1.0] * 20, ticks_per_duty=4, noise=900.0, memory=memory, t0=ts
+    )
+    assert curves == {}  # nothing is published any more
+    block = memory["models"]["p12"]
+    # a refused refit leaves the stamp alone: the last one that passed is the one from
+    # the clean sweep, hundreds of seconds before the end of the noisy one
+    assert block["fit"]["ts"] <= ts + cfg.fan_curve_refit_s
+    assert "RMSE" in (block["rejected"] or "")
+    summary = fancurve.summary(memory, cfg, {}, ts=block["sample_ts"])
+    row = summary["models"]["p12"]
+    assert row["stale"] is True and row["source"] == "config"
+    assert row["age_s"] > cfg.fan_curve_max_age_s  # the accepted fit aged out
+    assert row["sample_age_s"] < cfg.fan_curve_max_age_s  # while the tach kept reporting
+
+
+def test_a_stale_fit_falls_back_to_the_stored_curve_instead_of_erasing_it() -> None:
+    """``solver_memory["fan_curves"]`` is the section the model store writes back, and a
+    seed the store's own age rule accepted at load lives in it. A fit of this run going
+    stale must return to that curve, not delete it from the file (item 107)."""
+    from aqua_bridge import modelstore
+    from aqua_bridge.model import STORE_SEED_KEY
+
+    cfg = online_cfg(fan_curve_max_age_s=60.0)
+    stored = {"rpm_max": 1800.0, "deadband": 0.3, "exponent": 0.9}
+    memory, curves = feed(cfg, [0.2, 0.4, 0.6, 0.8, 1.0])
+    state = MpcState(
+        solver_memory={
+            STORE_SEED_KEY: {"source": "fresh", "fan_curves": {"p12": dict(stored)}},
+            "fan_fit": memory,
+        }
+    )
+    cmd, state = step(das_obs(cfg, 0.0, pwm=0.5), cfg, state)
+    # this run's fit is in force while it is confirmed, over the stored curve
+    assert state.solver_memory["fan_curves"]["p12"] == curves["p12"]
+    assert cmd.diagnostics["fan_curves"]["models"]["p12"]["source"] == "fit"
+
+    blind = {ch: None for ch in cfg.channels}
+    for i in range(1, 12):
+        cmd, state = step(das_obs(cfg, float(i) * 20.0, pwm=0.5, rpm=blind), cfg, state)
+    row = cmd.diagnostics["fan_curves"]["models"]["p12"]
+    assert row["stale"] is True and row["source"] == "store"
+    # back to the stored curve, and it is still the curve the readers plan on
+    assert state.solver_memory["fan_curves"]["p12"] == stored
+    assert (row["deadband"], row["exponent"]) == (stored["deadband"], stored["exponent"])
+    params = thermal.model_params(cfg, curves=state.solver_memory["fan_curves"])
+    assert params.fan["fa1"] == (stored["deadband"], stored["exponent"])
+    # p14 had no stored curve, so its stale fit leaves the section altogether
+    assert "p14" not in state.solver_memory["fan_curves"]
+    assert cmd.diagnostics["fan_curves"]["models"]["p14"]["source"] == "config"
+    # and what the store would write back still carries the commissioned curve
+    doc = modelstore.build_document(cfg, state.solver_memory, ts=0.0, wall=1_800_000_000.0)
+    assert doc["fan_curves"] == {"p12": stored}
+
+
+def test_a_zone_of_two_fan_models_reports_a_mixed_airflow_curve() -> None:
+    """``airflow_curve`` must not read ``fit`` for a zone most of whose airflow is still
+    the configured curve: a zone whose channels are of several fan models says ``mixed``
+    until every one of them has a usable curve (item 107)."""
+    from aqua_bridge.control import estimator
+
+    fans = das_mapping()["fans"]
+    fans["fa2"]["model"] = "p14"  # zone za now straddles p12 and p14
+    cfg = online_cfg(fans=fans)
+    temps = {k: v for k, v in default_temps(cfg).items() if v is not None}
+    u = dict.fromkeys(cfg.channels, 0.5)
+
+    def curve(curves: Any) -> str:
+        up = estimator.update(None, cfg, temps=temps, u=u, ts=0.0, curves=curves)
+        return up.zones["za"]["airflow_curve"]
+
+    assert curve(None) == "config"
+    assert curve({}) == "config"
+    assert curve({"p12": FITTED["p12"]}) == "mixed"
+    assert curve({"p14": FITTED["p14"]}) == "mixed"
+    assert curve(FITTED) == "fit"
+    # zone zb is one fan model, so it never reads mixed
+    up = estimator.update(None, cfg, temps=temps, u=u, ts=0.0, curves={"p12": FITTED["p12"]})
+    assert up.zones["zb"]["airflow_curve"] == "config"
+
+
+# ---------------------------------------------------------------------------
+# closed loop on the DAS truth plant, with the switch on (item 107)
+# ---------------------------------------------------------------------------
+
+#: A curve far from the DAS example's ``case120`` (``deadband: 0.1``, ``exponent: 1.0``):
+#: a fan that only starts to turn at a quarter duty. It moves the thermal model, the
+#: estimator's airflow and the noise objective at once.
+LOOP_FIT = {"rpm_max": 1500.0, "deadband": 0.25, "exponent": 1.0}
+
+
+def loop_cfg(das_example_cfg: MpcConfig, **changes: Any) -> MpcConfig:
+    """The DAS example with the MPC acting on its prior model and the fit switched on."""
+    return dataclasses.replace(
+        das_example_cfg,
+        solver="mpc",
+        model_accept_prior=True,
+        fan_curve_online=True,
+        **changes,
+    )
+
+
+def run_loop(cfg: MpcConfig, ticks: int, memory: dict[str, Any]) -> Any:
+    """``ticks`` of ``invariants.checked_step`` against the DAS truth plant, starting from
+    ``solver_memory``: every section 4.1 invariant is asserted on every tick."""
+    from aqua_bridge.sim.das import (
+        SENSOR_TYPES,
+        build_das_plant,
+        run_das_closed_loop,
+        topology_from_config,
+    )
+    from invariants import checked_step
+
+    topology = topology_from_config(cfg)
+    for entry in topology["sensors"].values():
+        entry["noise_sigma_c"] = SENSOR_TYPES[entry["type"]].noise_sigma_c
+    topology["inlet"] = {"base_c": 25.0}
+    plant = build_das_plant(
+        topology,
+        preset="basic",
+        dt=cfg.dt,
+        initial_pwm=0.5,
+        seed=20260913,
+        heat_schedule={"b02": [(300.0, 1.0)], "b10": [(600.0, 1.0)]},
+    )
+    state = MpcState(solver_memory=memory)
+    return run_das_closed_loop(plant, cfg, checked_step, ticks, state=state)
+
+
+def seeded_fit(cfg: MpcConfig, model: str, ts: float) -> dict[str, Any]:
+    """An accumulator whose only content is an accepted fit stamped at ``ts``: its bins
+    are empty, so no refit can ever re-accept it and it ages out on its own stamp."""
+    memory = fancurve.fresh_memory(cfg)
+    memory["models"][model]["fit"] = dict(
+        LOOP_FIT, rmse_frac=0.01, n=500.0, bins=8, span=0.6, ts=ts
+    )
+    memory["models"][model]["sample_ts"] = ts
+    return memory
+
+
+def test_a_curve_in_force_keeps_a_closed_loop_on_the_truth_plant_safe(
+    das_example_cfg: MpcConfig,
+) -> None:
+    """The fit moves the objective and the estimator, not only a reported number, so it
+    has to be run in the loop: 20 minutes on the truth plant through
+    ``invariants.checked_step``, with a curve whose dead band is two and a half times the
+    configured one. No invariant fires, no drive crosses its limit, no zone faults and the
+    MPC never falls back -- and the readers really are on that curve (item 107)."""
+    from aqua_bridge.model import Mode
+
+    cfg = loop_cfg(das_example_cfg)
+    run = run_loop(cfg, 240, {"fan_curves": {"case120": dict(LOOP_FIT)}})
+    assert run.violations() == 0
+    assert {r.cmd.mode for r in run.records} <= {Mode.AUTO, Mode.SATURATED}
+    assert {r.cmd.diagnostics["solver_diag"]["model"]["active"] for r in run.records} == {"mpc"}
+
+    last = run.records[-1].cmd.diagnostics
+    row = last["fan_curves"]["models"]["case120"]
+    assert (row["deadband"], row["exponent"]) == (LOOP_FIT["deadband"], LOOP_FIT["exponent"])
+    assert row["stale"] is False
+    ch = cfg.channels[0]
+    assert last["noise"]["channels"][ch]["u0"] == LOOP_FIT["deadband"]
+    assert all(z["airflow_curve"] == "fit" for z in last["estimator"]["zones"].values())
+
+
+def test_a_curve_going_stale_mid_loop_does_not_take_the_mpc_down(
+    das_example_cfg: MpcConfig,
+) -> None:
+    """The flip back to the configured curve changes the thermal regressor, the
+    estimator's airflow and the objective on one tick. It must stay a change of plan, not
+    a fault: the same closed loop, with the fit ageing out halfway (item 107)."""
+    from aqua_bridge.model import Mode
+
+    cfg = loop_cfg(das_example_cfg, fan_curve_refit_s=600.0, fan_curve_max_age_s=600.0)
+    run = run_loop(cfg, 240, {"fan_fit": seeded_fit(cfg, "case120", 0.0)})
+    rows = [r.cmd.diagnostics["fan_curves"]["models"]["case120"] for r in run.records]
+    assert rows[0]["source"] == "fit" and rows[0]["stale"] is False
+    assert rows[-1]["source"] == "config" and rows[-1]["stale"] is True
+    flip = next(i for i, row in enumerate(rows) if row["stale"])
+    assert 0 < flip < len(rows) - 1, "the fit must go stale inside the run"
+
+    assert run.violations() == 0
+    assert {r.cmd.mode for r in run.records} <= {Mode.AUTO, Mode.SATURATED}
+    assert {r.cmd.diagnostics["solver_diag"]["model"]["active"] for r in run.records} == {"mpc"}
+    # every reader moved together on that tick, and none of them lags a tick behind
+    before = run.records[flip - 1].cmd.diagnostics
+    after = run.records[flip].cmd.diagnostics
+    ch = cfg.channels[0]
+    assert before["noise"]["channels"][ch]["u0"] == LOOP_FIT["deadband"]
+    assert after["noise"]["channels"][ch]["u0"] == das_example_cfg.fan_models["case120"].deadband
+    assert all(z["airflow_curve"] == "fit" for z in before["estimator"]["zones"].values())
+    assert all(z["airflow_curve"] == "config" for z in after["estimator"]["zones"].values())
