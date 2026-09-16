@@ -747,6 +747,34 @@ def test_model_freeze_enters_a_converged_zone_frozen(small, monkeypatch):
     assert advance(zm, 0.05, True, True) == "frozen"
 
 
+def test_model_freeze_turned_on_later_freezes_an_already_converged_zone(small, monkeypatch):
+    """The case the switch is for: the owner watches ``/api/model`` until the zones read
+    ``converged``, then sets ``model_freeze`` and reloads the config. Without a restart
+    and without a store file, the zone must stop adapting -- so ``converged`` enters
+    ``frozen`` at its next closing window, not only ``learning``."""
+    d = thermal._derived(small)
+    params = thermal.model_params(small, st=d.st)
+    mem = thermal.fresh_memory(small)
+
+    def advance(cfg, zm, err, excited, converged):
+        monkeypatch.setattr(thermal, "_zone_blocks_converged", lambda *a, **k: converged)
+        thermal._advance_status(
+            zm, mem, cfg, d.st, "za", err, excited, params, d.zone_specs, d.bay_specs
+        )
+        return zm["status"]
+
+    zm = _zone_state(status="learning")
+    assert advance(small, zm, 0.05, True, True) == "converged"  # the switch is still off
+    assert advance(small, zm, 0.05, True, True) == "converged"
+
+    frozen_cfg = dataclasses.replace(small, model_freeze=True)
+    assert advance(frozen_cfg, zm, 0.05, True, True) == "frozen"
+    # and it still never holds a model the data contradicts
+    for _ in range(thermal.SUSPECT_WINDOWS):
+        status = advance(frozen_cfg, zm, 1.0, False, True)
+    assert status == "suspect"
+
+
 def test_model_freeze_holds_a_frozen_zone_theta_while_its_windows_close(small):
     """The freeze is the same hold a fresh store file gets: windows keep closing and
     scoring the prediction error, ``theta`` never moves."""

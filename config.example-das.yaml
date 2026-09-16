@@ -313,9 +313,11 @@ mpc:
   model_use_rpm: false   # airflow from the tachometer instead of the PWM curve where one reports
   model_reset_on_swap: true  # a hot-swapped bay's g0, k and q_s start over from the prior
   # Freeze a converged model: with model_freeze the zone that reaches the converged rule is
-  # entered frozen instead, so online identification never moves its coefficients again. The
-  # DAS MPC accepts frozen exactly like converged. It freezes a good model only: a zone whose
-  # prediction error later goes bad still becomes suspect and learns again.
+  # entered frozen instead, and a zone that is already converged when the switch is turned on
+  # freezes at its next closing window (no restart, no store file needed), so online
+  # identification never moves its coefficients again. The DAS MPC accepts frozen exactly like
+  # converged. It freezes a good model only: a zone whose prediction error later goes bad still
+  # becomes suspect and learns again.
   model_freeze: false
   # Per-channel split of a fan group's effectiveness (control/thermal.py). Regulation moves a
   # group's channels together, so only the group coefficient E.<zone>.<group> is identifiable
