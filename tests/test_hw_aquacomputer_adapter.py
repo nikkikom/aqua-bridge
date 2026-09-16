@@ -1307,17 +1307,23 @@ def test_aquabus_modes_get_no_warning_and_the_unconfigured_block_is_reported_onc
     assert state.mode is not None and state.mode.raw == 0  # the mode is never written
 
 
-def test_an_output_without_a_device_on_aquabus_fails_the_read_not_the_write(caplog) -> None:
-    """Nothing on aquabus: fan blocks 5-8 read rpm 0xFFFF. read() raises naming the
-    channel, lists it in absent_channels and logs one error; apply() writes every
-    channel and does not raise (an apply() that raised after its write would freeze the
-    loop's fallback ramp, PROJECT.md section 8 item 90)."""
-    binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1, "qd1": 5}, fan_map={"qd1": 5})
+def test_an_output_without_a_device_on_aquabus_faults_only_its_own_channel(caplog) -> None:
+    """Nothing on aquabus: fan blocks 5-8 read rpm 0xFFFF. That channel's rpm and duty are
+    None, every other channel and every temperature still comes through, read() does not
+    raise, and apply() writes every channel (PROJECT.md section 8 item 90)."""
+    binding = DeviceBinding(
+        kind=AQUAERO,
+        pwm_map={"xt1": 1, "qd1": 5},
+        fan_map={"xt1": 1, "qd1": 5},
+        temp_map={"inlet": "temp6"},
+    )
     adapter, device, _bus, clock, _ = _setup(binding)  # the plain aquaero fixture
     assert adapter.absent_channels == ()
     with caplog.at_level("INFO", logger=LOGGER):
-        with pytest.raises(DeviceUnavailable, match=r"pwm5 \(qd1\), fan5 \(qd1\).*0xFFFF"):
-            adapter.read()
+        obs = adapter.read()
+        assert obs.rpm == {"xt1": 0.0, "qd1": None}
+        assert obs.pwm == {"xt1": pytest.approx(1.0), "qd1": None}
+        assert obs.temps == {"inlet": pytest.approx(22.26)}
         assert adapter.absent_channels == ("qd1",)
         adapter.apply(_fault(Mode.FALLBACK, xt1=0.8, qd1=0.8))
         assert len(device.sets()) == 1
@@ -1329,27 +1335,51 @@ def test_an_output_without_a_device_on_aquabus_fails_the_read_not_the_write(capl
         for _ in range(5):
             clock.advance(AQUAERO_T.duty_mismatch_s)
             device.emit()
-            with pytest.raises(DeviceUnavailable):
-                adapter.read()
+            assert adapter.read().pwm["qd1"] is None
         assert adapter.control_report is not None and adapter.stuck_channels == ()
-        # The Quadro is plugged into aquabus: reads work again.
+        # The Quadro is plugged into aquabus again.
         device.status_template = fixture_bytes("aquaero-status-aquabus-fan7-100.bin")
         device.emit()
         obs = adapter.read()
-    assert obs.rpm == {"qd1": 0.0} and obs.pwm["qd1"] == pytest.approx(0.3)
+    assert obs.rpm == {"xt1": 349.0, "qd1": 0.0} and obs.pwm["qd1"] == pytest.approx(0.3)
     assert adapter.absent_channels == ()
     (error,) = _messages(caplog, "ERROR")
     assert error.startswith("aquaero: no device behind pwm5 (qd1), fan5 (qd1)")
+    assert "commands no reachable output" not in error  # xt1 is still commanded
     assert [m for m in _messages(caplog, "INFO") if "again" in m] == [
         "aquaero: a device is behind pwm5 (qd1), fan5 (qd1) again"
     ]
 
 
-def test_a_bound_aquabus_tachometer_without_a_device_fails_the_read_only() -> None:
+def test_every_commanded_output_absent_is_named_once_and_still_reads(caplog) -> None:
+    """The other half of item 90: every commanded output on the missing aquabus device.
+    The controller is still not unavailable -- its temperatures are what makes the fans
+    of the other controllers ramp -- but the error says it commands nothing reachable."""
+    binding = DeviceBinding(
+        kind=AQUAERO,
+        pwm_map={"qd1": 5, "qd2": 6},
+        fan_map={"qd1": 5},
+        temp_map={"inlet": "temp6"},
+    )
+    adapter, device, _bus, clock, _ = _setup(binding)
+    with caplog.at_level("INFO", logger=LOGGER):
+        for _ in range(3):  # the state change is logged once, not once per tick
+            clock.advance(1.0)
+            device.emit()
+            obs = adapter.read()
+    assert obs.pwm == {"qd1": None, "qd2": None} and obs.rpm == {"qd1": None}
+    assert obs.temps == {"inlet": pytest.approx(22.26)}
+    assert adapter.absent_channels == ("qd1", "qd2")
+    (error,) = _messages(caplog, "ERROR")
+    assert "no device behind pwm5 (qd1), pwm6 (qd2), fan5 (qd1)" in error
+    assert "commands no reachable output now" in error
+
+
+def test_a_bound_aquabus_tachometer_without_a_device_faults_the_rpm_only() -> None:
     binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1}, fan_map={"xt1": 7})
     adapter, device, _bus, _clock, _ = _setup(binding)
-    with pytest.raises(DeviceUnavailable, match=r"fan7 \(xt1\)"):
-        adapter.read()
+    obs = adapter.read()
+    assert obs.rpm == {"xt1": None} and obs.pwm == {"xt1": pytest.approx(1.0)}
     assert adapter.absent_channels == ("xt1",)
     adapter.apply(_cmd(xt1=0.5))  # the output itself is the aquaero's own
     assert len(device.sets()) == 1

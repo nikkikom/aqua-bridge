@@ -27,14 +27,25 @@ Reading
     report carrying another serial closes the device and raises. A commanded
     aquabus output (aquaero 5-8) or a bound aquabus tachometer whose fan block
     reads rpm ``0xFFFF`` has no device behind it (nothing on the aquaero's
-    aquabus): ``read()`` raises naming it (the loop runs its fallback), lists
-    it in ``absent_channels`` and logs one error when that list changes. The
-    check uses the newest status report alone; the aquaero's own outputs 1-4
-    are not checked. ``apply()`` writes such an output with the others and
-    does not raise for it: the loop rate limits its fallback ramp against the
-    last command whose ``apply()`` succeeded, so a write that went out and
-    then raised would hold every fan below ``fallback_pwm`` for as long as the
-    slot stays empty (PROJECT.md section 8 item 90).
+    aquabus): that channel's ``rpm`` and ``pwm`` are ``None`` in the
+    observation, it is listed in ``absent_channels``, and one error is logged
+    when that list changes (one info line when it empties) -- once per state
+    change, not once per tick. Everything else the controller reports comes
+    through unchanged, its temperatures included, and the write path is
+    untouched: ``apply()`` writes an absent output with the others and does not
+    raise for it. **Only a controller with no usable status report is
+    unavailable** (a vanished node, the wrong serial, or nothing within
+    ``status_max_age_s``): faulting the whole device for an empty slot would
+    blind its healthy half -- the aquaero's own thermistors and outputs -- and
+    put the loop in fallback for as long as the slot stays empty, which is what
+    PROJECT.md section 8 item 90 is about. A fan the daemon cannot command is
+    still safe through the plant: the zones it served lose cooling, their
+    temperatures rise and the remaining fans ramp. An adapter whose *every*
+    commanded output is absent says so in that one error line and is still not
+    unavailable, since its temperatures are exactly what the solver needs to
+    ramp the fans that are left. The check uses the newest status report alone,
+    with no confirmation over time, and never covers the aquaero's own outputs
+    1-4; a single transient ``0xFFFF`` costs that channel one tick of ``None``.
 
 Writing
     ``apply()`` opens the node without waiting for a status report, so the
@@ -684,38 +695,46 @@ class AquacomputerAdapter:
         behind it (rpm ``0xFFFF``). The aquaero's own outputs are never empty slots."""
         return number in self._aquabus and not status.fans[number - 1].present
 
-    def _check_absent(self, status: StatusReport) -> None:
-        """Updates ``absent_channels`` from ``status`` (one log line when it changes) and
-        raises :class:`DeviceUnavailable` while it is not empty."""
+    def _check_absent(self, status: StatusReport) -> tuple[frozenset[str], frozenset[str]]:
+        """Which channels have no device behind their output / their tachometer,
+        with one log line per state change (module docstring, Reading).
+
+        Returns ``(channels whose pwm is absent, channels whose rpm is absent)``;
+        those values are ``None`` in the observation. Nothing raises here: an empty
+        aquabus slot faults its own channel, never the whole controller.
+        """
         b = self.binding
-        found = [
-            (f"{role}{n} ({ch})", ch)
+        absent_pwm = frozenset(ch for ch, n in b.pwm_map.items() if self._empty_slot(status, n))
+        absent_rpm = frozenset(ch for ch, n in b.fan_map.items() if self._empty_slot(status, n))
+        inputs = tuple(
+            f"{role}{n} ({ch})"
             for role, mapping in (("pwm", b.pwm_map), ("fan", b.fan_map))
             for ch, n in sorted(mapping.items(), key=lambda item: item[1])
             if self._empty_slot(status, n)
-        ]
-        inputs = tuple(name for name, _ in found)
-        message = (
-            f"{b.label}: no device behind {', '.join(inputs)}: the status report's fan block "
-            "reads rpm 0xFFFF (nothing on the aquaero's aquabus)"
         )
         if inputs != self._absent_inputs:
-            if inputs:
-                _LOG.error(
-                    "%s; reads fail until a device is behind it, writes still go out "
-                    "(PROJECT.md section 8 item 90)",
-                    message,
-                )
-            else:
-                _LOG.info(
-                    "%s: a device is behind %s again",
-                    b.label,
-                    ", ".join(self._absent_inputs),
-                )
+            self._log_absent_change(inputs, absent_pwm)
             self._absent_inputs = inputs
-            self._absent_channels = tuple(sorted({ch for _, ch in found}))
-        if inputs:
-            raise DeviceUnavailable(message)
+            self._absent_channels = tuple(sorted(absent_pwm | absent_rpm))
+        return absent_pwm, absent_rpm
+
+    def _log_absent_change(self, inputs: tuple[str, ...], absent_pwm: frozenset[str]) -> None:
+        label = self.binding.label
+        if not inputs:
+            _LOG.info("%s: a device is behind %s again", label, ", ".join(self._absent_inputs))
+            return
+        commanded = set(self.binding.pwm_map)
+        all_gone = bool(commanded) and absent_pwm >= commanded
+        blind = "; this controller commands no reachable output now" if all_gone else ""
+        _LOG.error(
+            "%s: no device behind %s: the status report's fan block reads rpm 0xFFFF (nothing "
+            "on the aquaero's aquabus). Those channels report no rpm and no duty, every other "
+            "channel and every temperature of this controller is unaffected, and writes still "
+            "go out%s (PROJECT.md section 8 item 90)",
+            label,
+            ", ".join(inputs),
+            blind,
+        )
 
     # -- read --------------------------------------------------------------
 
@@ -746,12 +765,18 @@ class AquacomputerAdapter:
             )
         if fresh:
             self._verify_duties(status, received)
-        self._check_absent(status)
+        absent_pwm, absent_rpm = self._check_absent(status)
         b = self.binding
         return PlantObservation(
             temps={name: status.temp(input_name) for name, input_name in b.temp_map.items()},
-            rpm={ch: float(status.rpm(n)) for ch, n in b.fan_map.items()},
-            pwm={ch: status.duty(n) / DUTY_MAX for ch, n in b.pwm_map.items()},
+            rpm={
+                ch: None if ch in absent_rpm else float(status.rpm(n))
+                for ch, n in b.fan_map.items()
+            },
+            pwm={
+                ch: None if ch in absent_pwm else status.duty(n) / DUTY_MAX
+                for ch, n in b.pwm_map.items()
+            },
             ts=now,
         )
 
