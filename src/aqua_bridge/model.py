@@ -1270,6 +1270,7 @@ ESTIMATOR_DEFAULTS: dict[str, float] = {
     "bay_uncertain_var_c2": 1.0,
     "bay_cal_step_c": 0.05,
     "calibration_max_age_days": 30.0,
+    "manual_calibration_max_age_days": 7.0,
     "calibrate_min_c": 5.0,
     "calibrate_max_c": 80.0,
     "associate_window_s": 3600.0,
@@ -1395,8 +1396,18 @@ class EstimatorSpec:
     * ``bay_cal_step_c``           -- a change of a bay's ``sigma_cal`` floor above this,
       degC (> 0), is a calibration event: an accepted or expired map re-maps the drive
       estimate, which the same validity gate must not read as a model error
-    * ``calibration_max_age_days`` -- a SMART calibration without an accepted sample for
-      this long is no longer trusted (> 0)
+    * ``calibration_max_age_days`` -- a calibration without an accepted sample for
+      this long is no longer trusted (> 0). It is the running daemon's window, on the
+      controller clock, and it covers a manual calibration exactly as it covers a SMART
+      one
+    * ``manual_calibration_max_age_days`` -- how old a *stored* manual calibration
+      (PROJECT.md section 8 items 23 and 104) may be when the model store is loaded and
+      still come back, wall-clock days (> 0). Deliberately shorter than
+      ``calibration_max_age_days``: while the daemon was down nothing watched the bay, and
+      a manual map is keyed by bay, not by serial, so a drive swapped during the outage
+      would inherit the previous drive's map with nothing to notice. Past this window the
+      stored entry is dropped rather than restored at a reduced weight -- a stale
+      calibration silently trusted is worse than none
     * ``calibrate_min_c`` / ``calibrate_max_c`` -- the drive temperature a manual
       calibration (``POST /api/calibrate``, PROJECT.md section 8 item 23) may report,
       degC: the value must lie in ``[calibrate_min_c, calibrate_max_c]``
@@ -1433,6 +1444,7 @@ class EstimatorSpec:
     bay_uncertain_var_c2: float = ESTIMATOR_DEFAULTS["bay_uncertain_var_c2"]
     bay_cal_step_c: float = ESTIMATOR_DEFAULTS["bay_cal_step_c"]
     calibration_max_age_days: float = ESTIMATOR_DEFAULTS["calibration_max_age_days"]
+    manual_calibration_max_age_days: float = ESTIMATOR_DEFAULTS["manual_calibration_max_age_days"]
     calibrate_min_c: float = ESTIMATOR_DEFAULTS["calibrate_min_c"]
     calibrate_max_c: float = ESTIMATOR_DEFAULTS["calibrate_max_c"]
     associate_window_s: float = ESTIMATOR_DEFAULTS["associate_window_s"]
@@ -1549,6 +1561,11 @@ class EstimatorSpec:
         if self.calibration_max_age_days <= 0:
             raise ConfigError(
                 f"{where}.calibration_max_age_days must be > 0, got {self.calibration_max_age_days}"
+            )
+        if self.manual_calibration_max_age_days <= 0:
+            raise ConfigError(
+                f"{where}.manual_calibration_max_age_days must be > 0, got "
+                f"{self.manual_calibration_max_age_days}"
             )
         if not self.calibrate_min_c < self.calibrate_max_c:
             raise ConfigError(
@@ -2888,6 +2905,23 @@ class MpcConfig:
         cls = self.topology.bays[bay].drive_class or self.topology.default_class
         assert cls is not None
         return cls
+
+    def bay_declaration(self, bay: str) -> dict[str, Any]:
+        """What the config *says* bay ``bay`` holds: ``occupied`` / ``class`` / ``serial``
+        as declared (no defaults filled in), plain JSON.
+
+        These three are exactly the policy :func:`aqua_bridge.modelstore.fingerprint`
+        leaves out on purpose -- they do not change what an identified coefficient means
+        -- and exactly the policy that says *which drive* a bay-keyed map belongs to. The
+        model store writes one next to every stored manual calibration and compares it
+        again on load, so a calibration measured by hand for the drive that used to sit
+        in a bay is not silently applied to the one the owner has since declared there
+        (PROJECT.md section 8 item 104).
+        """
+        if self.topology is None:
+            raise KeyError(bay)
+        spec = self.topology.bays[bay]
+        return {"occupied": spec.occupied, "class": spec.drive_class, "serial": spec.serial}
 
     @property
     def regulates_drive_limits(self) -> bool:

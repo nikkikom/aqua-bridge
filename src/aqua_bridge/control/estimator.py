@@ -349,8 +349,39 @@ so a swapped drive's SMART calibration and the bay's manual one can never be
 confused. A bay's associated serial's calibration wins once it is an entry the
 filter would use (accepted once, or accepted now) -- a SMART entry still collecting
 its first samples leaves the manual map in force instead of dropping the bay back
-to the prior; the manual one is what a bay without SMART gets. Manual calibrations
-do **not** survive a restart (section 8 item 104).
+to the prior; the manual one is what a bay without SMART gets.
+
+**Manual calibrations survive a restart** (section 8 item 104), in their own per-bay
+``manual_calibration`` section of the model store, next to the per-serial
+``calibration`` one. What comes back, and what does not
+(:func:`restore_manual_calibration`) -- a stale calibration silently trusted is worse
+than none, so every doubtful case is a *drop*, which puts the bay back on the prior map
+at the uncalibrated sigma (more margin, more cooling, never less):
+
+* **old** -- an entry whose last accepted reading is further back than
+  ``estimator.manual_calibration_max_age_days`` (wall clock, the outage included), or
+  whose age is unknown or negative (a wall clock behind the file), is dropped outright,
+  not restored with its fresh count reset the way a SMART entry is. Nothing but the
+  operator can refresh a manual map, so an un-freshened one would sit there for ever
+  showing ``cal manual`` with no evidence behind it. The window is its own config key
+  and shorter than ``calibration_max_age_days`` on purpose: the daemon was not
+  watching, and a manual map is keyed by *bay*, so a drive swapped during the outage
+  would silently inherit the previous drive's map.
+* **swapped** -- the entry records the bay's declaration as it stood when the file was
+  written (``occupied``, ``class``, ``serial``). Any of the three different in the
+  running config drops it: the owner has said this bay holds a different drive. While
+  the daemon runs, the estimator's own swap rule (item 12 -- occupancy crossing
+  ``empty`` in either direction, or the fast-swap proximal jump) drops the bay's manual
+  entry on the tick it fires, restored or not.
+* **reconfigured** -- the store's fingerprint already refuses a file written for
+  another structure; the per-entry declaration above covers the policy the fingerprint
+  deliberately leaves out.
+* **always provisional** -- a restored entry always comes back with ``"inflate": 2.0``
+  and ``"confirm": 20``, from a ``fresh`` file as much as from a ``stale`` one. A SMART
+  calibration may be trusted at face value out of a fresh file because it is keyed by
+  serial and the SMART feed re-associates it; a manual one is keyed by bay and has no
+  feed, so its ``sigma_cal`` stays doubled until :data:`CAL_MIN_SAMPLES` fresh hand
+  readings of that bay confirm it (indefinitely without them).
 
 Memory (plain JSON)::
 
@@ -417,6 +448,7 @@ __all__ = [
     "calibration_update",
     "drive_capacity",
     "restore_calibration",
+    "restore_manual_calibration",
     "update",
 ]
 
@@ -2134,6 +2166,16 @@ def update(
             _forget_pair(mem, b, assoc[b][0])
             del assoc[b]
 
+    # A swapped bay's manual calibration described the drive that was there (items 12,
+    # 104). It is keyed by bay, not by serial, so unlike a SMART entry it would follow
+    # the slot rather than the drive and nothing later would notice. Dropped on the tick
+    # the swap rule fires, restored from the store or measured in this run alike, which
+    # returns the bay to the prior map at the uncalibrated sigma -- more margin, never
+    # less cooling.
+    for b, was_swapped in swapped.items():
+        if was_swapped:
+            mem["manual"].pop(b, None)
+
     # -- store the filter ----------------------------------------------------------------
     for z, (x, p) in arrays.items():
         if not (np.all(np.isfinite(x)) and np.all(np.isfinite(p))):
@@ -2483,6 +2525,88 @@ def restore_calibration(
             per_bay.setdefault(serial, entries[serial])
         if not per_bay:
             del mem["cal"][bay]
+    return mem, warnings
+
+
+def _declaration_change(cfg: MpcConfig, bay: str, declared: object) -> str | None:
+    """Why a stored manual calibration no longer belongs to ``bay``, ``None`` when it
+    still does (module docstring, *swapped*; :meth:`MpcConfig.bay_declaration`)."""
+    now = cfg.bay_declaration(bay)
+    if now["occupied"] is False:
+        return "the config now declares the bay empty"
+    if not isinstance(declared, Mapping):
+        return "it carries no record of the bay's declaration when it was saved"
+    for key in ("occupied", "class", "serial"):
+        was = declared.get(key)
+        if was != now[key]:
+            return f"the bay's declared {key} was {was!r} and is now {now[key]!r}"
+    return None
+
+
+def restore_manual_calibration(
+    memory: object, manual: object, cfg: MpcConfig, *, ts: float
+) -> tuple[dict[str, Any], list[str]]:
+    """``(estimator memory, warnings)`` with the model store's manual calibrations
+    installed (module docstring, *Manual calibration*; PROJECT.md section 8 item 104).
+
+    ``manual`` is ``{bay: {"th", "P", "n", "fresh", "rms2", "used", "age_s",
+    "declared": {"occupied", "class", "serial"}}}`` -- ``age_s`` the seconds since the
+    entry's last accepted hand reading at load time, ``None`` when unknown -- and ``ts``
+    the clock of the tick it is applied on. Every doubtful entry is **dropped** with a
+    named warning: an unknown bay, an entry that is malformed or out of bounds, an age
+    that is unknown, negative or past ``estimator.manual_calibration_max_age_days``, or a
+    bay whose declaration has changed since the file was written. What survives is
+    re-based on ``ts`` and always inflated (``inflate`` / ``confirm``), a fresh file
+    included. A bay already in ``memory`` is left alone. Pure; never raises for a bad
+    ``manual`` (only for a legacy ``cfg``).
+    """
+    if cfg.topology is None or cfg.estimator is None:
+        raise ValueError("the estimator needs a zoned config (mpc.topology)")
+    st = _structure(cfg)
+    mem = _load(memory, st)
+    warnings: list[str] = []
+    if not isinstance(manual, Mapping):
+        return mem, ["manual_calibration: not a mapping, section dropped"]
+    window = cfg.estimator.manual_calibration_max_age_days * _DAY_S
+    for bay, raw in manual.items():
+        where = f"manual_calibration: bay {bay!r}"
+        if bay not in st.bays:
+            warnings.append(f"{where} is not in the topology, dropped")
+            continue
+        if not isinstance(raw, Mapping):
+            warnings.append(f"{where} is not a mapping, dropped")
+            continue
+        if bay in mem["manual"]:
+            continue  # this run already has one: the live entry wins
+        change = _declaration_change(cfg, str(bay), raw.get("declared"))
+        if change is not None:
+            warnings.append(f"{where}: {change}; dropped (item 104)")
+            continue
+        age = raw.get("age_s")
+        if not _finite(age) or float(age) < 0.0:  # type: ignore[arg-type]
+            warnings.append(
+                f"{where}: the age of its last hand reading is unknown (the wall clock is "
+                "behind the file); dropped rather than trusted"
+            )
+            continue
+        if float(age) > window:  # type: ignore[arg-type]
+            warnings.append(
+                f"{where}: its last hand reading is {float(age) / _DAY_S:.1f} days old, past "  # type: ignore[arg-type]
+                f"estimator.manual_calibration_max_age_days "
+                f"({cfg.estimator.manual_calibration_max_age_days:g}); dropped"
+            )
+            continue
+        try:
+            # ``stale=True`` unconditionally: a bay-keyed map has no feed that could
+            # re-associate it, so it comes back provisional however fresh the file is.
+            entry = _restored_entry(raw, ts, True)
+        except ValueError as exc:
+            warnings.append(f"{where}: {exc}; dropped")
+            continue
+        if entry["ts"] is None:  # no usable sample time: nothing to age the entry by
+            warnings.append(f"{where}: it has no usable sample time; dropped")
+            continue
+        mem["manual"][str(bay)] = {"ts": float(entry["ts"]), "cal": entry}
     return mem, warnings
 
 

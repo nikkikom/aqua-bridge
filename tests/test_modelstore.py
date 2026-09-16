@@ -1145,3 +1145,214 @@ def test_http_model_view_shows_what_the_store_loaded(tmp_path):
     assert body["store"]["source"] == "fresh"
     assert body["store"]["sections"]["thermal"] == "loaded"
     assert body["thermal"]["status"] == "frozen"
+
+
+# ---------------------------------------------------------------------------
+# manual calibration: per bay, its own window, dropped on a swap (item 104)
+# ---------------------------------------------------------------------------
+
+
+def manual_memory(entry: dict[str, Any]) -> dict[str, Any]:
+    """An estimator memory holding one hand-measured calibration for b01."""
+    return {"manual": {"b01": {"ts": entry["ts"], "cal": entry}}}
+
+
+def saved_manual(cfg: MpcConfig, memory_ts: float, entry: dict[str, Any]) -> dict:
+    """The file's ``manual_calibration`` section for an entry at controller time ``ts``."""
+    doc = modelstore.build_document(
+        cfg, {"estimator": manual_memory(entry)}, ts=memory_ts, wall=NOW - 600
+    )
+    return doc["manual_calibration"]
+
+
+def manual_section(cfg: MpcConfig, *, age_s: float | None, **changes: Any) -> dict:
+    """A stored manual entry whose last hand reading was ``age_s`` before ``NOW``."""
+    entry = {k: v for k, v in cal_entry(rms2=0.49).items() if k != "ts"}
+    entry["last_sample_wall"] = None if age_s is None else NOW - age_s
+    entry["declared"] = cfg.bay_declaration("b01")
+    entry.update(changes)
+    return {"b01": entry}
+
+
+def test_a_manual_calibration_survives_a_restart(tmp_path):
+    """Item 104: the hand-measured map comes back per bay, with its sample time re-based
+    on the new clock, and the bay runs on it instead of the prior."""
+    cfg = load_config(EXAMPLE_DAS_CONFIG).mpc
+    section = saved_manual(cfg, 5_000_000.0, cal_entry(ts=5_000_000.0 - 100.0, rms2=0.49))
+    entry = section["b01"]
+    assert entry["last_sample_wall"] == pytest.approx(NOW - 700.0)
+    assert entry["declared"] == cfg.bay_declaration("b01")
+    assert "expires_wall" not in entry  # the window belongs to the config that loads it
+
+    doc = stored_doc(cfg, saved_wall=NOW - 600, manual_calibration=section)
+    _, state = load_state(write_doc(tmp_path / "m.json", doc), cfg)
+    cmd, state, _ = run(cfg, state, 1, t0=12.0)
+    known = state.solver_memory["estimator"]["manual"]["b01"]
+    assert known["ts"] == pytest.approx(12.0 - 700.0)
+    assert known["cal"]["th"] == [0.8, -1.5]
+    bay = cmd.diagnostics["bays"]["b01"]
+    assert bay["calibration_source"] == "manual" and bay["calibrated"] is True
+    assert bay["calibration"]["slope"] == 0.8
+    assert cmd.diagnostics["store"]["sections"]["manual_calibration"] == 1
+
+
+def test_a_restored_manual_calibration_is_always_provisional(tmp_path):
+    """A SMART map out of a fresh file is trusted at face value because the SMART feed
+    re-associates its serial. A hand-measured map is keyed by *bay* and has no feed, so
+    it comes back at twice sigma_cal until twenty fresh hand readings confirm it."""
+    cfg = load_config(EXAMPLE_DAS_CONFIG).mpc
+    doc = stored_doc(cfg, saved_wall=NOW - 600, manual_calibration=manual_section(cfg, age_s=600.0))
+    result, state = load_state(write_doc(tmp_path / "m.json", doc), cfg)
+    assert result.source == "fresh"
+    cmd, state, _ = run(cfg, state, 1)
+    bay = cmd.diagnostics["bays"]["b01"]
+    assert bay["calibrated"] is True
+    assert bay["sigma_cal_c"] == pytest.approx(2.0 * 0.7)
+    restored = state.solver_memory["estimator"]["manual"]["b01"]["cal"]
+    assert (restored["inflate"], restored["confirm"]) == (2.0, estimator.CAL_MIN_SAMPLES)
+    # the inflation survives a save and a reload: a save does not launder it
+    doc2 = modelstore.build_document(cfg, state.solver_memory, ts=0.0, wall=NOW)
+    assert doc2["manual_calibration"]["b01"]["inflate"] == 2.0
+
+
+@pytest.mark.parametrize(
+    ("age_s", "kept"),
+    [
+        (0.0, True),
+        (7 * DAY - 1.0, True),  # just inside manual_calibration_max_age_days
+        (7 * DAY, True),  # exactly the window: still inside
+        (7 * DAY + 1.0, False),  # one second past it
+        (None, False),  # no sample time at all
+        (-60.0, False),  # a wall clock behind the file: the age is unknown
+    ],
+)
+def test_the_staleness_window_of_a_stored_manual_calibration(tmp_path, age_s, kept):
+    """The window is ``estimator.manual_calibration_max_age_days`` and past it the entry
+    is *dropped*, not restored with its fresh count reset the way a SMART one is: nothing
+    but the operator can ever refresh a hand-measured map."""
+    cfg = load_config(EXAMPLE_DAS_CONFIG).mpc
+    assert cfg.estimator is not None and cfg.estimator.manual_calibration_max_age_days == 7.0
+    section = manual_section(cfg, age_s=age_s)
+    doc = stored_doc(cfg, saved_wall=NOW - 60, manual_calibration=section)
+    _, state = load_state(write_doc(tmp_path / "m.json", doc), cfg)
+    cmd, state, _ = run(cfg, state, 1)
+    store = cmd.diagnostics["store"]
+    bay = cmd.diagnostics["bays"]["b01"]
+    if kept:
+        assert store["sections"]["manual_calibration"] == 1
+        assert bay["calibration_source"] == "manual"
+    else:
+        assert store["sections"]["manual_calibration"] == 0
+        assert state.solver_memory["estimator"]["manual"] == {}
+        assert bay["calibration_source"] is None
+        assert bay["sigma_cal_c"] == est_prior.sigma_uncalibrated_c(cfg)
+        assert any("b01" in w for w in store["warnings"]), store["warnings"]
+
+
+def test_a_longer_window_keeps_what_the_default_drops(tmp_path):
+    """The window is a config key, not a number in the source."""
+    cfg = dataclasses.replace(
+        load_config(EXAMPLE_DAS_CONFIG).mpc,
+        estimator=dataclasses.replace(
+            load_config(EXAMPLE_DAS_CONFIG).mpc.estimator,  # type: ignore[arg-type]
+            manual_calibration_max_age_days=30.0,
+        ),
+    )
+    section = manual_section(cfg, age_s=10 * DAY)
+    doc = stored_doc(cfg, saved_wall=NOW - 60, manual_calibration=section)
+    _, state = load_state(write_doc(tmp_path / "m.json", doc), cfg)
+    cmd, _, _ = run(cfg, state, 1)
+    assert cmd.diagnostics["store"]["sections"]["manual_calibration"] == 1
+
+
+@pytest.mark.parametrize(
+    ("change", "needle"),
+    [
+        ({"serial": "SER-NEW"}, "serial"),
+        ({"class": "ssd_sata"}, "class"),
+        ({"occupied": False}, "empty"),
+    ],
+)
+def test_a_swapped_bay_drops_its_stored_manual_calibration(tmp_path, change, needle):
+    """A hand-measured map is keyed by bay, so it would follow the *slot*, not the drive.
+    The declaration the file was written under is compared with the running config, and
+    any difference drops the entry with the reason named (item 104)."""
+    before = load_config(EXAMPLE_DAS_CONFIG).mpc
+    section = manual_section(before, age_s=600.0)
+    data = das_mapping()
+    data["topology"]["bays"]["b01"].update(change)
+    after = MpcConfig.from_mapping(data)
+    doc = stored_doc(after, saved_wall=NOW - 60, manual_calibration=section)
+    _, state = load_state(write_doc(tmp_path / "m.json", doc), after)
+    cmd, state, _ = run(after, state, 1)
+    store = cmd.diagnostics["store"]
+    assert store["sections"]["manual_calibration"] == 0
+    assert state.solver_memory["estimator"]["manual"] == {}
+    assert any("b01" in w and needle in w for w in store["warnings"]), store["warnings"]
+    # ...and the same file on the config it was written for still loads
+    doc_ok = stored_doc(before, saved_wall=NOW - 60, manual_calibration=section)
+    _, state_ok = load_state(write_doc(tmp_path / "ok.json", doc_ok), before)
+    cmd_ok, _, _ = run(before, state_ok, 1)
+    assert cmd_ok.diagnostics["store"]["sections"]["manual_calibration"] == 1
+
+
+def test_a_manual_entry_without_a_saved_declaration_is_dropped(tmp_path):
+    cfg = load_config(EXAMPLE_DAS_CONFIG).mpc
+    section = manual_section(cfg, age_s=600.0, declared=None)
+    doc = stored_doc(cfg, saved_wall=NOW - 60, manual_calibration=section)
+    _, state = load_state(write_doc(tmp_path / "m.json", doc), cfg)
+    cmd, state, _ = run(cfg, state, 1)
+    assert state.solver_memory["estimator"]["manual"] == {}
+    assert any("declaration" in w for w in cmd.diagnostics["store"]["warnings"])
+
+
+@pytest.mark.parametrize(
+    ("change", "needle"),
+    [
+        ({"th": [0.1, -1.0]}, "slope"),
+        ({"P": [[-0.01, 0.0], [0.0, 1.0]]}, "covariance"),
+        ({"n": 5, "fresh": 9}, "fresh"),
+        ({"used": "yes"}, "used"),
+    ],
+)
+def test_a_bad_manual_entry_is_dropped_by_name(tmp_path, change, needle):
+    cfg = load_config(EXAMPLE_DAS_CONFIG).mpc
+    section = manual_section(cfg, age_s=600.0, **change)
+    section["b99"] = dict(section["b01"])  # not a bay of the topology
+    doc = stored_doc(cfg, saved_wall=NOW - 60, manual_calibration=section)
+    _, state = load_state(write_doc(tmp_path / "m.json", doc), cfg)
+    cmd, state, _ = run(cfg, state, 1)
+    assert state.solver_memory["estimator"]["manual"] == {}
+    warnings = cmd.diagnostics["store"]["warnings"]
+    assert any("b01" in w and needle in w for w in warnings), warnings
+    assert any("b99" in w for w in warnings)
+
+
+def test_a_malformed_manual_section_never_raises(tmp_path):
+    cfg = load_config(EXAMPLE_DAS_CONFIG).mpc
+    for section in (5, "x", {"b01": 7}):
+        doc = stored_doc(cfg, saved_wall=NOW - 60, manual_calibration=section)
+        _, state = load_state(write_doc(tmp_path / "m.json", doc), cfg)
+        cmd, state, _ = run(cfg, state, 1)
+        assert state.solver_memory["estimator"]["manual"] == {}
+        assert cmd.diagnostics["store"]["sections"]["manual_calibration"] == 0
+        assert any("manual_calibration" in w for w in cmd.diagnostics["store"]["warnings"])
+
+
+def test_the_two_calibration_sections_land_in_one_estimator_memory(tmp_path):
+    """``manual_calibration`` is applied on top of what ``calibration`` staged, not
+    instead of it: a bay may have a SMART map for its serial and a hand-measured one."""
+    cfg = serial_cfg("SER-A")
+    smart = saved_calibration(cfg, 5_000_000.0, {"SER-A": cal_entry(ts=5_000_000.0 - 100.0)})
+    doc = stored_doc(
+        cfg,
+        saved_wall=NOW - 60,
+        calibration=smart,
+        manual_calibration=manual_section(cfg, age_s=600.0),
+    )
+    _, state = load_state(write_doc(tmp_path / "m.json", doc), cfg)
+    cmd, state, _ = run(cfg, state, 1)
+    est_mem = state.solver_memory["estimator"]
+    assert set(est_mem["cal"]["b01"]) == {"SER-A"} and set(est_mem["manual"]) == {"b01"}
+    sections = cmd.diagnostics["store"]["sections"]
+    assert (sections["calibration"], sections["manual_calibration"]) == (1, 1)

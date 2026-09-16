@@ -24,6 +24,51 @@ Topic layout (``node_id`` from ``config.yaml`` ``mqtt.node_id``):
   ``start:channel:<channel>`` | ``start:<channel>`` | ``stop``: start or stop an
   identification experiment (DAS mode, ``POST /api/ident``); a retained ``start`` is
   ignored (it would be redelivered on every reconnect), only a live one starts
+* ``{node_id}/cmd/calibrate/<bay>``   -- raw number, one hand-measured drive temperature
+  in degC (DAS mode, ``POST /api/calibrate``). **Off by default** and only subscribed,
+  parsed and accepted with ``mqtt.allow_calibrate: true``; see *Manual calibration over
+  MQTT* below
+
+Manual calibration over MQTT (PROJECT.md section 8 items 23 and 105)
+--------------------------------------------------------------------
+``cmd/calibrate/<bay>`` exists but is **off unless the owner turns it on**, and this
+module refuses it in two independent places when it is off: the topic is not in
+:func:`command_topics`, so nothing subscribes to it, and :func:`parse_command` returns
+``None`` for it, so a message that arrives anyway (a wildcard subscription, a replayed
+session) produces no intent and never reaches the supervisor or the estimator.
+
+Why off by default, when ``cmd/limit`` and ``cmd/bay`` are on: MQTT has no
+authentication of its own -- every inbound topic relies entirely on the broker's ACL
+(section 7, *Security*), where the HTTPS route has its own (section 6). A limit or a
+declared occupancy is *policy*: it is a number the gate re-clamps every tick, it is
+visible in Home Assistant as the entity that carries it, and the safety core bounds
+what it can do. A calibration is not policy but *measurement*: it fits the bay's
+sensor-to-drive map, so a wrong reading biases every later estimate of that bay -- and
+an estimate biased low makes the controller run the fans slower than the drive needs.
+It is the one inbound topic whose payload can quietly reduce cooling, so it asks for a
+deliberate ``true`` in ``config.yaml`` rather than riding in on the broker's ACL by
+default.
+
+Its guards, when it *is* on:
+
+* ``mqtt.allow_calibrate: true`` -- the explicit opt-in, checked in
+  :func:`validate_mqtt_section` like every other scalar of the section
+* ``mqtt.username`` must be set with it, or the section is a named
+  :class:`MqttSetupError` at startup. An anonymous connection cannot be given an ACL of
+  its own, so "the broker's ACL" would be no guard at all -- the refusal is the
+  "rejection when the broker connection is not authenticated" the item asks for, made
+  at configuration time where the owner can see it rather than per message
+* a **retained** calibration is ignored and logged, exactly as a retained experiment
+  ``start`` is: a retained number would be redelivered on every reconnect and refitted
+  into the bay's map on every restart, which is the failure item 104 is about
+* no Discovery entity. A ``number`` per bay would be fifteen more entities, and Home
+  Assistant restores a ``number``'s state on restart by publishing it again -- the
+  retained-message problem in another costume. The topic is for a script or an
+  automation that publishes one live reading, not for a slider
+
+Everything past :func:`parse_command` is the ordinary :class:`Calibrate` path: the
+supervisor's own checks (the bay, the range, ``no_tick`` / ``empty`` / ``untrusted``)
+apply unchanged, and a refused reading costs no running identification experiment.
 
 Device health (PROJECT.md section 8 items 79 and 83) is one binary sensor,
 ``device_problem`` (``device_class: problem``, diagnostic): on whenever
@@ -111,6 +156,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from aqua_bridge.control.intents import (
+    Calibrate,
     ClearOverride,
     ControlMode,
     Ident,
@@ -154,6 +200,10 @@ class MqttSetupError(ValueError):
     """The ``mqtt:`` section has a bad value; the caller logs it and leaves MQTT off."""
 
 
+#: Every mqtt: boolean, all defaulting to ``false``. ``allow_calibrate`` is the opt-in
+#: of item 105 (module docstring, *Manual calibration over MQTT*).
+_MQTT_BOOL_KEYS: tuple[str, ...] = ("enabled", "allow_calibrate")
+
 #: (key, default) for every mqtt: string scalar; a YAML-null value falls back
 #: to the default rather than erroring (a bare ``username:`` line is common).
 _MQTT_STRING_KEYS: tuple[tuple[str, str], ...] = (
@@ -174,10 +224,12 @@ def validate_mqtt_section(section: Mapping[str, Any] | None) -> dict[str, Any]:
     :class:`MqttClient` already owns the rest of the connection's shape.
     """
     data = dict(section or {})
-    enabled = data.get("enabled", False)
-    if not isinstance(enabled, bool):
-        raise MqttSetupError(f"mqtt.enabled must be true or false, got {enabled!r}")
-    values: dict[str, Any] = {"enabled": enabled}
+    values: dict[str, Any] = {}
+    for name in _MQTT_BOOL_KEYS:
+        value = data.get(name, False)
+        if not isinstance(value, bool):
+            raise MqttSetupError(f"mqtt.{name} must be true or false, got {value!r}")
+        values[name] = value
     for name, default in _MQTT_STRING_KEYS:
         value = data.get(name, default)
         if value is None:
@@ -189,6 +241,15 @@ def validate_mqtt_section(section: Mapping[str, Any] | None) -> dict[str, Any]:
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise MqttSetupError(f"mqtt.port must be an integer in [1, 65535], got {port!r}")
     values["port"] = port
+    if values["allow_calibrate"] and not values["username"]:
+        # Item 105: the inbound topics have no authentication of their own, only the
+        # broker's ACL, and an anonymous connection cannot be given one. Refused here,
+        # once and by name, rather than per message.
+        raise MqttSetupError(
+            "mqtt.allow_calibrate: true needs mqtt.username: an anonymous broker "
+            "connection cannot be given an ACL of its own, and cmd/calibrate has no "
+            "authentication besides the broker's"
+        )
     return values
 
 
@@ -205,8 +266,13 @@ def state_topic(node_id: str) -> str:
     return f"{node_id}/state"
 
 
-def command_topics(node_id: str, cfg: MpcConfig) -> dict[str, str]:
-    """Every inbound command topic this bridge subscribes to."""
+def command_topics(
+    node_id: str, cfg: MpcConfig, *, allow_calibrate: bool = False
+) -> dict[str, str]:
+    """Every inbound command topic this bridge subscribes to.
+
+    ``allow_calibrate`` is ``mqtt.allow_calibrate`` (item 105, module docstring): without
+    it there is no ``cmd/calibrate/<bay>`` topic at all, so nothing subscribes to one."""
     topics = {
         "mode": f"{node_id}/cmd/mode",
         "preset": f"{node_id}/cmd/preset",
@@ -222,6 +288,9 @@ def command_topics(node_id: str, cfg: MpcConfig) -> dict[str, str]:
         for bay in cfg.topology.bays:
             topics[f"bay/{bay}"] = f"{node_id}/cmd/bay/{bay}"
         topics["ident"] = f"{node_id}/cmd/ident"
+        if allow_calibrate:
+            for bay in cfg.topology.bays:
+                topics[f"calibrate/{bay}"] = f"{node_id}/cmd/calibrate/{bay}"
     for ch in cfg.channels:
         topics[f"pwm/{ch}"] = f"{node_id}/cmd/pwm/{ch}"
     return topics
@@ -662,12 +731,19 @@ def _parse_ident(text: str) -> Ident:
     return Ident(action="start", channel=rest)
 
 
-def parse_command(node_id: str, topic: str, payload: bytes | str) -> Intent | None:
+def parse_command(
+    node_id: str, topic: str, payload: bytes | str, *, allow_calibrate: bool = False
+) -> Intent | None:
     """Turn one inbound MQTT message into an :class:`Intent`, or ``None``.
 
     Never raises: a garbage topic or payload (wrong type, not a number,
     unknown channel/enum value) is logged and rejected by returning
     ``None`` -- the caller simply does not call ``surface.submit()``.
+
+    ``allow_calibrate`` is ``mqtt.allow_calibrate`` (item 105, module docstring). Without
+    it a ``cmd/calibrate/<bay>`` message is refused here as well as never subscribed to,
+    and the refusal returns ``None`` before any :class:`Calibrate` is constructed, so
+    nothing downstream -- supervisor, estimator, running experiment -- is touched by it.
     """
     try:
         text = payload.decode("utf-8") if isinstance(payload, bytes | bytearray) else str(payload)
@@ -705,6 +781,15 @@ def parse_command(node_id: str, topic: str, payload: bytes | str) -> Intent | No
                     f"bay payload must be one of {sorted(_BAY_PAYLOADS)}, got {text!r}"
                 )
             return SetBay(bay=tail[len("bay/") :], changes={"occupied": occupied})
+        if tail.startswith("calibrate/"):
+            if not allow_calibrate:
+                _LOG.warning(
+                    "mqtt: refused a calibration on %s; MQTT calibration is off "
+                    "(set mqtt.allow_calibrate: true to enable it)",
+                    topic,
+                )
+                return None
+            return Calibrate(bay=tail[len("calibrate/") :], drive_temp_c=float(text))
         if tail == "ident":
             return _parse_ident(text)
     except (IntentError, ValueError) as exc:
@@ -739,6 +824,7 @@ class MqttClient:
         port: int = 1883,
         username: str = "",
         password: str = "",
+        allow_calibrate: bool = False,
         on_intent: Callable[[Intent], None] | None = None,
         on_connection_change: Callable[[bool], None] | None = None,
     ) -> None:
@@ -747,6 +833,8 @@ class MqttClient:
         self.node_id = node_id
         self.discovery_prefix = discovery_prefix
         self.cfg = cfg
+        #: ``mqtt.allow_calibrate`` (item 105, module docstring): off by default.
+        self.allow_calibrate = bool(allow_calibrate)
         self._on_intent = on_intent
         self._on_connection_change = on_connection_change
         self.connected = False
@@ -792,7 +880,8 @@ class MqttClient:
     # -- callbacks (also callable directly from tests) -------------------
 
     def _on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
-        for topic in command_topics(self.node_id, self.cfg).values():
+        topics = command_topics(self.node_id, self.cfg, allow_calibrate=self.allow_calibrate)
+        for topic in topics.values():
             client.subscribe(topic)
         for topic_filter in self._extra_handlers:
             client.subscribe(topic_filter)
@@ -845,13 +934,20 @@ class MqttClient:
                 if topic_matches(topic_filter, msg.topic):
                     handler(msg.topic, msg.payload)
                     return
-        intent = parse_command(self.node_id, msg.topic, msg.payload)
+        intent = parse_command(
+            self.node_id, msg.topic, msg.payload, allow_calibrate=self.allow_calibrate
+        )
         if intent is None or self._on_intent is None:
             return
         if isinstance(intent, Ident) and intent.action == "start" and getattr(msg, "retain", False):
             # A retained start is redelivered on every (re)connect: an experiment starts
             # only from a live, explicit command (reviewer fix; a retained stop is kept).
             _LOG.info("mqtt: ignored retained experiment start on %s", msg.topic)
+            return
+        if isinstance(intent, Calibrate) and getattr(msg, "retain", False):
+            # Same reason, and worse: a retained reading would be refitted into the bay's
+            # sensor-to-drive map on every reconnect and every restart (items 104, 105).
+            _LOG.info("mqtt: ignored retained calibration on %s", msg.topic)
             return
         try:
             self._on_intent(intent)

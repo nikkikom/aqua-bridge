@@ -1818,3 +1818,63 @@ def test_a_hot_swap_resets_only_that_bay_s_thermal_coefficients():
     assert swapped[0] is False and any(swapped), swapped  # the insert, not the quiet bay
     assert cmd.diagnostics["thermal"]["bays"]["b1"]["windows"] == 0
     assert cmd.diagnostics["thermal"]["bays"]["a1"]["windows"] == 11
+
+
+def test_a_swap_drops_the_bays_manual_calibration():
+    """Items 12 and 104: a hand-measured map is keyed by *bay*, so on a swap it would
+    follow the slot rather than the drive and nothing later would notice. The tick the
+    swap rule fires drops it, and the bay falls back to the prior map and the
+    uncalibrated sigma -- more margin, never less cooling."""
+    cfg = das_cfg(setpoints={})
+    up = _manual_run(cfg)
+    assert up.bays["a1"]["calibration_source"] == "manual"
+    assert up.memory["bays"]["a1"]["occ"] == E.OCCUPIED
+
+    # the drive is pulled: the owner declares the bay empty, so the occupancy crosses
+    # the ``empty`` boundary on the next tick and that is a swap
+    data = das_mapping()
+    data["setpoints"] = {}
+    data["topology"]["bays"]["a1"]["occupied"] = False
+    after = MpcConfig.from_mapping(data)
+    out = tick(after, up.memory, 10_000.0, prox_a1=PROX_C)
+    assert out.bays["a1"]["swapped"] is True
+    assert out.memory["manual"] == {}
+    assert out.bays["a1"]["calibration"] is None
+    assert out.bays["a1"]["calibration_source"] is None
+
+    # and a bay the swap rule never fired on keeps what it had
+    out2 = tick(cfg, up.memory, 10_000.0, prox_a1=PROX_C)
+    assert out2.bays["a1"]["swapped"] is False
+    assert set(out2.memory["manual"]) == {"a1"}
+
+
+def test_restore_manual_calibration_is_pure_and_never_raises_on_rubbish(cfg: MpcConfig):
+    """The estimator half of item 104: a legacy config is the only thing that raises."""
+    das = das_cfg(setpoints={})
+    for rubbish in (None, 5, "x", [1], {"a1": 7}, {"nope": {}}):
+        mem, warnings = E.restore_manual_calibration(None, rubbish, das, ts=0.0)
+        assert mem["manual"] == {}
+        assert isinstance(warnings, list)
+    with pytest.raises(ValueError, match="topology"):
+        E.restore_manual_calibration(None, {}, cfg, ts=0.0)
+
+
+def test_a_live_manual_entry_wins_over_a_stored_one():
+    """A restore only fills gaps: whatever this run has already measured stays."""
+    cfg = das_cfg(setpoints={})
+    up = _manual_run(cfg)
+    stored = {
+        "a1": {
+            "th": [0.4, 9.0],
+            "P": [[0.004, 0.0], [0.0, 0.5]],
+            "n": 40,
+            "fresh": 30,
+            "rms2": 0.36,
+            "used": True,
+            "age_s": 60.0,
+            "declared": cfg.bay_declaration("a1"),
+        }
+    }
+    mem, warnings = E.restore_manual_calibration(up.memory, stored, cfg, ts=1000.0)
+    assert mem["manual"]["a1"]["cal"]["th"] != [0.4, 9.0]
+    assert warnings == []

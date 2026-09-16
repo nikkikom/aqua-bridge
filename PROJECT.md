@@ -730,7 +730,8 @@ ones get their defaults):
 | `estimator.bay_settle_max_s` | 1800 | ≥ `bay_settle_s`, s; the most settling exemption one bay may draw from `trust_rule: sigma` before it has to run this long with neither a window nor a σ over `sigma_fault_c` (§3 per-zone trust, §8 item 69); 0 grants none at all |
 | `estimator.bay_uncertain_var_c2` | 1.0 | > 0, °C²; the DAS MPC's model checks skip a bay whose drive variance `σ² − σ_cal²` is over this, for `bay_settle_s` afterwards. A *level*, so it covers a bay just swapped and a bay nobody is reading alike; the `sigma` trust rule does not excuse it (§3 *One owner, two exemptions*, §8 item 100) |
 | `estimator.bay_cal_step_c` | 0.05 | > 0, °C; the same exemption when a bay's `σ_cal` floor moves by more than this — an accepted or expired map re-maps the drive estimate |
-| `estimator.calibration_max_age_days` | 30 | > 0 |
+| `estimator.calibration_max_age_days` | 30 | > 0; days, the running daemon's clock, SMART and handheld calibrations alike |
+| `estimator.manual_calibration_max_age_days` | 7 | > 0; wall-clock days, how old a **stored** handheld calibration may be when `model.json` is loaded and still come back (item 104). Shorter than `calibration_max_age_days` on purpose: nothing watched the bay during the outage and a handheld map is keyed by bay, not by serial. Past it the stored entry is dropped, not restored at a reduced weight |
 | `estimator.calibrate_min_c` / `calibrate_max_c` | 5.0 / 80.0 | °C; `calibrate_min_c < calibrate_max_c`; the range `POST /api/calibrate` accepts for a handheld drive reading (item 23), narrowed at submit time to the gate's `[temp_min_c, temp_max_c]` — a config that narrows the gate below these defaults is valid and never blocks the daemon's start |
 | `estimator.associate_window_s` / `associate_min_corr` / `associate_margin` | 3600 / 0.8 / 0.15 | ≥ 600 / `(0, 1)` / `(0, 1)` |
 | `estimator.associate_drop_corr` / `associate_drop_checks` | 0.3 / 3 | `0 < associate_drop_corr < associate_min_corr` / a whole number ≥ 1; a correlation pair re-scored below that on this many consecutive evaluations is dropped |
@@ -1849,9 +1850,46 @@ state)`. Its entry lives in the estimator's `manual` memory, never in `cal`
 and the bay's manual one can never be confused; a bay's associated serial's
 calibration wins once it is one the filter would use (accepted at least once, or
 accepted now) — a SMART entry still collecting its first twenty samples leaves
-the manual map in force instead of dropping the bay back to the prior. Manual
-calibrations do not survive a restart (item 104). The refusals are in §6
-*Control*.
+the manual map in force instead of dropping the bay back to the prior. The
+refusals are in §6 *Control*.
+
+**Manual calibrations survive a restart (item 104).** They ride in the model
+store's own per-bay `manual_calibration` section, next to the per-serial
+`calibration` one, and their rule is stricter than the SMART one, because a
+stale calibration silently trusted is worse than none. Every doubtful case is a
+**drop**, which puts the bay back on the prior map at `σ_cal`
+`sigma_uncalibrated_c` — more margin, more cooling, never less:
+
+- **old** — an entry whose last accepted reading is further back than
+  `estimator.manual_calibration_max_age_days` (7 days by default, wall clock,
+  the outage included), or whose age is unknown or negative (a Pi whose clock is
+  behind the file before NTP), is dropped outright, not restored with its fresh
+  count reset the way a SMART entry is: nothing but the operator can refresh a
+  handheld map, so an un-freshened one would sit there for ever showing
+  `cal manual` with no evidence behind it. The window is shorter than
+  `calibration_max_age_days` because the daemon was not watching and a handheld
+  map is keyed by *bay*: a drive swapped during the outage would inherit the
+  previous drive's map with nothing to notice.
+- **swapped** — each stored entry carries the bay's declaration as it stood when
+  the file was written (`occupied`, `class`, `serial` — exactly the policy the
+  store's fingerprint leaves out on purpose). Any of the three different in the
+  running config drops the entry, naming which: the owner has said this bay holds
+  a different drive. While the daemon runs, the estimator's own swap rule (item
+  12 — occupancy crossing `empty` in either direction, or the fast-swap proximal
+  jump) drops that bay's manual entry on the tick it fires, restored or measured
+  in this run alike. A reading the supervisor is still offering is simply
+  re-absorbed on the next tick, so the swap costs the new drive nothing.
+- **reconfigured** — a file written for another *structure* is already refused
+  whole by the store's fingerprint; the per-entry declaration covers the policy
+  the fingerprint leaves out.
+- **always provisional** — a restored entry always comes back with
+  `inflate: 2.0` and `confirm: 20`, out of a `fresh` file as much as out of a
+  `stale` one. A SMART calibration may be trusted at face value out of a fresh
+  file because it is keyed by serial and the SMART feed re-associates it; a
+  handheld map has no feed, so its `σ_cal` stays doubled until twenty fresh hand
+  readings of that bay confirm it — indefinitely without them. `GET /api/model`
+  and `diagnostics["store"]["sections"]["manual_calibration"]` show how many came
+  back, and the warnings name every entry that did not.
 
 **Association without SES** (`control/associate.py`). The PC reports
 serials, not bays. (1) A declared `bays.<b>.serial` (config or `POST
@@ -2225,7 +2263,12 @@ left out, so tightening a limit keeps the model), `saved_wall`,
 `thermal` (the thermal memory, which `tools/fit_model.py --store-out` can
 write straight from an offline fit, item 15), `fan_curves`, `calibration` (per bay and
 serial, with wall-clock `last_sample_wall` and `expires_wall` so expiry
-survives a reboot), `bays` (last occupancy, class, serial,
+survives a reboot), `manual_calibration` (per bay, item 104: the handheld
+maps of `POST /api/calibrate`, with `last_sample_wall` and the bay's
+declaration at the snapshot instead of an expiry of their own — their
+window is the *loading* config's `estimator.manual_calibration_max_age_days`,
+and the whole rule for what comes back is in §3 *Manual calibrations
+survive a restart*), `bays` (last occupancy, class, serial,
 association; report only) and `ident_settle` (the experiments' settle
 timers as **seconds already settled** per zone, so they need no clock
 conversion: the outage is subtracted from them on load). `ModelPersister`
@@ -3974,7 +4017,12 @@ runners allow it.
   templates and their attributes topics), PWM numbers only
   in manual and deleted on leaving it, state payload, command parsing
   never raises, `on_message` never raises, `cmd/ident` and a retained
-  `start` that never starts an experiment, `add_topic_handler` /
+  `start` that never starts an experiment, `cmd/calibrate` under and
+  without `mqtt.allow_calibrate` (item 105: no topic and no intent
+  without it, so the refusal never reaches the supervisor or the
+  estimator; a retained reading ignored; the opt-in refused without
+  `mqtt.username`; no Discovery entity either way),
+  `add_topic_handler` /
   `topic_matches`; and the whole Discovery contract item 21 confirms
   live: the exact entity table per config and control mode (component,
   unit, device class, state class), every payload's config topic, unique
@@ -4073,7 +4121,7 @@ tests carry the `nightly` marker.
 | `tests/test_model_fallback_sim.py` | the validity gate against the truth plant: the observed drive rate (ramp, restarts, memory), a sound model returns within `model_return_dwell_s + 2 · mpc_every_ticks · dt` and does not re-enter (§8 items 10, 64), a model with wrong bay gains is caught and held, a healthy enclosure never reaches the fallback (§8 item 65), a fouling jump to 0.15× airflow does (§8 item 66) and the same run without it does not, every drive within its limit and bumpless switches; the plain drift holds the same step | PR: 1 return, 1 broken model, 3 healthy seeds and the fouling pair per preset; nightly: zones × seeds on `basic` and `rich`, more broken gains, 8 healthy seeds and 4 fouling seeds per preset |
 | `tests/test_noise_regression.py` | calibrated DAS MPC noise ≤ 0.8× the quietest uniform curve at equal or better worst true margin (measured 0.31–0.48×); uncalibrated bound 2.0 (0.30–0.69×); rich preset bound 1.25 (up to 1.18×); on `rich` every bay calibrates and the estimate follows the drive-*reported* temperature to 2.5 °C rms and never reads more than 1.0 °C *below* it (§8 item 17); MPC vs PI-DAS reported, not asserted (PI-DAS has not settled within the window on several seeds) | PR: 2 seeds; nightly: 8-seed sweeps |
 | `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× (named constant) the legacy MPC p99, the 75th percentile of several interleaved, warm-up-discarded repeats (§8 item 6); `bench_step.py` runs both DAS solvers; absolute p99 ≤ `mpc.budget_ms` only on `armv6l`; the Zero W fallback of §8 item 73 (`budget_ms` 1000 with `budget_alarm_ms` 1250 loads, `budget_ms` 1000 alone is rejected, `mpc_every_ticks: 3` solves a third of the ticks and a solve tick is the expensive one) | PR / Pi |
-| `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise; a `tools/fit_model.py` report in the store's place loads as a model, ages like a store file, drops a model of another structure and is refused outright when its `store_fingerprint` is another config's or missing (item 15); the settle timers round-trip through the file as seconds already settled minus the daemon's outage, drop on a long outage, a stale file or an unknown age, a malformed section is dropped with a warning, and the persister asks the supervisor for them before a save (item 20) | PR |
+| `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise; a `tools/fit_model.py` report in the store's place loads as a model, ages like a store file, drops a model of another structure and is refused outright when its `store_fingerprint` is another config's or missing (item 15); the settle timers round-trip through the file as seconds already settled minus the daemon's outage, drop on a long outage, a stale file or an unknown age, a malformed section is dropped with a warning, and the persister asks the supervisor for them before a save (item 20); the handheld calibrations round-trip per bay, are always restored provisional, are kept at the staleness window's boundary and dropped one second past it, dropped for an unknown or negative age, dropped when the bay's declared `occupied` / `class` / `serial` has changed, and land in the same estimator memory as the SMART ones (item 104) | PR |
 | `tests/test_fancurve.py` | the online PWM → RPM fit (item 14): a swept fan is identified per fan model, one duty or a ramping command is never enough, a noisy tachometer is refused by the residual, the bins stay bounded and follow a fan that changes, a malformed memory or a changed channel → fan-model map starts over, `curve_pair` falls back to the config for anything unusable, `step` publishes the fit into the store's `fan_curves` and reports it, the curve round-trips through `model.json`, and `model_use_rpm` keeps the configured `rpm_max` as its reference so a worn fan still reads as less air | PR |
 | `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); the re-planned levels of item 52 (the echo of the experiment's own level taken out of the want and no ratchet over a run of high ticks, a fan the solver's own floor lifted still read as demand, the anchor rising at once and falling only at a switch and never below the frozen base, a held sibling with it, the band, `symmetric` dipping at most the amplitude below the live demand, the same aborts on the same tick with and without re-planning, a re-planned level never below the frozen one, the dip and the floor read off the running experiment's own plan, the demand copied only on its ticks, and through the loop a warming zone followed instead of held back, a spent load released instead of pinning the fans, and an experiment ending later than the frozen one and never earlier — against `ident_replan: false`, which still holds it back); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes a run but the settle timers come back from the store and a start between `plan_tick` and `record_tick` keeps its tick (§8 item 20); `k·σ` counted once and the absolute abort from `ident_abort_below_limit_c` (items 53, 54); a lost sensor group blocks a start and aborts a run (item 72); legacy refuses | PR |
 | `tests/test_ident_sim.py` | an experiment on the truth plant never takes a drive over a limit and never leaves the enclosure hotter than the same seed without one, with the excitation visible on the fans; a drawn enclosure that is already saturated refuses the start; and, with the room warming 20 °C/h so the envelope actually binds, the run aborts on `envelope:<bay>` with `T̂_d + k·σ` still below the absolute abort and no drive over its limit from the abort on, on `ident_levels: above` and `symmetric` (§8 item 53) | PR: `basic` seed 1, both `ident_levels`; nightly: `basic` and `rich` seeds 1–5, envelope sweep `basic` seeds 1–5 × both `ident_levels` |
@@ -4491,8 +4539,12 @@ Rules (`control/supervisor.py`):
   in Drives (`cal manual`) and Model. A second reading for the same bay replaces
   the first. Like every other accepted intent it aborts a running identification
   experiment — but a *refused* one does not: the bay, the range and the three
-  refusals are checked before the experiment is touched. There is no MQTT
-  counterpart (item 105).
+  refusals are checked before the experiment is touched. An accepted map
+  survives a restart through the model store (item 104, §3 *Manual
+  calibrations survive a restart*). The MQTT counterpart
+  `{node_id}/cmd/calibrate/<bay>` exists but is **off** unless
+  `mqtt.allow_calibrate` is set — this route has authentication of its own,
+  MQTT has only the broker's ACL (item 105, §7).
 - **`/api/ident`** (DAS): `start` needs exactly one of `group` / `channel`
   (unknown → 400); `409` when `ident_enabled` is false, an experiment is
   already running, or a precondition fails — the error names every failed
@@ -4561,7 +4613,9 @@ parsing as pure functions; `MqttClient` is a thin paho-mqtt 2.x wrapper;
 
 Config `mqtt:` — `enabled` (must be `true`; `false` in the example),
 `host`, `port` (1883), `username`, `password` (both optional),
-`discovery_prefix` (`homeassistant`), `node_id` (`aqua-bridge`). `host:` —
+`discovery_prefix` (`homeassistant`), `node_id` (`aqua-bridge`),
+`allow_calibrate` (`false`; item 105, *Manual calibration over MQTT* below).
+`host:` —
 `interval_s` (5): how often host metrics are refreshed. `start_publishers`
 parses the section through `validate_mqtt_section` before deciding
 whether to connect (item 57): a wrong-typed scalar anywhere in it,
@@ -4591,6 +4645,10 @@ Topics:
   `start:channel:<channel>` | `start:<channel>` | `stop`). A **retained**
   `start` is ignored and logged (a broker would redeliver it on every
   reconnect); a retained `stop` still stops.
+- inbound, DAS mode and **off by default**: `{node_id}/cmd/calibrate/<bay>`
+  (a raw number, °C — one handheld drive reading, the MQTT counterpart of
+  `POST /api/calibrate`, item 105). Only with `mqtt.allow_calibrate: true`;
+  see *Manual calibration over MQTT* below.
 - inbound SMART: `{node_id}/in/smart/<serial>`, retained JSON `{serial,
   model, temp_c, ts_wall}` from `tools/smart_agent.py`, into the
   `SmartInbox` on the same broker connection
@@ -4678,6 +4736,41 @@ publish on them: unlike the HTTPS API (§6), they rely entirely on the
 and password (Home Assistant's Mosquitto add-on does), give aqua-bridge
 its own account, and limit publishing to `{node_id}/cmd/#` and
 `{node_id}/in/smart/#` to the accounts that need it.
+
+**Manual calibration over MQTT is off by default (item 105).** There *is* a
+`{node_id}/cmd/calibrate/<bay>` topic (a raw number in °C, the counterpart of
+`POST /api/calibrate`), but `mqtt.allow_calibrate` defaults to `false` and
+nothing accepts one until the owner sets it: the topic is not in the
+subscription list, and the parser refuses it a second time, returning no intent
+at all, so a message that arrives anyway (a wildcard subscription, a replayed
+session) never reaches the supervisor or the estimator. **Why it is off when
+`cmd/limit` and `cmd/bay` are on**, given all three have only the broker's ACL
+behind them: a limit or a declared occupancy is *policy* — a number the gate
+re-clamps every tick, visible in Home Assistant as the entity that carries it,
+bounded by the safety core. A calibration is not policy but *measurement*: it
+fits the bay's sensor-to-drive map, so a wrong reading biases every later
+estimate of that bay, and an estimate biased low makes the controller run the
+fans slower than the drive needs. It is the one inbound payload that can quietly
+reduce cooling, so it asks for a deliberate `true` in `config.yaml` rather than
+riding in on the ACL by default. Its guards when it *is* on:
+
+- `mqtt.allow_calibrate: true`, checked like every other scalar of the section
+  (item 57), and refused as a named setup error together with
+  **`mqtt.username`**: an anonymous connection cannot be given an ACL of its own,
+  so "the broker's ACL" would be no guard at all. The rejection happens once, at
+  startup, where the owner can see it, not per message.
+- a **retained** calibration is ignored and logged, exactly as a retained
+  experiment `start` is — and for a sharper reason: a retained number is
+  redelivered on every reconnect and would be refitted into the bay's map on
+  every restart, which is the failure item 104 is about.
+- **no Discovery entity.** Fifteen more `number` entities would be fifteen more
+  things Home Assistant republishes on its own restart — the retained-message
+  problem in another costume. The topic is for a script or an automation
+  publishing one live reading, not for a slider.
+
+Past the parser it is the ordinary `Calibrate` path: the supervisor's own checks
+(the bay, the range, `no_tick` / `empty:<bay>` / `untrusted:<zone>`) apply
+unchanged, and a refused reading still costs no running identification run.
 
 Everything above is pinned by tests with a fake client
 (`tests/test_mqtt_ha.py`, §4.9): the entity table, every payload's fixed
@@ -5166,7 +5259,8 @@ Owner decision (2026-09-16):
     Visible in `GET /api/model` (`manual_calibrations`,
     `calibration_source`), in `GET /api/bays`, in the 200 body's
     `calibration` progress and on the page (Drives `cal manual`, Model).
-    Left open: persistence (item 104) and an MQTT counterpart (item 105).
+    Persistence is item 104 (**done**) and the MQTT counterpart item 105
+    (**done**, off by default).
 24. **Done:** the HTML page shows drive estimates, bays, zone and model
     status (§6 View, `publishers/static/index.html`), reusing the existing
     `/api/estimate`, `/api/bays`, `/api/model` views plus the new
@@ -6171,20 +6265,56 @@ Owner decision (2026-09-16):
     on every tick and an under-voltage it sees force a word refresh ahead of
     the cadence. Not done — it complicates the chain for the one condition of
     the four the hwmon source already reports on its own.
-104. A manual calibration (item 23) does not survive a restart: its RLS entry
-    lives in the estimator's `manual` memory, which the model store neither
-    saves nor restores (the store's `calibration` section is keyed by drive
-    serial, and a manual reading has no serial). An owner who calibrated
-    fifteen bays by hand loses all of it on a daemon restart. The work is a
-    per-bay section in the store next to `calibration`, restored under the
-    same fresh/stale rule (`σ_cal × 2` until `confirm` new samples) and
-    dropped when the bay's occupancy changed while the daemon was down.
-105. No MQTT counterpart of `POST /api/calibrate` (item 23). The HTTPS route
-    has authentication of its own; an MQTT `cmd/calibrate` would rely on the
-    broker's ACL like `cmd/limit` and `cmd/bay` do (§7), and would need a
-    topic shape (`cmd/calibrate/<bay>` with a raw number) plus a Home
-    Assistant `number` entity per bay. Decide whether the owner wants it
-    before adding fifteen more entities.
+104. **Done** (2026-09-17): a manual calibration (item 23) survives a restart.
+    Its RLS entry rides in the model store's own per-bay
+    `manual_calibration` section, next to the per-serial `calibration` one
+    (a handheld reading has no serial to key it by), with its sample time
+    converted to wall clock and re-based on the new controller clock the way
+    a SMART entry's is. The rule for what comes back is stricter than the
+    SMART one and lives in one place (`estimator.restore_manual_calibration`,
+    §3 *Manual calibrations survive a restart*), because a stale calibration
+    silently trusted is worse than none — every doubtful case is a **drop**,
+    which returns the bay to the prior map at `sigma_uncalibrated_c`, i.e.
+    more margin and more cooling: (a) **old** — past
+    `estimator.manual_calibration_max_age_days` (new `estimator` key,
+    default 7 wall-clock days, the outage included), or with an age that is
+    unknown or negative, it is dropped outright rather than restored with its
+    fresh count reset the way a SMART entry is, because nothing but the
+    operator can refresh a handheld map; the window is shorter than
+    `calibration_max_age_days` because the daemon was not watching and the map
+    is keyed by bay, not by serial; (b) **swapped** — each entry stores the
+    bay's declaration at the snapshot (`occupied`, `class`, `serial`, exactly
+    the policy the store fingerprint leaves out) and any difference in the
+    running config drops it by name, while a swap the *running* daemon sees
+    (item 12: occupancy crossing `empty`, or the fast-swap proximal jump) drops
+    that bay's manual entry on the tick it fires, restored or measured in this
+    run alike; (c) **always provisional** — a restored entry always comes back
+    `inflate: 2.0` / `confirm: 20`, out of a `fresh` file as much as a `stale`
+    one, since a bay-keyed map has no feed that could re-associate it after a
+    swap the daemon slept through. Visible as
+    `diagnostics["store"]["sections"]["manual_calibration"]`, with a named
+    warning for every entry that did not come back.
+105. **Done** (2026-09-17), and the answer is **off by default**. There is now
+    an MQTT counterpart of `POST /api/calibrate` —
+    `{node_id}/cmd/calibrate/<bay>`, a raw number in °C — behind the explicit
+    opt-in `mqtt.allow_calibrate` (new `mqtt` key, default `false`). Without
+    it the topic is not subscribed *and* the parser refuses it, returning no
+    intent at all, so a message that arrives anyway never reaches the
+    supervisor or the estimator. Why it is off when `cmd/limit` and `cmd/bay`
+    are on, all three having only the broker's ACL behind them: a limit or a
+    declared occupancy is policy the gate re-clamps every tick and the safety
+    core bounds, while a calibration is a *measurement* — it fits the bay's
+    sensor-to-drive map, and a map biased low makes the controller run the
+    fans slower than the drive needs. It is the one inbound payload that can
+    quietly reduce cooling, so it asks for a deliberate `true` in
+    `config.yaml`. Turning it on also requires `mqtt.username` (an anonymous
+    connection cannot be given an ACL of its own; refused as a named setup
+    error at startup, not per message), ignores a **retained** reading the way
+    a retained experiment `start` is ignored (it would be refitted into the map
+    on every reconnect and every restart — item 104's failure over the wire),
+    and publishes **no** Discovery entity: fifteen more `number` entities whose
+    state Home Assistant republishes on its own restart is the retained-message
+    problem in another costume. §7 *Manual calibration over MQTT*.
 106. Nothing at startup checks a config against the one-controlling-
     controller shape (owner decision 2026-09-16, §8.1, §2 "Supported
     topology"). `hw/sources.py::_check_quadro_commanded_once` refuses a

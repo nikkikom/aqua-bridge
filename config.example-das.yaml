@@ -43,6 +43,15 @@ mqtt:
   password: ""
   discovery_prefix: homeassistant
   node_id: aqua-bridge
+  allow_calibrate: false  # accept {node_id}/cmd/calibrate/<bay> (a raw number, degC: one
+                         # handheld drive reading, the MQTT counterpart of POST
+                         # /api/calibrate). OFF by default: MQTT has no authentication of
+                         # its own, only the broker's ACL, and unlike a limit or a declared
+                         # occupancy a calibration is a *measurement* -- it fits the bay's
+                         # sensor-to-drive map, and a map biased low makes the controller
+                         # run the fans slower than the drive needs. Turning it on requires
+                         # username: (an anonymous connection cannot be given an ACL) and
+                         # publishes no Home Assistant entity; a retained reading is ignored
 
 host:
   interval_s: 5          # refresh, s (MQTT host sensors, /api/state's "host" key)
@@ -321,7 +330,15 @@ mpc:
     bay_cal_step_c: 0.05  # ...and skip it the same way when its sigma_cal floor moves by more
                          # than this, degC: an accepted or expired map re-maps the drive
                          # estimate, which the model's prediction cannot be blamed for
-    calibration_max_age_days: 30  # a SMART calibration without samples this long is not trusted
+    calibration_max_age_days: 30  # a calibration without samples this long is not trusted
+                         # (SMART and handheld alike, on the running daemon's clock)
+    manual_calibration_max_age_days: 7  # how old a *stored* handheld calibration may be when
+                         # model.json is loaded and still come back (wall clock, the outage
+                         # included). Shorter than calibration_max_age_days on purpose: while
+                         # the daemon was down nothing watched the bay, and a handheld map is
+                         # keyed by bay, not by serial, so a drive swapped during the outage
+                         # would inherit the previous drive's map. Past this the entry is
+                         # dropped, not restored at a reduced weight
     calibrate_min_c: 5.0  # POST /api/calibrate: the drive temperature a handheld reading may
     calibrate_max_c: 80.0 # report, degC (min < max); narrowed at submit time to the gate's
                           # [temp_min_c, temp_max_c] -- a tighter gate is never a config error

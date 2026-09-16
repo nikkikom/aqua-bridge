@@ -37,6 +37,10 @@ File schema (:data:`SCHEMA`, version :data:`SCHEMA_VERSION`; plain JSON, finite 
                                      ["inflate", "confirm",]
                                      "last_sample_wall": unix time | null,
                                      "expires_wall": unix time | null}}},
+     "manual_calibration": {bay: {"th", "P", "n", "fresh", "rms2", "used",
+                                     ["inflate", "confirm",]
+                                     "last_sample_wall": unix time | null,
+                                     "declared": {"occupied", "class", "serial"}}},
      "bays": {bay: {"occupancy", "class", "serial", "association"}},
      "ident_settle": {zone: seconds trusted and fault-free at the snapshot}}
 
@@ -46,7 +50,18 @@ on load. ``calibration`` holds the estimator's SMART calibrations per bay and se
 their times are converted from the controller's clock (``obs.ts``, monotonic on the
 hardware) to wall time at the snapshot, so they survive a reboot:
 ``last_sample_wall = saved_wall - (ts - entry.ts)`` and ``expires_wall = last_sample_wall
-+ calibration_max_age_days``. ``bays`` is the last view per bay from the diagnostics.
++ calibration_max_age_days``. ``manual_calibration`` holds the estimator's *manual*
+calibrations (``POST /api/calibrate``, plan section 8 items 23 and 104), one entry per
+bay rather than per serial -- the operator names the bay, so there is no serial to key
+them by -- with the same wall-time conversion and, instead of an ``expires_wall`` of
+their own, the bay's declaration (``occupied`` / ``class`` / ``serial``) as it stood at
+the snapshot. Their window is the *loading* config's
+``estimator.manual_calibration_max_age_days``, and the whole rule for what comes back
+lives in one place,
+:func:`aqua_bridge.control.estimator.restore_manual_calibration`: an entry that is too
+old, whose age is unknown, or whose bay is now declared differently is dropped, and what
+survives is always restored provisional. ``bays`` is the last view per bay from the
+diagnostics.
 ``fan_curves`` is ``solver_memory["fan_curves"]``: the PWM -> RPM curve per fan model
 that ``mpc.fan_curve_online`` fits online (:mod:`aqua_bridge.control.fancurve`), empty
 without the switch.
@@ -279,6 +294,35 @@ def _calibration_seed(
     return out
 
 
+def _manual_calibration_seed(
+    raw: object, now_wall: float, warnings: list[str]
+) -> dict[str, dict[str, Any]] | None:
+    """The ``manual_calibration`` section as
+    :func:`aqua_bridge.control.estimator.restore_manual_calibration` wants it: the entry's
+    fields, its ``age_s`` at load time and the bay declaration it was saved under.
+
+    No ``expired`` flag: the window of a manual calibration is the *loading* config's
+    ``estimator.manual_calibration_max_age_days``, applied in the estimator where that
+    config is at hand, so the rule has exactly one home (module docstring).
+    """
+    if not isinstance(raw, Mapping):
+        warnings.append("manual_calibration: not a mapping, section dropped")
+        return None
+    out: dict[str, dict[str, Any]] = {}
+    for bay, entry in raw.items():
+        if not isinstance(entry, Mapping):
+            warnings.append(f"manual_calibration: bay {bay!r} is not a mapping, dropped")
+            continue
+        seeded = {k: entry[k] for k in _CAL_FIELDS if k in entry}
+        last = entry.get("last_sample_wall")
+        age = now_wall - float(last) if _finite(last) else None
+        seeded["age_s"] = age if age is not None and age >= 0 else None
+        declared = entry.get("declared")
+        seeded["declared"] = dict(declared) if isinstance(declared, Mapping) else None
+        out[str(bay)] = seeded
+    return out
+
+
 def load(path: str | os.PathLike[str], cfg: MpcConfig, *, now_wall: float) -> LoadResult:
     """Read the store file (module docstring, *Load*). Never raises."""
     result = LoadResult(path=str(path))
@@ -340,6 +384,10 @@ def load(path: str | os.PathLike[str], cfg: MpcConfig, *, now_wall: float) -> Lo
         seed["thermal"] = thermal
         if doc.get("calibration") is not None:
             seed["calibration"] = _calibration_seed(doc["calibration"], now_wall, result.warnings)
+        if doc.get("manual_calibration") is not None:
+            seed["manual_calibration"] = _manual_calibration_seed(
+                doc["manual_calibration"], now_wall, result.warnings
+            )
         for name in ("fan_curves", "bays", "ident_settle"):
             value = doc.get(name)
             if value is None:
@@ -402,6 +450,23 @@ def build_document(
                 out[str(serial)] = saved
             if out:
                 calibration[str(bay)] = out
+    manual_calibration: dict[str, Any] = {}
+    manual = est.get("manual") if isinstance(est, Mapping) else None
+    if isinstance(manual, Mapping) and cfg.topology is not None:
+        for bay, known in manual.items():
+            if not isinstance(known, Mapping):
+                continue
+            entry = known.get("cal")
+            if not isinstance(entry, Mapping) or str(bay) not in cfg.topology.bays:
+                continue  # a bay with a pending reading but no map yet carries nothing
+            saved = {k: entry[k] for k in _CAL_FIELDS if k in entry}
+            entry_ts = entry.get("ts")
+            last = None
+            if _finite(entry_ts) and _finite(ts) and float(ts) >= float(entry_ts):  # type: ignore[arg-type]
+                last = wall - (float(ts) - float(entry_ts))  # type: ignore[arg-type]
+            saved["last_sample_wall"] = last
+            saved["declared"] = cfg.bay_declaration(str(bay))
+            manual_calibration[str(bay)] = saved
     bays_out: dict[str, Any] = {}
     for bay, info in (bays or {}).items():
         if isinstance(info, Mapping):
@@ -422,6 +487,7 @@ def build_document(
         "thermal": dict(thermal) if isinstance(thermal, Mapping) else None,
         "fan_curves": dict(curves) if isinstance(curves, Mapping) else {},
         "calibration": calibration,
+        "manual_calibration": manual_calibration,
         "bays": bays_out,
         "ident_settle": settle_out,
     }
@@ -436,9 +502,10 @@ def document_from_fit(
     ``payload`` is the report as the tool writes it (``kind``/``v``, ``memory`` -- which
     is already in exactly the shape ``solver_memory["thermal"]`` uses -- and
     ``store_fingerprint``, :func:`fingerprint` of the config the fit ran against). The
-    thermal section is that memory; ``fan_curves``, ``calibration`` and ``bays`` are
-    empty, because a fit of a recording knows nothing about the SMART calibrations or the
-    bay view of the machine that will load it. ``wall`` defaults to the report's
+    thermal section is that memory; ``fan_curves``, ``calibration``,
+    ``manual_calibration`` and ``bays`` are empty, because a fit of a recording knows
+    nothing about the calibrations or the bay view of the machine that will load it.
+    ``wall`` defaults to the report's
     ``generated_at``, so the file's age -- and with it the ``fresh`` / ``stale`` rule --
     is the age of the *fit*, not of the conversion.
 
@@ -478,6 +545,7 @@ def document_from_fit(
         "thermal": dict(memory),
         "fan_curves": {},
         "calibration": {},
+        "manual_calibration": {},
         "bays": {},
     }
 

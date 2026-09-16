@@ -8,10 +8,12 @@ from typing import Any
 import pytest
 
 from aqua_bridge.control.intents import (
+    Calibrate,
     ClearOverride,
     ControlMode,
     IntentConflict,
     IntentInvalid,
+    SetBay,
     SetMode,
     SetPreset,
     SetPwm,
@@ -603,6 +605,7 @@ def test_a_retained_ident_start_never_starts_an_experiment() -> None:
 def test_validate_mqtt_section_defaults_when_absent() -> None:
     assert validate_mqtt_section(None) == {
         "enabled": False,
+        "allow_calibrate": False,  # item 105: MQTT calibration is off unless asked for
         "host": "localhost",
         "username": "",
         "password": "",
@@ -616,6 +619,7 @@ def test_validate_mqtt_section_defaults_when_absent() -> None:
 def test_validate_mqtt_section_accepts_every_key_explicit() -> None:
     section = {
         "enabled": True,
+        "allow_calibrate": True,
         "host": "broker.local",
         "username": "u",
         "password": "p",
@@ -984,3 +988,126 @@ def test_the_publisher_lifecycle_and_the_node_id_and_prefix_from_the_config(
     service.stop()
     assert paho.published[-1] == (f"{node_id}/status", "offline", 1, True)
     assert paho.loops[-1] == "stop"
+
+
+# --- cmd/calibrate: the MQTT counterpart of POST /api/calibrate (item 105) ---------------
+
+
+def _calibrate_rig():
+    from test_ident_experiment import Rig, ident_cfg
+
+    rig = Rig(ident_cfg())
+    rig.ticks(8)
+    return rig
+
+
+def _manual_memory(rig) -> dict:
+    """The estimator's per-bay manual calibrations after the rig's last tick."""
+    return dict(rig.loop.state.solver_memory.get("estimator", {}).get("manual", {}))
+
+
+def test_calibrate_topics_exist_only_under_the_opt_in(das_example_cfg: MpcConfig) -> None:
+    """Item 105: without ``mqtt.allow_calibrate`` there is no topic to subscribe to, so
+    the daemon never even asks the broker for the messages."""
+    bays = das_example_cfg.topology.bays  # type: ignore[union-attr]
+    off = command_topics(NODE_ID, das_example_cfg)
+    assert not any(t.startswith("calibrate/") for t in off)
+    on = command_topics(NODE_ID, das_example_cfg, allow_calibrate=True)
+    assert set(on) - set(off) == {f"calibrate/{bay}" for bay in bays}
+    for bay in bays:
+        assert on[f"calibrate/{bay}"] == f"{NODE_ID}/cmd/calibrate/{bay}"
+
+
+def test_calibrate_topics_are_das_only(cfg: MpcConfig) -> None:
+    # a legacy config has no bays, so the opt-in adds nothing to subscribe to
+    assert command_topics(NODE_ID, cfg, allow_calibrate=True) == command_topics(NODE_ID, cfg)
+
+
+def test_parse_command_refuses_a_calibration_without_the_opt_in() -> None:
+    topic = f"{NODE_ID}/cmd/calibrate/a1"
+    assert parse_command(NODE_ID, topic, b"41.0") is None
+    assert parse_command(NODE_ID, topic, b"41.0", allow_calibrate=False) is None
+    assert parse_command(NODE_ID, topic, b"41.0", allow_calibrate=True) == Calibrate(
+        bay="a1", drive_temp_c=41.0
+    )
+    # garbage is still garbage with the opt-in on
+    for bad in (b"", b"warm", b"\xff", b"nan"):
+        assert parse_command(NODE_ID, topic, bad, allow_calibrate=True) is None
+    empty_bay = f"{NODE_ID}/cmd/calibrate/"
+    assert parse_command(NODE_ID, empty_bay, b"41.0", allow_calibrate=True) is None
+
+
+def test_a_calibration_over_mqtt_reaches_the_estimator_under_the_opt_in() -> None:
+    rig = _calibrate_rig()
+    client = _client(rig.cfg, on_intent=rig.sup.submit, allow_calibrate=True)
+    assert client.allow_calibrate is True
+    client._on_message(client.client, None, _Msg(f"{NODE_ID}/cmd/calibrate/a1", b"41.0"))
+    stamp = rig.t
+    assert rig.sup.plan_tick().calibrations == {"a1": {"temp_c": 41.0, "ts": stamp}}
+    result = rig.ticks(1)[0]
+    assert result.obs.inputs["calibration"] == {"a1": {"temp_c": 41.0, "ts": stamp}}
+    assert result.mpc_cmd.diagnostics["estimator"]["manual_fresh"] == ["a1"]
+    assert set(_manual_memory(rig)) == {"a1"}
+
+
+def test_a_calibration_over_mqtt_is_refused_without_the_opt_in() -> None:
+    """The refusal happens before any intent exists, so nothing downstream sees it: no
+    supervisor state, no observation input, no RLS row in the estimator."""
+    rig = _calibrate_rig()
+    submitted: list[Any] = []
+
+    def on_intent(intent: Any) -> None:
+        submitted.append(intent)
+        rig.sup.submit(intent)
+
+    client = _client(rig.cfg, on_intent=on_intent)
+    assert client.allow_calibrate is False
+    topic = f"{NODE_ID}/cmd/calibrate/a1"
+    assert client._on_message(client.client, None, _Msg(topic, b"41.0")) is None
+    assert submitted == []
+    assert rig.sup.plan_tick().calibrations == {}
+    result = rig.ticks(1)[0]
+    assert not result.obs.inputs.get("calibration")
+    diagnostics = result.mpc_cmd.diagnostics["estimator"]
+    assert diagnostics["manual_fresh"] == []
+    assert diagnostics["manual_used"] == 0 and diagnostics["manual_rejected"] == 0
+    assert _manual_memory(rig) == {}
+    # an ordinary DAS command on the same connection still goes through
+    client._on_message(client.client, None, _Msg(f"{NODE_ID}/cmd/bay/a1", b"empty"))
+    assert submitted == [SetBay(bay="a1", changes={"occupied": False})]
+
+
+def test_a_retained_calibration_is_ignored() -> None:
+    """A retained number would be refitted into the bay's map on every reconnect and
+    every restart -- the failure item 104 is about, arriving over the wire."""
+    rig = _calibrate_rig()
+    client = _client(rig.cfg, on_intent=rig.sup.submit, allow_calibrate=True)
+    topic = f"{NODE_ID}/cmd/calibrate/a1"
+    retained = _Msg(topic, b"41.0")
+    retained.retain = True  # type: ignore[attr-defined]
+    client._on_message(client.client, None, retained)
+    assert rig.sup.plan_tick().calibrations == {}
+    client._on_message(client.client, None, _Msg(topic, b"41.0"))
+    assert set(rig.sup.plan_tick().calibrations) == {"a1"}
+
+
+def test_the_opt_in_needs_an_authenticated_broker_connection() -> None:
+    """Item 105: MQTT has no authentication of its own, only the broker's ACL, and an
+    anonymous connection cannot be given one. Refused by name at startup."""
+    with pytest.raises(MqttSetupError, match="mqtt.username"):
+        validate_mqtt_section({"enabled": True, "allow_calibrate": True})
+    with pytest.raises(MqttSetupError, match="mqtt.username"):
+        validate_mqtt_section({"enabled": True, "allow_calibrate": True, "username": ""})
+    ok = validate_mqtt_section({"enabled": True, "allow_calibrate": True, "username": "u"})
+    assert ok["allow_calibrate"] is True
+    with pytest.raises(MqttSetupError, match="mqtt.allow_calibrate"):
+        validate_mqtt_section({"allow_calibrate": "true"})
+
+
+def test_no_discovery_entity_is_published_for_calibration(das_example_cfg: MpcConfig) -> None:
+    """Fifteen more ``number`` entities, each of whose states Home Assistant republishes
+    on restart, is exactly the retained-message problem in another costume (item 105)."""
+    entities = build_discovery_entities(
+        das_example_cfg, node_id=NODE_ID, discovery_prefix=PREFIX, control_mode=ControlMode.AUTO
+    )
+    assert not any("calibrat" in e.object_id for e in entities)
