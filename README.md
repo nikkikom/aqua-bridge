@@ -118,8 +118,10 @@ hardware.
    aquaero's aquabus, its outputs are the aquaero's `pwm5..pwm8` and
    `fan5..fan8`), `temp_map` per input actually present (`tempN`
    physical sensors, `busN` the aquaero's aquabus slots, `softN` software
-   and `virtN` virtual sensors); the optional timing keys are shown at
-   their defaults, PROJECT.md §3 Track B), `onewire.sensors`
+   and `virtN` virtual sensors); the optional timing keys and the
+   software-sensor heartbeat (`heartbeat_sensor`, `heartbeat_value_c`,
+   off by default) are shown at their defaults, PROJECT.md §3 Track B),
+   `onewire.sensors`
    (bound in step 8), the MQTT host and credentials, `http.enabled` /
    `mqtt.enabled`. Every declared name must be bound exactly once — the
    daemon exits 2 otherwise. Legacy (no DAS sections): `xt6.device`,
@@ -161,7 +163,13 @@ hardware.
    memory: after a power cycle they run their saved configuration. A
    permission error means the udev rule has not applied
    (`ls -l /dev/hidraw*` must show group `plugdev` with read/write).
-   Firmware revert behaviour is still an open spike question. As the
+   For the aquaero's own watchdog, configure a software sensor on the
+   controller (enabled, a timeout of a few tens of seconds, a fallback
+   temperature above every alarm threshold) with an alarm that selects a
+   safe profile, save that configuration once, then set
+   `heartbeat_sensor` to that sensor: the daemon writes it every tick, and
+   a daemon or Pi that stops leaves the controller to run the safe profile
+   (PROJECT.md §2 "Software-sensor heartbeat and profiles", §8 item 84). As the
    service user:
    `HYPOTHESIS_PROFILE=pi .venv/bin/python -m pytest -m hardware`. Warm
    each mapped thermistor and confirm the right `obs.temps` key moves (a
