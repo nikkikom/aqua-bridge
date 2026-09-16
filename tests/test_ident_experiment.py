@@ -1069,7 +1069,7 @@ def test_a_transient_peak_does_not_pin_the_channel_for_the_rest_of_the_experimen
     assert max(anchors) > base + 0.15  # the load was followed up
     assert min(anchors) >= base - TOL  # never below the frozen base of the start
     assert anchors[-1] == pytest.approx(base)  # and released again, not pinned at the peak
-    frozen_rig, frozen_anchors, frozen_cmds = _load_run(replan=False)
+    _, frozen_anchors, frozen_cmds = _load_run(replan=False)
     assert set(frozen_anchors) == {0.5}  # the frozen plan never moved at all
     # so the noise the following cost is paid back: with the load gone the re-planned run
     # commands no more than the frozen one

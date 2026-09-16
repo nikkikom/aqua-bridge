@@ -2061,29 +2061,48 @@ and fallback beats them.
 
 **A rise in the solver's demand wins over the experiment's plan, always**
 (`ident_replan: true`, item 52). Every tick each channel's base is raised
-to the solver's honest demand for it (`diagnostics["target_pwm"]`, before
-the rate limit and the clamp) and its two levels are re-derived around the
-new base and clamped into `[pwm_min, pwm_max]`; the base never falls, so
-the experiment never reduces cooling below a level it has established, and
-a channel whose demand is missing this tick keeps its base. The schedule
-(phases and switch times) still comes from the seed once, at the start.
-Because a re-planned level can only reach the fans on the next tick,
-`compose` also floors an experiment channel's own override with the
-solver's command for the tick (`max(override, mpc_cmd.pwm[ch] - dip)`,
-`dip` 0 under `above` and `ident_amplitude` under `symmetric`), so no tick
-of an experiment puts less on a fan than the controller would have. The
-aborts of a tick are decided on that tick's estimates, with the same
-thresholds in the same order, *before* the next tick's levels are
-re-planned: no re-planned level can make an abort later or weaker, and a
-re-planned level is never below the frozen plan's. What it costs the
-identification: the levels move with the demand, so the step sizes change
-(a rise of `d` inside a hold makes the next switch `A ∓ d` instead of `A`,
-and a level clamped at `pwm_max` squeezes the step — under `above` with the
-demand at `pwm_max` the excitation stops until the demand falls back). The
-base drift is slow next to the 60–180 s holds, so the regressors keep the
-content the fit lives on (§8.4 item 52 has the sim numbers and the measured
-per-tick cost). `ident_replan: false` keeps the levels frozen at the base
-of the start, which is what ran on the Zero W. **Start preconditions**, each refused with a
+to the solver's want for it (`diagnostics["target_pwm"]`, before the rate
+limit and the clamp) and its two levels are re-derived around the new base
+and clamped into `[pwm_min, pwm_max]`. That want is **not** free of the
+experiment's own influence — the DAS MPC's objective carries
+`weight_dpwm·‖u₀ − prev‖²` and `prev` is what was last on the fan, so
+following it raw would ratchet (measured on the DAS example, all else
+equal: `prev` 0.40 → want 0.398, `prev` 1.00 → 0.962). The echo of the
+experiment's own level therefore comes off first,
+`wanted = demand − max(0, min(prev, own) − base)`, with `prev` from
+`diagnostics["prev_pwm"]` and `own` the override the experiment itself had
+on that tick: a fan above the base because the experiment put it there is
+an echo and comes off, a fan above the base because the solver's own floor
+lifted it there is demand and stays. The base **rises at once and falls
+slowly**: a fall is taken only at a level switch, by at most `d_pwm_max`,
+and never below the base of the start, so a hold keeps its level while a
+spent excursion is released within a hold or two instead of pinning the
+channel and its held siblings at its peak for the rest of
+`ident_max_duration_s`. A channel whose demand or `prev` is missing this
+tick keeps its base. The schedule (phases and switch times) still comes
+from the seed once, at the start. Because a re-planned level can only reach
+the fans on the next tick, `compose` also floors an experiment channel's
+own override with the solver's command for the tick
+(`max(override, mpc_cmd.pwm[ch] − dip)`, `dip` 0 under `above` and
+`ident_amplitude` under `symmetric`, both read off the **running**
+experiment's own plan so a config rebuilt under it cannot take the floor
+away), so no tick of an experiment puts less on a fan than the controller
+would have. The aborts of a tick are decided on that tick's estimates, with
+the same thresholds in the same order, *before* the next tick's levels are
+re-planned: the re-plan cannot weaken the decision itself, and a re-planned
+level is never below the frozen plan's for the same tick. Across ticks it
+does move the aborts, which is the point — a channel followed up cools its
+own bay, so an excursion the frozen plan would have ended on the envelope
+runs to completion; fewer envelope aborts are the intended outcome, not a
+weakened rule. What it costs the identification: the levels move with the
+demand, so the step sizes change (a rise of `d` inside a hold makes the
+next switch `A ∓ d` instead of `A`, and a level clamped at `pwm_max`
+squeezes the step — under `above` with the demand at `pwm_max` the
+excitation stops until the demand falls back). The base drift is slow next
+to the 60–180 s holds, so the regressors keep the content the fit lives on
+(§8.4 item 52 has the sim numbers and the measured per-tick cost).
+`ident_replan: false` keeps the levels frozen at the base of the start,
+which is what ran on the Zero W, and costs exactly what it cost then. **Start preconditions**, each refused with a
 named reason: control mode `auto` without human overrides
 (`control_mode`), last command `auto` (`mode:<m>`), no saturation, band
 or stall on the target (`saturated:`, `band:`, `no_command:`,
@@ -2987,6 +3006,7 @@ aqua-bridge/
     test_fancurve.py         # online PWM -> RPM fit, its acceptance rules and the store
     test_ident_experiment.py
     test_ident_sim.py        # experiments against the DAS truth plant
+    test_ident_replan_sim.py  # re-planned vs frozen levels on sim/das (nightly)
     test_recorder.py
     test_tools_fit_replay.py
     test_sim_das.py
@@ -3696,8 +3716,9 @@ tests carry the `nightly` marker.
 | `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× (named constant) the legacy MPC p99, the 75th percentile of several interleaved, warm-up-discarded repeats (§8 item 6); `bench_step.py` runs both DAS solvers; absolute p99 ≤ `mpc.budget_ms` only on `armv6l`; the Zero W fallback of §8 item 73 (`budget_ms` 1000 with `budget_alarm_ms` 1250 loads, `budget_ms` 1000 alone is rejected, `mpc_every_ticks: 3` solves a third of the ticks and a solve tick is the expensive one) | PR / Pi |
 | `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise; a `tools/fit_model.py` report in the store's place loads as a model, ages like a store file, drops a model of another structure and is refused outright when its `store_fingerprint` is another config's or missing (item 15); the settle timers round-trip through the file as seconds already settled minus the daemon's outage, drop on a long outage, a stale file or an unknown age, a malformed section is dropped with a warning, and the persister asks the supervisor for them before a save (item 20) | PR |
 | `tests/test_fancurve.py` | the online PWM → RPM fit (item 14): a swept fan is identified per fan model, one duty or a ramping command is never enough, a noisy tachometer is refused by the residual, the bins stay bounded and follow a fan that changes, a malformed memory or a changed channel → fan-model map starts over, `curve_pair` falls back to the config for anything unusable, `step` publishes the fit into the store's `fan_curves` and reports it, the curve round-trips through `model.json`, and `model_use_rpm` keeps the configured `rpm_max` as its reference so a worn fan still reads as less air | PR |
-| `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); the re-planned levels of item 52 (the anchor follows a rise and only a rise, a held sibling with it, the band, `symmetric` dipping at most the amplitude below the live demand, the same aborts on the same tick with and without re-planning, a re-planned level never below the frozen one, and through the loop a warming zone followed instead of held back — against `ident_replan: false`, which still holds it back); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes a run but the settle timers come back from the store and a start between `plan_tick` and `record_tick` keeps its tick (§8 item 20); `k·σ` counted once and the absolute abort from `ident_abort_below_limit_c` (items 53, 54); a lost sensor group blocks a start and aborts a run (item 72); legacy refuses | PR |
+| `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); the re-planned levels of item 52 (the echo of the experiment's own level taken out of the want and no ratchet over a run of high ticks, a fan the solver's own floor lifted still read as demand, the anchor rising at once and falling only at a switch and never below the frozen base, a held sibling with it, the band, `symmetric` dipping at most the amplitude below the live demand, the same aborts on the same tick with and without re-planning, a re-planned level never below the frozen one, the dip and the floor read off the running experiment's own plan, the demand copied only on its ticks, and through the loop a warming zone followed instead of held back, a spent load released instead of pinning the fans, and an experiment ending later than the frozen one and never earlier — against `ident_replan: false`, which still holds it back); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes a run but the settle timers come back from the store and a start between `plan_tick` and `record_tick` keeps its tick (§8 item 20); `k·σ` counted once and the absolute abort from `ident_abort_below_limit_c` (items 53, 54); a lost sensor group blocks a start and aborts a run (item 72); legacy refuses | PR |
 | `tests/test_ident_sim.py` | an experiment on the truth plant never takes a drive over a limit and never leaves the enclosure hotter than the same seed without one, with the excitation visible on the fans; a drawn enclosure that is already saturated refuses the start; and, with the room warming 20 °C/h so the envelope actually binds, the run aborts on `envelope:<bay>` with `T̂_d + k·σ` still below the absolute abort and no drive over its limit from the abort on, on `ident_levels: above` and `symmetric` (§8 item 53) | PR: `basic` seed 1, both `ident_levels`; nightly: `basic` and `rich` seeds 1–5, envelope sweep `basic` seeds 1–5 × both `ident_levels` |
+| `tests/test_ident_replan_sim.py` | re-planned against frozen experiment levels on the truth sim (`rich`, the real loop and supervisor), both solvers and three seeds: no tick below the solver's own command (and the frozen plan does hold one back), no anchor more than `ident_amplitude` above the demand the frozen arm saw (the ratchet guard, which the pre-review `_replan` fails on the MPC arm), and the fit no worse than frozen beyond a loose margin | nightly |
 | `tests/test_sim_das.py` | the truth plant: energy balance through transients and hot swap, steady state, more airflow never warms anything, dead band and exponent, quantisation per sensor type, lags, SMART cadence, determinism per seed | PR |
 
 Test cost: the PR selection is about 1,900 tests in under five minutes
@@ -4272,8 +4293,10 @@ them as "§8 item N".
   broker; its host name is in `private.md` (item 21).
 - An experiment holding back a cooling increase was deferred to the
   Zero 2 W upgrade (item 52); done 2026-09-16, the levels are re-planned
-  from the live solver demand every tick (`ident_replan`, §3), and the
-  measured cost says it would have fitted the Zero W as well.
+  from the live solver demand every tick (`ident_replan`, §3), at a
+  measured ≈ 10 µs per tick here and only while an experiment runs — small
+  enough that the board is unlikely to be what decides it, which the
+  Zero 2 W run confirms (item 52).
 
 Owner decisions (2026-09-14, later the same day):
 
@@ -5484,6 +5507,20 @@ Owner decision (2026-09-16):
     per sensor and serial, and the jump rule can then compare like with like.
     Check the step budget afterwards (item 73) and the goldens, which have
     one sensor per bay and should not move.
+102. No closed-loop scenario in which the identification converges. Every
+    convergence result there is comes from `tests/test_thermal_ident.py`,
+    which drives the outputs open loop (fixed levels 0.35/0.8, independent
+    sequences on every channel at once) and never runs `control/ident.py`.
+    In the closed loop the supervisor runs one experiment at a time while the
+    solver moves the rest of the zone, and neither `ident_replan: true` nor
+    `false` reaches `converged` — `pe_min` stays near zero on every seed of
+    `tests/test_ident_replan_sim.py` (item 52's A/B, §8.4). So the two
+    experiment machines are tested for different things: the fit is measured
+    where `ident.py` is absent, and `ident.py` is measured where the fit does
+    not converge. Worth deciding whether the closed-loop scenario should be
+    made to converge — several channels of a group excited at once, longer
+    runs, or `ident_max_duration_s` and the phase split reconsidered — or
+    whether the open-loop evidence is enough and this is only a note.
 
 ### 8.3 Open — needs the DAS hardware
 
@@ -5747,20 +5784,55 @@ Owner decision (2026-09-16):
 
 50. Run on a Zero 2 W with the same config.
 51. 64-bit Lite if needed, with no API change.
-52. **Done** (2026-09-16): the levels are re-planned from the live solver
-    demand every tick (`mpc.ident_replan`, default `true`; §3
-    "Active identification experiments"). Each tick every channel's base is
-    raised to the solver's honest demand (`diagnostics["target_pwm"]`) and
-    its levels are re-derived around it and clamped into the band; the base
-    never falls; and because a re-planned level can only reach the fans on
-    the next tick, `compose` floors an experiment channel's override with
-    the solver's command for the tick. The rule: **a rise in demand wins
-    over the experiment's plan, always** — no tick of an experiment puts
-    less on a fan than the controller would have (`symmetric`: at most the
-    owner-accepted `ident_amplitude` below it). The aborts of a tick are
-    decided before the next tick's levels are re-planned, on the same
-    estimates with the same thresholds in the same order, so nothing aborts
-    later or weaker.
+52. **Done** (2026-09-16; corrected the same day after review): the levels
+    are re-planned from the live solver demand every tick
+    (`mpc.ident_replan`, default `true`; §3 "Active identification
+    experiments"). Each tick every channel's base is raised to the solver's
+    want (`diagnostics["target_pwm"]`), its levels are re-derived around it
+    and clamped into the band, and because a re-planned level can only reach
+    the fans on the next tick, `compose` floors an experiment channel's
+    override with the solver's command for the tick. The rule: **a rise in
+    demand wins over the experiment's plan, always** — no tick of an
+    experiment puts less on a fan than the controller would have
+    (`symmetric`: at most the owner-accepted `ident_amplitude` below it).
+
+    Two things the first version of this got wrong, both found in review and
+    both fixed here:
+
+    - *The want is not free of the experiment.* The DAS MPC's objective
+      carries `weight_dpwm·‖u₀ − prev‖²` and `prev` is what was last put on
+      the fan, so during an experiment the want follows the experiment's own
+      level (measured on the DAS example, all else equal: `prev` 0.40 → want
+      0.398, `prev` 1.00 → 0.962, a slope near 1). Following it raw ratcheted:
+      the high level raised the want, the want raised the base, the base
+      raised the high level. On the closed loop with `solver: mpc` the base
+      ran **0.400 PWM (seed 1) and 0.198 (seed 2) above anything the frozen
+      arm ever wanted**, seed 1 pinned at `pwm_max`, so the fans were loud and
+      the excitation was squeezed out — on the very configuration
+      identification exists to enable. It went unseen because the numbers were
+      taken with `solver: pi`, whose demand does not depend on the last
+      command at all. The echo now comes off the want first,
+      `wanted = demand − max(0, min(prev, own) − base)` (`prev` from
+      `diagnostics["prev_pwm"]`, `own` the override the experiment itself had
+      on that tick), which leaves a fan the solver's own floor lifted reading
+      as demand. Same runs after the fix: **+0.000 and +0.102**, inside one
+      `ident_amplitude`.
+    - *A monotone base pinned a spent excursion.* The base only ever rose, and
+      under `above` the low level **is** the base, so one transient peak held
+      the channel and every sibling held with it at that peak for the rest of
+      `ident_max_duration_s` — against the noise objective this enclosure is
+      built around. The base now falls again: only at a level switch (so a
+      hold keeps its excitation), by at most `d_pwm_max`, and never below the
+      base of the start.
+
+    The abort decision of a tick is taken on that tick's estimates, with the
+    same thresholds in the same order, *before* the next tick's levels are
+    re-planned, so the re-plan cannot weaken the decision itself, and a
+    re-planned level is never below the frozen plan's for the same tick.
+    Across ticks the aborts do move, and that is the point of the item: a
+    channel followed up cools its own bay, so an excursion the frozen plan
+    would have ended on the envelope runs to completion. Fewer envelope
+    aborts are the intended outcome, not a weakened rule.
 
     *What it was:* with `above` levels the low level was the solver's base
     frozen at start, so a solver that later wanted more cooling on that
@@ -5768,52 +5840,56 @@ Owner decision (2026-09-16):
     Zero 2 W (owner, 2026-09-14) for the per-tick compute.
 
     *Cost per tick* (dev machine, arm64, Python 3.14, DAS example: 8
-    channels, 15 bays, 4 zones; 6 interleaved repeats × 2000 calls, median):
-    the experiment bookkeeping of one tick is 32.9 µs before this item,
-    35.7 µs with `ident_replan: false` and 37.4 µs with `true` — **+4.5 µs
-    per tick**, of which 1.7 µs is the re-plan itself and 2.8 µs the demand
-    copied into `TickFacts` on every tick. The DAS MPC step measures 3.25 ms
-    p99 on the same machine against 609–615 ms on the Zero W (item 73), a
-    factor of ~190; carried over, the re-plan is ≈ 0.9 ms per tick on a Zero
-    W and less on a Zero 2 W, against `budget_ms` 600. Only the levels are
-    re-derived, never the schedule, which is why it is this cheap: the
-    deferral was the right call for an unmeasured feature, but the measured
-    one would have fitted the Zero W too. Hence the default `true` on every
+    channels, 15 bays, 4 zones; `facts_from_tick` + `advance` + `compose`,
+    6 interleaved repeats × 2000 calls, median): 32.8 µs before this item,
+    32.5 µs with `ident_replan: false` and 42.6 µs with `true` — **+10 µs per
+    tick**, of which 5.6 µs is the two diagnostics maps copied into
+    `TickFacts`, 2.6 µs the re-plan itself and 1.9 µs the floor in `compose`.
+    It is paid only on the ticks of an experiment that re-plans: with
+    `ident_replan: false`, and on every tick without a running experiment,
+    the maps are not copied at all and the cost is what it was before the
+    item (−0.3 µs, i.e. nothing, measured). Only the levels are re-derived,
+    never the schedule, which is why it stays this small. Scaling it to a
+    Zero W by the factor its DAS MPC step differs by (3.25 ms p99 here
+    against 609–615 ms there, item 73, ≈ 190×) gives ≈ 2 ms per tick, which
+    is a crude upper bound — that factor is set by the numpy work in the
+    step, and interpreter bookkeeping does not scale the same way. Against
+    `budget_ms` 600 it is small either way, so the default is `true` on every
     board; `false` is there to get the frozen plan back, not to save time.
+    The board figure is an estimate until the Zero 2 W run below.
 
-    *Identification* (`sim/das.py`, `rich` preset, `k_sigma: 1`, the real
-    loop with experiments started one at a time as the supervisor runs them,
-    24 h per run, seeds 1–8, paired frozen against re-planned, scratch
-    harness): both modes start the same 174 experiments and abort on the
-    same bays, 17 aborts against 16 — seed 3 is the difference, where the
-    frozen plan aborted four times on the envelope and the re-planned one
-    three, following a rising demand the frozen plan could not. The fit is
-    the same within the seed spread: relative error of the in-zone `E`,
-    rms over the parameters, median over the seeds 0.408 (frozen) against
-    0.420 (re-planned), seed spread (sd) 0.127 against 0.124, per-seed
-    difference median +0.004 and worst +0.021; its worst parameter median
-    0.758 against 0.830, per-seed difference median 0.000, worst +0.106.
-    Per-bay `k`: rms median 0.273 against 0.275 (sd 0.062 against 0.058,
-    per-seed difference median +0.001, worst +0.032), worst parameter median
-    0.572 against 0.580, worst seed difference +0.230 (seed 4). What changes
-    is the cooling the experiment withheld: **3071 channel-ticks below the
-    solver's own command (worst 0.106 PWM, a full `d_pwm_max`) → 0**. With
-    every channel excited at once instead (8 h, seeds 1–4) the enclosure runs
-    cold, the demand never rises above the anchors and the two modes come out
-    identical to the digit. Neither mode reaches `converged` in this
-    closed-loop scenario (`pe_min` stays near zero: with the solver moving
-    the other channels of a zone, one experiment at a time does not excite
-    the zoned regressors) — that is the scenario, not this item; the
-    convergence evidence stays `tests/test_thermal_ident.py`, whose
-    open-loop excitation this item does not touch and which still passes.
+    *Identification* (`tests/test_ident_replan_sim.py`, the committed nightly
+    A/B: `sim/das.py` `rich` preset, `k_sigma: 1`, the real loop and
+    supervisor with experiments started one channel at a time; the table
+    below is that harness at 8 h, seeds 1–4, paired frozen against
+    re-planned, both solvers). Both arms start the same 64 experiments and
+    end them the same way (`pi`: 8 aborts each, the same reason on the same
+    bay; `mpc`: none). What changes is the cooling the experiment withheld:
+    **channel-ticks below the solver's own command 1162 (`pi`) and 5426
+    (`mpc`) → 0**. The fit is the same within the seed spread — relative
+    error of the in-zone `E`, rms over the parameters, median over the seeds:
+
+    | solver | `E` rms frozen → re-planned | worst per-seed | `k` rms frozen → re-planned | worst per-seed |
+    | --- | --- | --- | --- | --- |
+    | `pi` | 0.357 → 0.375 | +0.037 | 0.179 → 0.179 | +0.049 |
+    | `mpc` | 0.354 → 0.343 | −0.003 (every seed better) | 0.160 → 0.156 | +0.016 |
+
+    Neither arm reaches `converged` in this closed-loop scenario (`pe_min`
+    stays near zero: with the solver moving the other channels of a zone, one
+    experiment at a time does not excite the zoned regressors) — that is the
+    scenario, not this item, and it is item 102; the convergence evidence stays
+    `tests/test_thermal_ident.py`, whose open-loop excitation this item does
+    not touch and which still passes.
 
     *Main session, on the Zero 2 W:* run one experiment on the real
     enclosure with `ident_replan: true` and confirm (a) an experiment on a
     warming bay follows the solver up instead of aborting on the envelope,
-    (b) `GET /api/model`'s `experiment.plan_base` rises with the demand and
-    never falls, and (c) the per-tick cost stays inside the step budget
-    (`tools/bench_step.py`, `step_ms_max` and the budget counters in
-    `/api/health`, with an experiment running).
+    (b) `GET /api/model`'s `experiment.plan_base` rises with the demand, falls
+    back after an excursion and never goes below `experiment.base`, and (c)
+    the per-tick cost stays inside the step budget (`tools/bench_step.py`,
+    `step_ms_max` and the budget counters in `/api/health`, with an
+    experiment running) — the ≈ 2 ms above is a scaled estimate, not a board
+    measurement.
 
 ### 8.5 Done
 
