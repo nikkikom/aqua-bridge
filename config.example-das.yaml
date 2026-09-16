@@ -207,6 +207,8 @@ mpc:
     qd3: {model: case120, count: 1}
     qd4: {model: case120, count: 1}
   fan_models:            # PWM -> RPM curve and noise at full speed; tools/fit_fans.py fits the curve
+    # power_w_at_max (watts of ONE fan at full speed) has no default: measure it, or
+    # leave it out and the fan-health power rule stays off for this model (item 79).
     case120: {rpm_max: 1500, deadband: 0.1, exponent: 1.0, noise_db_at_max: 30.0}
   # zones: trust_rule strict (a zone faults when a required sensor group has no
   # trusted member) or sigma (a zone faults when a bay's drive sigma or its air
@@ -364,6 +366,32 @@ aquacomputer:
   #     qd4: {pwm: pwm4, rpm: fan4}
   #   temp_map: {}         # bind Quadro inputs only once they are connected
   #   ctrl_gap_ms: 0       # the one timing default that differs: the Quadro needs no gap
+
+# Fan-health drift monitoring (PROJECT.md section 3 "Fan and device health", section 8
+# item 79). Every status report carries each output's rpm, output duty, 12 V rail
+# voltage, current and power; they are recorded (the record's "fans" key) and published
+# (/api/state's device_health, the MQTT state blob, the page) either way, and these keys
+# decide when a deviation is reported. Defaults shown. The rpm rule compares against the
+# mpc.fan_models curve tools/fit_fans.py fits; the power rule needs
+# fan_models.<m>.power_w_at_max and is off until one is measured. The aquaero reports
+# 0 mA and 0 W for its own outputs (pwm1-4) in PWM mode, so the power rule never judges
+# them; only its aquabus outputs (pwm5-8, the Quadro's) report a real draw.
+fan_health:
+  enabled: true              # false: the readings are still recorded and published, no rule runs
+  min_duty: 0.25             # below this output duty no rpm or power rule fires (0..1)
+  settle_s: 15.0             # after a duty move, do not judge that channel for this long (>= 0):
+                             # an aquabus fan's rpm in the aquaero's report lags several seconds
+  settle_duty: 0.02          # how far the output duty must move to restart settle_s (0..1)
+  rpm_tolerance_frac: 0.25   # |rpm - curve| above this fraction of rpm_max is a deviation (>= 0)
+  rpm_fault_s: 120.0         # an rpm deviation held this long is reported, seconds (> 0)
+  rail_min_v: 11.0           # 12 V rail window, volts; a block reading 0.0 V is not judged
+  rail_max_v: 13.0           # (that is an empty aquabus slot, not a dead rail); max > min
+  rail_fault_s: 30.0         # a rail excursion held this long is reported, seconds (> 0)
+  power_tolerance_frac: 0.5  # measured power outside +- this fraction of expected is a deviation
+  power_exponent: 3.0        # expected power = power_w_at_max * phi(duty) ** this (fan law, > 0)
+  power_min_w: 0.2           # expected power below this is not judged, watts (>= 0)
+  power_fault_s: 120.0       # a power deviation held this long is reported, seconds (> 0)
+  log_interval_s: 300.0      # one log line per channel at most this often, seconds (> 0)
 
 # 1-Wire: two w1-gpio buses (dtoverlay=w1-gpio,gpiopin=4 and gpiopin=17 in
 # config.txt); bus masters are discovered under root (default /sys/bus/w1/devices).
