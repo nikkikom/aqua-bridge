@@ -698,10 +698,13 @@ long `dt`):
 | `mpc_every_ticks` | 1 | int ≥ 1 (DAS example 2) |
 | `rho_soft` / `rho_hard` | 40 / 4000 | > 0, `rho_hard ≥ rho_soft` |
 | `solver_outer_max` | 4 | int ≥ 1 |
-| `model_max_drift_c_per_min` | 0.5 | > 0 |
-| `model_return_factor` | 0.5 | `(0, 1]`: the validity gate's numeric limits are scaled by this for the MPC to return from the model fallback |
+| `model_max_drift_c_per_min` | 0.5 | > 0, °C/min: the drift the drives' own rate does not explain |
+| `model_return_factor` | 0.5 | `(0, 1]`: the validity gate's numeric limits, bar the air disturbance's, are scaled by this for the MPC to return from the model fallback |
 | `model_return_dwell_s` | 300 | ≥ 0, s: how long the scaled checks must pass continuously (and since the fallback began) |
-| `model_drift_rate_tau_s` | 120 | > 0, s: low-pass time constant of the drives' observed rate that the return's drift check subtracts |
+| `model_drift_rate_tau_s` | 120 | > 0, s: low-pass time constant both the drives' observed rate and the model's own rate go through |
+| `model_drift_dwell_s` | 120 | ≥ 0, s: how long the drift or the air-disturbance check must keep failing before the entry faults the model |
+| `model_max_air_dist_c_per_min` | 8.0 | > 0, °C/min: the zone-air disturbance's move away from its slow level (§8 items 66, 96) |
+| `model_air_dist_tau_s` | 900 | > 0, s: time constant of that slow level |
 | `model_accept_prior` | `false` | the DAS MPC may act on a model that has not converged (needs `topology`) |
 | `model_store_interval_s` | 600 | > 0 |
 | `model_store_max_age_days` | 30 | > 0 |
@@ -1697,31 +1700,64 @@ finite and inside its bounds; every eigenvalue of `A` real and negative
 (so every eigenvalue of `Ad` is in `(0, 1)`); every constrained bay has a
 channel with a non-zero steady-state gain on it; the rolling one-step
 (one prediction step ahead) prediction error of the drive rows ≤
-`model_max_pred_err_c`; the model's equilibrium drift at the estimate ≤
-`model_max_drift_c_per_min`. Bays within `bay_settle_s` of an occupancy
+`model_max_pred_err_c`; the **drift** ≤ `model_max_drift_c_per_min`; the
+**air disturbance** ≤ `model_max_air_dist_c_per_min`. Only bays with a
+row (an estimate, a trusted zone, not empty) are predicted and scored, so
+a drive in a faulted zone is not evidence about a model the solver never
+plans for it (§8 item 11). Bays within `bay_settle_s` of an occupancy
 change, a fast-swap jump or a calibration change are left out of the last
-two checks. A failure switches to the **PI-like DAS form on the same
+three checks. A failure switches to the **PI-like DAS form on the same
 estimates**: `mode` stays `auto`, `diagnostics.solver_diag.model` says
 `active: pi_das` and why. The MPC returns only after the checks pass at
 `model_return_factor` (0.5) times their numeric limits for
-`model_return_dwell_s` (300 s). On the return the drift check is
-relative: `max_j |dT_d,j/dt − r_j|`, with `r_j` the observed rate of the
-estimator's drive `j` (tick-to-tick difference low-passed with
-`model_drift_rate_tau_s`, 120 s; 0 for a fresh track). A load step warms
-the drives at 0.26–0.36 °C/min, which a sound model predicts; the plain
-drift had to fall below 0.25 °C/min before the dwell started and held the
-fallback for up to 29 minutes on the truth simulator, the relative check
-returns after the dwell (`tests/test_model_fallback_sim.py`: within
-`model_return_dwell_s + 2 · mpc_every_ticks · dt`, 320 s). A model whose
-equilibrium is wrong keeps its drift while the drives settle and stays in
-the fallback (bay gains 0.3×, 2× or 3×: caught within 150 s of a load
-step; 0.5×: 830–860 s, when the warming drives push the plain drift over
-the limit). The entry keeps the plain drift: the relative one follows the
-MPC's own command moves at once while the observed rate lags, and added
-fallbacks on the `rich` simulator. `checks` reports both
-(`drift_abs_c_per_min`, `drift_rel_c_per_min`). Every switch is bumpless. The
-fallback regulates every drive at its soft target with the same margins,
-so a model fallback changes loudness, not safety. Without
+`model_return_dwell_s` (300 s) — every limit but the air disturbance's,
+which is a move, not a level.
+
+The **drift** is relative: `max_j |m_j − r_j|`, with `m_j` the model's own
+rate `dT_d,j/dt` at the estimate and `r_j` the observed rate of the
+estimator's drive `j` (its tick-to-tick difference low-passed with
+`model_drift_rate_tau_s`, 120 s, starting at 0 for a fresh track). On the
+**entry** `m_j` goes through that same low-pass, starting at the model's
+raw rate for a bay without a filter state, so a fresh track checks the
+plain drift. A load step warms the
+drives at 0.26–0.36 °C/min, which a sound model predicts; the plain drift
+had to fall below 0.25 °C/min before the return's dwell started and held
+the fallback for up to 29 minutes on the truth simulator, and it tripped
+the *entry* twice over: on the drives' physical warm-up right after
+`bay_settle_s` (three of eight `rich` seeds, 0.50–0.52 °C/min, §8 item 65)
+and on the MPC's own quieter move right after a return (a return at
+2110 s, a re-entry at 2150 s on every preset and seed, §8 item 64). Both
+sides through one filter removes both: a command move enters the model's
+rate and the drives' alike, and physical warming the model predicts
+cancels. A model whose equilibrium is wrong keeps its drift while the
+drives settle and still enters the fallback and stays there (bay gains
+0.3×, 0.5×, 2× and 3×: caught 170–420 s after the load step, against
+0–860 s before). The **return** keeps the form §8 item 10 measured — the
+model's rate as it is against the filtered observed rate — because while
+the fallback regulates, the model's rate is not answering a move of its
+own, and filtering it there only lags the return (540 s against the
+documented 320 s bound on several `rich` seeds). `checks` reports the
+entry's drift, the return's (`drift_return_c_per_min`) and the plain one
+(`drift_abs_c_per_min`).
+
+The **air disturbance** is the one piece of evidence about the fan gains
+`E` (§8 item 66). `E` acts on the air node alone, and the estimator's
+per-zone air disturbance `d_air` re-balances that node at any one
+operating point, so airflow the enclosure no longer has — a blocked
+filter, a dust mat; the tachometers read the same — leaves the drive
+rows' prediction error and drift where they were (measured: 0.14 °C and
+0.20 °C/min against limits 1.0 and 0.5 at a third of the airflow). What it
+cannot hide is the move, so the check is `max_z |d_air,z −
+d_air,z(slow)|` over the zones of the constrained bays, against the same
+disturbances through a second low-pass `model_air_dist_tau_s` (900 s).
+
+Both are rates the plant itself moves, so on the **entry** they fault the
+model only after failing continuously for `model_drift_dwell_s` (120 s);
+until then the MPC keeps acting and `reason` names the failing check. The
+structural checks (status, parameters, eigenvalues, gain) and the
+prediction error still fault it on the tick they fail. Every switch is
+bumpless. The fallback regulates every drive at its soft target with the
+same margins, so a model fallback changes loudness, not safety. Without
 `model_accept_prior` nothing can act before a model has converged, which
 needs experiments (or a fresh store file).
 
@@ -3397,8 +3433,8 @@ tests carry the `nightly` marker.
 | `tests/test_hotswap.py` | slow swap, quick swap (never through `empty`, margin widens, class follows the new drive) and empty-at-boot on the truth sim: no limit violation, no zone fault, fans rise, constraints removed on empty | PR |
 | `tests/test_thermal_model.py` | structure, fan groups, parameter table, Jacobians vs finite differences, `eig` vs matrix exponential and the Euler fallback, windows, lag correction, RLS safeguards, status machine, never raising in `step`, shadow never changes the command | PR |
 | `tests/test_thermal_ident.py` | identifiability with group experiments on the truth sim: in-zone `E` within 15 % (PR seed), per-bay `k` within 25 %, `leak` / `κ` at prior, convergence; regulation only never converges; the seed sweep (bound 25 %), sensor offsets, the rich preset | PR: 4 cases; nightly: sweeps |
-| `tests/test_solver_das.py` | active-piece SQP vs a projected-gradient reference, monotone objective, iteration cap, forbidden-band snap and hysteresis, zero-order hold, prediction vs thermal Jacobians, noise index and surrogate, bumpless offset, fixed channels, validity gate and model fallback with dwell, a clock stepped back, horizon and block extremes | PR |
-| `tests/test_model_fallback_sim.py` | return from the model fallback after a load step (§8 item 10): the observed drive rate (ramp, restarts, memory), a sound model returns within `model_return_dwell_s + 2 · mpc_every_ticks · dt`, a model with wrong bay gains is caught and held, every drive within its limit and bumpless switches; the plain drift holds the same step | PR: 1 return, 1 broken model; nightly: zones × seeds on `basic` and `rich`, more broken gains |
+| `tests/test_solver_das.py` | active-piece SQP vs a projected-gradient reference, monotone objective, iteration cap, forbidden-band snap and hysteresis, zero-order hold, prediction vs thermal Jacobians, noise index and surrogate, bumpless offset, fixed channels, validity gate and model fallback with dwell (the entry dwell, the model rate through the drives' filter, the air-disturbance check, the prediction guard on eligible rows only), a clock stepped back, horizon and block extremes | PR |
+| `tests/test_model_fallback_sim.py` | the validity gate against the truth plant: the observed drive rate (ramp, restarts, memory), a sound model returns within `model_return_dwell_s + 2 · mpc_every_ticks · dt` and does not re-enter (§8 items 10, 64), a model with wrong bay gains is caught and held, a healthy enclosure never reaches the fallback (§8 item 65), a fouling jump to 0.15× airflow does (§8 item 66) and the same run without it does not, every drive within its limit and bumpless switches; the plain drift holds the same step | PR: 1 return, 1 broken model, 3 healthy seeds and the fouling pair per preset; nightly: zones × seeds on `basic` and `rich`, more broken gains, 8 healthy seeds and 4 fouling seeds per preset |
 | `tests/test_noise_regression.py` | calibrated DAS MPC noise ≤ 0.8× the quietest uniform curve at equal or better worst true margin (measured 0.31–0.48×); uncalibrated bound 2.0 (0.30–0.69×); rich preset bound 1.35 (up to 1.30×); MPC vs PI-DAS reported, not asserted (PI-DAS has not settled within the window on several seeds) | PR: 2 seeds; nightly: 8-seed sweeps |
 | `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× (named constant) the legacy MPC p99, the 75th percentile of several interleaved, warm-up-discarded repeats (§8 item 6); `bench_step.py` runs both DAS solvers; absolute p99 ≤ `mpc.budget_ms` only on `armv6l`; the Zero W fallback of §8 item 73 (`budget_ms` 1000 with `budget_alarm_ms` 1250 loads, `budget_ms` 1000 alone is rejected, `mpc_every_ticks: 3` solves a third of the ticks and a solve tick is the expensive one) | PR / Pi |
 | `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise | PR |
@@ -4033,8 +4069,11 @@ Owner decision (2026-09-16):
 
 ### 8.2 Open — no DAS hardware needed (dev machine, CI, the Pi, the PC)
 
-11. The prediction-error guard also scores drives in faulted zones (extra,
-    louder fallbacks only); restrict it to eligible zones.
+11. **Done** (2026-09-16): the one-step prediction is made for, and scored
+    against, only the bays that have a row on that tick (an estimate, a
+    trusted zone, not empty), so a drive in a faulted zone is no longer
+    evidence about a model the solver never plans for it (§3, validity gate
+    and model fallback).
 12. Reset a bay's thermal coefficients on a hot swap to a different drive
     (kept today; the MPC's settle exclusion covers only the transient).
 13. Split a fan group's shared `E` into per-channel coefficients from the
@@ -4306,15 +4345,43 @@ Owner decision (2026-09-16):
     `diagnostics["trusted"]` keeps its own meaning (the gate's verdict on
     this tick, §4.7) and the internal verdict `zones.py` reads for zone
     trust and fault closure is untouched (`tests/test_sensor_confirm.py`).
-64. Model-fallback flapping: after a return, the DAS MPC lowers the
-    fans, drives warm faster than the plain-drift entry threshold, and
-    the gate re-enters the fallback, often within 40 s. The entry check
-    should not treat the MPC's own quieter move as a model fault.
-65. On the `rich` sim the drift entry check trips on the drives'
-    physical warm-up right after `bay_settle_s` on about half the seeds.
-66. The drift check cannot see errors in the fan gains `E` (they only
-    change air-node dynamics): a fouling jump to 0.3–0.5× airflow causes
-    no model fallback.
+64. **Done** (2026-09-16): the entry checks the same relative drift the
+    return does, and the model's own rate now goes through the same
+    low-pass as the drives' observed rate (`model_drift_rate_tau_s`), so a
+    command move enters both sides alike instead of only the model's; a
+    drift also has to keep failing for the new `model_drift_dwell_s`
+    (120 s) before it faults the model (§3, validity gate and model
+    fallback). On the load-step scenario of item 10 the sequence was
+    `pi_das` at 1800 s, `mpc` at 2110 s, `pi_das` again at 2150 s, `mpc` at
+    2570 s on every preset and seed; it is now two switches, the fallback
+    and the return, on `basic` and `rich` seeds 1–3.
+65. **Done** (2026-09-16): the same change. A healthy idle enclosure ran
+    3600 s on both presets, seeds 1–8: three `rich` seeds used to enter the
+    fallback on the drives' warm-up right after `bay_settle_s`
+    (0.50–0.52 °C/min against the limit 0.5, at 600 s, 770 s and 1130 s,
+    60–70 ticks of fallback each), and none does now. Loaded and
+    hot-swapped runs (4800 s, seeds 1–4, both presets) enter none either.
+66. **Done** (2026-09-16): the gate has air-node evidence now — the
+    estimator's per-zone air disturbance against its own slow level
+    (`model_max_air_dist_c_per_min` 8.0 °C/min, `model_air_dist_tau_s`
+    900 s, under the same `model_drift_dwell_s` as the drift; §3, validity
+    gate and model fallback). `E` acts on the air node alone, and that
+    disturbance re-balances the node at any one operating point, so no
+    residual at a settled operating point can see a steady airflow error —
+    at a third of the airflow the drive rows' prediction error stayed at
+    0.14 °C (limit 1.0) and their drift at 0.20 °C/min (limit 0.5). What the
+    disturbance cannot hide is its own move when the airflow changes under
+    the model. Measured on the truth simulator, 8 seeds × (idle, loaded,
+    hot-swapped) per preset, the airflow scaled at 1800 s of a 4800 s run:
+    with the limit at 8.0 the gate enters the fallback on **24/24 runs of
+    both presets at 0.15× airflow and below**, 8/24 (`basic`) and 18/24
+    (`rich`) at 0.25×, 0/24 and 11/24 at 0.3×, 0/24 and 3/24 at 0.5× — and
+    on **0/48 healthy runs**. The limit cannot go lower without faulting a
+    healthy model: at 6.0 it catches 0.25× everywhere but faults 6/24
+    healthy `rich` runs, whose drawn physics leave the prior's air node as
+    wrong as a 2× airflow error. On the real enclosure the model is fitted,
+    so the healthy floor is far below the `rich` preset's and the limit can
+    come down — item 96.
 67. Sigma trust with two proximal sensors on one bay at different
     placements: the estimator fuses both into one sensor node, their
     disagreement trips the fast-swap rule every tick and the bay's σ
@@ -4693,6 +4760,20 @@ Owner decision (2026-09-16):
     revisions agree, not that the controller is unchanged, so the golden
     diff has to be read). If no, close this item and leave both phases as
     they are.
+96. Tune `model_max_air_dist_c_per_min` on the real enclosure (item 66).
+    The shipped 8.0 °C/min is set above what the `rich` truth simulator's
+    *drawn* physics produce on a healthy enclosure, where the prior's air
+    node is already as wrong as a 2× airflow error; with a fitted model
+    (§13 stage 3 onward) the healthy air disturbance should sit far lower
+    and the limit can come down, which is what buys detection between
+    0.25× and 0.5× airflow. The work is on the running enclosure, not the
+    hardware bench: record `solver_diag.model.checks.air_dist_c_per_min`
+    over a quiet week with a converged model, take its ceiling, and set the
+    limit a factor above it; then check a real fouling event (a filter
+    deliberately blocked) enters the fallback. `model_air_dist_tau_s`
+    (900 s) sets how slowly the reference level follows, so a genuine slow
+    drift of the enclosure is not a fault: lengthen it only if a real
+    seasonal drift trips the check.
 
 ### 8.3 Open — needs the DAS hardware
 
@@ -5877,7 +5958,7 @@ blob in the log.
    | 1 offline fit + fan curves | – | `tools/fit_model.py`: `E` per group and per-bay `k` pinned (relative SE under `model_converged_rel_se`); `tools/fit_fans.py` RMS < 5 % rpm, copied into `fan_models`; spare thermistors moved to the bays the fit ranks tightest | fit and replay reports |
    | 2 SMART calibration (if used) | agent on the PC | most bays `calibrated`, `σ_cal` ≤ 0.7 °C, calibrated estimates within 2 °C of SMART, associations match the physical bays | HA `drive_sigma_*`, `/api/model` calibration, `/api/bays` |
    | 3 shadow + experiments | `model_shadow: true`, `ident_enabled: true`, store on; experiments one group at a time under PI-DAS | every zone `converged`, prediction error < 0.5 °C, no experiment abort on the envelope | HA `model_status`, `model_pred_err_c`, `ident_running`, `/api/model` |
-   | 4 MPC | `solver: mpc` | the validity gate keeps `active: mpc` (no model fallbacks), no `degraded`, `noise_db` lower than stage 0 at equal or better `drive_margin_*`, step p99 under budget | `/api/health`, `solver_diag.model`, `noise_db`, `drive_margin_*` |
+   | 4 MPC | `solver: mpc` | the validity gate keeps `active: mpc` (no model fallbacks), no `degraded`, `noise_db` lower than stage 0 at equal or better `drive_margin_*`, step p99 under budget | `/api/health`, `solver_diag.model` (its `checks`, `air_dist_c_per_min` for §8 item 96), `noise_db`, `drive_margin_*` |
    | 5 restart check | restart the daemon | `model.json` loads `fresh` and the zones `frozen`; after > `model_store_max_age_days` offline it loads `stale` and re-confirms in shadow before the MPC acts | `/api/model` `store`, journal |
    | 6 `trust_rule: sigma` | `zones.trust_rule: sigma` (§3 per-zone trust; not with two proximal sensors on a bay at different placements) | fewer zone faults than `strict`, no violation, the time from a lost sensor to its zone fault acceptable | zone graphs, `diagnostics.zones` reasons, `drive_sigma_*` |
 
