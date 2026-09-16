@@ -702,9 +702,9 @@ long `dt`):
 | `model_return_factor` | 0.5 | `(0, 1]`: the validity gate's numeric limits, bar the air disturbance's, are scaled by this for the MPC to return from the model fallback |
 | `model_return_dwell_s` | 300 | ≥ 0, s: how long the scaled checks must pass continuously (and since the fallback began) |
 | `model_drift_rate_tau_s` | 120 | > 0, s: low-pass time constant both the drives' observed rate and the model's own rate go through |
-| `model_drift_dwell_s` | 120 | ≥ 0, s: how long the drift or the air-disturbance check must keep failing before the entry faults the model |
+| `model_drift_dwell_s` | 120 | ≥ 0, s: how long the drift or the air-disturbance check must keep failing before the entry faults the model (a leaky dwell: a passing tick does not restart it, a passing spell this long does) |
 | `model_max_air_dist_c_per_min` | 8.0 | > 0, °C/min: the zone-air disturbance's move away from its slow level (§8 items 66, 96) |
-| `model_air_dist_tau_s` | 900 | > 0, s: time constant of that slow level |
+| `model_air_dist_tau_s` | 900 | > 0, s: time constant of that slow level, and how long it must have run before the check has a reference to report a move against |
 | `model_accept_prior` | `false` | the DAS MPC may act on a model that has not converged (needs `topology`) |
 | `model_store_interval_s` | 600 | > 0 |
 | `model_store_max_age_days` | 30 | > 0 |
@@ -1732,7 +1732,12 @@ rate and the drives' alike, and physical warming the model predicts
 cancels. A model whose equilibrium is wrong keeps its drift while the
 drives settle and still enters the fallback and stays there (bay gains
 0.3×, 0.5×, 2× and 3×: caught 170–420 s after the load step, against
-0–860 s before). The **return** keeps the form §8 item 10 measured — the
+0–860 s before). Nearer the edge the residual is what limits the gate,
+not the dwell: bay gains 1.5× hold the drift at 0.49–0.54 °C/min against
+the limit 0.5 and are caught 220–530 s after the step wherever they reach
+it (`basic` z0, most `rich` zones and seeds), while on `basic` z2 a 1.5×
+error puts the drift over the limit on two ticks of a whole run and the
+gate does not see it at all — it is also 10.8 °C from any drive limit. The **return** keeps the form §8 item 10 measured — the
 model's rate as it is against the filtered observed rate — because while
 the fallback regulates, the model's rate is not answering a move of its
 own, and filtering it there only lags the return (540 s against the
@@ -1749,13 +1754,28 @@ rows' prediction error and drift where they were (measured: 0.14 °C and
 0.20 °C/min against limits 1.0 and 0.5 at a third of the airflow). What it
 cannot hide is the move, so the check is `max_z |d_air,z −
 d_air,z(slow)|` over the zones of the constrained bays, against the same
-disturbances through a second low-pass `model_air_dist_tau_s` (900 s).
+disturbances through a second low-pass `model_air_dist_tau_s` (900 s). A
+level is a reference only once it has run for that time constant: a fresh
+track, and one a gap of over an hour has made stale, report
+`air_dist_c_per_min: null` until then rather than a move of zero against
+a level snapped to whatever the disturbance is now. A clock stepped back
+keeps every level and its age — only the filter refuses to advance — so a
+step of the wall clock cannot re-reference the check to a disturbance
+that has already moved.
 
 Both are rates the plant itself moves, so on the **entry** they fault the
-model only after failing continuously for `model_drift_dwell_s` (120 s);
-until then the MPC keeps acting and `reason` names the failing check. The
+model only after failing for `model_drift_dwell_s` (120 s); until then
+the MPC keeps acting and `reason` names the failing check. The dwell is
+**leaky**: a passing tick does not restart it, and only a passing spell
+as long as the dwell itself does. A moderate parameter error holds its
+residual just over the limit and sensor noise dips it under every few
+ticks, so a dwell that had to be contiguous would restart for ever and
+never fault the model at all — measured with bay gains 1.5× on `basic`
+seed 2, where the drift was over its limit on 112 ticks across 18 minutes
+and never for 120 s together. A switch either way clears the dwell: it
+belongs to the entry, not to the fallback. The
 structural checks (status, parameters, eigenvalues, gain) and the
-prediction error still fault it on the tick they fail. Every switch is
+prediction error still fault the model on the tick they fail. Every switch is
 bumpless. The fallback regulates every drive at its soft target with the
 same margins, so a model fallback changes loudness, not safety. Without
 `model_accept_prior` nothing can act before a model has converged, which
@@ -4354,7 +4374,15 @@ Owner decision (2026-09-16):
     fallback). On the load-step scenario of item 10 the sequence was
     `pi_das` at 1800 s, `mpc` at 2110 s, `pi_das` again at 2150 s, `mpc` at
     2570 s on every preset and seed; it is now two switches, the fallback
-    and the return, on `basic` and `rich` seeds 1–3.
+    and the return, on `basic` and `rich` seeds 1–3. The dwell leaks: a
+    passing tick does not restart it and only a passing spell as long as
+    the dwell does, because a residual just over its limit dips under it
+    on sensor noise every few ticks. With a contiguous dwell bay gains
+    1.5× — the band between a sound model and the sweep's 2× — escaped the
+    gate on three of four `basic` zone/seed combinations while the drift
+    was over its limit on up to 176 ticks; they are now caught 220–530 s
+    after the load step wherever the drift reaches its limit at all
+    (§3 for the band it cannot reach).
 65. **Done** (2026-09-16): the same change. A healthy idle enclosure ran
     3600 s on both presets, seeds 1–8: three `rich` seeds used to enter the
     fallback on the drives' warm-up right after `bay_settle_s`
@@ -4379,9 +4407,24 @@ Owner decision (2026-09-16):
     on **0/48 healthy runs**. The limit cannot go lower without faulting a
     healthy model: at 6.0 it catches 0.25× everywhere but faults 6/24
     healthy `rich` runs, whose drawn physics leave the prior's air node as
-    wrong as a 2× airflow error. On the real enclosure the model is fitted,
-    so the healthy floor is far below the `rich` preset's and the limit can
-    come down — item 96.
+    wrong as a 2× airflow error. **The headroom is thin, and deliberately
+    so:** on the healthy runs the check reports at most 0.77 °C/min on
+    `basic` and 7.44 °C/min on `rich` (seed 6; idle 3600 s, seeds 1–8 of
+    both presets, and 0.49/7.11 on the loaded 4800 s runs), so the
+    shipped 8.0 sits just above the `rich` preset's own distribution and
+    another draw could reach it. Two things keep that from being item 65
+    again: the limit is under the same leaky 120 s dwell, so a peak has to
+    hold, and no healthy run of the 32 measured puts a single tick over
+    it. A level is also a reference only after `model_air_dist_tau_s`
+    (§3), which is what the highest healthy peaks were: with the level
+    snapped to a fresh track's first value, `rich` seed 5 reported 7.95.
+    Letting the check report but never fault while the status is `prior`
+    or `learning` would remove the risk and every catch above with it:
+    each of those runs is a prior-model run (`model_accept_prior`, §13
+    stage 3), which is what the enclosure runs on until identification has
+    happened, so the check faults on a prior model too.
+    On the real enclosure the model is fitted, so the healthy floor is far
+    below the `rich` preset's and the limit can come down — item 96.
 67. Sigma trust with two proximal sensors on one bay at different
     placements: the estimator fuses both into one sensor node, their
     disagreement trips the fast-swap rule every tick and the bay's σ
@@ -4766,11 +4809,18 @@ Owner decision (2026-09-16):
     node is already as wrong as a 2× airflow error; with a fitted model
     (§13 stage 3 onward) the healthy air disturbance should sit far lower
     and the limit can come down, which is what buys detection between
-    0.25× and 0.5× airflow. The work is on the running enclosure, not the
+    0.25× and 0.5× airflow. It is also the tuning the shipped default
+    needs rather than merely deserves: on the simulator the healthy
+    ceiling is 7.44 °C/min (`rich` seed 6) against the limit 8.0, about
+    7 % of margin, held only by the 120 s dwell (item 66). The work is on
+    the running enclosure, not the
     hardware bench: record `solver_diag.model.checks.air_dist_c_per_min`
-    over a quiet week with a converged model, take its ceiling, and set the
-    limit a factor above it; then check a real fouling event (a filter
-    deliberately blocked) enters the fallback. `model_air_dist_tau_s`
+    over a quiet week with a converged model (ignoring the first
+    `model_air_dist_tau_s` after every restart, where it reads `null`),
+    take its ceiling, and set the
+    limit a factor above it — a factor of two over a fitted model's
+    ceiling should land far below 8.0; then check a real fouling event (a
+    filter deliberately blocked) enters the fallback. `model_air_dist_tau_s`
     (900 s) sets how slowly the reference level follows, so a genuine slow
     drift of the enclosure is not a fault: lengthen it only if a real
     seasonal drift trips the check.

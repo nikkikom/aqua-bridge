@@ -302,7 +302,9 @@ mpc:
   # estimator observes, both through the low-pass model_drift_rate_tau_s, so a load step or
   # a command move the model predicts is not a fault and the drives' physical warm-up is
   # not either. It has to keep failing for model_drift_dwell_s before the MPC gives way to
-  # the PI-like DAS form (section 8 items 64 and 65).
+  # the PI-like DAS form (section 8 items 64 and 65). That dwell leaks: a passing tick does
+  # not restart it and only a passing spell as long as the dwell does, because a moderate
+  # parameter error holds its residual just over the limit and dips under it on noise.
   model_max_drift_c_per_min: 0.5
   model_drift_rate_tau_s: 120.0
   model_drift_dwell_s: 120.0
@@ -310,9 +312,13 @@ mpc:
   # estimator's per-zone air disturbance re-balances at any one operating point, so airflow
   # the enclosure no longer has (a blocked filter, a dust mat) leaves the drive rows clean.
   # What it cannot hide is the move: the check is that disturbance against its own slow
-  # level (model_air_dist_tau_s), under model_drift_dwell_s like the drift. The default is
-  # set above what the truth simulator's drawn physics produce on a healthy enclosure;
-  # section 8 items 66 and 96 have the measurements and the tuning on the real enclosure.
+  # level (model_air_dist_tau_s), under model_drift_dwell_s like the drift. A level is a
+  # reference only once it has run for model_air_dist_tau_s: until then (a fresh track, or
+  # one a gap of over an hour made stale) the check reports null instead of no move. The
+  # default is set above what the truth simulator's drawn physics produce on a healthy
+  # enclosure, but not far above it: the healthy ceiling measured there is 7.44 degC/min
+  # against this 8.0, so on a fitted model of the real enclosure this should come down --
+  # section 8 items 66 and 96 have the measurements and the tuning.
   model_max_air_dist_c_per_min: 8.0
   model_air_dist_tau_s: 900.0
   # Back from the model fallback (PI-like DAS) to the MPC: the gate's numeric limits scaled
