@@ -1309,7 +1309,15 @@ def test_a_flapping_proximal_sensor_still_faults_its_zone(solver):
 
 def test_a_swapped_bay_that_goes_blind_faults_at_once():
     """The exemption needs the bay observed: lose its sensor right after the insert and the
-    widened sigma faults the zone on that tick, sooner than it would have before item 69."""
+    widened sigma faults the zone, sooner than it would have before item 69.
+
+    The insert lands before the bay's occupancy evidence has confirmed (``RISE_TICKS``),
+    so it is still ``empty`` -- unconstrained, no sigma check -- when the sensor goes
+    blind. Item 19's occupancy debounce keeps that ``empty`` state, rather than falling
+    back to ``unknown`` at once, until the blindness has lasted ``occupancy_hold_s``: a
+    momentary dropout must not constrain an otherwise-settled bay. The zone still faults,
+    bounded by that hold instead of one tick, and no drive exceeds its limit in the
+    meantime (thermal time constants are minutes, not seconds)."""
     cfg = example_cfg("sigma")
     insert_s = 1200.0
     blind_from = insert_s + 2 * cfg.dt
@@ -1318,7 +1326,7 @@ def test_a_swapped_bay_that_goes_blind_faults_at_once():
         (i for i, r in enumerate(run.records) if "z1" in r.cmd.diagnostics["zones_in_fault"]), None
     )
     assert at is not None, "a blind bay with a wide sigma did not fault its zone"
-    assert run.records[at].obs.ts <= blind_from + cfg.dt
+    assert run.records[at].obs.ts <= blind_from + cfg.estimator.occupancy_hold_s
     reasons = run.records[at].cmd.diagnostics["zones"]["z1"]["reasons"]
     assert all(reason.startswith("sigma:bay:b06=") for reason in reasons), reasons
     assert run.violations() == 0
