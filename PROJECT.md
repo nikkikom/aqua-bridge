@@ -5415,7 +5415,7 @@ are.
 | `lint` | push, PR, dispatch | Python 3.13, `ruff==0.16.7`: `ruff check .`, `ruff format --check .` | 5 min |
 | `test (latest)` | push, PR, dispatch | Python 3.14, `pip install -e ".[dev,http,mqtt]"`, `HYPOTHESIS_PROFILE=ci`, `tools/ci_pytest_shards.py -- -m "not hardware and not nightly" --durations=15` | 15 min |
 | `test (pi-parity)` | push, PR, dispatch | Python 3.13 with the Pi’s apt versions pinned (numpy 2.2.4, pyyaml 6.0.2, pytest 8.3.5, hypothesis 6.130.5, aiohttp 3.11.16, paho-mqtt 2.1.0), `pip install -e . --no-deps`, same sharded pytest | 15 min |
-| `nightly-fuzz (latest, pi-parity)` | schedule, dispatch | same installs, `HYPOTHESIS_PROFILE=nightly` (randomized, 1000 examples), plain `pytest -m "not hardware"` (unsharded, 60-minute budget): everything the PR jobs run plus the `nightly` sweeps | 60 min |
+| `nightly-fuzz (latest, pi-parity)` | schedule, dispatch | same installs, `HYPOTHESIS_PROFILE=nightly` (randomized, 1000 examples), `tools/ci_pytest_shards.py -- -m "not hardware" --durations=15`: everything the PR jobs run plus the `nightly` sweeps | 90 min |
 
 **Sharded PR test job (§8 item 26).** `tools/ci_pytest_shards.py` replaces
 the single `pytest` invocation in `test (latest)` and `test (pi-parity)`:
@@ -5440,8 +5440,11 @@ which Hypothesis does not use its on-disk example database, and
 `tests/test_bench_budget.py`'s relative step-time gate was already
 written to tolerate a slow shared runner (§12 budget gate paragraph
 below) — so concurrent shards never touch the same file or destabilise
-each other's timing. `nightly-fuzz` keeps the plain unsharded `pytest`
-call: its 60-minute budget has headroom the 15-minute PR jobs do not.
+each other's timing. `nightly-fuzz` shards the same way: unsharded it took
+51 min on 2026-09-16 and hit the old 60-minute limit on 2026-09-15 (both
+matrix jobs killed), which is why it now runs through the same tool with a
+90-minute limit as the backstop for a hung run rather than the expected
+length.
 
 **Selectors.** PR and `main` runs exclude `hardware` (no device on a
 runner) and `nightly` (seed × placement sweeps of the identification,

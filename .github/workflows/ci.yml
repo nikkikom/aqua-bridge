@@ -156,7 +156,11 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     name: nightly-fuzz (${{ matrix.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Sharded like the test job above, so the wall time is minutes, not an hour.
+    # The limit is the backstop for a hung run, not the expected length: one
+    # pytest process took 51 min on 2026-09-16 and was killed at 60 min on
+    # 2026-09-15.
+    timeout-minutes: 90
     env:
       HYPOTHESIS_PROFILE: nightly
     strategy:
@@ -191,5 +195,9 @@ jobs:
         if: ${{ !matrix.pi-parity }}
         run: pip install -e ".[dev,http,mqtt]"
       # Randomized search; a failure prints a @reproduce_failure blob in the log.
-      - name: pytest (randomized Hypothesis)
-        run: pytest -m "not hardware" --durations=15
+      # Sharded across the runner's cores (tools/ci_pytest_shards.py) like the
+      # test job: each shard is a plain pytest process on a disjoint slice of
+      # tests/test_*.py and inherits HYPOTHESIS_PROFILE, so the search is the
+      # same, only spread over the cores.
+      - name: pytest (randomized Hypothesis, sharded)
+        run: python tools/ci_pytest_shards.py -- -m "not hardware" --durations=15
