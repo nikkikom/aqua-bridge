@@ -64,9 +64,15 @@ UNCALIBRATED_BOUND = 2.0
 #: The rich preset draws a per-drive SMART offset (+-2 degC) that no controller can
 #: observe: the estimate tracks the drive-*reported* temperature, the truth margin here
 #: is on the physical node, so the MPC cools the bays it believes hottest and a uniform
-#: curve sized on the truth can be quieter. Measured 0.29-1.18 over seeds 1-8 (seed 7:
-#: 1.18). Before section 8 item 17 (a bay with two proximal sensors never calibrated)
-#: it was 0.43-1.30; before section 8 item 10 seed 1 was still in the model fallback in
+#: curve sized on the truth can be quieter. Measured 0.29-1.18 over the six of seeds 1-8
+#: this bound is asserted on (seed 7: 1.18); seeds 2 and 5 skip it, because b10's
+#: remaining over-estimate (section 8 items 17 and 96) drives their hot zone to full
+#: speed, u* reaches 1.0 and the comparison has nothing left to say -- those two seeds
+#: are covered instead by
+#: ``test_rich_preset_estimates_follow_the_drive_reported_temperature`` below, and their
+#: margins are asserted here before the skip either way. Before section 8 item 17 (a bay
+#: with two proximal sensors never calibrated) the bound was 1.35 over seven asserted
+#: seeds, 0.43-1.30; before section 8 item 10 seed 1 was still in the model fallback in
 #: the window.
 RICH_BOUND = 1.25
 #: Section 8 item 17: with every bay calibrated the estimate follows the drive-reported
@@ -74,6 +80,14 @@ RICH_BOUND = 1.25
 #: window. Measured 0.12-1.97 rms over seeds 1-8; the outlier is a bay with a redundant
 #: proximal pair, which one sensor node per bay cannot represent (section 8 item 96).
 RICH_ESTIMATE_RMS_C = 2.5
+#: The same accuracy, signed and per bay: the rms above is symmetric and averages over
+#: 15 bays, so one bay 7.6 degC out still passes it. The two directions are not equally
+#: safe -- an over-estimate asks for more cooling, an under-estimate regulates a drive
+#: hotter than the daemon believes, and 7.6 degC under is past an hdd limit with the
+#: 5 degC comfort band spent -- so the under side gets its own tight bound, degC.
+#: Measured worst under-estimate over seeds 1-8: -0.27 degC (seed 4, b02); the over
+#: side stays on RICH_ESTIMATE_RMS_C, where b10's +7.62 degC on seed 2 lives.
+RICH_UNDER_ESTIMATE_C = 1.0
 #: A drive the rich preset draws may start above its limit; violations count after this.
 RICH_SETTLE_S = 600.0
 
@@ -260,6 +274,8 @@ def test_noise_sweep_rich_preset(seed):
     ]
     assert min(late) >= 0.0, describe(r)  # a drawn drive may start above its limit
     if r.u_star >= 1.0 - 1e-9:
+        # seeds 2 and 5 as measured: the uniform curve has nothing left to give, so the
+        # ratio is 1.0 by construction and says nothing about the MPC (RICH_BOUND).
         pytest.skip(f"the hot zone needs full speed on this seed ({describe(r)})")
     assert r.ratio <= RICH_BOUND, describe(r)
 
@@ -273,11 +289,18 @@ def test_rich_preset_estimates_follow_the_drive_reported_temperature(seed):
     errors = estimate_errors(r)
     rms = math.sqrt(sum(v * v for v in errors.values()) / len(errors))
     worst = max(errors.items(), key=lambda kv: abs(kv[1]))
+    under = min(errors.items(), key=lambda kv: kv[1])
     print(
         f"seed {seed} rich estimate error: rms {rms:.2f} degC, "
-        f"worst {worst[0]} {worst[1]:+.2f} degC"
+        f"worst {worst[0]} {worst[1]:+.2f} degC, "
+        f"worst under-estimate {under[0]} {under[1]:+.2f} degC"
     )
     bays = r.run.records[-1].cmd.diagnostics["bays"]
     uncalibrated = sorted(b for b, info in bays.items() if not info["calibrated"])
     assert not uncalibrated, f"bays that never calibrated: {uncalibrated}"
     assert rms <= RICH_ESTIMATE_RMS_C, f"rms {rms:.2f} degC, per bay {errors}"
+    # Signed and per bay: the rms above would pass a single bay 7.6 degC on the *unsafe*
+    # side (see RICH_UNDER_ESTIMATE_C).
+    assert under[1] >= -RICH_UNDER_ESTIMATE_C, (
+        f"{under[0]} reads {under[1]:+.2f} degC below what the drive reports; per bay {errors}"
+    )
