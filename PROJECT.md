@@ -701,8 +701,14 @@ long `dt`):
 | `model_p_trace_max` | 100 | > 0 |
 | `model_converged_rel_se` | 0.25 | `(0, 1)` |
 | `model_max_pred_err_c` | 1.0 | > 0 |
-| `model_use_rpm` | `false` | airflow from the tach for identification (needs `topology`) |
+| `model_use_rpm` | `false` | airflow from the tach for identification, normalised by `fan_models.<m>.rpm_max` (needs `topology`) |
 | `model_reset_on_swap` | `true` | a hot-swapped bay's identified `g0`, `k`, `q_s` start over from the prior (§8 item 12; inert in legacy mode and in a `frozen` zone) |
+| `model_freeze` | `false` | a converged zone is held frozen and stops adapting online (needs `topology`) |
+| `model_split_channels` | `false` | a fan group carries a per-channel split `Es.<z>.<G>.<ch>` (needs `topology`) |
+| `fan_curve_online` | `false` | fit each fan model's PWM → RPM curve online (needs `topology`) |
+| `fan_curve_settle_s` | 30 | ≥ 0, s: how long a duty must hold before its `(pwm, rpm)` pair is sampled |
+| `fan_curve_refit_s` | 600 | > 0, s: shortest interval between two fits per fan model |
+| `fan_curve_max_rmse_frac` | 0.05 | `(0, 1]`: a fit with a worse relative RMSE is refused and the curve in force stays |
 | `mpc_pred_dt_s` | 30 | > 0; ≥ `dt` with `topology` |
 | `mpc_blocks` | `[]` | ints ≥ 1 summing to `horizon`; `[]` = `[1, 1, 2, 4, 6, 6]` cut to `horizon` |
 | `mpc_every_ticks` | 1 | int ≥ 1 (DAS example 2) |
