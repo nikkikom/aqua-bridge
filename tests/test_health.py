@@ -11,6 +11,7 @@ aquabus slot reading rpm 0xFFFF, 0 V.
 
 from __future__ import annotations
 
+import copy
 import logging
 from pathlib import Path
 from typing import Any
@@ -99,13 +100,40 @@ def test_power_w_at_max_is_optional_and_must_be_positive(das_example_cfg: MpcCon
 
 
 def _cfg(**models: FanModel) -> Any:
-    """A minimal stand-in for MpcConfig with just what the rules read."""
+    """A minimal stand-in for MpcConfig with just what the rules read.
+
+    ``temps``/``sensors`` are the empty pair a legacy config has, so the board's air
+    reference resolves to nothing and the divergence rule is off unless a test names
+    its own ``air_temps``. The reference's own resolution is tested against real
+    configs (:func:`default_air_temps`, below).
+    """
 
     class _Cfg:
         fans = {"qd3": FanSpec(model="case120"), "xt2": FanSpec(model="case120")}
         fan_models = dict(models or {"case120": FanModel(rpm_max=1200.0, deadband=0.1)})
+        temps: tuple[str, ...] = ()
+        sensors: dict[str, Any] = {}
 
     return _Cfg()
+
+
+#: What the board's rules publish with no host reader at all: every measurement
+#: missing, nothing to judge, no problem. The payload tests below pin this instead of
+#: comparing the payload's ``host`` key against itself, so a verdict that started
+#: reporting a problem for a board with no readings would fail them.
+_EMPTY_BOARD: dict[str, Any] = {
+    "cpu_temp_c": None,
+    "air_c": None,
+    "air_temps": [],
+    "divergence_c": None,
+    "load1": None,
+    "idle": None,
+    "throttled": None,
+    "faults": [],
+    "hints": [],
+    "problems": [],
+    "ok": True,
+}
 
 
 def test_expected_rpm_follows_the_fitted_curve_and_is_none_without_a_model() -> None:
@@ -372,7 +400,7 @@ def test_on_tick_without_a_device_health_source_still_publishes_the_fan_verdicts
     assert published[-1] == {
         "devices": [],
         "fans": published[-1]["fans"],
-        "host": published[-1]["host"],
+        "host": _EMPTY_BOARD,
         "problems": [],
         "ok": True,
     }
@@ -413,7 +441,7 @@ def test_a_source_answering_with_neither_shape_contributes_nothing() -> None:
     assert payload == {
         "devices": [],
         "fans": {},
-        "host": payload["host"],
+        "host": _EMPTY_BOARD,
         "problems": [],
         "ok": True,
     }
@@ -501,9 +529,11 @@ def test_every_host_threshold_is_a_key_with_one_default() -> None:
         "idle_load1_max",
         "air_temps",
         "log_interval_s",
+        "vcgencmd_timeout_s",
     }
     assert defaults.enabled is True and defaults.air_temps == ()
-    assert defaults.temp_limit_c == 75.0 and defaults.divergence_c == 25.0
+    assert defaults.temp_limit_c == 75.0 and defaults.divergence_c == 40.0
+    assert defaults.vcgencmd_timeout_s == 2.0
     assert HostHealthConfig.from_section(None) == defaults
     assert HostHealthConfig.from_section({}) == defaults
 
@@ -524,6 +554,7 @@ def test_host_from_section_overrides_and_keeps_the_other_defaults() -> None:
         ({"divergence_c": 0}, "host_health.divergence_c must be >="),
         ({"idle_load1_max": -1.0}, "host_health.idle_load1_max must be >="),
         ({"divergence_fault_s": float("nan")}, "host_health.divergence_fault_s must be finite"),
+        ({"vcgencmd_timeout_s": 0}, "host_health.vcgencmd_timeout_s must be >="),
         ({"air_temps": "inlet_a"}, "host_health.air_temps must be a list"),
         ({"air_temps": [""]}, "air_temps entries must be non-empty strings"),
         ({"air_temps": [3]}, "air_temps entries must be non-empty strings"),
@@ -555,13 +586,18 @@ def test_default_air_temps_prefers_the_zone_air_sensors(das_example_cfg: MpcConf
 def test_default_air_temps_falls_back_to_inlet_then_to_every_temperature(
     das_example_cfg: MpcConfig, cfg: MpcConfig
 ) -> None:
+    """The inlet step is a backstop: ``mpc.sensors`` validation gives every zone a
+    non-redundant ``zone_air`` sensor today, so it is reached only by a config shape
+    that validation does not currently allow. It is exercised on a copy of the real
+    :class:`MpcConfig` -- the same object, its zone-air sensors removed after
+    construction -- rather than a stub with hand-written attributes, so a renamed
+    field breaks this test the way it breaks the daemon."""
     keep = tuple(t for t in das_example_cfg.temps if das_example_cfg.sensors[t].role != "zone_air")
+    no_zone_air = copy.copy(das_example_cfg)
+    object.__setattr__(no_zone_air, "temps", keep)
+    object.__setattr__(no_zone_air, "sensors", {t: das_example_cfg.sensors[t] for t in keep})
 
-    class _NoZoneAir:  # the same config with its zone-air sensors left out
-        temps = keep
-        sensors = {t: das_example_cfg.sensors[t] for t in keep}
-
-    inlets = default_air_temps(_NoZoneAir())
+    inlets = default_air_temps(no_zone_air)
     assert inlets and all(das_example_cfg.sensors[n].role == "inlet" for n in inlets)
     # a legacy config declares no roles at all: every configured temperature
     assert default_air_temps(cfg) == cfg.temps
@@ -585,6 +621,25 @@ def test_an_idle_board_next_to_the_air_has_no_problem() -> None:
     assert verdict["air_c"] == pytest.approx(28.0)
     assert verdict["divergence_c"] == pytest.approx(19.2)
     assert verdict["idle"] is True
+
+
+def test_the_owners_own_idle_board_against_room_air_stands_clear_of_the_default() -> None:
+    """The shipped divergence_c must not sit permanently tripped on a healthy board.
+
+    The owner's Zero 2 W reads 47.2 degC at idle, and an un-heatsinked Zero 2 W idles
+    roughly 20-25 degC above the air around it -- so against a room-temperature air
+    reference (an operator who names the intake, or a config whose only air role is
+    inlet) a *healthy* board is already ~25 degC away. The default must clear that by
+    a real margin, for as long as the board stays where it is.
+    """
+    board = _board()  # the shipped defaults
+    air = {"air_z1": 22.0, "air_z2": 22.0}  # room air at the intake
+    for t in (0.0, 900.0, 86_400.0):
+        verdict = board.check(_host_info(), air, t)
+        assert verdict["divergence_c"] == pytest.approx(25.2)
+        assert verdict["idle"] is True
+        assert verdict["problems"] == [], "a healthy idle board must not be a standing alarm"
+    assert HostHealthConfig().divergence_c - 25.2 >= 10.0
 
 
 def test_a_hot_board_is_reported_only_after_temp_fault_s_and_clears() -> None:
@@ -631,7 +686,7 @@ def test_an_unreadable_throttled_word_never_fires_the_rule() -> None:
 
 
 def test_a_divergence_at_idle_is_reported_after_divergence_fault_s_and_clears() -> None:
-    board = _board()  # the defaults: 25 degC for 900 s
+    board = _board()  # the defaults: 40 degC for 900 s
     far = _host_info(cpu_temp_c=70.0)  # 44 degC above the air, idle
     air = {"air_z1": 26.0, "air_z2": 26.0}
     assert board.check(far, air, 0.0)["problems"] == []
@@ -729,7 +784,45 @@ def test_on_tick_publishes_the_board_verdict_next_to_the_fans() -> None:
     assert payload["host"]["cpu_temp_c"] == 88.0
     assert payload["host"]["ok"] is False
     assert payload["problems"] == payload["host"]["problems"]
+    assert payload["host"]["faults"] == payload["host"]["problems"]
     assert payload["ok"] is False
+
+
+def test_the_divergence_hint_does_not_make_the_daemon_not_ok() -> None:
+    """A hint says where to look; it must not read like a controller that is broken.
+
+    It belongs to the board's own verdict (and to the host_problem sensor templated
+    off it), never to the daemon-wide problems list behind /api/health and Home
+    Assistant's device_problem -- where it would be indistinguishable from an aquabus
+    device that has gone missing.
+    """
+    published: list[dict[str, Any]] = []
+    mon = HealthMonitor(
+        _cfg(),
+        FanHealthConfig(),
+        publish=published.append,
+        host_settings=HostHealthConfig(divergence_fault_s=0.001),
+        hostinfo=lambda: _host_info(cpu_temp_c=90.0),
+    )
+    mon.host.air_temps = ("air_z1",)  # what a zone_air role gives on a real config
+    for ts in (0.0, 5.0):
+        mon.on_tick(_tick(PlantObservation(temps={"air_z1": 26.0}, rpm={}, pwm={}, ts=ts)))
+    board = published[-1]["host"]
+    assert board["faults"] == [] and len(board["hints"]) == 1
+    assert board["problems"] == board["hints"] and board["ok"] is False
+    assert published[-1]["problems"] == [] and published[-1]["ok"] is True
+
+
+def test_a_hot_board_is_a_daemon_problem_and_the_hint_rides_along() -> None:
+    """The facts (hot, throttling now) do join the one problems list."""
+    board = _board(HostHealthConfig(temp_fault_s=0.001, divergence_fault_s=0.001))
+    hot = _host_info(cpu_temp_c=90.0)
+    air = {"air_z1": 26.0, "air_z2": 26.0}
+    board.check(hot, air, 0.0)
+    verdict = board.check(hot, air, 1.0)
+    assert len(verdict["faults"]) == 1 and "above the 75 degC limit" in verdict["faults"][0]
+    assert len(verdict["hints"]) == 1 and "not a verdict" in verdict["hints"][0]
+    assert verdict["problems"] == [*verdict["faults"], *verdict["hints"]]
 
 
 def test_on_tick_without_a_hostinfo_reader_publishes_an_empty_board_verdict() -> None:
