@@ -329,8 +329,10 @@ mpc:
   # Online PWM -> RPM curve per fan model (control/fancurve.py). With fan_curve_online the
   # daemon collects settled (pwm, rpm) pairs from every output that reports a speed, fits
   # rpm_max / deadband / exponent per fan model on the same grid tools/fit_fans.py uses, and
-  # -- once a fit passes -- the thermal model and the DAS MPC plan on the fitted curve instead
-  # of the fan_models entry. The accepted curves live in the model store's fan_curves section,
+  # -- once a fit passes -- the thermal model and the DAS MPC plan on the fitted deadband and
+  # exponent instead of the fan_models entry. The fitted rpm_max is reported only: model_use_rpm
+  # keeps normalising the tachometer by the commissioned fan_models.<m>.rpm_max, so a fan that
+  # loses speed still shows up as less air. The accepted curves live in the model store's fan_curves section,
   # so they survive a restart; the configured curve stays in force until a fit is accepted, and
   # a tach-less output is covered by the curve of its own fan model.
   fan_curve_online: false

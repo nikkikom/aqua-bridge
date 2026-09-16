@@ -219,6 +219,42 @@ def test_model_params_uses_a_fitted_curve_only_when_curves_are_given() -> None:
     assert fitted.fan["fb1"] == configured.fan["fb1"]  # p14 has no fitted curve
 
 
+def test_model_use_rpm_keeps_the_configured_rpm_max_as_its_reference() -> None:
+    """A fitted ``rpm_max`` must never normalise the tachometer: it is fitted to those
+    same readings, so ``phi`` would reach 1 at full duty however slowly the fan turns and
+    a fan that loses speed would look unchanged. ``fan_models.<m>.rpm_max`` is the fixed
+    commissioned reference; the fit supplies the shape only."""
+    cfg = das_cfg(model_use_rpm=True)
+    st = thermal.cached_structure(cfg)
+    spec = cfg.fan_models["p12"]
+    u = dict.fromkeys(cfg.channels, 0.8)
+    healthy = spec.rpm_max * thermal.phi(0.8, spec.deadband, spec.exponent)
+    degraded = 0.7 * healthy  # a month of dust and bearing wear
+
+    # the fit follows the worn fan, as it should -- and the identification still sees the
+    # loss, because the tach branch divides by the configured rpm_max either way
+    fitted = {
+        "p12": {
+            "rpm_max": 0.7 * spec.rpm_max,
+            "deadband": spec.deadband,
+            "exponent": spec.exponent,
+        }
+    }
+    rpm = dict.fromkeys(cfg.channels, degraded)
+    phis: dict[str, float] = {}
+    for curves in (None, {}, fitted):
+        phis = thermal._channel_phi(cfg, st, u, rpm, curves)
+        assert phis["fa1"] == pytest.approx((degraded / spec.rpm_max) ** spec.exponent)
+    healthy_phi = thermal._channel_phi(cfg, st, u, dict.fromkeys(cfg.channels, healthy), fitted)
+    assert phis["fa1"] < 0.75 * healthy_phi["fa1"]
+
+    # the fitted shape does reach the rpm branch's exponent
+    shaped = {"p12": {"rpm_max": spec.rpm_max, "deadband": spec.deadband, "exponent": 1.4}}
+    assert thermal._channel_phi(cfg, st, u, rpm, shaped)["fa1"] == pytest.approx(
+        (degraded / spec.rpm_max) ** 1.4
+    )
+
+
 def test_step_publishes_the_fit_into_the_store_section_and_the_diagnostics() -> None:
     """End to end through ``step``: an accumulator that has seen a sweep puts its curves
     into ``solver_memory["fan_curves"]`` -- the model store's own section, which the
