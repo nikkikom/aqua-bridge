@@ -304,13 +304,19 @@ def push_window(
     return out
 
 
-def stuck_pwm_lag(stuck_ticks: int, fraction: float = 0.25) -> int:
+def stuck_pwm_lag(stuck_ticks: int, fraction: float) -> int:
     """Ticks a PWM move must be old before it counts as Stuck evidence (rule 3).
 
     ``fraction`` of the window (``cfg.stuck_pwm_lag_fraction``, default a quarter: the
     window is sized at several plant time constants, so a quarter of it is still a
     plant-scale delay), at least one command interval left to compare over. The default
     reproduces the previous hardcoded ``stuck_ticks // 4`` bit for bit (item 60).
+
+    ``fraction`` is validated to ``[0, 0.5]`` (``MpcConfig.validate``): the lag skips the
+    newest part of the window, so a larger one leaves a shorter span to measure the move
+    over and flags strictly less. It has no default here on purpose -- the one default
+    lives in ``MpcConfig``, and a fallback in this signature would quietly ignore the
+    operator's setting for any caller that forgot the argument.
     """
     return max(0, min(math.floor(stuck_ticks * fraction), stuck_ticks - 2))
 
@@ -503,26 +509,34 @@ def _pwm_move(old: object, new: object) -> float | None:
 def _airflow_move(
     airflow: Sequence[tuple[str, float, float, float]],
     commands: Sequence[Mapping[str, Any]],
-    lag_fraction: float = 0.25,
+    lag_fraction: float,
 ) -> float | None:
     """Net move of a zone's relative airflow over a Stuck window (``StuckParams.airflow``).
 
     ``commands`` are the window's commands, oldest first (``m`` of them). With
-    ``L = stuck_pwm_lag(m, lag_fraction)`` and ``B = max(1, L)`` the move is the mean
-    airflow of the ``B`` commands that end at the lagged one (``L`` before the newest)
-    minus the mean of the first ``B``: a move must be ``L`` samples old to count,
-    as in the legacy rule, and a short excursion of the command at either end
-    (the DAS MPC dips a fan for a tick or two) counts only by the share of the
-    block it fills. A drive with a time constant of minutes does not answer such
-    a dip, so a single oldest sample caught in it read as a move of the whole
-    window. The airflow of one command is ``sum w * phi(u)`` over the zone's
-    channels with ``phi(u) = clip((u - deadband) / (1 - deadband), 0, 1) **
-    exponent``, the estimator's fan curve; a channel without a usable command
-    adds nothing, and a block without any usable command gives ``None``.
+    ``L = stuck_pwm_lag(m, lag_fraction)`` and ``B = max(1, min(L, (m - L) // 2))`` the
+    move is the mean airflow of the ``B`` commands that end at the lagged one (``L``
+    before the newest) minus the mean of the first ``B``: a move must be ``L`` samples
+    old to count, as in the legacy rule, and a short excursion of the command at either
+    end (the DAS MPC dips a fan for a tick or two) counts only by the share of the block
+    it fills. A drive with a time constant of minutes does not answer such a dip, so a
+    single oldest sample caught in it read as a move of the whole window.
+
+    ``B`` is capped at half of what the lag leaves, so the two blocks never overlap,
+    coincide or run off the start of the window: with an unclamped ``B = L`` the lagged
+    block *is* the first block at ``L = m // 2`` (a move of exactly 0.0) and the slice is
+    empty above that (``None``). Either way the airflow branch would stop producing
+    evidence, and it is the only evidence a zoned sensor without siblings has. The cap is
+    inert at every ``lag_fraction <= 1/3``, the default included.
+
+    The airflow of one command is ``sum w * phi(u)`` over the zone's channels with
+    ``phi(u) = clip((u - deadband) / (1 - deadband), 0, 1) ** exponent``, the estimator's
+    fan curve; a channel without a usable command adds nothing, and a block without any
+    usable command gives ``None``.
     """
     m = len(commands)
     lag = stuck_pwm_lag(m, lag_fraction)
-    block = max(1, lag)
+    block = max(1, min(lag, (m - lag) // 2))
     first = _mean_airflow(airflow, commands[:block])
     last = _mean_airflow(airflow, commands[m - lag - block : m - lag])
     return None if first is None or last is None else last - first

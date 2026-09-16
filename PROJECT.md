@@ -613,7 +613,7 @@ Lists become tuples; ints are accepted for floats.
 | `stuck_eps_c` | required | “unchanged” band, °C; > 0 (≥ sensor resolution, aquaero 0.01 °C). DAS: per sensor, `sensors.<name>.stuck_eps_c` |
 | `stuck_pwm_net` | required | net PWM move that must show up in T; in `(0, 1]`. DAS: a zoned sensor's evidence is its zone's relative airflow instead, `stuck_airflow_net` |
 | `stuck_sibling_dT_c` | required | net move of another temperature, °C; > 0. DAS: only the siblings of `stuck_params` (same zone and role; a proximal sensor's own bay) |
-| `stuck_pwm_lag_fraction` | `0.25` | fraction of the Stuck window a PWM (legacy) or airflow (DAS) move must be old before it counts as evidence (`stuck_pwm_lag`); in `[0, 1]`. The default reproduces the previous hardcoded `stuck_ticks // 4` bit for bit |
+| `stuck_pwm_lag_fraction` | `0.25` | fraction of the Stuck window a PWM (legacy) or airflow (DAS) move must be old before it counts as evidence (`stuck_pwm_lag`); in `[0, 0.5]`. The default reproduces the previous hardcoded `stuck_ticks // 4` bit for bit. The lag skips the newest part of the window, so the move is only ever measured over the oldest `1 − fraction` of it: raising the fraction is strictly more conservative (less of the window carries evidence), and a lag above half a window would leave less window to measure over than it skips, which is why the range stops at `0.5` |
 | `median3` | `false` | pre-filter; must be a YAML bool (`"false"` is rejected) |
 | `temp_min_c`, `temp_max_c` | `-20.0`, `120.0` | gate absolute valid range, °C; min < max |
 | `solver` | `pi` | `pi` or `mpc`. Legacy: PI / small linear MPC. DAS without setpoints: PI-like DAS form / DAS MPC |
@@ -1098,7 +1098,8 @@ PWM):
      `stuck_pwm_net`, measured from the oldest window sample to the
      sample `max(0, min(floor(stuck_ticks * stuck_pwm_lag_fraction),
      stuck_ticks - 2))` ticks **before** the newest (`stuck_pwm_lag`;
-     `stuck_pwm_lag_fraction` default `0.25`, a quarter window), **or**
+     `stuck_pwm_lag_fraction` default `0.25`, a quarter window, in
+     `[0, 0.5]`), **or**
    - another temperature in `config.temps` moved (net) by more than
      `stuck_sibling_dT_c` along a physically plausible path: every
      sample finite and in range, no single step above `dT_max_tick`.
@@ -1190,11 +1191,14 @@ number of rule 3 comes from `MpcConfig.stuck_params(name)`:
   `φ(u) = clip((u − deadband) / (1 − deadband), 0, 1) ^ exponent` from
   `fan_models` (the estimator's fan curve) and `w` the channel's
   `fans.<ch>.count` split evenly over the zones that list it, normalised
-  to a sum of 1. It counts when the mean `Qn` of the `L` samples that end
+  to a sum of 1. It counts when the mean `Qn` of the `B` samples that end
   at the lagged sample (`L = stuck_pwm_lag`, `stuck_pwm_lag_fraction`
   of the window, default a quarter, before the newest) differs from the
-  mean of the first `L` samples by more than
+  mean of the first `B` samples by more than
   `stuck_airflow_net` (`stuck_pwm_net` stays the legacy per-channel rule).
+  The block is `B = max(1, min(L, (m − L) / 2))` of the window's `m`
+  samples, so the two blocks never overlap or coincide however wide the
+  lag is (`B = L` at the default and at every fraction up to `1/3`).
   Block means, not the oldest sample: a drive does not answer a fan dip
   of a tick or two. An inlet without a zone has none: the fans do not move
   the inlet;
@@ -4156,11 +4160,17 @@ Owner decision (2026-09-16):
     pytest processes concurrently, each on a disjoint deterministic slice
     of `tests/test_*.py`, inside both `test` matrix jobs (§12).
 27. **Done** (2026-09-16): the sine's turning points never held a
-    plateau close to `stuck_s`; `test_a_truly_idle_drive_frozen_longer_
-    than_the_window_never_flags_stuck` (`tests/test_gate.py`) holds
-    `prox_a2` at one exact value for the whole 1100-tick run (several
-    times `stuck_s`) while a faster, independent fan cycle keeps every
-    window supplied with airflow evidence; never flags.
+    plateau close to `stuck_s`. `tests/test_gate.py` now holds `prox_a2`
+    (bay a2's only sensor, so the airflow branch is its Stuck rule's
+    only evidence path) at one exact code for the whole 1100-tick run,
+    several times `stuck_s`, while zone za's fans step from 0.2 to 0.9
+    and stay there — a real net airflow move over every later window.
+    Two runs of that scenario: with za's air warming against the rising
+    airflow by more than `stuck_air_oppose_c` the reading is spared for
+    the whole run, and with za's air flat it *is* branded Stuck, from
+    one tick on and then continuously. So the plateau run is spared by
+    the designed protection (`_air_opposes`), not by the absence of
+    evidence, and the pair would fail if the Stuck rule were deleted.
 28. **Done** (2026-09-16): `tools/bench_step.py --sim-plant das` takes
     `--sim-preset` (`basic`, default, or `rich`, item 17) and reports the
     preset it actually ran in `plant.preset`, instead of the literal
@@ -4243,13 +4253,20 @@ Owner decision (2026-09-16):
     swing would expose in a zone whose fans sit still.
 60. **Done** (2026-09-16): the Stuck rule's quarter-window lag is now
     `mpc.stuck_pwm_lag_fraction` (§3 field table), a fraction of the
-    window in `[0, 1]`, default `0.25`; `control/gate.stuck_pwm_lag`
-    takes it as a parameter instead of a literal `// 4`, both call sites
-    (the legacy per-channel PWM lag and the DAS `_airflow_move` block
-    lag) pass `cfg.stuck_pwm_lag_fraction`, and `floor(n * 0.25) == n //
-    4` for every window length the config allows, so the legacy and
-    default-DAS paths stay bit for bit (`tests/test_gate.py`,
-    `tests/test_stuck_sim.py`).
+    window in `[0, 0.5]`, default `0.25`; `control/gate.stuck_pwm_lag`
+    takes it as a required parameter instead of a literal `// 4`, both
+    call sites (the legacy per-channel PWM lag and the DAS
+    `_airflow_move` block lag) pass `cfg.stuck_pwm_lag_fraction`, and
+    `floor(n * 0.25) == n // 4` for every window length the config
+    allows, so the legacy and default-DAS paths stay bit for bit
+    (`tests/test_gate.py`, `tests/test_stuck_sim.py`). The key may not
+    switch the rule off: `_airflow_move` caps its block at
+    `max(1, min(L, (m - L) / 2))` so the two blocks never coincide (a
+    move of exactly `0.0` at `L = m // 2`) or run off the start
+    (`None`), the range stops at half a window because a wider lag would
+    leave less window to measure the move over than it skips, and a
+    parametrised test flags a frozen, sibling-less reading at every
+    fraction the config accepts.
 61. **Done** (2026-09-16): a name whose slew check (gate rule 2) passed
     with neither a `last_good_obs` value nor a previous raw one to
     compare against, while the run is past its own cold start

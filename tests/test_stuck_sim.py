@@ -148,7 +148,7 @@ def test_frozen_proximal_reading_is_flagged_once_its_zone_airflow_moves(
     # decimation intervals, t1 being when the zone's airflow has moved (section 3, pinned
     # on scripted samples in test_gate.py). The load raises z0's fans within minutes: allow
     # t1 up to three quarters of a window after the load.
-    lag_s = stuck_pwm_lag(params.samples) * params.decimate * cfg.dt
+    lag_s = stuck_pwm_lag(params.samples, cfg.stuck_pwm_lag_fraction) * params.decimate * cfg.dt
     bound_s = LOAD_S + window_s + lag_s
     run = frozen_run(cfg, sensor, int(bound_s / cfg.dt) + 2)
     flags = [r.obs.ts for r in run.records if r.cmd.diagnostics["gate"]["stuck"][sensor]]

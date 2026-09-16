@@ -142,7 +142,9 @@ mpc:
   stuck_air_oppose_max_c: 3.0
   stuck_zone_air_dT_c: 1.5
   # Fraction of the Stuck window a PWM (legacy) or airflow (DAS) move must be old
-  # before it counts as evidence (stuck_pwm_lag); a quarter window, [0, 1].
+  # before it counts as evidence (stuck_pwm_lag); a quarter window, [0, 0.5]. The
+  # move is measured over the oldest 1 - fraction of the window, so raising this
+  # flags strictly less; half a window is the most that still leaves room to measure.
   stuck_pwm_lag_fraction: 0.25
   solver_max_iter: 50
   channels: [xt1, xt2, xt3, xt4, qd1, qd2, qd3, qd4]
