@@ -2764,12 +2764,39 @@ a model converges only with them.
   §8.1, 2026-09-16): about a watt against the drives' tens of watts, and
   its reading is dominated by its own self-heating, which moves with CPU
   load. It is not a solver input, not a zone air sensor and not a model
-  node. `hostinfo.read_throttled()` adds the firmware's `get_throttled`
-  word to the host metrics — preferring the sysfs attribute
-  `/sys/devices/platform/soc/soc:firmware/get_throttled` over a `vcgencmd`
-  subprocess, `null` when neither reads, never an exception — decoded into
-  `under_voltage`, `freq_capped`, `throttled` and `soft_temp_limit`, each
-  both `_now` and `_since_boot`. `health.HostHealth` then applies three
+  node. `hostinfo.read_throttled()` adds the board's throttling state to the
+  host metrics, decoded into `under_voltage`, `freq_capped`, `throttled` and
+  `soft_temp_limit`, each both `_now` and `_since_boot`, `null` when nothing
+  reads it and never an exception. **Three sources, best first, because no
+  single one is present everywhere** — measured on the owner's board, a
+  Raspberry Pi Zero 2 W on kernel 6.18:
+
+  1. the firmware driver's sysfs attribute
+     `/sys/devices/platform/soc/soc:firmware/get_throttled` — the whole word
+     for a file read. **Absent on that kernel**: the `soc:firmware` platform
+     device is there and carries no such attribute, and nothing under `/sys`
+     is named for throttling at all. It stays first for the kernels that do
+     expose it, but it is not the normal case;
+  2. `vcgencmd get_throttled` — the whole word, and on that kernel **the only
+     source of it**. A process: 3.3 ms median, 3.8 ms p95 there. Rate limited
+     by `hostinfo.ThrottledReader` to one run per
+     `host_health.vcgencmd_interval_s`, with the last word served in between
+     and tagged with its age;
+  3. the `rpi_volt` hwmon device's `in0_lcrit_alarm` — the **under-voltage
+     condition only**, 0.17 ms median / 0.23 ms p95, found by the device's
+     `name` and never by its index, which is not stable across boots (on that
+     board `hwmon0` is the `cpu_thermal` zone the temperature already comes
+     from and `hwmon1` is `rpi_volt`, today).
+
+  A source that reads less than the whole word **says so**: the conditions it
+  could not see stay `null`, `unknown` names them and `partial` flags the
+  reading, and the `now` / `since_boot` summaries are `null` rather than
+  `false` while an unread condition could be the one in force. An unknown bit
+  is never reported as an absent one, so a partial source can raise the
+  throttling rule but never silence it. A board with none of the three
+  degrades to `null` and warns about nothing.
+
+  `health.HostHealth` then applies three
   rules on the same `on_tick` observer as the fans', and the verdict rides
   the same payload as `device_health.host` (§6, §7):
 
@@ -2784,7 +2811,11 @@ a model converges only with them.
     is seen, with no window and no config key: the firmware has already
     latched the condition, so a sustained rule would only delay a fact. The
     `_since_boot` half is published next to it and never warns on its own —
-    an under-voltage during boot is history, not a live problem.
+    an under-voltage during boot is history, not a live problem. It fires on
+    whatever source the board has, the `rpi_volt` under-voltage bit on its
+    own included, and the message says which source it was, how old the word
+    is where it came from the cache, and which conditions that source could
+    not read.
   - **the board diverges from the enclosure air** — its temperature further
     than `divergence_c` from the mean of the air reference for
     `divergence_fault_s`, **and only while the CPU is idle**
@@ -2821,15 +2852,28 @@ a model converges only with them.
   are logged at most once per `log_interval_s` (300 s). Every threshold is
   a `host_health:` key with one default declared once in
   `health.HostHealthConfig`, validated there, shown in both example
-  configs — `vcgencmd_timeout_s` (2 s) included, which bounds the only
-  fallback that starts a process. That fallback belongs to the HTTP and
-  MQTT readers: the control tick's reader has it switched off
-  (`health.host_metrics_reader(..., subprocess_fallback=False)`), because
-  `on_tick` runs on the loop thread, where a fork/exec would stretch the
-  tick and the watchdog ping behind it without showing in the step budget,
-  which is measured before the tick's observers run. Nothing here can
-  change a duty: the board's numbers never enter `PlantObservation` or the
-  `diagnostics` the solver reads.
+  configs — including the two that govern the one source that starts a
+  process, `vcgencmd_interval_s` (60 s) and `vcgencmd_timeout_s` (2 s).
+
+  **Every reader gets that source, the control loop's included.** `on_tick`
+  runs on the loop thread, and a fork/exec there does stretch the tick — and
+  the watchdog ping behind it — without showing in the step budget, which is
+  measured before the tick's observers run. The alternative, though, is
+  worse: with no sysfs attribute on this kernel, a tick reader without
+  `vcgencmd` sees `throttled: null` forever and the "throttling now" rule can
+  never fire on the one thread that matters, while the HTTP and MQTT readers
+  quietly do see it. So the cost is spent knowingly and bounded by two
+  documented keys instead: one 3.3 ms fork per `vcgencmd_interval_s` is
+  0.07 % of the one `dt = 5 s` tick it lands on, 0.5 % of `mpc.budget_ms`
+  (600, alarm 750), and nothing on the other eleven ticks of that minute;
+  `vcgencmd_timeout_s` guards the one failure that could cost more — a
+  VideoCore mailbox that never answers — and a failed poll drops the stale
+  word, falls through to the hwmon bit and still waits out the interval, so
+  a board where the call hangs pays one timeout a minute and not one a tick.
+  `health.host_metrics_reader(..., subprocess_fallback=False)` builds a
+  file-only reader for a caller that wants no process at all. Nothing here
+  can change a duty: the board's numbers never enter `PlantObservation` or
+  the `diagnostics` the solver reads.
 - `hw/onewire.py`: `W1Source`, DS18B20 over the kernel's `w1_therm`
   bulk-read ABI (assumed layout, unverified on hardware, kept name-based
   and rooted at `onewire.root`): `w1_bus_master<N>/therm_bulk_read`
@@ -3702,10 +3746,11 @@ runners allow it.
   exit 2), publisher wiring and start failures, the
   SIGTERM stop path in-process, a SIGTERM delivered inside a stderr write,
   a second SIGTERM during shutdown, and a real subprocess (`slow`). Item 97:
-  a `host_health.air_temps` typo exits 2 before anything opens, and the
-  tick's host reader starts no `vcgencmd` process even on a machine that has
-  one, while the publishers' reader does and honours
-  `host_health.vcgencmd_timeout_s`.
+  a `host_health.air_temps` typo exits 2 before anything opens; the tick's
+  host reader runs `vcgencmd` once per `host_health.vcgencmd_interval_s` and
+  not once per tick, honours `vcgencmd_timeout_s` and leaves the tick's
+  `throttled` non-null; the publishers' reader is built from the same keys.
+  The run itself is faked, so no test starts a process.
 - `tests/test_sdnotify.py` — address resolution, the watchdog period
   from `$WATCHDOG_USEC` / `$WATCHDOG_PID`, no-op without
   `$NOTIFY_SOCKET`, failures return `False`, a real `AF_UNIX` datagram
@@ -3763,11 +3808,19 @@ runners allow it.
   while disconnected, Discovery per connect and on the manual boundary,
   host refresh interval, swallowed publish errors.
 - `tests/test_hostinfo.py` — every host metric against fake procfs /
-  sysfs files, `None` on missing or malformed input; the board's
-  `get_throttled` word (§8 item 97): every bit of both halves, the sysfs
-  attribute preferred over `vcgencmd`, the `vcgencmd` fallback parsed, and
-  `None` for an unreadable source, a malformed word, a missing binary or a
-  runner that raises — no test starts a `vcgencmd` process.
+  sysfs files, `None` on missing or malformed input; the board's throttling
+  state (§8 item 97): every bit of both halves; the three sources in the
+  order the chain tries them — the sysfs attribute preferred, `vcgencmd`
+  where it is absent, the `rpi_volt` hwmon alarm where both are (found by
+  `name` across several hwmon directories, with `rpi_volt` deliberately not
+  at index 1), and `None` where none of them reads; a partial reading
+  claiming nothing it did not read, and its summaries `None` rather than
+  false; `ThrottledReader`'s cadence counting the runner's calls against a
+  fake clock (one a minute over ten minutes of 5 s ticks), the cached word
+  reused between polls with its age, and a failed poll dropping the word,
+  falling through to the hwmon bit and not being retried before the interval
+  is out. The runner is always a callable the test owns — no test starts a
+  `vcgencmd` process.
 - `tests/test_deploy.py` — unit file (`Type=notify`, `NotifyAccess=main`,
   `Restart=always`, watchdog, no `ExecStop=`, venv `ExecStart`,
   `TimeoutStartSec >= WatchdogSec`), udev rules against the unit’s
@@ -4041,7 +4094,7 @@ Config `http:` (parsed and validated by `HttpSettings` in
   `expected_power_w`, `problems`), `host` (§8 item 97: the board's own
   `cpu_temp_c`, the `air_c` reference it is compared against with the
   `air_temps` it was averaged from, the signed `divergence_c`, `load1`,
-  `idle`, the decoded `throttled` word and this board's own `faults`,
+  `idle`, the `throttled` reading and this board's own `faults`,
   `hints`, `problems` and `ok`), `problems` and `ok`. Only the board's
   *faults* — it is hot, it is throttling now — are in the top-level
   `problems` list `/api/health` shows; the divergence *hint* stays in
@@ -4055,8 +4108,10 @@ Config `http:` (parsed and validated by `HttpSettings` in
 - `host` — host machine metrics (`aqua_bridge.hostinfo.collect_hostinfo`:
   `cpu_temp_c`, `load1`, `load5`, `load15`, `mem_used_pct`, `mem_total_kb`,
   `disk_used_pct`, `disk_free_gb`, `wifi_rssi_dbm`, `uptime_s`, and
-  `throttled` — the decoded `get_throttled` word, §8 item 97, the one
-  nested value; `null` per key when unreadable), refreshed at most every `host.interval_s` seconds
+  `throttled` — the board's throttling state, §8 item 97, the one nested
+  value: the decoded word with its `source` and, for a cached `vcgencmd`
+  word, its `age_s`, or a `partial` reading whose `unknown` conditions are
+  `null`; `null` per key when unreadable), refreshed at most every `host.interval_s` seconds
   through a cache the HTTP app owns (`publishers/http.py`, item 25); present
   in both modes
 
@@ -4467,7 +4522,13 @@ Owner decision (2026-09-16):
 - **The Pi's own board is a health signal, never a model input**
   (item 97). On the owner's Zero 2 W (64-bit trixie, kernel 6.18.50-v8)
   `/sys/class/thermal/thermal_zone0` is `cpu-thermal` and read 47.2 °C at
-  idle, and `vcgencmd get_throttled` returned `0x0`. The board is **not**
+  idle, and `vcgencmd get_throttled` returned `0x0`. Measured there since:
+  the firmware's `get_throttled` **sysfs attribute does not exist** on that
+  kernel (the `soc:firmware` platform device carries none, and `find /sys
+  -iname '*throttl*'` finds nothing), so `vcgencmd` — 3.3 ms median, 3.8 ms
+  p95 per run — is the only source of the whole word there; `hwmon1` is
+  `rpi_volt` with the single attribute `in0_lcrit_alarm`, the under-voltage
+  condition alone, at 0.17 ms median / 0.23 ms p95. The board is **not**
   part of the thermal model: about a watt against the drives' tens of
   watts, and its reading is dominated by its own self-heating, which moves
   with CPU load. It must never become a solver input, a zone air sensor or
@@ -5650,22 +5711,27 @@ Owner decision (2026-09-16):
 
 97. **Done** (2026-09-16): the Pi's own temperature and throttling as a
     health signal (owner decision above, §8.1). `hostinfo.read_throttled()`
-    reads the firmware's `get_throttled` word — the sysfs attribute
-    `/sys/devices/platform/soc/soc:firmware/get_throttled` first, a
-    `vcgencmd get_throttled` subprocess only as a fallback (short-circuited
-    on `PATH`, so no process is started on a machine that is not a Pi),
-    `null` when neither reads and never an exception, like the rest of
-    `hostinfo` — and `decode_throttled()` turns it into named booleans:
-    `under_voltage`, `freq_capped`, `throttled`, `soft_temp_limit`, each
-    `_now` and `_since_boot`, plus the `now` / `since_boot` summaries, the
-    raw word and its hex. It rides `collect_hostinfo()` as the `throttled`
+    reads the board's throttling state from whichever of three sources this
+    kernel has — the sysfs attribute
+    `/sys/devices/platform/soc/soc:firmware/get_throttled` first, then
+    `vcgencmd get_throttled` (short-circuited on `PATH`, so no process is
+    started on a machine that is not a Pi), then the `rpi_volt` hwmon
+    device's `in0_lcrit_alarm`, which is the under-voltage condition alone
+    and is reported as exactly that; `null` when none reads and never an
+    exception, like the rest of `hostinfo`. `decode_throttled()` turns a
+    whole word into named booleans: `under_voltage`, `freq_capped`,
+    `throttled`, `soft_temp_limit`, each `_now` and `_since_boot`, plus the
+    `now` / `since_boot` summaries, the raw word and its hex; a source that
+    saw less leaves what it did not read `null`, names it in `unknown`, sets
+    `partial` and summarises to `null` rather than `false`, so an unknown bit
+    is never read as an absent one. Every reading carries its `source` and,
+    for a `vcgencmd` word served from the cache, its `age_s`. It rides
+    `collect_hostinfo()` as the `throttled`
     key, so `/api/state`'s `host` and the MQTT state blob carry it
     (item 25). `health.HostHealth` adds the three rules and the
     `host_health:` keys described in §3 ("The board itself"), runs on the
     same `on_tick` observer as the fan health with a `CachedHostInfo` on
-    `host.interval_s` whose `vcgencmd` fallback is switched off (the tick
-    runs on the loop thread; the HTTP and MQTT readers keep the fallback,
-    bounded by `host_health.vcgencmd_timeout_s`), and publishes its verdict
+    `host.interval_s`, and publishes its verdict
     as `device_health.host` — so `/api/state`, `/api/health`, the MQTT state
     blob and the page show it the way item 83 shows device health, plus a
     Home Assistant binary sensor `host_problem` of its own (`device_class:
@@ -5678,7 +5744,14 @@ Owner decision (2026-09-16):
     the `diagnostics` the solver reads: no golden changes, and a failure
     here cannot reduce cooling (§2). Tests: every bit of the throttled word
     in both halves, an unreadable source, a malformed word, a missing
-    binary and a raising runner (no test shells out to `vcgencmd`); each
+    binary and a raising runner (no test shells out to `vcgencmd`); the
+    hwmon source found by `name` among several hwmon directories and not by
+    index, alone as the whole chain, and claiming nothing it did not read;
+    the `vcgencmd` cadence counted against a fake clock and a fake runner,
+    the cached word reused with its age, and a failed poll falling through
+    to the hwmon bit without a retry before the interval is out; the rule
+    firing from the under-voltage bit alone and staying silent when that one
+    bit is clear; each
     rule firing and clearing against a fake clock; the idle gate switching
     the divergence rule off and restarting its window; the air reference and
     its default; the publishers' payloads and the Discovery entity.
@@ -5687,12 +5760,24 @@ Owner decision (2026-09-16):
     `divergence_c` in particular ships as a coarse backstop (40 °C) because a
     healthy idle Zero 2 W is already 20–25 °C from room air; it means little
     until someone measures the board-vs-air delta where the Pi actually sits,
-    and only then should it be narrowed. Still unverified on hardware: which
-    source the firmware exposes on 64-bit trixie (kernel 6.18.50-v8) —
-    `cat /sys/devices/platform/soc/soc:firmware/get_throttled`, and if that
-    is absent, whether `/api/state`'s `host.throttled` is non-null from the
-    `vcgencmd` fallback. Only `hostinfo.THROTTLED_SYSFS` changes if the
-    attribute lives elsewhere.
+    and only then should it be narrowed. **The source question is now
+    answered** (measured on the board, 2026-09-16, §8.1): on 64-bit trixie
+    with kernel 6.18.50-v8 the firmware sysfs attribute is **absent** and
+    `vcgencmd` is the only source of the whole word, so the control tick runs
+    it too — once per `host_health.vcgencmd_interval_s` (60 s; one run is
+    3.3 ms median, 0.07 % of the tick it lands on), with
+    `vcgencmd_timeout_s` bounding the one call that could cost more. The
+    `rpi_volt` hwmon alarm covers under-voltage on a board that has no
+    `vcgencmd` either, and only `hostinfo.THROTTLED_SYSFS` changes if the
+    attribute lives elsewhere on some other kernel. Still open: on a board
+    whose only source is that process, "throttling now" can be up to one
+    `vcgencmd_interval_s` late — acceptable for a health signal (the firmware
+    latches the `_since_boot` half regardless, and the message carries the
+    word's age), and lowering the key trades forks for latency. A cheap way
+    to do better would be to escalate: the 0.17 ms hwmon bit could be read
+    on every tick and an under-voltage it sees force a word refresh ahead of
+    the cadence. Not done — it complicates the chain for the one condition of
+    the four the hwmon source already reports on its own.
 
 ### 8.3 Open — needs the DAS hardware
 

@@ -285,7 +285,20 @@ hardware.
     section show the board's temperature against the enclosure air, whether
     its CPU was idle when that was judged, and the decoded
     `get_throttled` word (throttling now, and what has occurred since boot);
-    in Home Assistant it is the `Board problem` binary sensor. The board is
+    in Home Assistant it is the `Board problem` binary sensor.
+
+    That word comes from whichever source the board has, and the reading
+    names it: the firmware's sysfs attribute where the kernel exposes one;
+    otherwise `vcgencmd get_throttled`, which on a Raspberry Pi Zero 2 W
+    running kernel 6.18 is the only source of the whole word (the sysfs
+    attribute does not exist there) and is a 3.3 ms process, so it is run at
+    most once per `host_health.vcgencmd_interval_s` (60 s) and bounded by
+    `vcgencmd_timeout_s`, with the last word served in between and shown with
+    its age; otherwise the `rpi_volt` hwmon under-voltage alarm, which is one
+    condition and says so — the other three read as *unknown*, never as
+    absent. A board with none of the three simply shows `-`.
+
+    The board is
     a health signal only — it is never a solver input, a zone air sensor or
     a model node — and the divergence rule is a hint about the air sensors
     or the board's placement, not a verdict about either: it shows on the
