@@ -841,15 +841,32 @@ def test_every_publish_uses_the_qos_and_retain_flags_of_section_7(cfg: MpcConfig
     assert paho.disconnected == 1
 
 
-def test_the_last_will_is_a_retained_offline_on_the_availability_topic(cfg: MpcConfig) -> None:
+def test_the_last_will_is_a_retained_offline_on_the_availability_topic(
+    cfg: MpcConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A daemon killed without a clean stop must still go unavailable in Home Assistant.
-    paho keeps the will on private attributes; there is no public reader for it."""
-    client = _client(cfg)
-    paho = client.client
-    assert paho._will is True
-    assert paho._will_topic == availability_topic(NODE_ID).encode()
-    assert paho._will_payload == b"offline"
-    assert paho._will_qos == 1 and paho._will_retain is True
+
+    Asserted on the ``will_set`` call the wrapper makes, which is what ``MqttClient``
+    promises, rather than on paho's private ``_will*`` attributes: the package allows
+    any paho 2.x and the Pi installs the distro build, so library internals renamed in
+    a later release would fail here looking like an aqua-bridge regression.
+    """
+    mqtt = pytest.importorskip("paho.mqtt.client")
+    wills: list[tuple[Any, ...]] = []
+
+    class _RecordingPaho(_FakePaho):
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            super().__init__()
+
+        def username_pw_set(self, username: str, password: str | None = None) -> None:
+            self.auth = (username, password)
+
+        def will_set(self, topic: str, payload: Any = None, qos: int = 0, retain: bool = False):
+            wills.append((topic, payload, qos, retain))
+
+    monkeypatch.setattr(mqtt, "Client", _RecordingPaho)
+    _client(cfg)
+    assert wills == [(availability_topic(NODE_ID), "offline", 1, True)]
 
 
 def test_the_publisher_lifecycle_and_the_node_id_and_prefix_from_the_config(

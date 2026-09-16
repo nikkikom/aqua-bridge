@@ -1,8 +1,10 @@
 """Opt-in integration test of the whole publisher against a **real** MQTT broker
 (PROJECT.md section 7, section 8 item 21). Marker: ``mqtt_live``.
 
-Skipped unless ``$AQUA_BRIDGE_MQTT_TEST_HOST`` names a broker, so CI stays offline
-and the rest of the suite never touches a network:
+It needs **two** signals, so neither alone can start a broker session by accident:
+``$AQUA_BRIDGE_MQTT_TEST_HOST`` naming a broker *and* ``-m mqtt_live`` selecting the
+marker on the command line. An exported variable left over in a shell therefore does
+not make the next ordinary full-suite run connect to the owner's live broker:
 
     AQUA_BRIDGE_MQTT_TEST_HOST=broker.lan \\
     AQUA_BRIDGE_MQTT_TEST_USERNAME=aqua-bridge \\
@@ -24,6 +26,7 @@ left on the broker.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -47,7 +50,8 @@ from aqua_bridge.publishers.mqtt_ha import (
 
 pytestmark = pytest.mark.mqtt_live
 
-#: Naming a broker here opts the whole module in; without it every test skips.
+#: Naming a broker here is half the opt-in; ``-m mqtt_live`` on the command line is the
+#: other half. Without either, every test skips.
 HOST = os.environ.get("AQUA_BRIDGE_MQTT_TEST_HOST", "")
 PORT = int(os.environ.get("AQUA_BRIDGE_MQTT_TEST_PORT", "1883"))
 USERNAME = os.environ.get("AQUA_BRIDGE_MQTT_TEST_USERNAME", "")
@@ -96,10 +100,15 @@ def _plain_client(client_id: str) -> Any:
 
 
 @pytest.fixture
-def live(cfg: MpcConfig):
+def live(cfg: MpcConfig, pytestconfig: pytest.Config):
     """The daemon's MQTT publisher, connected to the real broker under a test node id."""
     if not HOST:
         pytest.skip("set AQUA_BRIDGE_MQTT_TEST_HOST to run the live MQTT test")
+    # The env var alone is not enough: left exported in a shell it would make the next
+    # ordinary `-m "not hardware and not nightly"` run open a session on the owner's
+    # live Home Assistant broker. Opting in has to be typed out each time.
+    if "mqtt_live" not in (pytestconfig.option.markexpr or ""):
+        pytest.skip("select the marker deliberately as well: -m mqtt_live")
     pytest.importorskip("paho.mqtt.client")
     from aqua_bridge.publishers.runtime import MqttService
 
@@ -132,8 +141,22 @@ def live(cfg: MpcConfig):
             _clean_retained(cfg, node_id)
 
 
+def _left_behind(reason: str, topics: list[str]) -> None:
+    """Say what is still retained on the broker, by topic, so it can be cleared by hand."""
+    print(f"\ncould not delete the retained messages this test left ({reason}).")
+    print("clear them with: mosquitto_pub -r -n -t <topic>")
+    for topic in topics:
+        print(f"  {topic}")
+
+
 def _clean_retained(cfg: MpcConfig, node_id: str) -> None:
-    """Delete every retained message this test left, so the broker is as it was."""
+    """Delete every retained message this test left, so the broker is as it was.
+
+    Never raises: this runs in the fixture's ``finally``, and an exception here would
+    both bury the real assertion failure and hide which topics are still on the owner's
+    broker. A failure is printed with the topics instead, and the connect is retried
+    once (the daemon under test has just disconnected; a broker can be briefly busy).
+    """
     topics = {availability_topic(node_id), state_topic(node_id), f"{node_id}/in/smart/TESTSERIAL"}
     for mode in ControlMode:
         topics.update(
@@ -142,15 +165,33 @@ def _clean_retained(cfg: MpcConfig, node_id: str) -> None:
                 cfg, node_id=node_id, discovery_prefix=PREFIX, control_mode=mode
             )
         )
-    client = _plain_client(f"aqua-bridge-test-clean-{os.getpid()}")
+    client = None
+    for attempt in (1, 2):
+        try:
+            client = _plain_client(f"aqua-bridge-test-clean-{os.getpid()}")
+            break
+        except Exception as exc:  # broker restarted, network blip, auth hiccup
+            if attempt == 2:
+                _left_behind(f"{type(exc).__name__}: {exc}", sorted(topics))
+                return
+            time.sleep(1.0)
+    assert client is not None
+    left: list[str] = []
     try:
         for topic in sorted(topics):
-            client.publish(topic, payload="", qos=1, retain=True).wait_for_publish(
-                timeout=STEP_TIMEOUT_S
-            )
+            try:
+                client.publish(topic, payload="", qos=1, retain=True).wait_for_publish(
+                    timeout=STEP_TIMEOUT_S
+                )
+            except Exception:
+                left.append(topic)
     finally:
-        client.loop_stop()
-        client.disconnect()
+        with contextlib.suppress(Exception):
+            client.loop_stop()
+        with contextlib.suppress(Exception):
+            client.disconnect()
+    if left:
+        _left_behind("the broker refused or timed out on these", left)
 
 
 def test_the_publisher_and_the_check_tool_against_a_real_broker(live, cfg: MpcConfig) -> None:
