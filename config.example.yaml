@@ -232,10 +232,20 @@ host_health:
                              # empty means every zone_air sensor, else every inlet sensor,
                              # else every configured temperature
   log_interval_s: 300.0      # one log line for the board at most this often, seconds (> 0)
-  vcgencmd_timeout_s: 2.0    # how long a `vcgencmd get_throttled` fallback may take,
-                             # seconds (> 0); only the HTTP and MQTT readers ever start
-                             # that process, and only where the sysfs attribute is
-                             # missing -- the control tick's reader never does
+  vcgencmd_interval_s: 60.0  # how often a reader may run `vcgencmd get_throttled`,
+                             # seconds (> 0). On a Raspberry Pi Zero 2 W with kernel
+                             # 6.18 the firmware exposes no get_throttled sysfs
+                             # attribute, so that process is the only source of the
+                             # whole word and the control tick uses it too; one fork
+                             # costs 3.3 ms there (3.8 ms p95), so once a minute is
+                             # 0.07 % of the one 5 s tick it lands on and 0.5 % of
+                             # mpc.budget_ms. The last word is served in between,
+                             # tagged with its age. Lower it to notice throttling
+                             # sooner, at one 3.3 ms fork per interval
+  vcgencmd_timeout_s: 2.0    # how long one `vcgencmd get_throttled` may take, seconds
+                             # (> 0); it guards against a VideoCore mailbox that never
+                             # answers. A timeout is simply unknown, and the chain
+                             # falls through to the rpi_volt hwmon under-voltage bit
 
 http:
   # HTTPS with basic auth only; there is no plain-HTTP listener (PROJECT.md section 6).

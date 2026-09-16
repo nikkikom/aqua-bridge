@@ -357,20 +357,23 @@ def build_health_monitor(
     at most every ``host.interval_s`` seconds like the HTTP app's and the MQTT
     service's -- a tick shorter than that costs no ``/proc`` or ``/sys`` read.
 
-    This reader has the ``vcgencmd`` fallback switched off
-    (:func:`~aqua_bridge.health.host_metrics_reader`): it runs on the loop thread,
-    where a fork/exec would stretch the tick -- and the watchdog ping behind it --
-    without showing in the step budget, which is measured before the tick's
-    observers run. On a board whose firmware exposes no sysfs ``get_throttled``
-    attribute the loop simply sees ``throttled: null``; the HTTP and MQTT readers,
-    which are not on the loop thread, keep the fallback and still publish the word.
+    This reader gets the whole throttling source chain
+    (:func:`~aqua_bridge.health.host_metrics_reader`), ``vcgencmd`` included, because
+    the board this daemon runs on exposes no ``get_throttled`` sysfs attribute and a
+    reader without that process would leave the "throttling now" rule unable to fire
+    on the one thread that matters. It does run on the loop thread, so the process is
+    rate limited to one run per ``host_health.vcgencmd_interval_s`` (60 s by default,
+    3.3 ms measured) and bounded by ``host_health.vcgencmd_timeout_s``: 0.07 % of the
+    tick it lands on, nothing on the rest. The step budget is measured before the
+    tick's observers run, so that cost does not show there -- it is small enough to
+    be spent knowingly rather than hidden, which is why both keys are documented.
     """
     settings = FanHealthConfig.from_section(app.section("fan_health"))
     host_settings = HostHealthConfig.from_section(app.section("host_health"))
     if not settings.enabled and not host_settings.enabled and not hasattr(source, "device_health"):
         return None
     interval_s = float(app.section("host").get("interval_s", 5.0))
-    reader = host_metrics_reader(host_settings, subprocess_fallback=False)
+    reader = host_metrics_reader(host_settings)
     return HealthMonitor(
         app.mpc,
         settings,

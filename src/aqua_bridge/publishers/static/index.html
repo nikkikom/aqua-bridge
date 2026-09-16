@@ -152,12 +152,22 @@ function hostHealthRows(health) {
   }
   const t = h.throttled;
   if (t) {
-    const now = ["under_voltage", "freq_capped", "throttled", "soft_temp_limit"]
-      .filter(n => t[n + "_now"]);
-    const ever = ["under_voltage", "freq_capped", "throttled", "soft_temp_limit"]
-      .filter(n => t[n + "_since_boot"]);
-    rows.push(row("Throttling now", now.length ? now.join(", ") : "no (" + t.hex + ")"));
-    rows.push(row("Since boot", ever.length ? ever.join(", ") : "none"));
+    const names = ["under_voltage", "freq_capped", "throttled", "soft_temp_limit"];
+    // A bit the source could not read is null, never false: it is shown as unknown,
+    // and "unknown" names the conditions this source cannot see at all. The source
+    // and the age of the word are shown too -- a vcgencmd word is polled on a cadence
+    // and served from cache in between (§8 item 97).
+    const now = names.filter(n => t[n + "_now"] === true);
+    const ever = names.filter(n => t[n + "_since_boot"] === true);
+    const where = [t.source || "unknown source"];
+    if (t.hex) where.push(t.hex);
+    if (t.age_s) where.push(fmt(t.age_s, 0) + " s ago");
+    if ((t.unknown || []).length) where.push(t.unknown.join(", ") + " not read");
+    rows.push(row("Throttling now",
+      (now.length ? now.join(", ") : (t.now === false ? "no" : "unknown")) +
+      " (" + where.join(", ") + ")"));
+    rows.push(row("Since boot",
+      ever.length ? ever.join(", ") : (t.since_boot === false ? "none" : "unknown")));
   } else {
     rows.push(row("Throttling now", "-"));
   }
