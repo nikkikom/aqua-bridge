@@ -4550,9 +4550,7 @@ Owner decision (2026-09-16):
     the two arms offset 0 one tick further out. A restart still never resumes
     a running experiment, and `bay_settle_s` deliberately still runs again
     (occupancy restarts `unknown`: a drive may have moved while the daemon
-    was down). Experiments: settle timers are not persisted (after a restart
-    a start waits `ident_settle_s` + `bay_settle_s`); a start that arrives
-    between `plan_tick` and `record_tick` shifts the levels by one tick.
+    was down).
 
 21. Live MQTT and Home Assistant check against the owner's Home Assistant
     broker (host and credentials in `private.md`). Needs the Pi, the broker
