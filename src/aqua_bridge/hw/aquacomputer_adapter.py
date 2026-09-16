@@ -74,24 +74,40 @@ Writing
 
 The software-sensor heartbeat (hardware watchdog)
     With ``heartbeat_sensor`` set (0, the default, is off), every ``apply()``
-    first writes ``heartbeat_value_c`` into that aquaero software sensor with
-    the HID output report ``0x07`` -- once per tick, before the duties, sent
-    once per ``apply()`` however often the control write is retried. Only the
-    configured sensor is written; the other seven slots carry ``0x7FFF`` ("no
-    data"), so the device keeps its own values for them. The point is the
-    controller's own watchdog: with that sensor enabled on the device, given a
-    timeout and a high fallback temperature, and an alarm on it that selects a
-    safe profile, a daemon (or Pi) that stops writing lets the sensor fall back
-    and the controller take over -- verified on the owner's aquaero, which goes
-    to 100 % on every output about 30 s after the last heartbeat and back on
-    the next one (PROJECT.md section 8 items 33, 84). The heartbeat is one
-    device operation like any other: it waits ``ctrl_gap_ms`` and is inside
-    ``ctrl_budget_s``, so the worst case per tick stays what
-    ``worst_case_tick_s`` states. It never fails the tick -- a failed write is
-    logged once per state change (error when it starts failing, info when it
-    goes out again), and the cost of it not arriving is exactly the fallback
-    the device is configured for, which is the safe direction. ``heartbeat_on``
-    and ``heartbeat_ok`` expose it.
+    writes ``heartbeat_value_c`` into that aquaero software sensor with the HID
+    output report ``0x07`` -- once per tick, **after** the duty work and only
+    when it succeeded, so once per ``apply()`` however often the control write
+    is retried. Only the configured sensor is written; the other seven slots
+    carry ``0x7FFF`` ("no data"), so the device keeps its own values for them.
+    The point is the controller's own watchdog: with that sensor enabled on the
+    device, given a timeout and a high fallback temperature, and an alarm on it
+    that selects a safe profile, a daemon (or Pi) that stops writing lets the
+    sensor fall back and the controller take over -- verified on the owner's
+    aquaero, which goes to 100 % on every output about 30 s after the last
+    heartbeat and back on the next one (PROJECT.md section 8 items 33, 84).
+
+    The heartbeat must therefore never outlive the writing it stands for.
+    The failure the controller's watchdog uniquely covers is a daemon that is
+    *alive but cannot write* -- every control operation failing on a live node
+    (``DeviceUnavailable`` every tick, the loop logging the apply and carrying
+    on) -- so the heartbeat goes out only behind a ``_apply_once`` that
+    returned: a tick that could not command a duty sends none, the sensor runs
+    down the device's timeout and the alarm takes over. ``_apply_once``
+    returning with nothing to send (no duty changed) still counts, which is why
+    the cadence is one per tick and not one per SET. What the heartbeat does
+    *not* cover is a write that reaches the kernel but not the device: the
+    output report is handed to hidraw, not acknowledged by the controller
+    (:meth:`~aqua_bridge.hw.hidraw.HidrawTransport.write_report`), so
+    ``heartbeat_ok`` means "accepted for sending", and only a soft sensor read
+    back from the status report proves delivery (PROJECT.md section 8 item 93).
+
+    The heartbeat is one device operation like any other: it waits
+    ``ctrl_gap_ms`` and is inside ``ctrl_budget_s``, so the worst case per tick
+    stays what ``worst_case_tick_s`` states. It never fails the tick -- a
+    failed write is logged once per state change (error when it starts failing,
+    info when it goes out again), and the cost of it not arriving is exactly
+    the fallback the device is configured for, which is the safe direction.
+    ``heartbeat_on`` and ``heartbeat_ok`` expose it.
 
 The active profile
     Byte ``0x06`` of the aquaero's control report is the profile it runs
@@ -105,10 +121,21 @@ The active profile
     noticed within ``duty_mismatch_s`` plus a tick whenever the reloaded
     profile drives the outputs differently than the daemon last wrote (the duty
     verification sees the changed output duty and re-reads the report), and
-    otherwise at the latest after ``ctrl_refresh_s``. Waiting is safe: the
-    profile an alarm selects is the safe one (on the owner's controller every
-    output at 100 %), so the delay only postpones the daemon taking the fans
-    back down.
+    otherwise at the latest after ``ctrl_refresh_s``.
+
+    Both edges matter, and byte ``0x06`` is what bounds neither of them. On the
+    *alarm-set* edge the reloaded profile is the safe one (on the owner's
+    controller every output at 100 %), so a late rewrite only postpones the
+    daemon taking the fans back down. On the *alarm-clear* edge -- the one every
+    daemon restart after an alarm goes through -- the reloaded profile is the
+    quiet one (20 % there), which **reduces cooling** below what the daemon
+    thinks it commands. What bounds that edge is the duty verification, not the
+    profile check: the reloaded duty differs from the written one, so within
+    ``duty_mismatch_s`` plus a tick the cache is invalidated, the report re-read,
+    the profile change seen and every channel written again. The
+    ``ctrl_refresh_s`` worst case is reached only when the reloaded profile
+    happens to drive the outputs exactly as the daemon last wrote them, i.e.
+    when there is nothing to lose by waiting.
 
 Keeping the cache honest
     Speed, duty, voltage, current and power arrive in every status report, so
@@ -469,7 +496,7 @@ class _BudgetSpent(Exception):
     """``ctrl_budget_s`` ran out before ``operation`` could start."""
 
     def __init__(self, operation: str) -> None:
-        super().__init__(operation)
+        super().__init__(f"ctrl_budget_s spent before the {operation}")
         self.operation = operation
 
 
@@ -595,8 +622,14 @@ class AquacomputerAdapter:
 
     @property
     def heartbeat_ok(self) -> bool | None:
-        """Whether the last heartbeat write succeeded; ``None`` before the first
-        one (and while the heartbeat is off)."""
+        """Whether the last heartbeat the adapter tried to send was accepted for
+        sending; ``None`` while the heartbeat is off and before the first attempt.
+        A tick whose duty write failed attempts none and leaves this as it was --
+        what matters then is the controller's own timeout. ``True`` is not proof
+        the controller saw the report either: an output report is queued, not
+        acknowledged (:meth:`~aqua_bridge.hw.hidraw.HidrawTransport.write_report`);
+        reading the sensor back from a status report is what would prove delivery
+        (PROJECT.md section 8 item 93)."""
         return self._heartbeat_ok
 
     def close(self) -> None:
@@ -799,7 +832,8 @@ class AquacomputerAdapter:
         label = self.binding.label
         for k, duty in sorted(self._written.items()):
             if self._empty_slot(status, k + 1):
-                continue  # no device behind it: no duty evidence, read() raises instead
+                continue  # no device behind it: no duty evidence (read() reports the
+                # channel as None and lists it in absent_channels, item 90)
             reported = status.fans[k].duty
             name = self._names.get(k, "?")
             if abs(reported - duty) <= tolerance:
@@ -985,6 +1019,10 @@ class AquacomputerAdapter:
     def _send_heartbeat(self, transport: HidTransport, deadline: float) -> None:
         """One heartbeat into the configured software sensor (module docstring).
 
+        Called only after the tick's duty work went out: the heartbeat holds the
+        controller's own watchdog shut, so a daemon that is alive but cannot write
+        must not send it (module docstring).
+
         Never raises: a heartbeat that does not go out costs the controller's own
         timeout, and the profile its alarm then selects is the safe one, so it must
         not turn a tick into a failed write. It is sequenced like every other device
@@ -1072,17 +1110,19 @@ class AquacomputerAdapter:
         ``absent_channels`` (module docstring, Reading).
 
         With ``heartbeat_sensor`` configured, the software-sensor heartbeat goes
-        out first, once per call and whatever the duties do (module docstring).
+        out after the duty work, once per call and whatever the duties do -- and
+        *not at all* when this call cannot command the duties (module docstring).
         """
         duties = self._duties(cmd)
         never_lower = getattr(cmd, "mode", None) in _NEVER_LOWER_MODES
-        pending_heartbeat = [self.timing.heartbeat_on]
 
         def once(transport: HidTransport, deadline: float) -> None:
-            if pending_heartbeat[0]:  # once per apply(), not once per retry
-                pending_heartbeat[0] = False
-                self._send_heartbeat(transport, deadline)
+            # The duties first: the heartbeat tells the device the daemon is still
+            # commanding it, so it must not go out on a tick that failed to. A
+            # retried attempt reaches this line only once, when it succeeded.
             self._apply_once(transport, duties, deadline, never_lower)
+            if self.timing.heartbeat_on:
+                self._send_heartbeat(transport, deadline)
 
         self._with_retries("control report write", once)
 

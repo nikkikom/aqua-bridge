@@ -1075,7 +1075,7 @@ def test_the_heartbeat_report_carries_the_configured_sensor_only(caplog) -> None
     assert len(write.data) == 17 and write.data[0] == 0x07
     assert write.data[1:3] == b"\x07\xd0"  # 20.00 degC, big-endian centi-degC
     assert write.data[3:] == b"\x7f\xff" * 7
-    assert [op.what for op in device.ops] == ["write", "get", "set"]  # the heartbeat first
+    assert [op.what for op in device.ops] == ["get", "set", "write"]  # after the duty work
     assert adapter.heartbeat_ok is True
     assert device.soft_sensors == {1: 20.0}  # and the device reports it back
     clock.advance(1.0)
@@ -1113,8 +1113,8 @@ def test_the_heartbeat_waits_the_control_gap_and_is_not_repeated_on_a_retry() ->
     device.failures = [FeatureReportError("ETIMEDOUT")]  # the first GET fails and is retried
     adapter.apply(_cmd(xt1=0.5, xt2=0.5))
     assert len(device.writes()) == 1 and len(device.gets()) == 2 and len(device.sets()) == 1
-    write, first_get = device.writes()[0], device.gets()[0]
-    assert first_get.t - write.t == pytest.approx(AQUAERO_GAP_S)
+    write, last_set = device.writes()[0], device.sets()[-1]
+    assert write.t - last_set.t == pytest.approx(AQUAERO_GAP_S)
 
 
 def test_a_failed_heartbeat_does_not_fail_the_tick_and_is_logged_once(caplog) -> None:
@@ -1142,17 +1142,54 @@ def test_a_failed_heartbeat_does_not_fail_the_tick_and_is_logged_once(caplog) ->
     ]
 
 
-def test_a_heartbeat_that_spends_the_budget_leaves_the_write_to_fail_normally() -> None:
-    """The heartbeat is one device operation inside ctrl_budget_s, so the worst case
-    per tick is unchanged; a heartbeat that eats the budget costs the tick's write,
-    which is the loop's ordinary fallback path."""
+def test_a_tick_that_cannot_command_the_duties_sends_no_heartbeat(caplog) -> None:
+    """The failure the controller's own watchdog uniquely covers: the daemon runs and
+    the node answers, but every control operation fails. Feeding the software sensor
+    then would hold the watchdog shut while nothing commands the fans, so the
+    heartbeat goes out only behind an apply() that reached the device (item 84)."""
+    adapter, device, _bus, clock, _ = _heartbeat_aquaero()
+    adapter.read()
+    adapter.apply(_cmd(xt1=0.5, xt2=0.5))
+    assert len(device.writes()) == 1 and adapter.heartbeat_ok is True
+    device.failures = [FeatureReportError("EPIPE") for _ in range(20)]
+    with caplog.at_level("WARNING", logger=LOGGER):
+        for duty in (0.6, 0.7, 0.8):
+            clock.advance(1.0)
+            device.emit()
+            adapter.read()  # the observation still comes through
+            with pytest.raises(DeviceUnavailable, match="control report write failed"):
+                adapter.apply(_cmd(xt1=duty, xt2=0.5))
+    assert len(device.writes()) == 1  # none since the last duty that went out
+    assert device.soft_sensors == {1: 20.0}  # the real device now runs down its own timeout
+    # None was attempted, so there is no heartbeat failure either: only the write failed.
+    assert [m for m in _messages(caplog, "ERROR") if "heartbeat" in m] == []
+    assert adapter.heartbeat_ok is True  # the state of the last one actually sent
+
+
+def test_a_budget_spent_on_the_duties_leaves_the_heartbeat_unsent() -> None:
+    """Same rule through the budget path: the control work fails, so nothing feeds the
+    software sensor. The worst case per tick is still worst_case_tick_s."""
     timing = _timing(AQUAERO, **HEARTBEAT, ctrl_budget_s=2.0)
     binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1}, timing=timing)
     adapter, device, _bus, clock, _ = _setup(binding, op_delay_s=2.5)
     with pytest.raises(DeviceUnavailable, match="ctrl_budget_s"):
         adapter.apply(_cmd(xt1=0.5))
-    assert len(device.writes()) == 1 and device.gets() == []
+    assert device.writes() == [] and len(device.gets()) == 1 and device.sets() == []
     assert clock() - 100.0 <= timing.worst_case_tick_s()
+
+
+def test_a_heartbeat_with_no_budget_left_drops_the_heartbeat_not_the_tick(caplog) -> None:
+    """The heartbeat runs last and inside ctrl_budget_s: a duty write that spent the
+    budget leaves it unsent, and that is logged, not raised -- the duties went out."""
+    timing = _timing(AQUAERO, **HEARTBEAT, ctrl_budget_s=1.95)
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1}, timing=timing)
+    adapter, device, _bus, _clock, _ = _setup(binding, op_delay_s=0.9)
+    with caplog.at_level("ERROR", logger=LOGGER):
+        adapter.apply(_cmd(xt1=0.5))  # GET, then SET, then no budget for the write
+    assert len(device.sets()) == 1 and device.writes() == []
+    assert adapter.heartbeat_ok is False
+    (error,) = [m for m in _messages(caplog, "ERROR") if "heartbeat" in m]
+    assert "ctrl_budget_s spent" in error
 
 
 def test_the_heartbeat_stops_when_the_serial_does_not_match() -> None:
