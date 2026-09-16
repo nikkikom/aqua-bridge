@@ -8,14 +8,15 @@ no I/O. ``mpc.step`` calls it every tick, fault ticks included (plan section
 
 Model (per zone ``z``; SI units: W, J/K, W/K, degC, s)
 -----------------------------------------------------
-States ``x = [T_a, d_a, T_d(1..n), T_s(1..n), q(1..n)]`` over **every** bay of
-the zone (topology order), so the layout never changes with occupancy::
+States ``x = [T_a, d_a, T_d(1..n), T_s(1..n), q(1..n), c(1..r)]`` over **every**
+bay of the zone (topology order), so the layout never changes with occupancy::
 
     C_a dT_a/dt = sum_j g_j (T_d,j - T_a) - (Q_z + leak)(T_a - T_in) + sum_z' kappa (T_a,z' - T_a)
                   + C_a d_a
     C_d dT_d/dt = C_d q_j - g_j (T_d,j - T_a)            g_j = g0 + k * Qn_z
     tau_s dT_s/dt = s_j T_d,j + (1 - s_j) T_a + b_j - T_s,j
     dd_a/dt = 0, dq_j/dt = 0                             (integrating disturbances)
+    dc_i/dt = 0                                          (placement offsets, random walk)
 
 ``s_j = 1 - beta_j`` and ``b_j`` are the proximal sensor map: the prior
 ``s = 0.7``, ``b = -2.1`` (:data:`~aqua_bridge.control.estimates.PRIOR_BETA`,
@@ -23,6 +24,22 @@ the zone (topology order), so the layout never changes with occupancy::
 has no drive: its drive and heat rows are frozen (no dynamics, no process
 noise) and its sensor node follows the air (``tau_s dT_s/dt = T_a - T_s``); an
 ``unknown`` bay is modelled like an occupied one (conservative).
+
+**Placement offsets** (``c``, plan section 8 item 67). A bay's sensor node is
+anchored on its first proximal member that is not ``redundant``; every further
+member reads that node **plus its own offset** ``c_i``, so its measurement row is
+``H = e_{T_s} + e_{c_i}``. Two sensors on one bay sit at different placements: they
+see different fractions of the drive (``beta``) and carry different offsets, so
+they disagree by several degC at load, and one sensor node for both leaves that
+disagreement in the innovations, where the fast-swap rule below reads it as a swap
+on every tick (a bay's sigma stuck at 4-7 degC on the ``rich`` simulator, which
+faulted healthy zones under ``zones.trust_rule: sigma``). The offsets are ``r``
+random-walk states per zone (``estimator.q_offset`` per tick) with the prior
+``N(0, estimator.proximal_offset_c ** 2)``; that prior is wide, so the first
+reading of a further member identifies its offset instead of moving the drive.
+With ``proximal_offset_c: 0`` there are no offset states and every member reads
+the node directly, as before this existed. A bay with one proximal sensor has no
+offset either, so its arithmetic is unchanged.
 
 Priors (plan section 3 table): ``C_a = 200``, ``leak = 1``, ``kappa = 3`` for
 declared ``coupled_to`` pairs (the neighbour's previous air estimate is a
@@ -44,13 +61,15 @@ affine system instead: the matrix exponential of ``[[A h, c h], [0, 0]]`` by
 scaling and squaring with a degree-10 Taylor polynomial (numpy only, no
 scipy). ``h`` is the time since the previous tick (0 on a clock that does not
 advance, at most :data:`MAX_PREDICT_S`). Process noise per tick
-``diag(q_t_air, q_d_air, q_t_drive..., q_t_sensor..., q_heat...) * h / dt``.
+``diag(q_t_air, q_d_air, q_t_drive..., q_t_sensor..., q_heat..., q_offset...)
+* h / dt``.
 
 Measurements are sequential scalar updates in Joseph form
 ``P = (I - K H) P (I - K H)^T + K R K^T`` (evaluated through the rank-one
-structure of ``H = e_i``, then symmetrised): every trusted ``zone_air`` sensor
+structure of ``H``, then symmetrised): every trusted ``zone_air`` sensor
 on ``T_a`` and every trusted ``drive_proximal`` sensor of a bay on that bay's
-``T_s`` with ``R = sensor_noise_c ** 2 + quant_c ** 2 / 12`` (an empty bay's
+``T_s`` -- on ``T_s + c_i`` for a member that is not the anchor -- with
+``R = sensor_noise_c ** 2 + quant_c ** 2 / 12`` (an empty bay's
 sensor measures air: weight 0.5, ``R / 0.5``). Untrusted sensors are skipped
 (predict only). SMART enters as a measurement of ``T_d`` with ``R = 1`` only
 for a calibrated bay.
@@ -59,7 +78,13 @@ Fast-swap rule (an addition to the plan, conservative): a proximal innovation
 ``nu`` with ``|nu| > JUMP_MIN_C`` and ``|nu| > JUMP_SIGMAS * sqrt(S)`` on an
 occupied or unknown bay adds ``(nu / s) ** 2`` to the drive variance and
 ``nu ** 2`` to the sensor node's variance before the update, and drops the
-bay's correlation association. A drive pulled and another one pushed in within
+bay's correlation association. ``S`` is that measurement's own innovation
+variance, so for a member with an offset it carries ``c_i``'s variance too: an
+uncertain placement offset cannot look like a swap, while a swap -- which moves
+the drive and therefore every member together -- still does. The offset keeps its
+variance through the inflation: the drive moved, the placement did not.
+
+A drive pulled and another one pushed in within
 ``empty_confirm_s`` never passes through ``empty``; this rule makes sigma (hence
 the margin) grow at once and lets the filter follow the new drive instead of
 explaining the step slowly through ``q``. Inflating the sensor node as well lets
@@ -71,12 +96,24 @@ two (seen on the truth simulator). On an ``empty`` bay the same test adds
 shows in ``T_s - T_a`` at once (the rising-edge count starts sooner).
 
 Initialisation (per zone, on the first tick with a trusted zone-air sensor):
-``T_a`` the mean of the trusted air sensors, ``T_s`` the hottest trusted
-proximal member (else ``T_a``), ``T_d`` the inverted sensor map at steady
+``T_a`` the mean of the trusted air sensors, ``T_s`` the bay's anchor member's
+reading (the hottest trusted member when the anchor is missing, else ``T_a``),
+``T_d`` the inverted sensor map at steady
 state, ``q`` and ``d_a`` the values that make the model stationary at that
 point, so constant readings at a constant command keep the estimate where it
 starts. ``P0 = diag(0.25, 0.05^2, 0.1, 0.1, 0.005^2)`` per state kind (the drive
-variance only covers the transient: the map offset is ``sigma_cal``).
+variance only covers the transient: the map offset is ``sigma_cal``), and
+``proximal_offset_c ** 2`` per placement offset, which starts at 0.
+
+**Per bay** (plan section 8 item 69): a bay with no trusted proximal member when
+its zone starts is *not* initialised -- its node holds the prior above until its
+first trusted reading arrives, which then seeds ``T_s``, ``T_d``, ``q`` and the
+bay's offsets exactly as the zone start would have. Without that, the first
+reading of a sensor that was missing on the zone's first tick met a node sitting
+at the zone air and tripped the fast-swap rule. A bay is seeded once: a sensor
+that returns after a *later* loss is an innovation like any other, and the
+fast-swap rule is right to widen the bay, since the drive may have been changed
+while nothing was watching.
 
 Output
 ------
@@ -86,6 +123,14 @@ hard targets of its class; per zone ``T_a``, ``sigma_air = sqrt(P_aa)``, ``d_a``
 and ``drift = max_j |q_j - g_j (T_d,j - T_a) / C_d|`` (degC/min, a validity
 metric for the DAS MPC milestone). ``sigma_cal`` is 1.5 degC uncalibrated and
 ``max(0.5, EW-RMS residual)`` calibrated; the filter cannot shrink it.
+
+Per bay the block also carries ``observed`` (a trusted proximal member this tick),
+``seeded`` (the bay has had a reading of its own; see *Per bay* above),
+``settling`` (within ``bay_settle_s`` of a fast-swap jump or of an occupancy change
+into or out of ``empty``, both of which widen the bay's variance on purpose) and
+``offsets_c`` (the placement offset the filter carries per further member); per
+zone ``air_blind_s``, the time since a trusted ``zone_air`` reading was last fused.
+``zones.trust_rule: sigma`` reads all four (``aqua_bridge.control.zones``).
 
 Occupancy (``topology.bays.<b>.occupied``; runtime ``POST /api/bay``)
 -------------------------------------------------------------------
@@ -168,8 +213,8 @@ after the previous one of that serial. Serial -> bay association:
 Memory (plain JSON)::
 
     {"v": 1, "fp": <structure fingerprint>, "ts": last ts,
-     "zones": {zone: {"x": [...], "P": [[...]], "t_in": float | None}},
-     "bays": {bay: {"occ", "low", "rise", "since", "assoc", "map"}},
+     "zones": {zone: {"x": [...], "P": [[...]], "t_in": float | None, "blind": s}},
+     "bays": {bay: {"occ", "low", "rise", "since", "assoc", "map", "init", "disturb"}},
      "cal": {bay: {serial: {"th", "P", "n", "fresh", "rms2", "ts", "used"
                             [, "inflate", "confirm"]}}},
      "smart": {serial: {"ts", "t", "model", "hist"}},
@@ -321,7 +366,15 @@ class _Bay:
     zone: str
     index: int
     sensors: tuple[str, ...]
+    #: The member the bay's sensor node is anchored on (the first that is not
+    #: ``redundant``): its lag and the bay's sensor map are the node's, and it is the
+    #: one member without a placement offset.
+    primary: str
     tau_s: float
+    #: Every proximal member beyond the first -> its index in the zone's offset block
+    #: (the first member anchors the node, so it has no offset; empty when
+    #: ``estimator.proximal_offset_c`` is 0).
+    offsets: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -332,6 +385,8 @@ class _Zone:
     inlet: tuple[str, ...]
     e_w_per_k: dict[str, float]
     coupled: tuple[str, ...]
+    #: Placement-offset states of the zone (``_Bay.offsets`` over its bays).
+    n_offsets: int
 
 
 @dataclass(frozen=True)
@@ -363,19 +418,28 @@ def _structure(cfg: MpcConfig) -> _Structure:
 def _build_structure(cfg: MpcConfig) -> _Structure:
     topo = cfg.topology
     assert topo is not None
+    spec_est = cfg.estimator
+    with_offsets = spec_est is not None and spec_est.proximal_offset_c > 0
     sensors = cfg.sensors
     zones: dict[str, _Zone] = {}
     bays: dict[str, _Bay] = {}
     inlets = tuple(t for t in cfg.temps if sensors[t].role == "inlet")
     for z, spec in topo.zones.items():
         zone_bays = tuple(b for b, bay in topo.bays.items() if bay.zone == z)
+        n_offsets = 0
         for i, b in enumerate(zone_bays):
             members = tuple(
                 t for t in cfg.temps if sensors[t].role == "drive_proximal" and sensors[t].bay == b
             )
             primary = next((t for t in members if not sensors[t].redundant), members[0])
             tau = sensors[primary].tau_s
-            bays[b] = _Bay(b, z, i, members, float(tau) if tau else TAU_SENSOR_S)
+            offsets: dict[str, int] = {}
+            if with_offsets:
+                for name in members:
+                    if name != primary:
+                        offsets[name] = n_offsets
+                        n_offsets += 1
+            bays[b] = _Bay(b, z, i, members, primary, float(tau) if tau else TAU_SENSOR_S, offsets)
         e: dict[str, float] = {}
         for ch in spec.channels:
             listed = sum(1 for other in topo.zones.values() if ch in other.channels)
@@ -389,9 +453,10 @@ def _build_structure(cfg: MpcConfig) -> _Structure:
             inlet=inlets if spec.inlet == "mix" else (spec.inlet,),
             e_w_per_k=e,
             coupled=tuple(spec.coupled_to),
+            n_offsets=n_offsets,
         )
     fingerprint = json.dumps(
-        [[z, list(zs.bays), list(zs.air)] for z, zs in zones.items()]
+        [[z, list(zs.bays), list(zs.air), zs.n_offsets] for z, zs in zones.items()]
         + [[b, list(bs.sensors)] for b, bs in bays.items()],
         separators=(",", ":"),
     )
@@ -474,6 +539,32 @@ def _scalar_update(x: np.ndarray, p: np.ndarray, i: int, z: float, r: float) -> 
     p *= 0.5
 
 
+def _reset_state(x: np.ndarray, p: np.ndarray, i: int, value: float, var: float) -> None:
+    """Re-seed state ``i`` at ``value`` with variance ``var`` and no correlations."""
+    x[i] = value
+    p[i, :] = 0.0
+    p[:, i] = 0.0
+    p[i, i] = var
+
+
+def _pair_update(x: np.ndarray, p: np.ndarray, i: int, j: int, z: float, r: float) -> None:
+    """Joseph-form update of ``x``, ``p`` (in place) with one measurement of ``x[i] + x[j]``.
+
+    ``H = e_i + e_j``: a proximal sensor reads its bay's sensor node plus its own placement
+    offset. With ``j`` absent this is :func:`_scalar_update`.
+    """
+    hp = p[i, :] + p[j, :]  # H P
+    s = hp[i] + hp[j] + r
+    if not s > 0:
+        return
+    k = hp / s
+    x += k * (z - x[i] - x[j])
+    a1 = p - k[:, None] * hp  # (I - K H) P
+    joseph = a1 - (a1[:, i] + a1[:, j])[:, None] * k + r * (k[:, None] * k)
+    np.add(joseph, joseph.T, out=p)
+    p *= 0.5
+
+
 def _sensor_var(cfg: MpcConfig, name: str) -> float:
     quant = cfg.sensors[name].quant_c
     assert cfg.estimator is not None
@@ -503,7 +594,16 @@ def _fresh_memory(st: _Structure) -> dict[str, Any]:
 
 
 def _fresh_bay() -> dict[str, Any]:
-    return {"occ": UNKNOWN, "low": 0.0, "rise": 0, "since": None, "assoc": None, "map": None}
+    return {
+        "occ": UNKNOWN,
+        "low": 0.0,
+        "rise": 0,
+        "since": None,
+        "assoc": None,
+        "map": None,
+        "init": False,
+        "disturb": None,
+    }
 
 
 def _load(memory: object, st: _Structure) -> dict[str, Any]:
@@ -533,14 +633,22 @@ def _parse(memory: object, st: _Structure) -> dict[str, Any]:
     out["ts"] = _opt_num(memory.get("ts"))
     for z, raw in dict(memory.get("zones") or {}).items():
         zone = st.zones[z]
-        n = 2 + 3 * len(zone.bays)
+        n = 2 + 3 * len(zone.bays) + zone.n_offsets
         x = np.array(raw["x"], dtype=float)
         p = np.array(raw["P"], dtype=float)
         if x.shape != (n,) or p.shape != (n, n):
             raise ValueError("shape")
         if not (np.all(np.isfinite(x)) and np.all(np.isfinite(p))):
             raise ValueError("non-finite filter state")
-        out["zones"][z] = {"x": x, "P": 0.5 * (p + p.T), "t_in": _opt_num(raw.get("t_in"))}
+        blind = _num(raw.get("blind", 0.0))
+        if blind < 0:
+            raise ValueError("blind")
+        out["zones"][z] = {
+            "x": x,
+            "P": 0.5 * (p + p.T),
+            "t_in": _opt_num(raw.get("t_in")),
+            "blind": blind,
+        }
     for b, raw in dict(memory.get("bays") or {}).items():
         if b not in st.bays:
             raise KeyError(b)
@@ -563,6 +671,10 @@ def _parse(memory: object, st: _Structure) -> dict[str, Any]:
             "since": _opt_num(raw.get("since")),
             "assoc": assoc,
             "map": mapping,
+            # A memory written before the per-bay initialisation existed has every bay
+            # of an initialised zone seeded, which is what ``True`` says.
+            "init": bool(raw.get("init", True)),
+            "disturb": _opt_num(raw.get("disturb")),
         }
     for b, per_serial in dict(memory.get("cal") or {}).items():
         if b not in st.bays:
@@ -752,6 +864,16 @@ def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _seed_sensor(bay: _Bay, temps: Mapping[str, float]) -> float:
+    """The value a bay's sensor node starts at: its anchor member's reading if that one is
+    trusted, else the hottest trusted member (conservative). The offsets of the others are
+    seeded at 0, so a pair at different placements starts consistent instead of handing the
+    anchor a step the fast-swap rule would read as a swap."""
+    if bay.primary in temps:
+        return float(temps[bay.primary])
+    return max(float(temps[name]) for name in bay.sensors if name in temps)
+
+
 def update(
     memory: object,
     cfg: MpcConfig,
@@ -849,9 +971,11 @@ def update(
     geometry: dict[str, tuple[float, float, float]] = {}  # zone -> (Q, Qn, t_in)
 
     q_scale = h_pred / cfg.dt if cfg.dt > 0 else 0.0
+    offset_var = spec.proximal_offset_c**2
     for z, zone in st.zones.items():
         n = len(zone.bays)
-        i_d, i_s, i_q = 2, 2 + n, 2 + 2 * n
+        i_d, i_s, i_q, i_off = 2, 2 + n, 2 + 2 * n, 2 + 3 * n
+        dim = 2 + 3 * n + zone.n_offsets
         inlet_vals = [temps[t] for t in zone.inlet if t in temps]
         zm = mem["zones"].get(z)
         q_flow, qn = _airflow(cfg, zone, u)
@@ -862,15 +986,17 @@ def update(
                 continue
             t_in = _mean(inlet_vals)
             t_in = air0 if t_in is None else t_in
-            x = np.zeros(2 + 3 * n)
+            x = np.zeros(dim)
             x[0] = air0
-            p_diag = np.zeros(2 + 3 * n)
+            p_diag = np.zeros(dim)
             p_diag[0], p_diag[1] = P0_T_AIR, P0_D_AIR
+            p_diag[i_off:] = offset_var
             f_air = 0.0
             for j, b in enumerate(zone.bays):
                 members = [temps[t] for t in st.bays[b].sensors if t in temps]
-                t_s = max(members) if members else air0
+                t_s = _seed_sensor(st.bays[b], temps) if members else air0
                 x[i_s + j] = t_s
+                mem["bays"][b]["init"] = bool(members)
                 p_diag[i_d + j], p_diag[i_s + j], p_diag[i_q + j] = P0_T_DRIVE, P0_T_SENSOR, P0_HEAT
                 occ = _declared_state(topo.bays[b].occupied, mem["bays"][b]["occ"])
                 if occ == EMPTY:
@@ -892,7 +1018,7 @@ def update(
             p = np.diag(p_diag)
             arrays[z] = (x, p)
             geometry[z] = (q_flow, qn, t_in)
-            mem["zones"][z] = {"x": x, "P": p, "t_in": t_in}
+            mem["zones"][z] = {"x": x, "P": p, "t_in": t_in, "blind": 0.0}
             continue
 
         x = zm["x"]
@@ -911,7 +1037,6 @@ def update(
                 bm["map"] = source
 
         if h_pred > 0:
-            dim = 2 + 3 * n
             a = np.zeros((dim, dim))
             c = np.zeros(dim)
             a[0, 0] -= (q_flow + LEAK_W_PER_K) / C_AIR_J_PER_K
@@ -923,6 +1048,7 @@ def update(
             a[0, 1] = 1.0
             qd = np.zeros(dim)
             qd[0], qd[1] = spec.q_t_air, spec.q_d_air
+            qd[i_off:] = spec.q_offset  # the placement offsets are random walks
             g = G0_W_PER_K + K_W_PER_K * qn
             for j, b in enumerate(zone.bays):
                 tau = st.bays[b].tau_s
@@ -952,31 +1078,58 @@ def update(
             if name in temps:
                 _scalar_update(x, p, 0, float(temps[name]), _sensor_var(cfg, name))
         for j, b in enumerate(zone.bays):
-            occ = mem["bays"][b]["occ"]
+            bay = st.bays[b]
+            bm = mem["bays"][b]
+            occ = bm["occ"]
             s_map = sensor_map(b)[0]
-            for name in st.bays[b].sensors:
-                if name not in temps:
-                    continue
+            present = [name for name in bay.sensors if name in temps]
+            if present and not bm["init"]:
+                # No trusted member when the zone started: seed the bay from this first
+                # reading instead of leaving the fast-swap rule to see the gap (item 69).
+                t_s = _seed_sensor(bay, temps)
+                _reset_state(x, p, i_s + j, t_s, P0_T_SENSOR)
+                for k_off in bay.offsets.values():
+                    _reset_state(x, p, i_off + k_off, 0.0, offset_var)
+                air_now = float(x[0])
+                if occ == EMPTY:
+                    _reset_state(x, p, i_d + j, air_now, P0_T_DRIVE)
+                else:
+                    s_seed, b_seed, _ = sensor_map(b)
+                    t_d = air_now + (t_s - air_now - b_seed) / s_seed
+                    g_seed = G0_W_PER_K + K_W_PER_K * qn
+                    cd_seed = drive_capacity(cfg, classes[b][0])
+                    _reset_state(x, p, i_d + j, t_d, P0_T_DRIVE)
+                    _reset_state(x, p, i_q + j, g_seed * (t_d - air_now) / cd_seed, P0_HEAT)
+                bm["init"] = True
+            for name in present:
                 value = float(temps[name])
                 r = _sensor_var(cfg, name)
-                nu = value - x[i_s + j]
                 if occ == EMPTY:
                     r /= EMPTY_WEIGHT
-                    if abs(nu) > JUMP_MIN_C and nu * nu > JUMP_SIGMAS**2 * (
-                        p[i_s + j, i_s + j] + r
-                    ):
-                        p[i_s + j, i_s + j] += nu * nu  # something moved in: follow the sensor
-                    _scalar_update(x, p, i_s + j, value, r)
-                    continue
-                s_innov = p[i_s + j, i_s + j] + r
+                k_off = bay.offsets.get(name)
+                idx = i_s + j
+                if k_off is None:
+                    nu = value - x[idx]
+                    s_innov = p[idx, idx] + r
+                else:
+                    off = i_off + k_off
+                    nu = value - x[idx] - x[off]
+                    s_innov = p[idx, idx] + 2.0 * p[idx, off] + p[off, off] + r
                 if abs(nu) > JUMP_MIN_C and nu * nu > JUMP_SIGMAS**2 * s_innov:
-                    p[i_d + j, i_d + j] += (nu / s_map) ** 2
-                    p[i_s + j, i_s + j] += nu * nu
-                    jumped[b] = True
-                _scalar_update(x, p, i_s + j, value, r)
+                    # something moved: follow the sensor (the placement offset did not
+                    # move, so it keeps its own variance)
+                    if occ != EMPTY:
+                        p[i_d + j, i_d + j] += (nu / s_map) ** 2
+                        jumped[b] = True
+                    p[idx, idx] += nu * nu
+                if k_off is None:
+                    _scalar_update(x, p, idx, value, r)
+                else:
+                    _pair_update(x, p, idx, i_off + k_off, value, r)
         arrays[z] = (x, p)
         geometry[z] = (q_flow, qn, t_in)
         mem["zones"][z]["t_in"] = t_in
+        mem["zones"][z]["blind"] = 0.0 if trusted_air[z] else zm.get("blind", 0.0) + h_occ
 
     # -- SMART: reject, calibrate, measure ------------------------------------------
     for b, (serial, _source) in assoc.items():
@@ -1009,12 +1162,16 @@ def update(
 
     # -- occupancy -----------------------------------------------------------------------
     evidence: dict[str, tuple[float, float]] = {}
+    observed: dict[str, bool] = {}
     for b, bay in st.bays.items():
         bm = mem["bays"][b]
+        if jumped.get(b):
+            bm["disturb"] = float(ts)  # the fast-swap rule widened this bay on purpose
         before = bm["occ"]
         declared_occ = topo.bays[b].occupied
         zone_ready = bay.zone in arrays
         sensor_ok = any(t in temps for t in bay.sensors)
+        observed[b] = sensor_ok
         air_ok = bool(trusted_air.get(bay.zone))
         after = before
         if declared_occ is True:
@@ -1071,6 +1228,8 @@ def update(
                     x[i_q] = 0.0
                     p[i_q, :], p[:, i_q] = 0.0, 0.0
                     p[i_q, i_q] = P0_HEAT
+                if before == EMPTY or after == EMPTY:  # a deliberate widening, as a jump
+                    bm["disturb"] = float(ts)
             if (before == EMPTY) != (after == EMPTY):
                 bm["assoc"] = None
                 if b in assoc and assoc[b][1] == "correlation":
@@ -1171,6 +1330,7 @@ def update(
             "initialised": True,
             "t_air_c": float(x[0]),
             "sigma_air_c": math.sqrt(max(float(p[0, 0]), 0.0)),
+            "air_blind_s": float(mem["zones"][z]["blind"]),
             "d_air_c_per_s": float(x[1]),
             "t_in_c": geometry[z][2],
             "airflow_w_per_k": geometry[z][0],
@@ -1195,6 +1355,16 @@ def update(
             "since_ts": bm["since"],
             "pending_empty_s": float(bm["low"]),
             "pending_occupied_ticks": int(bm["rise"]),
+            "observed": observed.get(b, False),
+            "seeded": bool(bm["init"]),
+            "settling": bm["disturb"] is not None
+            and 0.0 <= float(ts) - float(bm["disturb"]) < spec.bay_settle_s,
+            "offsets_c": {
+                name: float(arrays[bay.zone][0][2 + 3 * len(st.zones[bay.zone].bays) + k])
+                for name, k in bay.offsets.items()
+            }
+            if bay.zone in arrays
+            else {},
             "class": cls,
             "class_source": cls_source,
             "serial": serial,
