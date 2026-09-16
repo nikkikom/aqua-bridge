@@ -4239,6 +4239,196 @@ Owner decision (2026-09-16):
     `fans.<ch>.pwm`, `fans.<ch>.rpm` or `temp_map` is rejected with a message
     saying flow sensors cannot be bound and that an aquaero's hwmon-era
     `fan5`/`fan6` are aquabus tachometers now.
+94. Tune the fan-health thresholds on the real enclosure (item 79). The
+    `fan_health:` defaults are deliberately wide guesses; nothing but the
+    rail window has been checked against hardware (every captured report sits
+    inside 11–13 V). Needs the Pi and the fans, so the **main session**:
+    - record a run that sweeps each channel over its duty range, fit it with
+      `tools/fit_fans.py` and put the result in `mpc.fan_models` — the rpm
+      rule is only as good as that curve, and with the DAS example's
+      placeholder `rpm_max: 1500` it would fire on healthy fans;
+    - measure each fan model's power at full speed and set
+      `fan_models.<m>.power_w_at_max` (the power rule is off without it).
+      The one measurement so far is the Quadro's aquabus fan 7: 27 mA and
+      0.32 W at 100 % duty, 1105 rpm — small enough that `power_min_w` 0.2
+      leaves little headroom, so check whether the controllers' 0.01 W
+      quantisation makes the rule usable at all on these fans or whether it
+      should key on current instead;
+    - watch how long the aquabus rpm actually lags after a duty step and set
+      `settle_s` from that (15 s is a guess from "several seconds"). It is now
+      the width of the duty band the rpm and power rules judge against, so too
+      large a value only makes them blunt, never false;
+    - confirm no rule fires over a quiet day before narrowing
+      `rpm_tolerance_frac` or the `*_fault_s` windows.
+
+### 8.3 Open — needs the DAS hardware
+
+31. USB host: `dtoverlay=dwc2,dr_mode=host` (`deploy/host-usb.sh`), powered
+    hub.
+32. **Done** (2026-09-15): yes, the Quadro's PWM is writable through the
+    aquaero over aquabus (§2 "Quadro on aquabus"). The Quadro stays on
+    aquabus; the adapter commands it as the aquaero's outputs 5–8 since
+    item 85.
+33. Spike: does the XT6 revert after the Pi stops writing? If not, software
+    sensor plus firmware timeout (§2); then decide whether `release()` runs
+    at exit. Since item 86 written duties are not saved: a power cycle of
+    the controllers brings back their saved configuration (item 84). But
+    while they stay powered, a Pi that stops writing leaves the fans at the
+    last written duty, possibly low, until the daemon runs again — unless
+    the software-sensor heartbeat of item 84 is configured, which is the
+    answer: about 30 s after the last write the aquaero's alarm selects the
+    safe profile and every output runs at 100 %, verified on the hardware
+    (§2 "Software-sensor heartbeat and profiles"). It covers the daemon or
+    the Pi stopping **and** a daemon that runs but can no longer write (the
+    heartbeat goes out only behind an `apply()` that reached the device, §3
+    Track B). What it does not cover is a write the kernel accepts and the
+    device never sees: `write_report` queues an output report rather than
+    waiting for an acknowledgement, so `heartbeat_ok` means "accepted", and
+    reading the sensor back is the check item 93 adds. What is left of this
+    item is the owner's decision whether `release()` runs at exit, and
+    running the daemon's own heartbeat on the hardware (item 93).
+34. Spike: which Quadro temperature inputs carry a reading in its status
+    report (`tools/aquacomputer_probe.py`); bind them in its `temp_map`.
+    Over aquabus the Quadro's sensors 1–4 appear in the aquaero's aquabus
+    temperature slots `bus1..bus4` (§2 "Quadro on aquabus"); with one
+    thermistor on sensor 2 only `bus2` read. Which inputs will be used is
+    decided when the sensors are wired; the config binds them as `busN`
+    (item 85). Also open: whether the Quadro's 16 slots at `0x3C`, named
+    software sensors `soft1..16` after the aquaero's, are software sensors.
+35. Confirm the HID report layout of `hw/aquacomputer.py` on the real
+    devices in their final wiring (the Quadro on aquabus or on its own
+    USB port, every fan and sensor connected): the status report fields
+    of every input and output, the control-report duty fields of every
+    channel, and that the udev rule makes `/dev/hidrawN` readable and
+    writable for the service user. Partly answered (§2 "USB spike
+    results", 2026-09-14 and 2026-09-15): with one fan and one thermistor
+    on each controller, each on its own USB port, both status reports
+    decode to the Linux driver's readings, the aquaero's output duty field
+    is verified, and patching the control reports reproduces the driver's
+    writes byte for byte (`tests/fixtures/aquacomputer/`). With the Quadro on
+    aquabus the aquaero's fan blocks 5–8, aquabus slot 2, flow 3 and the
+    output 7 write are verified (item 85). Still open: the udev rule for the
+    service user, the other channels, and a sub-zero temperature (decoded
+    signed by design, not observed).
+36. `pytest -m hardware` on the Pi with the aquaero attached (after
+    item 2).
+37. Verify every `temp_map` entry against its physical sensor (warm one,
+    watch it move).
+38. `w1-gpio` overlays on GPIO 4 and 17; confirm the `w1_therm` sysfs
+    layout the reader assumes (`therm_bulk_read`, per-slave `temperature`
+    and `resolution`).
+39. Wire the DS18B20 buses (3-wire, 4.7 kΩ), bind every ROM id with
+    `tools/w1_commission.py --identify`, measure cycle time and CRC error
+    rate with `--check` (< 1 %; 11 bit if a cycle exceeds `0.4 dt`).
+40. Cross-check zone-air against inlet sensor offsets at commissioning
+    (0.1 °C of offset biases `E` by 15–35 %).
+41. Run the SMART agent on the PC against the real drives (smartctl
+    permissions, standby behaviour, NVMe namespaces); watch the
+    association find the bays.
+42. Enable the service once the spike is answered
+    (`systemctl enable --now aqua-bridge`).
+43. `control/loop.py` on the Pi against the aquaero with the service
+    running.
+44. Priors against the real enclosure (33 W/K per fan, `g0` / `k`, drive
+    and sensor time constants, the prior sensor map `β = 0.3`,
+    `b = −2.1 °C`).
+45. Tune the PI-like DAS gains (`pi_kp`, `pi_ki`).
+46. Promotion ladder (§13): record, fit, SMART calibration, shadow with
+    experiments, MPC; decide when `config.example-das.yaml` switches to
+    `solver: mpc`.
+47. Move the spare thermistor inputs to the bays `tools/fit_model.py` ranks
+    tightest.
+48. Time `model.json` writes on the Pi's SD card.
+49. Digole: protocol, pages (Overview, Drives, Zones/Fans, Model, Host),
+    touch, hit-test.
+75. Fan stall and restart: a fan below its stall duty stops and starts
+    again only at a higher duty (aquaero test fan: stops at 13 %, starts
+    at 25 %), and a fan can speed up in a low-duty band (Quadro test fan:
+    up to 860 rpm at 5–8 %). `mpc.pwm_min` is one global value. Per-output
+    stall and start duties in the config, a start kick when a channel
+    reads 0 rpm under a command above its stall duty, and
+    `tools/fit_fans.py` finding both duties and the unstable band. Open
+    question for the Quadro: whether its jump to 860 rpm at 5–8 % is a
+    firmware start boost; if so, it may restart a stalled fan without daemon
+    code. (For the aquaero that guess is withdrawn: the outputs that stayed
+    at 100 % were in DC voltage mode, §2 "hidraw check".)
+76. What the aquaero channels hold after exit: each commanded channel
+    keeps its manual preset (the stop write leaves `fallback_pwm`).
+    `AquacomputerAdapter.release()` now restores the captured firmware
+    assignment over HID (the aquaero's preset, control source and power
+    limits, and the Quadro's duty, as the first control report read after
+    the daemon started saw them), but it is not called at exit. Decide
+    together with item 33 whether that stays or `release()` runs at exit.
+    Note that after a daemon restart the first read sees the previous
+    run's presets, not the firmware controllers, so a restore at exit also
+    needs the capture kept across restarts (for example in the state
+    directory). Since item 86 neither the stop write nor `release()` is
+    saved: after a power cycle a controller runs its saved configuration
+    (item 84), so what the channels hold after exit matters only until then.
+77. **Done** (2026-09-15): control-report writes are stored in
+    non-volatile memory on both controllers. The owner removed 12 V and USB
+    from both for 30 s. The Quadro's power-cycle count went from 12 to 13,
+    and the aquaero status report's u32 at `0x11` went from 39478 to 32 (it
+    restarts at power-on; likely seconds since power-on, not otherwise
+    decoded). Both control reports read back byte-identical to the copies
+    taken just before, and the fans came back at the written duties (aquaero
+    outputs 1, 2, 4 at 25 %, 14.12 %, 25 % on their presets, output 4 still in
+    PWM mode; Quadro output 3 at 9.02 %). Those writes were a SET followed by
+    the save report (report 6 on the aquaero); a SET without it does not
+    persist (item 84). The adapter sent it after every SET, so every write
+    was saved and the write limiting of §3 Track B was required, until item
+    86 stopped saving: writes are live, write limiting is off by default,
+    and after a power loss the controllers come back with their saved
+    configuration, not the last written duty (items 33, 84). The daemon side
+    of item 84 is done; what is left before item 42 is the hardware run of
+    item 93 and the commissioning tool of item 88.
+78. Send the driver fix in `deploy/dkms/aquacomputer_d5next/` upstream
+    (linux-hwmon), then drop the patch once a Raspberry Pi OS kernel
+    carries it. Only relevant if the DKMS driver path is revived: the
+    daemon uses hidraw (§8.1, 2026-09-15).
+80. Time a full tick over hidraw on the Pi with both controllers.
+    Measured 2026-09-15 (§2 "hidraw check"): status read 2 ms, first open
+    0.1–0.9 s, `apply()` 1 ms without a write and 9–13 ms with one, one SET
+    with all four outputs 16 ms (aquaero) / 26 ms (Quadro); the gap scan
+    that set `ctrl_gap_ms` to 100 ms (aquaero) and 0 (Quadro), all with the
+    save report after every SET (item 87 measures without it). Still open: a
+    full daemon tick with both controllers and the 1-Wire buses, a periodic
+    refresh tick, the reopen after a re-plug, and how often a control read
+    fails in long operation (about one in 60 in the hwmon spike).
+81. Outputs that do not follow the written duty. On the Pi (§2 "hidraw
+    check") one SET wrote all outputs, but aquaero outputs 3 and 4 and
+    Quadro outputs 1, 2 and 4, all without a fan, kept reporting 100 %. The
+    aquaero part is explained: the word at controller block +0x0E is the
+    output mode (low byte `0x01` DC voltage, `0x02` PWM); outputs 3 and 4
+    were in DC mode. `hw/aquacomputer.py` decodes it, the probe prints it,
+    and the adapter logs one warning per open for every commanded aquaero
+    output of its own not in PWM mode (the aquabus outputs 5–8 read mode
+    word `0x0500`, not interpreted, item 85); it does not set the mode.
+    Duty verification is escalated: a channel that still reports another
+    duty after one rewrite
+    is logged once as an error, listed in `stuck_channels` and not
+    rewritten for the mismatch again until the device reports its duty
+    (writes on a changed command continue). Open: whether the config
+    declares a mode per output and the adapter sets it; the Quadro's mode
+    field (its four channel regions are identical apart from the duty); why
+    a DC output without a load reports 100 %. A Quadro whose outputs stay at
+    100 % because it sits on the aquaero's aquabus is named as such in the
+    stuck error when the aquaero reports the aquabus device (item 85).
+87. The aquaero's `ctrl_gap_ms` of 100 ms comes from back-to-back writes
+    that were a SET followed by the save report (§2 "hidraw check": `EPIPE`
+    at 0 and 25 ms). Repeat the gap scan with SETs alone (item 86) and, if
+    the aquaero no longer needs the gap, decide a new default; time
+    `apply()` with a changed duty again (9–13 ms included the save report,
+    item 80).
+89. Aquabus details the adapter writes or decodes without verification:
+    writing the unconfigured aquaero control block 8 (source `0xFFFF`, mode
+    `0x0000`; the Quadro's output 4 on aquabus) with a fan on that output,
+    before item 42 if it carries one; what the aquabus blocks' mode word
+    `0x0500` means; the `u16` at `+0x0A` of an aquabus fan block (27 on fan 7
+    at 100 %, equal to its current in mA); and whether the lag of an aquabus
+    fan's rpm in the aquaero's status report, several seconds behind the
+    Quadro's own report, matters for stall detection (item 75).
+
 92. The aquaero lost the Quadro on aquabus without a restart (2026-09-15,
     between 21:14 and 22:21; aquaero uptime counter 81 min, Quadro power
     cycles unchanged, its USB still connected). The aquaero's fans 5–8 then
@@ -4302,27 +4492,6 @@ Owner decision (2026-09-16):
     hardware: the aquaero's own thermistors and outputs keep working with
     `pwm5..pwm8` absent, one error line instead of a read failure per tick,
     and the channels back when the Quadro returns.
-94. Tune the fan-health thresholds on the real enclosure (item 79). The
-    `fan_health:` defaults are deliberately wide guesses; nothing but the
-    rail window has been checked against hardware (every captured report sits
-    inside 11–13 V). Needs the Pi and the fans, so the **main session**:
-    - record a run that sweeps each channel over its duty range, fit it with
-      `tools/fit_fans.py` and put the result in `mpc.fan_models` — the rpm
-      rule is only as good as that curve, and with the DAS example's
-      placeholder `rpm_max: 1500` it would fire on healthy fans;
-    - measure each fan model's power at full speed and set
-      `fan_models.<m>.power_w_at_max` (the power rule is off without it).
-      The one measurement so far is the Quadro's aquabus fan 7: 27 mA and
-      0.32 W at 100 % duty, 1105 rpm — small enough that `power_min_w` 0.2
-      leaves little headroom, so check whether the controllers' 0.01 W
-      quantisation makes the rule usable at all on these fans or whether it
-      should key on current instead;
-    - watch how long the aquabus rpm actually lags after a duty step and set
-      `settle_s` from that (15 s is a guess from "several seconds"). It is now
-      the width of the duty band the rpm and power rules judge against, so too
-      large a value only makes them blunt, never false;
-    - confirm no rule fires over a quiet day before narrowing
-      `rpm_tolerance_frac` or the `*_fault_s` windows.
 
 ### 8.4 Open — Zero 2 W upgrade
 
