@@ -686,6 +686,52 @@ def test_ds18b20_plateaus_next_to_a_drive_never_flag_stuck():
     assert len(replay.window) == cfg.window_ticks == 36
 
 
+def test_a_truly_idle_drive_frozen_longer_than_the_window_never_flags_stuck():
+    """Item 27: the sine above turns every few minutes, so no single plateau in it comes
+    close to ``stuck_s`` (1800 s) -- the scenario PROJECT.md actually describes ("An idle
+    bay's DS18B20 sat inside its band for half an hour") is a reading held flat for at
+    least a whole window, not just near a turning point. Hold ``prox_a2`` at one exact
+    value for the entire run while its siblings and its zone's fans keep moving on the
+    same sine as above: the frozen reading must still never flag, on a real plateau
+    several times longer than ``stuck_s`` itself."""
+    m = das_mapping()
+    m.update(dt=5.0, confirm_s=10.0, fallback_hold_s=20.0, stuck_s=10.0)
+    cfg = MpcConfig.from_mapping(m)
+    temp_period = 1800.0
+    fan_period = 240.0  # much faster than the window: every window sees several full swings
+    idle_prox_a2 = _q(40.0, 0.0625)
+
+    def sample(i: int) -> tuple[dict[str, float | None], dict[str, float]]:
+        w = 2.0 * math.pi * i * cfg.dt / temp_period
+        wf = 2.0 * math.pi * i * cfg.dt / fan_period
+        dither = 0.03 * (-1) ** i  # thermistor noise on the zone-air sensors
+        temps: dict[str, float | None] = {
+            "inlet": 25.0,
+            "air_a": _q(35.0 + 0.3 * math.sin(w) + dither, 0.01),
+            "air_a2": _q(35.1 + 0.3 * math.sin(w) + dither, 0.01),
+            "air_b": 35.0,
+            "air_c": 35.0,
+            "prox_a1": _q(41.0 + 0.5 * math.sin(w + 1.0), 0.0625),
+            "prox_a1b": _q(41.2 + 0.5 * math.sin(w + 1.1), 0.0625),
+            "prox_a2": idle_prox_a2,  # genuinely idle for the whole run, not a turning point
+            "prox_b1": 40.0,
+            "prox_c1": 30.0,
+            "exhaust": 38.0,
+        }
+        fan = 0.55 + 0.4 * math.cos(wf)  # moves the zone's air throughout, unlike prox_a2
+        return temps, {"fa1": fan, "fa2": fan, "fb1": 0.5, "fc1": 0.5}
+
+    replay = DasReplay(cfg)
+    ticks = 1100
+    for i in range(ticks):
+        temps, pwm = sample(i)
+        r = replay.tick(temps, pwm)
+        assert not r.stuck["prox_a2"], f"tick {i}: {r.reasons['prox_a2']}"
+        assert r.trusted, f"tick {i}: {r.reasons}"
+    # a real plateau, several times the length of the window it is checked against
+    assert ticks * cfg.dt >= 2 * cfg.stuck_params("prox_a2").ticks * cfg.dt
+
+
 def _dense_das(**extra: Mapping[str, object]) -> MpcConfig:
     """Small non-decimated windows (8 ticks at dt=1) on the sensors under test."""
     overrides: dict[str, dict[str, object]] = {
