@@ -107,10 +107,14 @@ mpc:
   model_split_channels: false  # true (needs topology): a fan group carries a per-channel split
                          # coefficient the single-channel experiment phases identify
   fan_curve_online: false      # true (needs topology): fit each fan model's PWM -> RPM curve online
-                         # (deadband/exponent; model_use_rpm keeps the configured rpm_max)
+                         # (deadband/exponent, read by the thermal model, the MPC's prediction,
+                         # the estimator's airflow and the noise objective's u0; the fan_health
+                         # rules, the Stuck airflow evidence and every rpm_max stay on fan_models)
   fan_curve_settle_s: 30.0     # a duty must hold this long before its (pwm, rpm) pair is sampled (>= 0)
   fan_curve_refit_s: 600.0     # shortest interval between two fits per fan model, seconds (> 0)
   fan_curve_max_rmse_frac: 0.05  # relative RMSE above which a fit is refused, (0, 1]
+  fan_curve_max_age_s: 3600.0  # a fit nothing re-confirms for this long goes stale and its readers
+                         # fall back to the configured curve (>= fan_curve_refit_s)
   # DAS MPC (control/solver_das.py: solver "mpc" with topology and no setpoints); inert in legacy mode.
   mpc_pred_dt_s: 30.0    # prediction step, seconds (> 0; >= dt with topology); horizon counts these steps
   mpc_blocks: []         # move blocks summing to horizon; [] = [1, 1, 2, 4, 6, 6] cut to horizon
