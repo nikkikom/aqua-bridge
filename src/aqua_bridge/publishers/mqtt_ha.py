@@ -44,9 +44,11 @@ further than ``divergence_c`` from the enclosure air for ``divergence_fault_s``.
 Its attributes are the host half of the same blob: the board's temperature, the
 air reference, the load average and the decoded ``get_throttled`` word. The board
 is a health signal only -- never a solver input, never a zone air sensor -- so it
-gets a sensor of its own rather than being read as a controller fault; the
-daemon-wide ``device_problem`` still covers it, since the board's problems join the
-one ``health.device_health.problems`` list.
+gets a sensor of its own rather than being read as a controller fault. Only the
+board's *facts* -- it is hot, it is throttling now -- also join the daemon-wide
+``health.device_health.problems`` list behind ``device_problem``; the divergence
+rule is a hint about where to look, not a verdict, so it turns on ``host_problem``
+alone and leaves ``device_problem`` for something that is actually broken.
 
 DAS mode (``mpc.topology``) subscribes to the limit and bay topics and adds one
 ``limit_<class>`` number entity per drive class (state from

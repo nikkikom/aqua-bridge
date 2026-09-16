@@ -43,7 +43,7 @@ from typing import Any, Protocol
 from aqua_bridge.config import AppConfig
 from aqua_bridge.control.intents import ControlMode, ControlSurface
 from aqua_bridge.control.supervisor import Supervisor
-from aqua_bridge.hostinfo import collect_hostinfo
+from aqua_bridge.health import HostHealthConfig, host_metrics_reader
 from aqua_bridge.publishers.http import run_http
 from aqua_bridge.publishers.mqtt_ha import MqttClient, validate_mqtt_section
 
@@ -182,13 +182,16 @@ class MqttService:
         supervisor: Supervisor,
         *,
         host_interval_s: float = 5.0,
-        hostinfo: Callable[[], Mapping[str, Any]] = collect_hostinfo,
+        hostinfo: Callable[[], Mapping[str, Any]] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.client = client
         self.supervisor = supervisor
         self.host_interval_s = max(0.0, float(host_interval_s))
-        self._hostinfo = hostinfo
+        # Left None: collect_hostinfo with the vcgencmd get_throttled fallback bounded
+        # by host_health.vcgencmd_timeout_s. This publisher does not run on the loop
+        # thread, so that fallback costs the control tick nothing (item 97).
+        self._hostinfo = hostinfo if hostinfo is not None else host_metrics_reader()
         self._clock = clock
         self._host: dict[str, Any] | None = None
         self._host_at = 0.0
@@ -217,6 +220,12 @@ class MqttService:
             client_factory = MqttClient  # looked up at call time (monkeypatchable)
         mqtt_cfg = validate_mqtt_section(app_cfg.section("mqtt"))
         host_cfg = app_cfg.section("host")
+        # The host reader's vcgencmd fallback is bounded by a documented key, not by a
+        # number in the source (item 97); a caller-supplied reader wins.
+        kwargs.setdefault(
+            "hostinfo",
+            host_metrics_reader(HostHealthConfig.from_section(app_cfg.section("host_health"))),
+        )
         service: MqttService | None = None
 
         def on_connection_change(connected: bool) -> None:

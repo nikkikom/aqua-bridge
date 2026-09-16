@@ -161,7 +161,10 @@ function hostHealthRows(health) {
   } else {
     rows.push(row("Throttling now", "-"));
   }
-  for (const p of (h.problems || [])) rows.push(row("problem", p));
+  // Facts (hot, throttling) and the divergence hint are labelled apart: only the
+  // facts are daemon problems, the hint says where to look, never what is wrong.
+  for (const p of (h.faults || [])) rows.push(row("problem", p));
+  for (const p of (h.hints || [])) rows.push(row("hint", p));
   return rows;
 }
 

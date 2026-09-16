@@ -20,9 +20,12 @@ and ``ok`` before the first tick and with a source that has no device health
 
 ``device_health`` also carries a ``host`` key (PROJECT.md section 8 item 97): the
 board's own temperature, the enclosure-air reference it is compared against, the
-load average, the decoded ``get_throttled`` word and this board's own ``problems``
-and ``ok``. Its problems are part of the same ``problems`` list, so ``/api/health``
-shows them too. The board is a health signal and nothing else: it is not in
+load average, the decoded ``get_throttled`` word and this board's own ``faults``,
+``hints``, ``problems`` and ``ok``. Only its *faults* -- the board is hot, the board
+is throttling now -- join the top-level ``problems`` list that ``/api/health``
+shows; the divergence rule is a hint about where to look, not a verdict, so it
+stays in ``device_health.host`` and does not make the daemon not-ok. The board is a
+health signal and nothing else: it is not in
 ``PlantObservation``, not in the ``diagnostics`` the solver reads, and no rule here
 can change a duty.
 
@@ -136,7 +139,8 @@ from aqua_bridge.control.intents import (
     parse_intent,
 )
 from aqua_bridge.control.thermal import PARAMETERS
-from aqua_bridge.hostinfo import CachedHostInfo, collect_hostinfo
+from aqua_bridge.health import HostHealthConfig, host_metrics_reader
+from aqua_bridge.hostinfo import CachedHostInfo
 from aqua_bridge.publishers.httpauth import (
     AuthDecision,
     BasicAuthenticator,
@@ -362,7 +366,7 @@ def create_app(
     *,
     auth: BasicAuthenticator,
     smart_inbox: Any = None,
-    hostinfo: Callable[[], Mapping[str, Any]] = collect_hostinfo,
+    hostinfo: Callable[[], Mapping[str, Any]] | None = None,
 ) -> web.Application:
     """Build the aiohttp application. ``cfg`` is accepted for parity with
     :func:`run_http` and future per-instance config; today the app reads only
@@ -374,8 +378,12 @@ def create_app(
     ``.record(dict) -> bool`` is used) wires ``POST /api/in/smart``; left
     ``None`` that route answers 404, never a 5xx. ``hostinfo`` is the reader
     :class:`~aqua_bridge.hostinfo.CachedHostInfo` wraps for ``GET /api/state``'s
-    ``host`` key (default :func:`aqua_bridge.hostinfo.collect_hostinfo`; tests
-    inject a fixed dict).
+    ``host`` key; left ``None`` it is
+    :func:`aqua_bridge.hostinfo.collect_hostinfo` with its ``vcgencmd
+    get_throttled`` fallback bounded by ``host_health.vcgencmd_timeout_s``
+    (:func:`aqua_bridge.health.host_metrics_reader`) -- this server runs on its own
+    thread, so that fallback costs the control loop nothing. Tests inject a fixed
+    dict.
     """
     if not isinstance(auth, BasicAuthenticator):
         raise TypeError("create_app needs a BasicAuthenticator")
@@ -390,6 +398,13 @@ def create_app(
     app[_CFG_KEY] = cfg
     app[_SMART_KEY] = smart_inbox
     host_interval_s = 5.0 if cfg is None else float(cfg.section("host").get("interval_s", 5.0))
+    if hostinfo is None:
+        host_settings = (
+            HostHealthConfig()
+            if cfg is None
+            else HostHealthConfig.from_section(cfg.section("host_health"))
+        )
+        hostinfo = host_metrics_reader(host_settings)
     app[_HOST_KEY] = CachedHostInfo(interval_s=host_interval_s, reader=hostinfo)
     app.router.add_get("/api/state", _get_state)
     app.router.add_get("/api/health", _get_health)
