@@ -59,6 +59,19 @@ controller's memory; the adapter sends it only on an explicit request. It is
 verified to save on the aquaero; the Quadro's is byte-identical to the
 Farbwerk 360's documented save report, not verified on the Quadro.
 
+Byte ``0x06`` of the aquaero's control report is the profile it runs
+(:func:`active_profile`, 0 = profile 1). An alarm action can select a profile,
+and the switch reloads the *saved* profile, so live duties are lost with it
+(PROJECT.md section 8 item 84).
+
+The aquaero's eight software temperature sensors are set by the host with HID
+*output* report ``0x07`` (:func:`software_sensor_report`, 17 bytes: the id then
+eight centi-degC ``s16`` values, ``0x7FFF`` = no data). With the sensor enabled,
+a fallback temperature and a timeout configured on the device, a value written
+every tick is the heartbeat of a hardware watchdog: the device falls back to the
+configured temperature when the host stops, and an alarm on it can select a safe
+profile. The Quadro's software-sensor report is not known.
+
 The aquaero controller block also holds the output mode, a ``u16`` at
 ``+0x0E``: low byte ``0x01`` drives the output as a DC voltage, ``0x02`` as PWM
 (verified on the Pi 2026-09-15 by switching one output; the high byte is not
@@ -81,8 +94,11 @@ __all__ = [
     "KINDS",
     "QUADRO",
     "SENSOR_NOT_CONNECTED",
+    "SOFT_SENSOR_REPORT_ID",
     "SOURCE_UNCONFIGURED",
     "STATUS_REPORT_ID",
+    "TEMP_MAX_C",
+    "TEMP_MIN_C",
     "VENDOR_ID",
     "ChannelSnapshot",
     "ChannelState",
@@ -94,6 +110,7 @@ __all__ = [
     "ReportError",
     "StatusReport",
     "TempGroup",
+    "active_profile",
     "capture_channel",
     "channel_holds",
     "channel_state",
@@ -107,6 +124,7 @@ __all__ = [
     "output_mode",
     "patch_duties",
     "restore_channel",
+    "software_sensor_report",
 ]
 
 #: USB vendor id of Aqua Computer GmbH & Co. KG.
@@ -122,6 +140,13 @@ FAN_ABSENT_RPM = 0xFFFF
 SOURCE_UNCONFIGURED = 0xFFFF
 #: Duties are centi-percent: 10000 is 100 %.
 DUTY_MAX = 10000
+#: HID OUTPUT report that sets the aquaero's software temperature sensors
+#: (:func:`software_sensor_report`); the Quadro's is not known.
+SOFT_SENSOR_REPORT_ID = 0x07
+#: Temperature range a centi-degC ``s16`` field can carry. The top value
+#: (``0x7FFF``) is :data:`SENSOR_NOT_CONNECTED`, so 327.66 degC is the largest.
+TEMP_MIN_C = -327.68
+TEMP_MAX_C = 327.66
 
 
 class ReportError(ValueError):
@@ -218,6 +243,14 @@ class DeviceKind:
     save_report: bytes
     #: The save report was seen to persist the configuration over a power cycle.
     save_verified: bool
+    #: HID OUTPUT report id that sets this kind's software temperature sensors
+    #: (:func:`software_sensor_report`); ``None`` where the report is not known.
+    soft_sensor_report_id: int | None = None
+    #: How many software sensors that report carries (``None`` with no report).
+    soft_sensor_count: int | None = None
+    #: Offset of the active-profile byte in the control report (``None`` where
+    #: the kind has no profiles or the byte is not known).
+    profile_offset: int | None = None
 
     @property
     def temp_names(self) -> tuple[str, ...]:
@@ -300,6 +333,9 @@ AQUAERO = DeviceKind(
     ctrl_channels=tuple(_aquaero_channel(k) for k in range(_AQUAERO_OUTPUTS)),
     save_report=bytes((0x06, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00)),
     save_verified=True,
+    soft_sensor_report_id=SOFT_SENSOR_REPORT_ID,
+    soft_sensor_count=8,
+    profile_offset=0x06,
 )
 
 QUADRO = DeviceKind(
@@ -474,6 +510,54 @@ def decode_status(kind: DeviceKind, data: bytes | bytearray) -> StatusReport:
 
 
 # ---------------------------------------------------------------------------
+# Software sensors (HID OUTPUT report)
+# ---------------------------------------------------------------------------
+
+
+def _centi_degrees(value: float) -> int:
+    """``value`` degC as the centi-degC ``s16`` the reports carry."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"temperature must be a number, got {value!r}")
+    if not TEMP_MIN_C <= value <= TEMP_MAX_C:
+        raise ValueError(
+            f"temperature {value!r} is outside the {TEMP_MIN_C} .. {TEMP_MAX_C} degC a "
+            "centi-degC s16 field can carry"
+        )
+    return round(value * 100.0)
+
+
+def software_sensor_report(kind: DeviceKind, values: Mapping[int, float]) -> bytes:
+    """The HID OUTPUT report that sets the software sensors ``{number: degC}``.
+
+    ``number`` is 1-based, as in the config name ``softN``. Every slot this call
+    does not name carries :data:`SENSOR_NOT_CONNECTED` ("no data"), which leaves
+    the device's own value for that sensor alone -- the report sets all of them
+    at once, so writing one sensor must not blank the other seven. The report is
+    an *output* report (it goes to the device node with ``write``), not a feature
+    report, and it changes no field of the control report.
+
+    Verified on the aquaero (PROJECT.md section 8 item 84): report ``0x07``, 17
+    bytes, the eight values big-endian in 1/100 degC. :class:`ValueError` for a
+    kind whose report is not known (the Quadro) or a value the field cannot
+    carry.
+    """
+    report_id, count = kind.soft_sensor_report_id, kind.soft_sensor_count
+    if report_id is None or count is None:
+        raise ValueError(f"the {kind.name}'s software-sensor report is not known")
+    buf = bytearray(1 + 2 * count)
+    buf[0] = report_id
+    for i in range(count):
+        _put_u16(buf, 1 + 2 * i, SENSOR_NOT_CONNECTED)
+    for number, value in values.items():
+        if isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= count:
+            raise ValueError(
+                f"{kind.name} software sensor number must be an int in 1..{count}, got {number!r}"
+            )
+        struct.pack_into(">h", buf, 1 + 2 * (number - 1), _centi_degrees(value))
+    return bytes(buf)
+
+
+# ---------------------------------------------------------------------------
 # Control report
 # ---------------------------------------------------------------------------
 
@@ -587,6 +671,20 @@ def channel_state(kind: DeviceKind, data: bytes | bytearray, k: int) -> ChannelS
         mode=output_mode(kind, data, k),
         aquabus=channel.aquabus,
     )
+
+
+def active_profile(kind: DeviceKind, data: bytes | bytearray) -> int | None:
+    """The profile the controller runs, 1-based, or ``None`` where the kind has no
+    known profile byte.
+
+    The aquaero holds it in byte ``0x06`` of the control report (0 = profile 1,
+    verified on the Pi 2026-09-15: a temperature alarm on a software sensor
+    switched it to 1 = profile 2 and back). A profile switch reloads the saved
+    profile, so every duty written live is gone after it (PROJECT.md section 8
+    item 84).
+    """
+    offset = kind.profile_offset
+    return None if offset is None else data[offset] + 1
 
 
 def output_mode(kind: DeviceKind, data: bytes | bytearray, k: int) -> OutputMode | None:

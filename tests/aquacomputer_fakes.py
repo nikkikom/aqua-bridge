@@ -12,10 +12,12 @@ Quadro on its aquabus (the captured aquabus reports).
 
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from aqua_bridge.hw.aquacomputer import (
+    SENSOR_NOT_CONNECTED,
     DeviceKind,
     channel_state,
     check_control_report,
@@ -57,9 +59,28 @@ def _put_u16(buf: bytearray, offset: int, value: int) -> None:
     buf[offset : offset + 2] = value.to_bytes(2, "big")
 
 
+def decode_software_sensors(
+    kind: DeviceKind, report: bytes, held: dict[int, float]
+) -> dict[int, float]:
+    """The software sensors a HID output report sets, degC by 1-based number.
+
+    A slot holding ``0x7FFF`` ("no data") leaves the device's own value alone,
+    which is what the adapter relies on when it writes one sensor of eight.
+    """
+    count = kind.soft_sensor_count
+    assert count is not None and report[0] == kind.soft_sensor_report_id
+    assert len(report) == 1 + 2 * count, f"expected {1 + 2 * count} bytes, got {len(report)}"
+    out = dict(held)
+    for i in range(count):
+        (raw,) = struct.unpack_from(">h", report, 1 + 2 * i)
+        if raw != SENSOR_NOT_CONNECTED:
+            out[i + 1] = raw / 100.0
+    return out
+
+
 @dataclass
 class Op:
-    what: str  # "get" | "set" | "save"
+    what: str  # "get" | "set" | "save" | "write"
     t: float
     data: bytes
 
@@ -79,6 +100,11 @@ class FakeController:
     ops: list[Op] = field(default_factory=list)
     #: Raised by the next feature report operations, in order.
     failures: list[BaseException] = field(default_factory=list)
+    #: Raised by the next output report writes, in order (the heartbeat).
+    write_failures: list[BaseException] = field(default_factory=list)
+    #: Software sensor values the device holds, degC by 1-based number, as the
+    #: output reports set them (the real device falls back after its timeout).
+    soft_sensors: dict[int, float] = field(default_factory=dict)
     gone: bool = False
     closed: bool = False
     #: wait_readable() makes a report arrive after this many seconds (None: never).
@@ -126,6 +152,10 @@ class FakeController:
 
     def status(self) -> bytes:
         buf = bytearray(self.status_template)
+        group = next((g for g in self.kind.temp_groups if g.prefix == "soft"), None)
+        for number, value in self.soft_sensors.items():
+            assert group is not None and 1 <= number <= group.count
+            struct.pack_into(">h", buf, group.offset + 2 * (number - 1), round(value * 100))
         layout = self.kind.fan_layout
         for k, base in enumerate(self.kind.fan_blocks):
             _put_u16(buf, base + layout.duty, self.output_duty(k))
@@ -156,6 +186,10 @@ class FakeController:
 
     def saves(self) -> list[Op]:
         return [op for op in self.ops if op.what == "save"]
+
+    def writes(self) -> list[Op]:
+        """Output reports written to the node (the software-sensor heartbeat)."""
+        return [op for op in self.ops if op.what == "write"]
 
     # -- HidTransport -----------------------------------------------------
 
@@ -201,6 +235,14 @@ class FakeController:
             self.ctrl = bytearray(data)
         else:
             assert data == self.kind.save_report
+
+    def write_report(self, data: bytes) -> None:
+        self._check_usable()
+        self.clock.advance(self.op_delay_s)
+        self.ops.append(Op("write", self.clock(), bytes(data)))
+        if self.write_failures:
+            raise self.write_failures.pop(0)
+        self.soft_sensors = decode_software_sensors(self.kind, data, self.soft_sensors)
 
     def close(self) -> None:
         self.closed = True

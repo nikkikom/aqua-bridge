@@ -13,7 +13,8 @@ aquabus temperature slots ``busN``, software sensors ``softN``, the aquaero's
 virtual sensors ``virtN``), each output's rpm, output duty, voltage, current
 and power (the aquaero's outputs 5-8 belong to a device on its aquabus, and
 read "no device" without one), flow ``flowN``, and the Quadro's power-cycle
-count -- and each output's duty in the control report, with the aquaero's
+count -- then the profile the aquaero runs (control report byte 0x06) and each
+output's duty in the control report, with the aquaero's
 control source and power limits (the daemon's duty is in effect only while the
 channel follows its own preset with limits 0 / 100 %) and output mode (PWM or
 DC voltage; not interpreted on the aquabus outputs; an unconfigured block
@@ -42,6 +43,7 @@ from aqua_bridge.hw.aquacomputer import (
     DeviceKind,
     ReportError,
     StatusReport,
+    active_profile,
     channel_state,
     check_control_report,
     decode_status,
@@ -118,6 +120,9 @@ def _print_status(kind: DeviceKind, status: StatusReport, out: TextIO) -> None:
 
 
 def _print_control(kind: DeviceKind, data: bytes, out: TextIO) -> None:
+    profile = active_profile(kind, data)
+    if profile is not None:
+        print(f"  active profile: {profile}", file=out)
     print("  outputs (control report):", file=out)
     for k in range(kind.pwm_count):
         state = channel_state(kind, data, k)

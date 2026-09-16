@@ -87,8 +87,10 @@ def test_lists_and_decodes_both_devices_without_writing(rig) -> None:
     # Quadro: power cycles, duty from the control report, software sensors
     assert "power cycles:" in text and "pwm3  duty 100.00 %" in text
     assert "software sensors (soft1..soft16, degC):" in text
+    assert "  active profile: 1" in text  # the aquaero's control report byte 0x06
     for controller in rig[3].values():
         assert controller.sets() == [] and controller.saves() == []
+        assert controller.writes() == []  # no software-sensor report either
         assert len(controller.gets()) == 1 and controller.closed
 
 
