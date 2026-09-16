@@ -408,6 +408,9 @@ CAL_RMS_ALPHA = 0.1
 SIGMA_CAL_FLOOR_C = 0.5
 #: Calibrations kept per bay (other serials), oldest dropped first.
 CAL_SERIALS_PER_BAY = 4
+#: Identity of a manual calibration's sensor map (item 23), where a SMART one uses the
+#: drive serial. The parentheses keep it out of the space of real drive serials.
+MANUAL_MAP = "(manual)"
 
 #: Longest interval one prediction covers, seconds.
 MAX_PREDICT_S = 3600.0
@@ -1227,11 +1230,14 @@ def update(
         return b in assoc and (assoc[b][1] == "declared" or bool(mem["bays"][b]["ver"]))
 
     def sensor_map(b: str) -> tuple[float, float, str | None]:
-        """``(s, b, source)`` the filter uses for bay ``b``: the source is the
-        associated serial for a SMART map (re-verified here, item 18 -- an
-        unverified correlation guess is never used, however calibrated its
-        entry), ``"manual"`` for a handheld one (item 23, no association to
-        re-check), else ``None``."""
+        """``(s, b, source)`` the filter uses for bay ``b``.
+
+        ``source`` identifies the map, so a switch (a calibration accepted or lost, a
+        different drive) re-maps the drive state: the serial for a SMART calibration
+        (re-verified here, item 18 -- an unverified correlation guess is never used,
+        however calibrated its entry), :data:`MANUAL_MAP` for a manual one (item 23,
+        no association to re-check), ``None`` for the prior.
+        """
         entry = cal_entry(b)
         if entry is None or not entry["used"]:
             return CAL_PRIOR[0], CAL_PRIOR[1], None
@@ -1239,7 +1245,7 @@ def update(
             if not verified(b):
                 return CAL_PRIOR[0], CAL_PRIOR[1], None
             return entry["th"][0], entry["th"][1], assoc[b][0]
-        return entry["th"][0], entry["th"][1], "manual"
+        return entry["th"][0], entry["th"][1], MANUAL_MAP
 
     prev_air = {z: float(zm["x"][0]) for z, zm in mem["zones"].items()}
     trusted_air = {z: [temps[t] for t in zone.air if t in temps] for z, zone in st.zones.items()}
