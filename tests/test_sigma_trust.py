@@ -1252,6 +1252,58 @@ def test_a_hot_swap_no_longer_faults_its_zone_under_sigma():
     assert rise > 0.05
 
 
+#: A loose probe steps its bay's proximal sensor this far, once every FLAP_EVERY ticks.
+FLAP_STEP_C = 3.5
+FLAP_EVERY = 48
+
+
+def flapping(name: str, step_c: float, every: int) -> ObsHook:
+    """``name`` reads ``step_c`` high on every ``every``-th tick and normally in between: a
+    loose probe, an intermittent 1-Wire contact, a drive repeatedly reseated. The step is
+    inside the gate's slew limit (0.7 degC/s against ``dT_max_c_per_s: 1.0``), so every
+    value is gate-trusted and reaches the estimator, where it trips the fast-swap rule."""
+
+    def hook(i: int, obs: PlantObservation) -> PlantObservation:
+        if i % every or obs.temps.get(name) is None:
+            return obs
+        temps = dict(obs.temps)
+        temps[name] = float(temps[name]) + step_c  # type: ignore[arg-type]
+        return dataclasses.replace(obs, temps=temps)
+
+    return hook
+
+
+@pytest.mark.parametrize("solver", ["pi", "mpc"])
+def test_a_flapping_proximal_sensor_still_faults_its_zone(solver):
+    """Item 69's exemption is bounded in wall-clock, not by the sigma coming back. A bay's
+    sigma falls back within a tick or two of every jump, so a rule that re-armed on a
+    recovered sigma renewed the window at every cadence slower than one jump per tick and
+    the zone never faulted again. The windows of one bay may now total ``bay_settle_max_s``
+    of suspended check; after that the zone faults on every tick the sigma is over, as it
+    did before item 69."""
+    cfg = example_cfg("sigma", solver)
+    hook = flapping("prox_b06", FLAP_STEP_C, FLAP_EVERY)
+    run = sim_run(cfg, LONG_TICKS, hook=hook, controller=checked_step)
+    episodes, fault_ticks = zone_faults(run)
+    assert episodes > 0, "a flapping sensor kept its zone exempt for the whole run"
+    bound = cfg.estimator.bay_settle_max_s + cfg.estimator.bay_settle_s
+    first = next(r.obs.ts for r in run.records if r.cmd.diagnostics["zones_in_fault"])
+    assert first <= bound + cfg.dt, first  # the budget plus the window it ran out inside
+    exempt = sum(1 for r in run.records if r.cmd.diagnostics["bays"]["b06"]["settling"])
+    assert exempt * cfg.dt <= bound, exempt
+    assert all(
+        r.cmd.diagnostics["zones_in_fault"] in ([], ["z1"]) for r in run.records
+    )  # only b06's zone
+    assert run.violations() == 0
+    # ``bay_settle_max_s: 0`` is the rule before item 69: every jump faults the zone
+    none = sim_run(
+        example_cfg("sigma", solver, bay_settle_s=0.0, bay_settle_max_s=0.0),
+        LONG_TICKS,
+        hook=hook,
+    )
+    assert zone_faults(none)[0] > episodes > 0
+
+
 def test_a_swapped_bay_that_goes_blind_faults_at_once():
     """The exemption needs the bay observed: lose its sensor right after the insert and the
     widened sigma faults the zone on that tick, sooner than it would have before item 69."""

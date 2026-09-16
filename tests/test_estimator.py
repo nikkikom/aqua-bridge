@@ -151,6 +151,8 @@ def test_estimator_section_parses_and_round_trips():
         {"empty_dT_c": 0.0},
         {"empty_confirm_s": 1.0},  # < 2 dt
         {"bay_settle_s": -1.0},
+        {"bay_settle_max_s": -1.0},
+        {"bay_settle_max_s": 599.0},  # below bay_settle_s: a window it could not pay for
         {"calibration_max_age_days": 0.0},
         {"associate_window_s": 599.0},
         {"associate_min_corr": 1.0},
@@ -420,22 +422,74 @@ def test_settling_expires_after_bay_settle_s():
     assert [up.bays["b1"]["settling"] for up in later][-1] is False
 
 
-def test_repeated_jumps_never_renew_the_settling_window():
-    """The window runs from the first widening of an episode, so a sensor that jumps on
-    every tick cannot keep its bay exempt from the sigma trust rule for ever."""
-    cfg = lcfg(bay_settle_s=10.0)
-    mem = run_ticks(cfg, 30)[-1].memory
+def flap(cfg: MpcConfig, mem, n: int, *, t0: float, cadence: int, jump_c: float = 10.0):
+    """``n`` ticks with ``prox_b1`` stepping ``jump_c`` away every ``cadence`` ticks:
+    (settling flags, sigmas, the memory after the last tick)."""
     flags, sigmas = [], []
-    for i in range(20):
-        up = run_ticks(cfg, 1, mem=mem, t0=30.0 + i, prox_b1=PROX_C + (10.0 if i % 2 else -10.0))[
-            -1
-        ]
+    for i in range(n):
+        step_c = jump_c if cadence and i % cadence == 0 else 0.0
+        up = run_ticks(cfg, 1, mem=mem, t0=t0 + i * cfg.dt, prox_b1=PROX_C + step_c)[-1]
         mem = up.memory
         flags.append(up.bays["b1"]["settling"])
         sigmas.append(up.estimates["b1"]["sigma"])
-    assert flags[0] is True and flags[9] is True and flags[10] is False
-    assert not any(flags[10:]), flags
-    assert min(sigmas[10:]) > est.SIGMA_UNCALIBRATED_C  # the jumps did keep firing
+    return flags, sigmas, mem
+
+
+@pytest.mark.parametrize("cadence", [2, 5, 12, 20])
+def test_repeated_jumps_spend_the_settling_budget_and_then_stop_exempting(cadence):
+    """A bay's settling windows may suspend the sigma check for at most ``bay_settle_max_s``
+    in total. Nothing about the *cadence* of the jumps buys more: a bay's sigma falls back
+    within a tick or two of each jump, so a rule that re-armed on a recovered sigma renewed
+    the window for ever at every cadence but the fastest, and the zone never faulted."""
+    cfg = lcfg(bay_settle_s=10.0, bay_settle_max_s=20.0)
+    mem = run_ticks(cfg, 30)[-1].memory
+    flags, sigmas, _ = flap(cfg, mem, 80, t0=30.0, cadence=cadence)
+    assert flags[0] is True
+    # the budget, plus at most the window that was still open when it ran out
+    exempt_s = sum(flags) * cfg.dt
+    assert exempt_s <= cfg.estimator.bay_settle_max_s + cfg.estimator.bay_settle_s, exempt_s
+    assert not any(flags[40:]), (cadence, flags)
+    # ...and the jumps did keep firing, so the zone faults on those ticks as it did before
+    pairs = zip(sigmas, flags, strict=True)
+    faulting = [s > cfg.estimator.sigma_fault_c and not f for s, f in pairs]
+    assert any(faulting[40:]), max(sigmas[40:])
+
+
+def test_a_clean_run_earns_the_settling_budget_back():
+    """The budget is not spent for good: a bay that runs ``bay_settle_max_s`` with neither a
+    window nor a sigma over its threshold is a bay whose next swap is a swap again."""
+    cfg = lcfg(bay_settle_s=10.0, bay_settle_max_s=20.0)
+    mem = run_ticks(cfg, 30)[-1].memory
+    flags, _, mem = flap(cfg, mem, 60, t0=30.0, cadence=2)
+    assert flags[-1] is False  # the budget is gone
+    quiet, _, mem = flap(cfg, mem, 40, t0=90.0, cadence=0)
+    assert not any(quiet)
+    again, _, _ = flap(cfg, mem, 1, t0=130.0, cadence=1)
+    assert again == [True]
+
+
+def test_bay_settle_max_s_zero_grants_no_exemption_at_all():
+    cfg = lcfg(bay_settle_s=0.0, bay_settle_max_s=0.0)
+    mem = run_ticks(cfg, 30)[-1].memory
+    flags, sigmas, _ = flap(cfg, mem, 10, t0=30.0, cadence=1)
+    assert not any(flags)
+    assert max(sigmas) > cfg.estimator.sigma_fault_c  # the widening is still there
+
+
+def test_an_empty_bay_spends_no_settling_budget():
+    """A bay the trust rule skips outright (``empty``) is charged nothing while it waits:
+    the exemption it is not using must not be spent, or a slow hot swap -- a drive pulled,
+    the bay confirmed empty, a drive inserted minutes later -- would run out mid-way."""
+    cfg = lcfg(bay_settle_s=600.0, bay_settle_max_s=900.0)
+    mem = run_ticks(cfg, 30)[-1].memory
+    pulled = run_ticks(cfg, 600, mem=mem, t0=30.0, prox_b1=SP)  # the drive is out
+    first = next(i for i, up in enumerate(pulled) if up.bays["b1"]["occupancy"] == "empty")
+    spent = pulled[first].memory["bays"]["b1"]["spent"]
+    assert 0.0 < spent < cfg.estimator.bay_settle_max_s  # the occupied part did cost
+    assert pulled[-1].memory["bays"]["b1"]["spent"] == spent  # the empty part did not
+    assert len(pulled) - first > 200  # over 200 empty ticks of it
+    back = run_ticks(cfg, 3, mem=pulled[-1].memory, t0=630.0, prox_b1=PROX_C + 10.0)
+    assert back[-1].bays["b1"]["settling"] is True
 
 
 def test_air_blind_s_counts_the_time_without_a_trusted_zone_air_reading():
@@ -447,6 +501,21 @@ def test_air_blind_s_counts_the_time_without_a_trusted_zone_air_reading():
     assert blind[-1].zones["zb"]["air_blind_s"] == 0.0  # zb kept its own sensor
     back = run_ticks(cfg, 1, mem=blind[-1].memory, t0=11.0)[-1]
     assert back.zones["za"]["air_blind_s"] == 0.0
+
+
+def test_air_blind_s_counts_a_tick_gap_in_full():
+    """Wall clock, not the occupancy horizon (which caps at 3 dt): under-counting a gap
+    delays the ``sigma:zone_air_blind`` fault, and the air sigma cannot make it up --
+    that the variance stays small with nothing reading the air is item 70's premise."""
+    cfg = lcfg()
+    mem = run_ticks(cfg, 5)[-1].memory
+    blind = run_ticks(cfg, 1, mem=mem, t0=5.0, air_a=None, air_a2=None)[-1]
+    assert blind.zones["za"]["air_blind_s"] == 1.0
+    gap = tick(cfg, blind.memory, 605.0, air_a=None, air_a2=None)
+    assert gap.zones["za"]["air_blind_s"] == pytest.approx(601.0)  # not 1 + 3 * dt
+    later = tick(cfg, gap.memory, 1205.0, air_a=None, air_a2=None)
+    assert later.zones["za"]["air_blind_s"] == pytest.approx(1201.0)
+    assert later.zones["za"]["sigma_air_c"] < 1.0  # the variance never says it
 
 
 def test_a_redundant_air_sensor_keeps_the_zone_from_going_blind():
