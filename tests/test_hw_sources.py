@@ -12,7 +12,12 @@ import pytest
 
 from aqua_bridge.control.loop import Loop, TickResult
 from aqua_bridge.control.supervisor import Supervisor
-from aqua_bridge.hw.aquacomputer import AQUAERO, QUADRO, control_duty
+from aqua_bridge.hw.aquacomputer import (
+    AQUAERO,
+    QUADRO,
+    control_duty,
+    finalize_control_report,
+)
 from aqua_bridge.hw.aquacomputer_adapter import AquacomputerAdapter, DeviceBinding
 from aqua_bridge.hw.hidraw import DeviceUnavailable
 from aqua_bridge.hw.onewire import W1Source
@@ -770,6 +775,52 @@ def test_device_health_lists_an_own_output_not_in_pwm_mode() -> None:
     health = adapter.device_health()
     assert health["not_pwm_channels"] == ["radiator"]
     assert health["problems"] == ["aquaero: radiator are not in PWM mode"]
+
+
+def test_device_health_follows_a_mode_changed_behind_the_daemon_back() -> None:
+    """device_health() promises what the controller looks like now: the owner can move
+    an output to DC voltage in aquasuite at any time, and the periodic control read must
+    carry that into the published list, not only the first read of an open (item 83)."""
+    clock = FakeClock()
+    device = FakeController(AQUAERO, clock)
+    adapter = AquacomputerAdapter(
+        DeviceBinding(kind=AQUAERO, pwm_map={"radiator": 2}),
+        clock=clock,
+        sleep=FakeSleep(clock),
+        opener=FakeBus(device),
+    )
+    adapter.apply(MpcCommand(pwm={"radiator": 0.4}, mode=Mode.AUTO))
+    assert adapter.device_health()["not_pwm_channels"] == []
+    mode = 0x20C + 20 * 1 + 0x0E  # controller block 2 (output 2)
+    changed = bytearray(device.ctrl)
+    changed[mode : mode + 2] = (0x0001).to_bytes(2, "big")  # low byte 1 = DC voltage
+    finalize_control_report(AQUAERO, changed)
+    device.ctrl = changed
+    clock.advance(adapter.timing.ctrl_refresh_s)
+    adapter.apply(MpcCommand(pwm={"radiator": 0.4}, mode=Mode.AUTO))
+    health = adapter.device_health()
+    assert health["not_pwm_channels"] == ["radiator"]
+    assert health["problems"] == ["aquaero: radiator are not in PWM mode"]
+
+
+def test_the_fan_readings_report_the_bound_tachometer_not_the_output_block() -> None:
+    """A channel's rpm may be bound to another block than its output (a splitter, or a
+    fan whose tach lead is on a different header), and that is the speed obs.rpm carries
+    and tools/fit_fans.py fits: the drift rule must judge the same one (item 79)."""
+    clock = FakeClock()
+    adapter = AquacomputerAdapter(
+        DeviceBinding(kind=AQUAERO, pwm_map={"qd3": 5}, fan_map={"qd3": 7}),
+        clock=clock,
+        sleep=FakeSleep(clock),
+        opener=FakeBus(aquabus_aquaero(clock)),
+    )
+    obs = adapter.read()
+    reading = obs.inputs["fans"]["qd3"]
+    assert reading["output"] == "pwm5" and reading["tach"] == "fan7"
+    assert reading["rpm"] == obs.rpm["qd3"] == 1105.0  # block 7's fan, not pwm5's 0 rpm
+    # the electrical fields stay the output's own block: pwm5 drives 88.61 % and, with
+    # nothing wired to its own header, reports 0 V / 0 mA
+    assert reading["duty"] == pytest.approx(0.8861) and reading["voltage_v"] == 0.0
 
 
 def test_composite_device_health_merges_every_controller_and_its_problems() -> None:

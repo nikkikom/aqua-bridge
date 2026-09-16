@@ -168,7 +168,10 @@ Keeping the cache honest
        its own (1-4) not in PWM mode gets one warning per open, an aquabus
        output (5-8, mode word not interpreted) none, an unconfigured block
        (source ``0xFFFF``, mode 0) one warning per adapter that writing it is
-       unverified; the mode is never written;
+       unverified; the mode is never written. Both lists are recomputed from
+       every control report the adapter adopts (so a mode changed in aquasuite
+       mid-run reaches ``device_health`` at the next refresh), only the warnings
+       are kept to one;
     b) a change of the Quadro's power-cycle count invalidates the same way;
     c) every ``ctrl_refresh_s`` (0 disables) ``apply()`` GETs the report again
        and rewrites any channel that no longer holds its duty.
@@ -572,14 +575,16 @@ class AquacomputerAdapter:
         #: Fields captured by the first GET, restored by release().
         self._originals: dict[int, ChannelSnapshot] | None = None
         self._ever_written: set[int] = set()
-        #: The output modes were checked on this open's first control report.
-        self._modes_checked = False
-        #: Commanded own outputs found in DC (or an unknown) mode, and commanded
-        #: unconfigured blocks, on this open's first control report (item 83).
+        #: Commanded own outputs in DC (or an unknown) mode, and commanded
+        #: unconfigured blocks, as the newest adopted control report showed them
+        #: (item 83): recomputed on every adoption, so a mode changed behind the
+        #: daemon's back shows up at the next periodic control read.
         self._not_pwm_channels: tuple[str, ...] = ()
         self._unconfigured_channels: tuple[str, ...] = ()
-        #: Unconfigured aquaero blocks already reported (once per adapter).
+        #: Blocks already logged: unconfigured ones once per adapter, non-PWM ones
+        #: once per open (the lists above are state, these two only gate the log).
         self._unconfigured_reported: set[int] = set()
+        self._not_pwm_reported: set[int] = set()
         #: Output numbers that belong to a device on the aquaero's aquabus.
         self._aquabus = frozenset(binding.kind.aquabus_outputs)
         #: The absent inputs read() found last ("pwm5 (qd1)", ...), logged when it changes.
@@ -649,9 +654,10 @@ class AquacomputerAdapter:
         return self._heartbeat_ok
 
     def not_pwm_channels(self) -> tuple[str, ...]:
-        """Commanded outputs of the aquaero's own that the control report showed in DC
-        voltage (or an unknown) mode instead of PWM; empty until a control report has
-        been read, and on the Quadro, whose mode field is unknown."""
+        """Commanded outputs of the aquaero's own that the newest adopted control
+        report showed in DC voltage (or an unknown) mode instead of PWM; empty until a
+        control report has been read, and on the Quadro, whose mode field is
+        unknown."""
         return self._not_pwm_channels
 
     @property
@@ -667,12 +673,17 @@ class AquacomputerAdapter:
         item 79).
 
         ``duty`` is the output duty the device drives, in 0..1 like ``obs.pwm``;
-        ``rpm`` the tachometer of that output (not only the ones ``fans.<ch>.rpm``
-        binds, since every output has a block); ``voltage_v`` the 12 V rail as the
-        block reports it; ``current_ma`` and ``power_w`` the electrical draw, which
-        is meaningful only where ``power_reported`` is true (an aquaero reports 0 mA
-        and 0 W for its own outputs in PWM mode). An aquabus slot with no device
-        behind it is left out entirely: its whole block is meaningless.
+        ``rpm`` the speed of the channel's *bound* tachometer (``fans.<ch>.rpm``,
+        reported in ``tach``), which a config may deliberately put on another block
+        than the output -- a splitter, or a fan whose tach lead is on a different
+        header -- and which is therefore the only speed the fitted curve of
+        ``mpc.fan_models`` describes; without a binding the output's own block is
+        used. ``voltage_v`` is the 12 V rail as the *output's* block reports it, and
+        ``current_ma`` / ``power_w`` that block's electrical draw, meaningful only
+        where ``power_reported`` is true (an aquaero reports 0 mA and 0 W for its own
+        outputs in PWM mode). An aquabus slot with no device behind it is left out
+        entirely: its whole block is meaningless; a bound tachometer on such a slot
+        leaves ``rpm`` ``None`` rather than publishing its ``0xFFFF``.
         """
         if status is None:
             status = self._status
@@ -683,10 +694,12 @@ class AquacomputerAdapter:
             if self._empty_slot(status, number):
                 continue
             fan = status.fans[number - 1]
+            tach = self.binding.fan_map.get(ch, number)
             out[ch] = {
                 "device": self.kind.name,
                 "output": f"pwm{number}",
-                "rpm": float(fan.rpm),
+                "tach": f"fan{tach}",
+                "rpm": None if self._empty_slot(status, tach) else float(status.fans[tach - 1].rpm),
                 "duty": fan.duty / DUTY_MAX,
                 "voltage_v": fan.voltage_v,
                 "current_ma": float(fan.current_ma),
@@ -786,7 +799,7 @@ class AquacomputerAdapter:
         self._power_cycles = None
         self._ctrl = None
         self._mismatch_since.clear()
-        self._modes_checked = False
+        self._not_pwm_reported.clear()
         self._not_pwm_channels = ()
         self._unconfigured_channels = ()
         _LOG.info("%s: opened %s", self.binding.label, transport.info.node)
@@ -1082,6 +1095,7 @@ class AquacomputerAdapter:
                 self._written[k] = held
                 self._changed_t[k] = now
         self._ctrl, self._ctrl_t = data, now
+        self._scan_modes(data)
         return drifted
 
     def _write(self, transport: HidTransport, report: bytes, deadline: float) -> float:
@@ -1254,12 +1268,15 @@ class AquacomputerAdapter:
 
         self._with_retries("control report write", once)
 
-    def _warn_about_modes(self, ctrl: bytes) -> None:
-        """One warning per open for every commanded output of the aquaero's own not in
-        PWM mode, and one per adapter for every commanded unconfigured block. The mode
-        is only reported, never changed (PROJECT.md section 8 items 81, 85). Both lists
-        are also kept for :meth:`device_health` (item 83)."""
-        self._modes_checked = True
+    def _scan_modes(self, ctrl: bytes) -> None:
+        """Recomputes ``not_pwm_channels`` / ``unconfigured_channels`` from ``ctrl`` and
+        warns once per open (per adapter for an unconfigured block) about each.
+
+        Called for every control report this adapter adopts, not only the first of an
+        open: the owner can switch an output to DC voltage in aquasuite at any time,
+        and :meth:`device_health` promises what the controller looks like *now*
+        (PROJECT.md section 8 item 83). The mode itself is only reported, never
+        changed (items 81, 85)."""
         not_pwm: list[str] = []
         unconfigured: list[str] = []
         for k in sorted(self._names):
@@ -1284,8 +1301,12 @@ class AquacomputerAdapter:
                     )
                 continue
             if state.aquabus or mode.is_pwm:
+                self._not_pwm_reported.discard(k)  # back in PWM: say so again if it leaves
                 continue  # an aquabus output's mode word is not interpreted
             not_pwm.append(self._names[k])
+            if k in self._not_pwm_reported:
+                continue
+            self._not_pwm_reported.add(k)
             _LOG.warning(
                 "%s: pwm%d (%s) is in %s mode (mode word 0x%04X), not PWM; the daemon does not "
                 "change the mode, set it with the controller's own software",
@@ -1354,8 +1375,6 @@ class AquacomputerAdapter:
         if self._ctrl is None:
             self._adopt(self._fetch(transport, deadline))
         ctrl = self._ctrl
-        if not self._modes_checked and ctrl is not None:
-            self._warn_about_modes(ctrl)
         assert ctrl is not None
         if never_lower:
             duties = self._not_below_held(ctrl, duties)
