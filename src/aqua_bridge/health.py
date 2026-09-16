@@ -1,4 +1,5 @@
-"""Fan-health drift rules and device health (PROJECT.md section 8 items 79 and 83).
+"""Fan health, device health and the board's own health (PROJECT.md section 8 items
+79, 83 and 97).
 
 Every status report of an aquaero or a Quadro carries, per output, the speed, the
 output duty the device drives, the 12 V rail voltage and the current and power the
@@ -78,6 +79,22 @@ power against the duty
 Every threshold above is a ``fan_health:`` key with one default declared once in
 :class:`FanHealthConfig`, validated there, shown in both example configs and
 described in PROJECT.md section 3.
+
+The board itself
+----------------
+:class:`HostHealth` adds three rules about the Raspberry Pi the daemon runs on
+(item 97, and the owner decision of 2026-09-16 in PROJECT.md section 8.1): the
+board is hot, the board is throttling now, and -- only while the CPU is idle --
+the board's temperature diverges from the enclosure air. Its inputs are
+:func:`aqua_bridge.hostinfo.collect_hostinfo`'s ``cpu_temp_c``, ``load1`` and
+``throttled``, plus the observation's own temperatures as the air reference.
+
+The board is **not** part of the thermal model: about a watt against the drives'
+tens of watts, and its reading is dominated by its own self-heating, which moves
+with CPU load. It never becomes a solver input, a zone air sensor or a model
+node; its verdict rides the same published health payload as the fans' and is
+read by nothing that computes a duty. Its thresholds are ``host_health:`` keys,
+declared once in :class:`HostHealthConfig` under the same rules.
 """
 
 from __future__ import annotations
@@ -86,19 +103,34 @@ import dataclasses
 import logging
 import math
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from aqua_bridge.control.thermal import phi
+from aqua_bridge.hostinfo import THROTTLED_BITS
 from aqua_bridge.model import ConfigError, MpcConfig
 
-__all__ = ["FANHEALTH_KEYS", "RULES", "FanHealthConfig", "HealthMonitor", "expected_rpm"]
+__all__ = [
+    "FANHEALTH_KEYS",
+    "HOSTHEALTH_KEYS",
+    "HOST_RULES",
+    "RULES",
+    "FanHealthConfig",
+    "HealthMonitor",
+    "HostHealth",
+    "HostHealthConfig",
+    "default_air_temps",
+    "expected_rpm",
+]
 
 _LOG = logging.getLogger("aqua_bridge.health")
 
 #: Rule names, in the order a channel's problems are reported.
 RULES: tuple[str, ...] = ("rail", "rpm", "power")
+
+#: Host-health rule names, in the order the board's problems are reported.
+HOST_RULES: tuple[str, ...] = ("temp", "throttled", "divergence")
 
 
 def _number(name: str, value: Any, *, minimum: float | None, maximum: float | None) -> float:
@@ -212,6 +244,239 @@ def _finite(value: Any) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
 
 
+# ---------------------------------------------------------------------------
+# The board itself (PROJECT.md section 8 item 97)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, kw_only=True)
+class HostHealthConfig:
+    """The ``host_health:`` section: the board's own thresholds, each with one default.
+
+    The Raspberry Pi is **not** part of the thermal model (owner decision,
+    PROJECT.md section 8.1, 2026-09-16): about a watt against the drives' tens of
+    watts, and its reading is dominated by its own self-heating. Nothing here is
+    ever a solver input, a zone air sensor or a model node; every rule below only
+    produces a published field and a log line.
+    """
+
+    #: Run the rules at all. The board's temperature and throttling are read,
+    #: published and shown either way.
+    enabled: bool = True
+    #: The board's temperature above this is a deviation, degC. The Pi caps its ARM
+    #: clock around 80 degC and hard-throttles around 85; this sits below the first
+    #: cap so the warning arrives before the board starts defending itself, and well
+    #: above the 47.2 degC the owner's Zero 2 W reads at idle.
+    temp_limit_c: float = 75.0
+    #: A board temperature above the limit held this long is reported, seconds (> 0).
+    #: A build, an update or a log rotation heats the SoC for tens of seconds; two
+    #: minutes is placement or airflow, not a burst of work.
+    temp_fault_s: float = 120.0
+    #: The board's temperature further than this from the enclosure air is a
+    #: deviation while the CPU is idle, degC (> 0). At idle a Zero 2 W sits roughly
+    #: 10-20 degC above the air around it, so this leaves room for that spread and
+    #: still catches a board sitting in hot exhaust, or an air sensor that stopped
+    #: tracking. Judged on the absolute difference: air reading *above* the board is
+    #: just as much evidence.
+    divergence_c: float = 25.0
+    #: A divergence held this long -- idle throughout -- is reported, seconds (> 0).
+    #: The enclosure's air moves in minutes, so a quarter of an hour of continuous
+    #: idle divergence is not a transient.
+    divergence_fault_s: float = 900.0
+    #: The CPU counts as idle while ``load1`` is at or below this (>= 0). Four cores,
+    #: so below 0.5 the daemon's own tick is the only load and the SoC's self-heating
+    #: is at its floor; above it the board's temperature says more about the CPU than
+    #: about the air, and the divergence rule is not evidence of anything.
+    idle_load1_max: float = 0.5
+    #: The temperatures averaged as the enclosure-air reference. Empty means
+    #: :func:`default_air_temps`: every ``zone_air`` sensor, else every ``inlet``
+    #: sensor, else every configured temperature. Name them here when the board sits
+    #: somewhere a different sensor describes better.
+    air_temps: tuple[str, ...] = ()
+    #: One log line for the board at most this often, seconds (> 0).
+    log_interval_s: float = 300.0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError(f"host_health.enabled must be true or false, got {self.enabled!r}")
+        _number("host_health.temp_limit_c", self.temp_limit_c, minimum=0.0, maximum=None)
+        _number("host_health.divergence_c", self.divergence_c, minimum=1e-9, maximum=None)
+        _number("host_health.idle_load1_max", self.idle_load1_max, minimum=0.0, maximum=None)
+        for name in ("temp_fault_s", "divergence_fault_s", "log_interval_s"):
+            _number(f"host_health.{name}", getattr(self, name), minimum=1e-9, maximum=None)
+        if isinstance(self.air_temps, str) or not isinstance(self.air_temps, list | tuple):
+            raise ConfigError(
+                f"host_health.air_temps must be a list of temperature names, got {self.air_temps!r}"
+            )
+        for name in self.air_temps:
+            if not isinstance(name, str) or not name:
+                raise ConfigError(
+                    f"host_health.air_temps entries must be non-empty strings, got {name!r}"
+                )
+        object.__setattr__(self, "air_temps", tuple(self.air_temps))
+
+    @classmethod
+    def from_section(cls, section: Mapping[str, Any] | None) -> HostHealthConfig:
+        """Build from the raw ``host_health:`` section; :class:`ConfigError` for an
+        unknown key or a bad value, the same rule every other section follows."""
+        raw = dict(section or {})
+        unknown = sorted(str(k) for k in raw if k not in HOSTHEALTH_KEYS)
+        if unknown:
+            raise ConfigError(
+                f"host_health: unknown key(s) {unknown}; allowed: {list(HOSTHEALTH_KEYS)}"
+            )
+        return cls(**raw)
+
+
+HOSTHEALTH_KEYS: tuple[str, ...] = tuple(f.name for f in dataclasses.fields(HostHealthConfig))
+
+
+def default_air_temps(cfg: Any) -> tuple[str, ...]:
+    """The enclosure-air reference when ``host_health.air_temps`` is empty.
+
+    Every ``zone_air`` sensor (the air the drives and the board actually sit in),
+    else every ``inlet`` sensor, else -- a legacy config, which declares no roles --
+    every configured temperature. The divergence rule is a hint either way, so a
+    rough reference is better than none.
+    """
+    temps = tuple(getattr(cfg, "temps", ()) or ())
+    sensors = getattr(cfg, "sensors", None) or {}
+    for role in ("zone_air", "inlet"):
+        named = tuple(t for t in temps if getattr(sensors.get(t), "role", None) == role)
+        if named:
+            return named
+    return temps
+
+
+class HostHealth:
+    """The board's own temperature and throttling, judged by three rules.
+
+    ``the board is hot``
+        Its temperature above ``temp_limit_c`` for ``temp_fault_s``. The board
+        throttles itself around 80 degC, and it is the first thing to notice when
+        the Pi ends up in hot exhaust.
+    ``the board is throttling``
+        Any of the *now* bits of ``get_throttled`` -- under-voltage, a capped ARM
+        frequency, hard throttling, the soft temperature limit
+        (:func:`aqua_bridge.hostinfo.decode_throttled`). Reported the tick it is
+        seen, with no window: the firmware has already latched the condition, and a
+        sustained window would only delay a fact. The latched *since boot* half is
+        published next to it but never warns on its own -- an under-voltage during
+        boot is history, not a live problem.
+    ``the board diverges from the enclosure air``
+        Its temperature further than ``divergence_c`` from the mean of the air
+        reference for ``divergence_fault_s``, **and only while the CPU is idle**
+        (``load1 <= idle_load1_max``): the board's reading is dominated by its own
+        self-heating, which moves with CPU load, so under load the divergence is
+        evidence of nothing. Any tick that is not idle, or carries no reading,
+        starts the window again. This rule is a **hint, not a verdict**: it says
+        that either the air sensors or the board's placement deserve a look, never
+        which.
+
+    None of this steers anything: the verdict is published (``/api/state``,
+    ``/api/health``, the MQTT state blob, the page) and logged, and never enters
+    ``PlantObservation`` or the ``diagnostics`` the solver reads.
+    """
+
+    def __init__(self, settings: HostHealthConfig, *, air_temps: Sequence[str] = ()) -> None:
+        self.settings = settings
+        self.air_temps: tuple[str, ...] = tuple(settings.air_temps or air_temps)
+        self._since: dict[str, float] = {}
+        self._logged_at: float | None = None
+
+    def _sustained(self, rule: str, deviating: bool, now: float) -> float | None:
+        """Seconds this rule has been deviating once past its window, else ``None``."""
+        if not deviating:
+            self._since.pop(rule, None)
+            return None
+        held = now - self._since.setdefault(rule, now)
+        window = {
+            "temp": self.settings.temp_fault_s,
+            "divergence": self.settings.divergence_fault_s,
+        }[rule]
+        return held if held >= window else None
+
+    def air_c(self, temps: Mapping[str, Any] | None) -> float | None:
+        """The reference air temperature: the mean of the readings that are there."""
+        values = [
+            float(temps[name])
+            for name in self.air_temps
+            if temps is not None and _finite(temps.get(name))
+        ]
+        return sum(values) / len(values) if values else None
+
+    def check(
+        self,
+        host: Mapping[str, Any] | None,
+        temps: Mapping[str, Any] | None,
+        now: float,
+    ) -> dict[str, Any]:
+        """One tick's verdict: the measurements plus a ``problems`` list and ``ok``."""
+        s = self.settings
+        info = host or {}
+        board = info.get("cpu_temp_c")
+        board_c = float(board) if _finite(board) else None
+        load = info.get("load1")
+        load1 = float(load) if _finite(load) else None
+        throttled = info.get("throttled")
+        throttled = dict(throttled) if isinstance(throttled, Mapping) else None
+        air = self.air_c(temps)
+        idle = None if load1 is None else load1 <= s.idle_load1_max
+        divergence = None if board_c is None or air is None else board_c - air
+        out: dict[str, Any] = {
+            "cpu_temp_c": board_c,
+            "air_c": air,
+            "air_temps": list(self.air_temps),
+            "divergence_c": divergence,
+            "load1": load1,
+            "idle": idle,
+            "throttled": throttled,
+            "problems": [],
+            "ok": True,
+        }
+        if not s.enabled:
+            return out
+
+        problems: list[str] = []
+        held = self._sustained("temp", board_c is not None and board_c > s.temp_limit_c, now)
+        if held is not None and board_c is not None:
+            problems.append(
+                f"host: the board reads {board_c:.1f} degC, above the "
+                f"{s.temp_limit_c:g} degC limit, for {held:.0f} s"
+            )
+
+        if throttled is not None and throttled.get("now"):
+            flags = [name for _, name in THROTTLED_BITS if throttled.get(f"{name}_now")]
+            problems.append(
+                f"host: the board is throttling now ({', '.join(flags) or 'unknown bit'}, "
+                f"get_throttled {throttled.get('hex')})"
+            )
+
+        diverging = idle is True and divergence is not None and abs(divergence) > s.divergence_c
+        held = self._sustained("divergence", diverging, now)
+        if held is not None and divergence is not None and air is not None:
+            problems.append(
+                f"host: the board is {divergence:+.1f} degC from the enclosure air "
+                f"({air:.1f} degC) at idle, beyond {s.divergence_c:g} degC, for {held:.0f} s "
+                f"-- a hint about the air sensors or the board's placement, not a verdict"
+            )
+
+        out["problems"] = problems
+        out["ok"] = not problems
+        self._log(problems, now)
+        return out
+
+    def _log(self, problems: list[str], now: float) -> None:
+        """One warning for the board, rate limited to ``log_interval_s``."""
+        if not problems:
+            return
+        if self._logged_at is not None and now - self._logged_at < self.settings.log_interval_s:
+            return
+        self._logged_at = now
+        for text in problems:
+            _LOG.warning("host health: %s (PROJECT.md section 8 item 97)", text)
+
+
 @dataclass
 class _ChannelState:
     """What one channel's rules need to remember between ticks."""
@@ -250,6 +515,13 @@ class HealthMonitor:
     contributes none. ``publish`` is called with the merged payload every tick --
     ``Supervisor.set_device_health`` in the daemon.
 
+    ``hostinfo`` is the host-metrics reader the board's own rules judge
+    (:class:`HostHealth`, item 97): a
+    :class:`~aqua_bridge.hostinfo.CachedHostInfo` bound to ``host.interval_s`` in
+    the daemon, ``None`` in a test or a run that wants no host health. Its verdict
+    is the payload's ``host`` key and its problems join the payload's ``problems``,
+    so the one ``ok`` a Home Assistant problem sensor reads covers the board too.
+
     :meth:`on_tick` never raises: the loop isolates it anyway, and a diagnostics
     bug must not cost a tick.
     """
@@ -262,6 +534,8 @@ class HealthMonitor:
         source: Any = None,
         publish: Callable[[dict[str, Any]], None] | None = None,
         clock: Callable[[], float] | None = None,
+        host_settings: HostHealthConfig | None = None,
+        hostinfo: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self.cfg = cfg
         self.settings = settings
@@ -270,7 +544,21 @@ class HealthMonitor:
         self._clock = clock
         self._channels: dict[str, _ChannelState] = {}
         self._tick = 0
-        self.last: dict[str, Any] = {"devices": [], "fans": {}, "problems": [], "ok": True}
+        self.host_settings = host_settings or HostHealthConfig()
+        unknown = sorted(set(self.host_settings.air_temps) - set(getattr(cfg, "temps", ()) or ()))
+        if unknown:
+            raise ConfigError(
+                f"host_health.air_temps names temperature(s) {unknown} that are not in mpc.temps"
+            )
+        self.host = HostHealth(self.host_settings, air_temps=default_air_temps(cfg))
+        self._hostinfo = hostinfo
+        self.last: dict[str, Any] = {
+            "devices": [],
+            "fans": {},
+            "host": {},
+            "problems": [],
+            "ok": True,
+        }
 
     # -- the rules ---------------------------------------------------------
 
@@ -425,7 +713,14 @@ class HealthMonitor:
 
     # -- the tick ----------------------------------------------------------
 
-    def update(self, readings: Mapping[str, Any], now: float) -> dict[str, Any]:
+    def update(
+        self,
+        readings: Mapping[str, Any],
+        now: float,
+        *,
+        host: Mapping[str, Any] | None = None,
+        temps: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Run the rules over one tick's readings and merge in the device health.
 
         One call is one tick, whatever it carries: a tick a channel is missing from
@@ -433,6 +728,11 @@ class HealthMonitor:
         aquabus slot went away) is a gap in that channel's evidence, and every window
         of it starts again on the next live reading. Without that, an outage's wall
         time would count towards a ``*_fault_s`` nothing measured during it.
+
+        ``host`` is the tick's host metrics (:func:`aqua_bridge.hostinfo.collect_hostinfo`)
+        and ``temps`` the observation's temperatures, the two the board's own rules
+        need (item 97). They are judged and published here and nowhere else: neither
+        reaches ``PlantObservation`` or the solver's ``diagnostics``.
         """
         self._tick += 1
         fans: dict[str, Any] = {}
@@ -451,10 +751,12 @@ class HealthMonitor:
                 problems.extend(verdict["problems"])
                 self._log(channel, verdict["problems"], now)
         devices = self.device_health()
+        board = self.host.check(host, temps, now)
         payload = {
             "devices": devices["devices"],
             "fans": fans,
-            "problems": [*devices["problems"], *problems],
+            "host": board,
+            "problems": [*devices["problems"], *problems, *board["problems"]],
         }
         payload["ok"] = not payload["problems"]
         self.last = payload
@@ -509,11 +811,29 @@ class HealthMonitor:
             inputs = getattr(obs, "inputs", None) or {}
             readings = inputs.get("fans") or {}
             now = self._now(obs)
-            payload = self.update(readings, now)
+            host = self._read_hostinfo()
+            temps = getattr(obs, "temps", None)
+            payload = self.update(readings, now, host=host, temps=temps)
             if self.publish is not None:
                 self.publish(payload)
         except Exception:
             _LOG.exception("fan health: this tick was not evaluated")
+
+    def _read_hostinfo(self) -> Mapping[str, Any] | None:
+        """This tick's host metrics, or ``None`` without a reader or after a failure.
+
+        The reader is a :class:`~aqua_bridge.hostinfo.CachedHostInfo` in the daemon,
+        so a tick shorter than ``host.interval_s`` costs no ``/proc`` or ``/sys``
+        read at all. A failure leaves the board's rules with nothing to judge this
+        tick, which is exactly what they do with a missing reading anyway.
+        """
+        if self._hostinfo is None:
+            return None
+        try:
+            return self._hostinfo()
+        except Exception:  # the reader promises not to raise; belt and braces
+            _LOG.exception("host health: the host metrics reader failed")
+            return None
 
     def _now(self, obs: Any) -> float:
         if self._clock is not None:

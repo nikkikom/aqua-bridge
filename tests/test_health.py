@@ -1,4 +1,5 @@
-"""Fan-health drift rules and device health (PROJECT.md section 8 items 79, 83).
+"""Fan health, device health and the board's own health (PROJECT.md section 8 items
+79, 83 and 97).
 
 The readings the rules judge come from the captured status reports in
 ``tests/fixtures/aquacomputer/``, decoded by the real adapter against the real
@@ -17,7 +18,17 @@ from typing import Any
 import pytest
 
 from aqua_bridge.config import load_config
-from aqua_bridge.health import FANHEALTH_KEYS, FanHealthConfig, HealthMonitor, expected_rpm
+from aqua_bridge.health import (
+    FANHEALTH_KEYS,
+    HOSTHEALTH_KEYS,
+    FanHealthConfig,
+    HealthMonitor,
+    HostHealth,
+    HostHealthConfig,
+    default_air_temps,
+    expected_rpm,
+)
+from aqua_bridge.hostinfo import decode_throttled
 from aqua_bridge.hw.aquacomputer import AQUAERO, QUADRO, decode_status
 from aqua_bridge.model import ConfigError, FanModel, FanSpec, MpcConfig, PlantObservation
 from aquacomputer_fakes import fixture_bytes
@@ -361,6 +372,7 @@ def test_on_tick_without_a_device_health_source_still_publishes_the_fan_verdicts
     assert published[-1] == {
         "devices": [],
         "fans": published[-1]["fans"],
+        "host": published[-1]["host"],
         "problems": [],
         "ok": True,
     }
@@ -397,7 +409,14 @@ def test_a_single_controller_source_is_published_as_one_device() -> None:
 
 def test_a_source_answering_with_neither_shape_contributes_nothing() -> None:
     mon = HealthMonitor(_cfg(), FanHealthConfig(), source=_FakeSource({}))
-    assert mon.update({}, 0.0) == {"devices": [], "fans": {}, "problems": [], "ok": True}
+    payload = mon.update({}, 0.0)
+    assert payload == {
+        "devices": [],
+        "fans": {},
+        "host": payload["host"],
+        "problems": [],
+        "ok": True,
+    }
 
 
 def test_disabled_still_publishes_device_health_but_runs_no_rule() -> None:
@@ -467,6 +486,286 @@ def test_the_captured_rails_sit_inside_the_default_window() -> None:
                 assert defaults.rail_min_v <= fan.voltage_v <= defaults.rail_max_v, name
 
 
+# --- the board itself (item 97) ---------------------------------------------------------
+
+
+def test_every_host_threshold_is_a_key_with_one_default() -> None:
+    """Item 97's thresholds are config keys, declared once in HostHealthConfig."""
+    defaults = HostHealthConfig()
+    assert set(HOSTHEALTH_KEYS) == {
+        "enabled",
+        "temp_limit_c",
+        "temp_fault_s",
+        "divergence_c",
+        "divergence_fault_s",
+        "idle_load1_max",
+        "air_temps",
+        "log_interval_s",
+    }
+    assert defaults.enabled is True and defaults.air_temps == ()
+    assert defaults.temp_limit_c == 75.0 and defaults.divergence_c == 25.0
+    assert HostHealthConfig.from_section(None) == defaults
+    assert HostHealthConfig.from_section({}) == defaults
+
+
+def test_host_from_section_overrides_and_keeps_the_other_defaults() -> None:
+    settings = HostHealthConfig.from_section({"temp_limit_c": 70.0, "air_temps": ["inlet_a"]})
+    assert settings.temp_limit_c == 70.0 and settings.air_temps == ("inlet_a",)
+    assert settings.divergence_c == HostHealthConfig().divergence_c
+
+
+@pytest.mark.parametrize(
+    ("section", "match"),
+    [
+        ({"temp_limit": 70}, r"unknown key\(s\) \['temp_limit'\]"),
+        ({"enabled": "true"}, "host_health.enabled must be true or false"),
+        ({"temp_limit_c": "70"}, "host_health.temp_limit_c must be a number"),
+        ({"temp_fault_s": 0}, "host_health.temp_fault_s must be >="),
+        ({"divergence_c": 0}, "host_health.divergence_c must be >="),
+        ({"idle_load1_max": -1.0}, "host_health.idle_load1_max must be >="),
+        ({"divergence_fault_s": float("nan")}, "host_health.divergence_fault_s must be finite"),
+        ({"air_temps": "inlet_a"}, "host_health.air_temps must be a list"),
+        ({"air_temps": [""]}, "air_temps entries must be non-empty strings"),
+        ({"air_temps": [3]}, "air_temps entries must be non-empty strings"),
+    ],
+)
+def test_a_bad_host_health_key_is_a_config_error(section: dict[str, Any], match: str) -> None:
+    with pytest.raises(ConfigError, match=match):
+        HostHealthConfig.from_section(section)
+
+
+def test_air_temps_naming_an_unknown_temperature_is_a_config_error(
+    das_example_cfg: MpcConfig,
+) -> None:
+    with pytest.raises(ConfigError, match="air_temps names temperature"):
+        HealthMonitor(
+            das_example_cfg,
+            FanHealthConfig(),
+            host_settings=HostHealthConfig(air_temps=("nowhere",)),
+        )
+
+
+def test_default_air_temps_prefers_the_zone_air_sensors(das_example_cfg: MpcConfig) -> None:
+    """The air the drives and the board sit in, not the intake and not a bay probe."""
+    names = default_air_temps(das_example_cfg)
+    assert names, "the DAS example config has zone_air sensors"
+    assert all(das_example_cfg.sensors[n].role == "zone_air" for n in names)
+
+
+def test_default_air_temps_falls_back_to_inlet_then_to_every_temperature(
+    das_example_cfg: MpcConfig, cfg: MpcConfig
+) -> None:
+    keep = tuple(t for t in das_example_cfg.temps if das_example_cfg.sensors[t].role != "zone_air")
+
+    class _NoZoneAir:  # the same config with its zone-air sensors left out
+        temps = keep
+        sensors = {t: das_example_cfg.sensors[t] for t in keep}
+
+    inlets = default_air_temps(_NoZoneAir())
+    assert inlets and all(das_example_cfg.sensors[n].role == "inlet" for n in inlets)
+    # a legacy config declares no roles at all: every configured temperature
+    assert default_air_temps(cfg) == cfg.temps
+
+
+def _host_info(**over: Any) -> dict[str, Any]:
+    """The board at the idle the owner measured: 47.2 degC, nothing throttling."""
+    base: dict[str, Any] = {"cpu_temp_c": 47.2, "load1": 0.1, "throttled": decode_throttled(0)}
+    base.update(over)
+    return base
+
+
+def _board(settings: HostHealthConfig | None = None) -> HostHealth:
+    return HostHealth(settings or HostHealthConfig(), air_temps=("air_z1", "air_z2"))
+
+
+def test_an_idle_board_next_to_the_air_has_no_problem() -> None:
+    board = _board()
+    verdict = board.check(_host_info(), {"air_z1": 27.0, "air_z2": 29.0}, 0.0)
+    assert verdict["ok"] is True and verdict["problems"] == []
+    assert verdict["air_c"] == pytest.approx(28.0)
+    assert verdict["divergence_c"] == pytest.approx(19.2)
+    assert verdict["idle"] is True
+
+
+def test_a_hot_board_is_reported_only_after_temp_fault_s_and_clears() -> None:
+    board = _board(HostHealthConfig(temp_limit_c=75.0, temp_fault_s=120.0))
+    hot = _host_info(cpu_temp_c=82.0)
+    assert board.check(hot, {}, 0.0)["problems"] == []
+    assert board.check(hot, {}, 119.0)["problems"] == []
+    problems = board.check(hot, {}, 120.0)["problems"]
+    assert len(problems) == 1 and "82.0 degC, above the 75 degC limit" in problems[0]
+    # back under the limit: the window is forgotten, not merely paused
+    assert board.check(_host_info(), {}, 121.0)["problems"] == []
+    assert board.check(hot, {}, 240.0)["problems"] == []
+
+
+def test_a_missing_board_temperature_never_fires_the_temperature_rule() -> None:
+    board = _board(HostHealthConfig(temp_fault_s=1.0))
+    verdict = board.check(_host_info(cpu_temp_c=None), {}, 0.0)
+    assert verdict["cpu_temp_c"] is None
+    assert board.check(_host_info(cpu_temp_c=None), {}, 1000.0)["problems"] == []
+
+
+def test_throttling_now_is_reported_the_tick_it_is_seen_and_clears() -> None:
+    """The firmware has already latched it; a sustained window would only delay a fact."""
+    board = _board()
+    verdict = board.check(_host_info(throttled=decode_throttled(0x4)), {}, 0.0)
+    assert len(verdict["problems"]) == 1
+    assert "throttling now (throttled" in verdict["problems"][0]
+    assert verdict["ok"] is False
+    assert board.check(_host_info(), {}, 1.0)["problems"] == []
+
+
+def test_the_since_boot_half_alone_never_warns() -> None:
+    """An under-voltage during boot is history, published but not a live problem."""
+    board = _board()
+    verdict = board.check(_host_info(throttled=decode_throttled(0x50000)), {}, 0.0)
+    assert verdict["problems"] == [] and verdict["ok"] is True
+    assert verdict["throttled"]["under_voltage_since_boot"] is True
+
+
+def test_an_unreadable_throttled_word_never_fires_the_rule() -> None:
+    board = _board()
+    verdict = board.check(_host_info(throttled=None), {}, 0.0)
+    assert verdict["throttled"] is None and verdict["problems"] == []
+
+
+def test_a_divergence_at_idle_is_reported_after_divergence_fault_s_and_clears() -> None:
+    board = _board()  # the defaults: 25 degC for 900 s
+    far = _host_info(cpu_temp_c=70.0)  # 44 degC above the air, idle
+    air = {"air_z1": 26.0, "air_z2": 26.0}
+    assert board.check(far, air, 0.0)["problems"] == []
+    assert board.check(far, air, 899.0)["problems"] == []
+    problems = board.check(far, air, 900.0)["problems"]
+    assert len(problems) == 1 and "hint about the air sensors" in problems[0]
+    assert "not a verdict" in problems[0]
+    assert board.check(_host_info(), air, 901.0)["problems"] == []
+
+
+def test_the_divergence_rule_is_judged_on_the_absolute_difference() -> None:
+    """Air reading above the board is evidence too -- of the sensor, most likely."""
+    board = _board(HostHealthConfig(divergence_fault_s=1.0))
+    air = {"air_z1": 90.0, "air_z2": 90.0}
+    board.check(_host_info(), air, 0.0)
+    verdict = board.check(_host_info(), air, 1.0)
+    assert verdict["divergence_c"] == pytest.approx(-42.8)
+    assert (
+        len(verdict["problems"]) == 1
+        and "-42.8 degC from the enclosure air" in (verdict["problems"][0])
+    )
+
+
+def test_a_busy_cpu_gates_the_divergence_rule_entirely() -> None:
+    """The board's reading is dominated by its own self-heating, which moves with load."""
+    board = _board(HostHealthConfig(divergence_fault_s=1.0, idle_load1_max=0.5))
+    air = {"air_z1": 26.0, "air_z2": 26.0}
+    busy = _host_info(cpu_temp_c=70.0, load1=2.0)
+    for t in (0.0, 10.0, 1000.0):
+        verdict = board.check(busy, air, t)
+        assert verdict["idle"] is False and verdict["problems"] == []
+    # and a busy tick in the middle starts the window again
+    idle = _host_info(cpu_temp_c=70.0)
+    board.check(idle, air, 1001.0)
+    board.check(busy, air, 1002.0)
+    assert board.check(idle, air, 1003.0)["problems"] == []
+    assert len(board.check(idle, air, 1004.0)["problems"]) == 1
+
+
+def test_an_unknown_load_average_gates_the_divergence_rule() -> None:
+    board = _board(HostHealthConfig(divergence_fault_s=0.001))
+    air = {"air_z1": 26.0, "air_z2": 26.0}
+    verdict = board.check(_host_info(cpu_temp_c=70.0, load1=None), air, 0.0)
+    assert verdict["idle"] is None and verdict["problems"] == []
+
+
+def test_without_an_air_reading_the_divergence_rule_is_off() -> None:
+    board = _board(HostHealthConfig(divergence_fault_s=0.001))
+    verdict = board.check(_host_info(cpu_temp_c=70.0), {"somewhere_else": 26.0}, 0.0)
+    assert verdict["air_c"] is None and verdict["divergence_c"] is None
+    assert board.check(_host_info(cpu_temp_c=70.0), {}, 10.0)["problems"] == []
+
+
+def test_air_temps_from_the_config_override_the_default_reference() -> None:
+    settings = HostHealthConfig(air_temps=("air_z3",))
+    board = HostHealth(settings, air_temps=("air_z1",))
+    assert board.air_temps == ("air_z3",)
+    assert board.check(_host_info(), {"air_z1": 5.0, "air_z3": 30.0}, 0.0)["air_c"] == 30.0
+
+
+def test_host_health_disabled_still_publishes_the_numbers_but_runs_no_rule() -> None:
+    board = _board(HostHealthConfig(enabled=False, temp_fault_s=0.001))
+    verdict = board.check(_host_info(cpu_temp_c=95.0, throttled=decode_throttled(0x7)), {}, 10.0)
+    assert verdict["cpu_temp_c"] == 95.0 and verdict["throttled"]["throttled_now"] is True
+    assert verdict["problems"] == [] and verdict["ok"] is True
+
+
+def test_a_repeated_board_problem_is_logged_at_most_once_per_log_interval_s(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    board = _board(HostHealthConfig(log_interval_s=300.0))
+    hot = _host_info(throttled=decode_throttled(0x4))
+    with caplog.at_level(logging.WARNING, logger="aqua_bridge.health"):
+        for t in (0.0, 10.0, 20.0, 400.0):
+            board.check(hot, {}, t)
+    lines = [r for r in caplog.records if "host health" in r.getMessage()]
+    assert len(lines) == 2
+    assert "item 97" in lines[0].getMessage()
+
+
+def test_on_tick_publishes_the_board_verdict_next_to_the_fans() -> None:
+    """The host verdict rides the same payload, and its problems join the same list."""
+    published: list[dict[str, Any]] = []
+    mon = HealthMonitor(
+        _cfg(),
+        FanHealthConfig(),
+        publish=published.append,
+        host_settings=HostHealthConfig(temp_fault_s=0.001),
+        hostinfo=lambda: _host_info(cpu_temp_c=88.0),
+    )
+    obs = PlantObservation(temps={"air_z1": 26.0}, rpm={}, pwm={}, ts=0.0, inputs={})
+    mon.on_tick(_tick(obs))
+    mon.on_tick(_tick(PlantObservation(temps={"air_z1": 26.0}, rpm={}, pwm={}, ts=5.0, inputs={})))
+    payload = published[-1]
+    assert payload["host"]["cpu_temp_c"] == 88.0
+    assert payload["host"]["ok"] is False
+    assert payload["problems"] == payload["host"]["problems"]
+    assert payload["ok"] is False
+
+
+def test_on_tick_without_a_hostinfo_reader_publishes_an_empty_board_verdict() -> None:
+    published: list[dict[str, Any]] = []
+    mon = HealthMonitor(_cfg(), FanHealthConfig(), publish=published.append)
+    mon.on_tick(_tick(PlantObservation(temps={}, rpm={}, pwm={}, ts=0.0, inputs={})))
+    host = published[-1]["host"]
+    assert host["cpu_temp_c"] is None and host["throttled"] is None and host["ok"] is True
+
+
+def test_on_tick_survives_a_hostinfo_reader_that_raises() -> None:
+    def boom() -> dict[str, Any]:
+        raise RuntimeError("no /proc here")
+
+    published: list[dict[str, Any]] = []
+    mon = HealthMonitor(_cfg(), FanHealthConfig(), publish=published.append, hostinfo=boom)
+    mon.on_tick(_tick(PlantObservation(temps={}, rpm={}, pwm={}, ts=0.0, inputs={})))
+    assert published[-1]["host"]["cpu_temp_c"] is None
+
+
+def test_the_board_never_reaches_the_observation_or_the_solver_diagnostics() -> None:
+    """Item 97: a health signal, never a model input. The observation the monitor was
+    given must come back untouched, and nothing the board reports may be in it."""
+    obs = PlantObservation(temps={"air_z1": 26.0}, rpm={}, pwm={}, ts=0.0, inputs={})
+    before = obs.to_dict()
+    mon = HealthMonitor(
+        _cfg(),
+        FanHealthConfig(),
+        host_settings=HostHealthConfig(temp_fault_s=0.001),
+        hostinfo=lambda: _host_info(cpu_temp_c=95.0),
+    )
+    mon.on_tick(_tick(obs))
+    assert obs.to_dict() == before
+    assert "cpu_temp_c" not in obs.temps and "host" not in obs.inputs
+
+
 # --- the example configs --------------------------------------------------------------
 
 
@@ -478,3 +777,6 @@ def test_both_example_configs_show_every_key_at_its_default(name: str) -> None:
     section = app.section("fan_health")
     assert set(section) == set(FANHEALTH_KEYS), name
     assert FanHealthConfig.from_section(section) == FanHealthConfig(), name
+    host_section = app.section("host_health")
+    assert set(host_section) == set(HOSTHEALTH_KEYS), name
+    assert HostHealthConfig.from_section(host_section) == HostHealthConfig(), name
