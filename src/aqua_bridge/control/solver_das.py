@@ -145,7 +145,9 @@ On every solve tick the model must pass (:func:`check_model`):
 * the **air disturbance** ``max_z |d_air,z - d_air,z(slow)| <=
   model_max_air_dist_c_per_min`` over the zones of the constrained bays: the estimator's
   per-zone air disturbance against its own slow level (``model_air_dist_tau_s``), the one
-  piece of evidence about the fan gains ``E`` (below).
+  piece of evidence about the fan gains ``E`` (below). This limit is the only one
+  ``model_return_factor`` does not scale: it is a move, not a level, and asking the
+  enclosure to be twice as steady to come back only delays the return.
 
 Bays within ``estimator.bay_settle_s`` of an occupancy change are left out of the last
 three checks (a hot swap's transient is real, not a model error), and so are bays within
@@ -177,7 +179,12 @@ minutes and tripped the entry on the drives' physical warm-up right after ``bay_
 on the ``rich`` simulator (section 8 item 65), the relative one does neither. A model whose
 equilibrium is wrong (bay gains off by 2x) keeps its drift while the drives settle and
 fails the relative check as well, so it still enters the fallback and stays there.
-``checks`` reports both rates' worst difference and the plain drift
+
+The **return** compares the model's rate as it is against the filtered observed rate,
+which is the form section 8 item 10 measured: while the PI-like DAS form regulates, the
+model's rate is not answering a move of its own, and filtering it as well only lags the
+return (540 s against the documented 320 s bound on several ``rich`` seeds). ``checks``
+reports the entry's drift, the return's (``drift_return_c_per_min``) and the plain one
 (``drift_abs_c_per_min``).
 
 Neither check sees the fan gains ``E``: they act on the air node, whose model the
@@ -965,7 +972,9 @@ def check_model(
     checks["max_drift_c_per_min"] = max_drift
     if drift_c_per_min is not None and drift_c_per_min > max_drift:
         reasons.append(f"drift:{drift_c_per_min:.3g}")
-    max_air = cfg.model_max_air_dist_c_per_min * relax
+    # the air disturbance is a move, not a level: scaling it on the return would ask the
+    # enclosure to be steadier than the entry needs, and the entry dwell is the hysteresis
+    max_air = cfg.model_max_air_dist_c_per_min
     checks["air_dist_c_per_min"] = air_dist_c_per_min
     checks["max_air_dist_c_per_min"] = max_air
     if air_dist_c_per_min is not None and air_dist_c_per_min > max_air:
@@ -1173,6 +1182,7 @@ class _Model:
     x0: np.ndarray | None = None
     drift: float | None = None
     drift_rel: float | None = None
+    drift_return: float | None = None
     rate: dict[str, float] = field(default_factory=dict)
     air_dist: float | None = None
     zones_checked: tuple[str, ...] = ()
@@ -1527,6 +1537,11 @@ class DasMpcSolver:
         model.drift_rel = max(
             (abs(v - observed.get(b, 0.0)) for b, v in filtered.items()), default=None
         )
+        # the return compares the model's rate as it is, which is what item 10 measured:
+        # while the fallback regulates, the model's rate is not answering its own move
+        model.drift_return = max(
+            (abs(v - observed.get(b, 0.0)) for b, v in model.rate.items()), default=None
+        )
         slow = mem["dslow"]["d"]
         model.air_dist = max(
             (
@@ -1709,7 +1724,7 @@ class DasMpcSolver:
             pred=model.pred,
             rows=model.rows,
             pred_err_c=err,
-            drift_c_per_min=model.drift_rel,
+            drift_c_per_min=model.drift_return if in_fallback else model.drift_rel,
             air_dist_c_per_min=model.air_dist,
             relax=cfg.model_return_factor if in_fallback else 1.0,
             error=model.error,
@@ -1723,6 +1738,7 @@ class DasMpcSolver:
         checks["cache_hit"] = model.hit
         checks["drift_abs_c_per_min"] = model.drift
         checks["drift_rel_c_per_min"] = model.drift_rel
+        checks["drift_return_c_per_min"] = model.drift_return
         checks["drift_since_ts"] = mem["drift_since"]
         mem["checks"] = checks
         mem["status"] = model.status
