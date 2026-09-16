@@ -4430,15 +4430,27 @@ Owner decision (2026-09-16):
     store, since `save()` persists whatever the control report holds *now*
     and this tool changes nothing about it first -- and, only with `--save`
     and a typed confirmation (the flag alone never saves), calls
-    `AquacomputerAdapter.save()` once. Refuses while `systemctl is-active
-    <unit>` (default `aqua-bridge.service`) answers active, activating or
-    reloading, or cannot be determined at all (a missing `systemctl`, a
-    timeout, an unrecognised answer): undeterminable fails closed, the same
-    as running. Names the Quadro's save report as unverified (item 86)
-    before asking to send it. `AquacomputerAdapter.control_snapshot()`
-    (new: a control-report GET that adopts the result like `apply()` does,
-    writing nothing) is what reads the report to show. Fake-transport
-    tests only (`tests/test_aquacomputer_commission.py`,
+    `AquacomputerAdapter.save()` once. What is saved is what was shown: the
+    device stays open for the whole run and the control report is read once
+    more right before the save, since the controller can change while the
+    prompt waits (the heartbeat times out, the alarm selects another
+    profile, and a profile switch reloads *that* profile's saved settings;
+    aquasuite; the front panel). A report that no longer matches the one
+    printed aborts the run with exit 6 and saves nothing. Refuses unless
+    `systemctl is-active <unit>` (default `aqua-bridge.service`) answers
+    `inactive` or `failed`; every other answer counts as running --
+    `active`, `activating`, `reloading`, `deactivating` (a `systemctl stop`
+    returns while the daemon's own `fallback_pwm` write and its `release()`
+    SET are still in flight) and anything undeterminable (a missing
+    `systemctl`, a timeout, a blank or unrecognised answer). Names the
+    Quadro's save report as unverified (item 86) before asking to send it.
+    `AquacomputerAdapter.control_snapshot()` (new: a control-report GET
+    that adopts the result like `apply()` does, writing nothing) is what
+    reads the report, both times. The per-output line is formatted by
+    `hw.aquacomputer.format_channel_state()` (new, with
+    `format_percent()`), shared with `tools/aquacomputer_probe.py` so the
+    two tools cannot drift apart. Fake-transport tests only
+    (`tests/test_aquacomputer_commission.py`,
     `tests/test_hw_aquacomputer_adapter.py`); confirming the Quadro's save
     persists over a power cycle on the hardware is item 96.
 90. **Done** (2026-09-16): an aquabus output or tachometer with nothing
