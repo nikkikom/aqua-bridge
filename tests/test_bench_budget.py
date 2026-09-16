@@ -339,3 +339,28 @@ def test_bench_tool_runs_both_das_solvers_on_the_das_plant(capsys):
     assert mpc["model_active_fraction"] == 1.0 and mpc["solve_ticks"] >= 6
     assert mpc["budget_ms"] == cfg.budget_ms and report["results"]["pi"]["solve_ticks"] == 0
     assert mpc["budget_alarm_ms"] == cfg.budget_alarm_ms
+
+
+def test_bench_tool_reports_the_sim_preset_it_actually_ran(capsys):
+    """Item 28: ``plant.preset`` names the preset ``--sim-preset`` selected, not a
+    literal ``"basic"`` regardless of it."""
+    spec = importlib.util.spec_from_file_location(
+        "bench_step", REPO_ROOT / "tools" / "bench_step.py"
+    )
+    assert spec is not None and spec.loader is not None
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+
+    assert tool.main(["--sim-plant", "das", "--ticks", "6"]) == 0
+    assert json.loads(capsys.readouterr().out)["plant"]["preset"] == "basic"
+
+    assert tool.main(["--sim-plant", "das", "--ticks", "6", "--sim-preset", "rich"]) == 0
+    assert json.loads(capsys.readouterr().out)["plant"]["preset"] == "rich"
+
+    with pytest.raises(SystemExit):
+        tool.main(["--sim-plant", "das", "--ticks", "6", "--sim-preset", "bogus"])
+    assert "--sim-preset must be one of" in capsys.readouterr().err
+
+    # basic: --sim-preset is unused and never validated
+    assert tool.main(["--sim-plant", "basic", "--ticks", "6", "--sim-preset", "bogus"]) == 0
+    assert "preset" not in json.loads(capsys.readouterr().out)["plant"]
