@@ -47,8 +47,10 @@ malformed body, an unknown group or channel or a legacy config, 409 when
 ``ident_enabled`` is false, an experiment already runs or a precondition fails
 (the body's ``error`` names every failed precondition, e.g. ``settle:z1``,
 ``mode:degraded``, ``start_band:b03``). Its status (``ControlSnapshot.extra["experiment"]``:
-running, target, phase, level, elapsed and remaining seconds, the last result and
-abort reason) is in ``GET /api/model`` under ``experiment`` and in the MQTT state blob.
+running, target, phase, level, the base at the start, the anchor the levels are drawn
+around now (``plan_base``) with ``levels`` and ``replan``, elapsed and remaining seconds,
+the last result and abort reason) is in ``GET /api/model`` under ``experiment`` and in
+the MQTT state blob.
 
 DAS views (plan sections 1 and 7), read from the snapshot, never computed here:
 
