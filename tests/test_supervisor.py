@@ -626,6 +626,48 @@ def test_a_manual_calibration_aborts_a_running_experiment_like_any_other_intent(
     assert status["last_abort_reason"] == "human_intent:calibrate"
 
 
+def test_a_refused_calibration_leaves_a_running_experiment_alone():
+    """A calibration is the one command a human types off a thermometer display, so
+    the refusals are the likely case: a missing decimal point must not cost a
+    twenty-minute identification run. The checks run before the experiment is."""
+    from aqua_bridge.control.intents import Ident
+
+    rig = _cal_rig()
+    refused = (
+        Calibrate(bay="nope", drive_temp_c=41.0),  # unknown bay
+        Calibrate(bay="a1", drive_temp_c=450.0),  # 45.0 with the point missed
+        Calibrate(bay="c1", drive_temp_c=41.0),  # declared empty in the fixture
+    )
+    for intent in refused:
+        rig.sup.submit(Ident("start", group="front"))
+        assert rig.sup.snapshot().extra["experiment"]["running"] is True
+        with pytest.raises((IntentInvalid, IntentConflict)):
+            rig.sup.submit(intent)
+        status = rig.sup.snapshot().extra["experiment"]
+        assert status["running"] is True
+        assert status["last_abort_reason"] != "human_intent:calibrate"
+        assert rig.sup.plan_tick().calibrations == {}  # and nothing was recorded
+        rig.sup.submit(Ident("stop"))
+
+
+def test_a_reading_is_held_back_while_its_zone_is_no_longer_trusted():
+    """The refusals of section 6 are re-read on every tick that offers the reading:
+    a zone that loses the gate's trust between submit and absorption would otherwise
+    get its map fitted against a predicted, not measured, sensor value."""
+    rig = _cal_rig()
+    rig.sup.submit(Calibrate(bay="b1", drive_temp_c=41.0))
+    stamp = rig.t
+    assert rig.sup.plan_tick().calibrations == {"b1": {"temp_c": 41.0, "ts": stamp}}
+    rig.drop = ("air_b", "prox_b1")  # zone zb loses every sensor of bay b1
+    rig.ticks(6)
+    assert rig.sup.snapshot().last_cmd.diagnostics["zones"]["zb"]["trusted"] is False
+    assert rig.sup.plan_tick().calibrations == {}  # held back, not absorbed
+    rig.drop = ()
+    rig.ticks(6)
+    assert rig.sup.snapshot().last_cmd.diagnostics["zones"]["zb"]["trusted"] is True
+    assert rig.sup.plan_tick().calibrations == {"b1": {"temp_c": 41.0, "ts": stamp}}
+
+
 def test_a_legacy_supervisor_refuses_a_calibration(sup):
     with pytest.raises(IntentInvalid, match="DAS"):
         sup.submit(Calibrate(bay="b03", drive_temp_c=41.0))

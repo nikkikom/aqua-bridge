@@ -40,16 +40,22 @@ Rules (section 6 "Control", section 4.8, section 5 "Modes")
   temperature measured with a handheld thermometer for one bay -- the stand-in for
   SMART on an enclosure whose drives no agent can read. The bay must exist
   (:class:`IntentInvalid`) and ``drive_temp_c`` must lie in
-  ``[estimator.calibrate_min_c, estimator.calibrate_max_c]`` (:class:`IntentInvalid`);
-  the reading is refused as meaningless or unsafe (:class:`IntentConflict`, naming the
-  bay and the reason) before the first tick, when the bay holds no drive, and when the
-  bay's zone is untrusted or in fault -- a map fitted to a reading the gate does not
-  believe would quietly bias every later estimate of that bay, and the estimate is what
-  decides how hard the fans run. An accepted reading is kept for
-  ``estimator.smart_max_age_s`` (the SMART staleness rule) and handed to the loop in
-  :attr:`TickPlan.calibrations`, which merges it into
+  :attr:`MpcConfig.calibrate_range` -- ``[estimator.calibrate_min_c,
+  estimator.calibrate_max_c]`` narrowed to the gate's ``temp_min_c`` / ``temp_max_c``
+  (:class:`IntentInvalid`); the reading is refused as meaningless or unsafe
+  (:class:`IntentConflict`, naming the bay and the reason) before the first tick, when
+  the bay holds no drive, and when the bay's zone is untrusted or in fault -- a map
+  fitted to a reading the gate does not believe would quietly bias every later estimate
+  of that bay, and the estimate is what decides how hard the fans run. All of it is
+  checked *before* a running identification experiment is ended, so a refused reading
+  costs no experiment; an accepted one aborts it like every other human intent. An
+  accepted reading is kept for ``estimator.smart_max_age_s`` (the SMART staleness rule)
+  and handed to the loop in :attr:`TickPlan.calibrations`, which merges it into
   ``PlantObservation.inputs["calibration"]``; the estimator then treats it exactly like
-  a SMART sample of that bay. A second reading for the same bay replaces the first.
+  a SMART sample of that bay -- one of the 20 fresh samples an accepted calibration
+  needs, not a calibration on its own. The refusals are re-checked on every tick that
+  offers it, so a reading whose zone has lost the gate's trust meanwhile is held back
+  until it goes stale. A second reading for the same bay replaces the first.
 * ``SetMode(auto)`` clears every override. ``SetMode(manual)`` gives every
   channel without an override one, seeded from the last applied PWM (or
   ``fallback_pwm`` before anything was applied) so entering manual does
@@ -599,6 +605,11 @@ class Supervisor:
             if isinstance(intent, Ident):
                 self._ident(intent)
                 return
+            # A calibration is checked before the experiment is touched: it is the one
+            # command whose payload a human copies off a thermometer display, so a
+            # refusal (a typo, an untrusted zone) is the likely case and must not cost
+            # a running identification run (item 23).
+            checked = self._check_calibrate(intent) if isinstance(intent, Calibrate) else None
             if self._experiment is not None:
                 kind = next(
                     (k for k, (cls, _) in INTENT_KINDS.items() if isinstance(intent, cls)),
@@ -618,7 +629,8 @@ class Supervisor:
             elif isinstance(intent, SetBay):
                 self._set_bay(intent)
             elif isinstance(intent, Calibrate):
-                self._calibrate(intent)
+                assert checked is not None  # set above for every Calibrate
+                self._record_calibration(*checked)
             elif isinstance(intent, ClearOverride):
                 self._clear_override(intent.channel)
             else:
@@ -730,12 +742,16 @@ class Supervisor:
         self._effective = self._validated(self._setpoints, self._preset, self._limits, candidate)
         self._bays = candidate
 
-    def _calibrate(self, intent: Calibrate) -> None:
-        """One handheld drive reading for one bay (module docstring, item 23)."""
+    def _check_calibrate(self, intent: Calibrate) -> tuple[str, float, float]:
+        """Check one handheld drive reading (module docstring, item 23); no state changes.
+
+        Returns ``(bay, drive_temp_c, sample ts)`` or raises. Called before ``submit``
+        ends a running experiment, so a refused reading costs nothing.
+        """
         cfg = self._effective
         topo = cfg.topology
-        spec = cfg.estimator
-        if topo is None or spec is None or not cfg.is_das:
+        rng = cfg.calibrate_range
+        if topo is None or rng is None or not cfg.is_das:
             raise IntentInvalid(
                 "manual calibration needs a DAS config (mpc.topology): a legacy config has "
                 "no drive estimates to calibrate"
@@ -744,26 +760,36 @@ class Supervisor:
         if bay not in topo.bays:
             raise IntentInvalid(f"unknown bay {bay!r}; bays are {sorted(topo.bays)}")
         temp = intent.drive_temp_c
-        if not spec.calibrate_min_c <= temp <= spec.calibrate_max_c:
+        if not rng[0] <= temp <= rng[1]:
             raise IntentInvalid(
-                f"drive_temp_c {temp} for bay {bay!r} must lie in "
-                f"[{spec.calibrate_min_c}, {spec.calibrate_max_c}] "
-                "(mpc.estimator.calibrate_min_c / calibrate_max_c)"
+                f"drive_temp_c {temp} for bay {bay!r} must lie in [{rng[0]}, {rng[1]}] "
+                "(mpc.estimator.calibrate_min_c / calibrate_max_c, narrowed to the gate's "
+                "mpc.temp_min_c / temp_max_c)"
             )
-        stamp = self._check_calibratable(bay, topo.bays[bay].zone)
+        refusal = self._calibration_refusal(bay, topo.bays[bay].zone)
+        if refusal is not None:
+            raise IntentConflict(refusal)
+        facts = self._ident_facts
+        assert facts is not None and facts.ts is not None  # _calibration_refusal checked it
+        return bay, temp, float(facts.ts)
+
+    def _record_calibration(self, bay: str, temp: float, stamp: float) -> None:
+        """Keep a checked reading for the loop to offer (``TickPlan.calibrations``)."""
         self._calibrations[bay] = (stamp, temp)
         _LOG.info("manual calibration: bay %s at %.2f degC (ts %.1f)", bay, temp, stamp)
 
-    def _check_calibratable(self, bay: str, zone: str) -> float:
-        """The observation clock to stamp the reading with, or :class:`IntentConflict`.
+    def _calibration_refusal(self, bay: str, zone: str) -> str | None:
+        """Why ``bay`` cannot take a handheld reading right now, ``None`` when it can.
 
-        The stamp is the last tick's observation time, the same clock the estimator
-        measures a SMART sample's age on, so a reading that waits for a tick keeps one
-        fixed sample time instead of looking new again every tick.
+        Read against the last completed tick, the same facts the gate and the
+        experiment machine act on. Both doors use it: ``submit`` turns the message
+        into an :class:`IntentConflict`, and :meth:`_fresh_calibrations` re-checks it
+        every tick, so a reading accepted while the zone was trusted is held back
+        instead of fitting a map to a reading the gate has since stopped believing.
         """
         facts = self._ident_facts
         if facts is None or facts.mode is None or facts.ts is None or not facts.zones:
-            raise IntentConflict(
+            return (
                 f"no_tick: bay {bay!r} has no estimate yet; the estimator needs one "
                 "completed tick before a calibration means anything"
             )
@@ -772,7 +798,7 @@ class Supervisor:
         if info.get("trusted") is not True or info.get("fault") is True:
             reasons = info.get("reasons")
             named = ", ".join(str(r) for r in reasons) if isinstance(reasons, list | tuple) else ""
-            raise IntentConflict(
+            return (
                 f"untrusted:{zone}: bay {bay!r} sits in zone {zone!r}, which the gate does "
                 f"not trust{f' ({named})' if named else ''}; a map fitted to a reading the "
                 "gate does not believe would bias every later estimate of this bay"
@@ -780,31 +806,43 @@ class Supervisor:
         bay_info = facts.bays.get(bay)
         bay_info = bay_info if isinstance(bay_info, Mapping) else {}
         if bay_info.get("occupancy") == "empty":
-            raise IntentConflict(
+            return (
                 f"empty:{bay}: bay {bay!r} holds no drive (occupancy 'empty'), so there is "
                 "nothing a drive temperature could calibrate"
             )
-        return float(facts.ts)
+        return None
 
     def _fresh_calibrations(self) -> dict[str, dict[str, float]]:
         """Pending manual readings still within ``estimator.smart_max_age_s``.
 
-        ``{bay: {"temp_c", "ts"}}`` on the observation clock. Stale entries are dropped
-        here, so a reading no tick ever consumed (a long fallback stretch) expires by
-        the same rule a SMART sample does instead of landing in the filter minutes
-        later. A reading is *not* consumed on the first plan: the estimator decides
-        what is new from its sample time, exactly as it does for SMART.
+        ``{bay: {"temp_c", "ts"}}`` on the observation clock -- the last tick's
+        observation time, the same clock the estimator measures a SMART sample's age
+        on, so a reading that waits for a tick keeps one fixed sample time instead of
+        looking new again every tick. Stale entries are dropped here, so a reading no
+        tick ever consumed (a long fallback stretch) expires by the same rule a SMART
+        sample does instead of landing in the filter minutes later. A reading whose bay
+        has since become uncalibratable (an untrusted zone, an emptied bay) is held
+        back, not offered, until it expires -- the refusals of §6 are worth no less on
+        the tick that absorbs the reading than on the one that took it. A reading is
+        *not* consumed on the first plan: the estimator decides what is new from its
+        sample time, exactly as it does for SMART.
         """
-        spec = self._effective.estimator
+        cfg = self._effective
+        spec, topo = cfg.estimator, cfg.topology
         facts = self._ident_facts
         now = None if facts is None else facts.ts
-        if spec is None or not self._calibrations or now is None:
+        if spec is None or topo is None or not self._calibrations or now is None:
             return {}
         out: dict[str, dict[str, float]] = {}
+        kept: dict[str, tuple[float, float]] = {}
         for bay, (stamp, temp) in sorted(self._calibrations.items()):
-            if 0.0 <= float(now) - stamp <= spec.smart_max_age_s:
+            if not 0.0 <= float(now) - stamp <= spec.smart_max_age_s:
+                continue  # stale: forgotten, as a SMART sample of that age would be
+            kept[bay] = (stamp, temp)
+            entry = topo.bays.get(bay)
+            if entry is not None and self._calibration_refusal(bay, entry.zone) is None:
                 out[bay] = {"temp_c": temp, "ts": stamp}
-        self._calibrations = {b: v for b, v in self._calibrations.items() if b in out}
+        self._calibrations = kept
         return out
 
     def _ident(self, intent: Ident) -> None:

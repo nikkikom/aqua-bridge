@@ -26,10 +26,12 @@ DAS mode) declares a bay's occupancy, drive class or drive serial at runtime.
 Manual calibration: ``Calibrate`` (``POST /api/calibrate``, DAS mode) reports one
 drive temperature measured with a handheld thermometer for one bay, the stand-in
 for SMART where no agent can reach the drives. ``submit`` checks the bay, the
-temperature range (``estimator.calibrate_min_c`` / ``calibrate_max_c``) and that the
-reading can mean anything at all (the bay is not empty, its zone is trusted and
-fault-free on the last tick); the reading then reaches the estimator through
-``TickPlan.calibrations`` exactly like a SMART sample of that bay.
+temperature range (``estimator.calibrate_min_c`` / ``calibrate_max_c``, narrowed to
+the gate's absolute range) and that the reading can mean anything at all (the bay is
+not empty, its zone is trusted and fault-free on the last tick) -- all of it before a
+running experiment is ended, so a refused reading costs none; the reading then reaches
+the estimator through ``TickPlan.calibrations`` exactly like a SMART sample of that
+bay, one of the twenty fresh samples an accepted calibration needs.
 
 Experiments: ``Ident`` (``POST /api/ident``, MQTT ``cmd/ident``, DAS mode) starts
 an active identification experiment on a fan group or a single channel, or stops
@@ -300,9 +302,9 @@ class Calibrate:
     enclosure whose drives no SMART agent can read (PROJECT.md section 8 item 23).
     Construction only checks the shape (a non-empty bay name, a finite number);
     ``submit`` checks that the bay exists, that ``drive_temp_c`` lies in
-    ``[estimator.calibrate_min_c, estimator.calibrate_max_c]``
-    (:class:`IntentInvalid`) and that the reading is not meaningless -- an empty bay,
-    a zone the gate does not trust, or no tick yet (:class:`IntentConflict`).
+    :attr:`~aqua_bridge.model.MpcConfig.calibrate_range` (:class:`IntentInvalid`) and
+    that the reading is not meaningless -- an empty bay, a zone the gate does not
+    trust, or no tick yet (:class:`IntentConflict`).
     """
 
     bay: str
