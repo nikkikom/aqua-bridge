@@ -136,6 +136,8 @@ mpc:
   ident_settle_s: 600    # every zone served trusted this long before a start (>= confirm_s when enabled)
   ident_start_band_c: 1.0  # start only with every drive within this of its soft target, degC
   ident_max_over_c: 3.0  # envelope above each drive's soft target while running, degC
+  ident_abort_below_limit_c: 1.0  # absolute abort: estimate + k sigma this far below the limit
+  ident_settle_resume_max_gap_s: 300.0  # longest outage after which model.json's settle timers count
   ident_seed: 1          # seed of the hold-time sequence (int >= 0)
 
 # --source xt6 (the default): one Aqua Computer controller over hidraw, found under

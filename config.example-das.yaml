@@ -397,7 +397,8 @@ mpc:
   # Active identification experiments (control/ident.py): POST /api/ident {"action": "start",
   # "group": ...} (or MQTT cmd/ident start:group:<g>) steps one fan group, then each of its
   # channels, between two PWM levels while every drive the group cools stays within its
-  # envelope (estimate + k sigma <= soft + ident_max_over_c, <= hard, < limit - 1 degC).
+  # envelope (estimate <= soft + ident_max_over_c and <= hard -- k sigma is inside soft and
+  # hard already -- and estimate + k sigma below limit - ident_abort_below_limit_c).
   # Explicit start only; any fallback or degraded tick, a human intent or stop aborts it.
   ident_enabled: false   # true: allow POST /api/ident and MQTT cmd/ident to start one
   ident_amplitude: 0.15  # PWM step, (0, 0.3]
@@ -406,7 +407,9 @@ mpc:
   ident_max_duration_s: 1800    # the whole experiment, seconds
   ident_settle_s: 600    # every zone the group serves trusted this long before a start
   ident_start_band_c: 1.0  # start only with every drive within this of its soft target
-  ident_max_over_c: 3.0  # abort when a drive's estimate + k sigma exceeds soft + this
+  ident_max_over_c: 3.0  # abort when a drive's estimate exceeds soft + this
+  ident_abort_below_limit_c: 1.0  # absolute abort: estimate + k sigma this far below the limit
+  ident_settle_resume_max_gap_s: 300.0  # longest outage after which model.json's settle timers count
   ident_seed: 1
 
 # Hardware bindings for --source composite: every mpc.temps name bound exactly once
