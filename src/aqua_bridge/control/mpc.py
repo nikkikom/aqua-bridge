@@ -833,15 +833,24 @@ def step(
 
     # item 63: a confirming sensor's raw reading can pass the gate (it is not itself a
     # Jump/Spike/Stuck this tick); report that, not "trusted", to whoever reads
-    # diagnostics["gate"]["per_temp"] (HTTP, MQTT) -- it is excluded from the estimator,
-    # the solver and last_good_obs (step 3b) exactly like a rejected one. The gate's own
-    # per_temp (used above and by zones.py) is untouched; only this outward copy changes.
+    # diagnostics["gate"] (HTTP, MQTT) -- it is excluded from the estimator, the solver
+    # and last_good_obs (step 3b) exactly like a rejected one. Only such a name is
+    # overridden: one the gate itself rejected already reads false with the gate's own
+    # reason. The override changes the outward copy as a whole -- "per_temp", the
+    # "reasons" that explain it (REASON_CONFIRMING, the wording zones._member_detail
+    # already uses) and the "trusted" summary recomputed over them -- so a consumer
+    # cannot pick the one key that still says the old thing. The gate's own per_temp
+    # (used above and by zones.py) is untouched, and so is the top-level
+    # diagnostics["trusted"]: that answers a different question, whether the gate itself
+    # accepted this tick (PROJECT.md section 4.7).
     gate_diag = gate.to_dict()
-    if das:
-        gate_diag["per_temp"] = {
-            name: (trusted_bit and name not in confirming)
-            for name, trusted_bit in gate_diag["per_temp"].items()
-        }
+    overridden = [n for n in confirming if gate.per_temp.get(n, False)] if das else []
+    if overridden:
+        per_temp = {**gate_diag["per_temp"], **dict.fromkeys(overridden, False)}
+        reasons = {**gate_diag["reasons"], **{n: [zones.REASON_CONFIRMING] for n in overridden}}
+        gate_diag["per_temp"] = per_temp
+        gate_diag["reasons"] = reasons
+        gate_diag["trusted"] = not gate_diag["unknown_keys"] and all(per_temp.values())
 
     diagnostics: dict[str, Any] = {
         "trusted": trusted,
