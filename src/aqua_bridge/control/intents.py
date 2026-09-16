@@ -23,6 +23,14 @@ to their limits instead and ``SetLimit`` (``POST /api/limit``) changes the
 absolute limit of one bay or one drive class. ``SetBay`` (``POST /api/bay``,
 DAS mode) declares a bay's occupancy, drive class or drive serial at runtime.
 
+Manual calibration: ``Calibrate`` (``POST /api/calibrate``, DAS mode) reports one
+drive temperature measured with a handheld thermometer for one bay, the stand-in
+for SMART where no agent can reach the drives. ``submit`` checks the bay, the
+temperature range (``estimator.calibrate_min_c`` / ``calibrate_max_c``) and that the
+reading can mean anything at all (the bay is not empty, its zone is trusted and
+fault-free on the last tick); the reading then reaches the estimator through
+``TickPlan.calibrations`` exactly like a SMART sample of that bay.
+
 Experiments: ``Ident`` (``POST /api/ident``, MQTT ``cmd/ident``, DAS mode) starts
 an active identification experiment on a fan group or a single channel, or stops
 the running one (:mod:`aqua_bridge.control.ident`). ``submit`` answers a refused
@@ -43,6 +51,7 @@ from aqua_bridge.model import FaultReason, Mode, MpcCommand, PlantObservation
 
 __all__ = [
     "INTENT_KINDS",
+    "Calibrate",
     "ClearOverride",
     "ControlMode",
     "ControlSnapshot",
@@ -284,6 +293,27 @@ class SetBay:
 
 
 @dataclass(frozen=True)
+class Calibrate:
+    """``POST /api/calibrate`` ``{"bay": "b03", "drive_temp_c": 41.5}``.
+
+    DAS mode only. One drive temperature measured by hand for one bay, for an
+    enclosure whose drives no SMART agent can read (PROJECT.md section 8 item 23).
+    Construction only checks the shape (a non-empty bay name, a finite number);
+    ``submit`` checks that the bay exists, that ``drive_temp_c`` lies in
+    ``[estimator.calibrate_min_c, estimator.calibrate_max_c]``
+    (:class:`IntentInvalid`) and that the reading is not meaningless -- an empty bay,
+    a zone the gate does not trust, or no tick yet (:class:`IntentConflict`).
+    """
+
+    bay: str
+    drive_temp_c: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "bay", _name("bay", self.bay))
+        object.__setattr__(self, "drive_temp_c", _finite("drive_temp_c", self.drive_temp_c))
+
+
+@dataclass(frozen=True)
 class ClearOverride:
     """``POST /api/auto`` ``{"channel": "radiator"}`` or ``{}`` (all channels)."""
 
@@ -327,7 +357,17 @@ class Ident:
             raise IntentInvalid("stop takes no 'group' or 'channel'")
 
 
-Intent = SetMode | SetSetpoint | SetPwm | SetPreset | ClearOverride | SetLimit | SetBay | Ident
+Intent = (
+    SetMode
+    | SetSetpoint
+    | SetPwm
+    | SetPreset
+    | ClearOverride
+    | SetLimit
+    | SetBay
+    | Ident
+    | Calibrate
+)
 
 # URL tail / MQTT command name -> intent class and the body keys it accepts.
 INTENT_KINDS: dict[str, tuple[type, tuple[str, ...]]] = {
@@ -339,6 +379,7 @@ INTENT_KINDS: dict[str, tuple[type, tuple[str, ...]]] = {
     "limit": (SetLimit, ("bay", "class", "limit_c")),
     "bay": (SetBay, ("bay", *BAY_FIELDS)),
     "ident": (Ident, ("action", "group", "channel")),
+    "calibrate": (Calibrate, ("bay", "drive_temp_c")),
 }
 
 
