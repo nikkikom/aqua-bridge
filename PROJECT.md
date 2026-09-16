@@ -1952,7 +1952,8 @@ ignored, `--model-store` exits 2). File (schema
 (sha256 over `dt`, channels, temps, zones, the bay-to-zone map, sensor
 placement and fans; policy such as limits, classes, serials and gains is
 left out, so tightening a limit keeps the model), `saved_wall`,
-`thermal` (the thermal memory), `fan_curves`, `calibration` (per bay and
+`thermal` (the thermal memory, which `tools/fit_model.py --store-out` can
+write straight from an offline fit, item 15), `fan_curves`, `calibration` (per bay and
 serial, with wall-clock `last_sample_wall` and `expires_wall` so expiry
 survives a reboot) and `bays` (last occupancy, class, serial,
 association; report only). `ModelPersister` (a loop `on_tick` observer)
@@ -2820,7 +2821,7 @@ aqua-bridge/
     w1_commission.py         # --list, --identify, --check (Pi)
     aquacomputer_probe.py    # read-only: attached controllers, status and control reports (Pi)
     smart_agent.py           # SMART over MQTT (PC)
-    fit_model.py             # offline zoned model fit from recordings
+    fit_model.py             # offline zoned model fit from recordings (--store-out: a store file)
     fit_fans.py              # PWM -> RPM curve per fan model
     replay.py                # replay recordings through the thermal model
     http_user.py             # create or update an HTTPS API user (Pi, as root)
@@ -4247,8 +4248,19 @@ Owner decision (2026-09-16):
 14. Online fan-curve fit: `fan_curves` in the store is validated but
     nothing produces or reads it; `tools/fit_fans.py` output is copied into
     `fan_models` by hand.
-15. Load `tools/fit_model.py`'s `model.json` into the model store
-    (different file shape today).
+15. **Done** (2026-09-16): `modelstore.document_from_fit` converts a
+    `tools/fit_model.py` report (`kind: aqua_bridge.thermal_model`, whose
+    `memory` is already the thermal memory) into a store document: the fit
+    becomes `thermal`, `fan_curves` / `calibration` / `bays` are empty (a
+    fit of a recording knows nothing about the calibrations or the bay view
+    of the machine that loads it) and `saved_wall` is the report's
+    `generated_at`, so the fresh / stale rule measures the age of the *fit*.
+    `tools/fit_model.py --store-out PATH` writes it, and `load` also accepts
+    the report itself in the store's place. Two things it warns about: a
+    report carries no store fingerprint, so only the thermal model's own
+    fingerprint checks its structure (a mismatch drops the section and the
+    model starts at its prior), and the persister replaces the file with a
+    store document at its first save, so keep the report elsewhere.
 16. **Done** (2026-09-16): `mpc.model_freeze` (needs `topology`, default
     `false`). With it on, a zone that reaches the `converged` rule is
     entered `frozen` instead, which online identification never moves; the
@@ -6131,7 +6143,9 @@ selects the rich preset):
 .venv/bin/python -m aqua_bridge --config config.example-das.yaml --source sim --sim-plant das \
   --sim-speed 0 --ticks 3600 --record /tmp/rec.jsonl --model-store /tmp/model-store.json
 # offline zoned model fit: windowed LS, air-block output-error refinement, hold-out validation
-.venv/bin/python tools/fit_model.py --config config.example-das.yaml --topology --out /tmp/model.json /tmp/rec.jsonl
+# --store-out also writes the fit as a model store file the daemon loads (--model-store)
+.venv/bin/python tools/fit_model.py --config config.example-das.yaml --topology \
+  --out /tmp/model.json --store-out /tmp/model-store.json /tmp/rec.jsonl
 # PWM -> RPM curve per fan model (copy the result into fan_models)
 .venv/bin/python tools/fit_fans.py --config config.example-das.yaml --out /tmp/fan_curves.json /tmp/rec.jsonl
 # prediction errors: learning as it goes, or a fitted model frozen

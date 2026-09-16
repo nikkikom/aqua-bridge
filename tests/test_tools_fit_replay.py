@@ -9,6 +9,7 @@ standalone script is expected to be run (matches ``tests/test_w1_commission.py``
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -238,6 +239,69 @@ def test_fit_model_cli_writes_model_json(
     doc = json.loads(out.read_text(encoding="utf-8"))
     assert doc["kind"] == "aqua_bridge.thermal_model"
     assert doc["recordings"] == [str(rec_path)]
+
+
+def test_fit_model_cli_store_out_writes_a_loadable_model(
+    recording: tuple[MpcConfig, Path, list[dict[str, Any]]], config_path: Path, tmp_path: Path
+) -> None:
+    """PROJECT.md section 8 item 15: ``--store-out`` converts the fit into a model store
+    document, and the daemon's own loader takes it -- fresh, thermal loaded, carrying the
+    coefficients the fit produced."""
+    from aqua_bridge import modelstore
+    from aqua_bridge.control import persist
+
+    cfg, rec_path, _ = recording
+    out = tmp_path / "report.json"
+    store = tmp_path / "model.json"
+    code = fit_model.main(
+        [
+            "--config",
+            str(config_path),
+            "--topology",
+            "--out",
+            str(out),
+            "--store-out",
+            str(store),
+            str(rec_path),
+        ]
+    )
+    assert code == 0
+    doc = json.loads(store.read_text(encoding="utf-8"))
+    assert doc["schema"] == modelstore.SCHEMA and doc["v"] == modelstore.SCHEMA_VERSION
+    assert doc["fingerprint"] == modelstore.fingerprint(cfg)
+
+    shadow = dataclasses.replace(load_config(config_path).mpc, model_shadow=True)
+    result = modelstore.load(store, shadow, now_wall=doc["saved_wall"] + 60.0)
+    assert result.source == "fresh" and not result.warnings
+    mem: dict[str, Any] = {}
+    summary = persist.apply_seed(mem, shadow, result.seed, 0.0)
+    assert summary["sections"]["thermal"] == "loaded"
+    fitted = json.loads(out.read_text(encoding="utf-8"))
+    st = thermal.structure(shadow)
+    assert thermal.theta_from_memory(shadow, mem["thermal"], st=st) == pytest.approx(
+        thermal.theta_from_memory(shadow, fitted["memory"], st=st)
+    )
+
+
+def test_fit_model_cli_store_out_refuses_to_overwrite_the_report(
+    recording: tuple[MpcConfig, Path, list[dict[str, Any]]], config_path: Path, tmp_path: Path
+) -> None:
+    _, rec_path, _ = recording
+    out = tmp_path / "same.json"
+    code = fit_model.main(
+        [
+            "--config",
+            str(config_path),
+            "--topology",
+            "--out",
+            str(out),
+            "--store-out",
+            str(out),
+            str(rec_path),
+        ]
+    )
+    assert code == 2
+    assert json.loads(out.read_text(encoding="utf-8"))["kind"] == "aqua_bridge.thermal_model"
 
 
 def test_fit_model_cli_requires_topology_flag(config_path: Path, tmp_path: Path) -> None:
