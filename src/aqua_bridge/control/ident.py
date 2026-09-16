@@ -57,37 +57,74 @@ PROJECT.md section 8.4).
 
 Two pieces, both on only with ``ident_replan``:
 
-* **The anchor follows the demand up.** :func:`advance` reads the solver's honest
-  per-channel demand of the tick that just ran (``diagnostics["target_pwm"]``: the
-  want before the rate limit and the clamp, so it is neither dragged toward the
-  experiment's own level by the rate limit nor capped by ``pwm_max``) and raises
-  each channel's base to it: ``plan_base = max(plan_base, clamp(demand))``, then
+* **The anchor follows the demand up, de-biased.** :func:`advance` reads the
+  solver's want for the tick that just ran (``diagnostics["target_pwm"]``: before
+  the rate limit and the clamp) and raises each channel's base to it, then
   re-derives that channel's two levels around the new base and clamps them into
-  ``[pwm_min, pwm_max]``. The anchor is monotone: a falling demand is not
-  followed, so the experiment never reduces cooling below a level it has already
-  established, and a channel without a finite demand this tick keeps its anchor.
+  ``[pwm_min, pwm_max]``.
+
+  That want is **not** free of the experiment's own influence, and taking it raw
+  would ratchet. The DAS MPC's objective carries ``weight_dpwm ||u_0 - prev||^2``
+  and ``prev`` is what was last put on the fan, which during an experiment is the
+  experiment's own level: the high level raises the want, the want raises the
+  anchor, the anchor raises the high level (measured on the DAS example, all else
+  equal: ``prev`` 0.40 gives a want of 0.398, ``prev`` 1.00 gives 0.962 -- a slope
+  near 1). So the echo of the experiment's own level comes off the want first,
+
+      ``wanted = demand - max(0, min(prev, own) - plan_base)``
+
+  with ``prev`` from ``diagnostics["prev_pwm"]`` (the very PWM that penalty pulls
+  toward) and ``own`` the override the experiment itself had in force on that tick.
+  Bounding the echo by ``own`` is what keeps the two reasons for a fan above the
+  anchor apart: the experiment put it there (an echo, it comes off) or the solver's
+  own command floored it there (demand, it stays -- otherwise the anchor would stick
+  wherever the floor found it and the levels would stop tracking the solver at all).
+  On a tick the experiment ran at its anchor -- every low tick under ``above``, every
+  held sibling, every tick under ``symmetric`` -- nothing is subtracted and the
+  anchor follows the want whole; on a high tick the level's own excess comes off,
+  which under-follows by however much of the pull the solver did not exert (the
+  slope is below 1), and that is the safe direction: the composed command is floored
+  by the solver's own on every tick regardless. The PI solver has no such term at
+  all (its integrator is its own state), so in practice nothing is taken off it --
+  its ``prev`` is at the anchor whenever the echo would matter.
+* **The anchor rises at once, falls slowly.** A rise is taken on the tick it
+  appears. A fall is taken only at a level switch, at most ``d_pwm_max`` at a time,
+  and never below ``base`` (the frozen base of the start): a hold keeps the level
+  it started with, so its excitation is preserved, while a transient peak in the
+  demand is released within a hold or two instead of pinning the channel -- and
+  every sibling held at its anchor -- at that peak for the rest of
+  ``ident_max_duration_s``. A channel whose demand or ``prev`` this tick is missing
+  or not finite keeps its anchor.
 * **The composed command is floored by the solver's.** The anchor can only act on
   the next tick, so :meth:`~aqua_bridge.control.supervisor.Supervisor.compose`
   floors an experiment channel's override with the solver's own command for that
   tick (``max(override, mpc_cmd.pwm[ch])``, before the usual rate limit and clamp).
   That closes the one-tick gap exactly: on no tick does an experiment channel get
   less than the controller would have put on it, ``symmetric`` excepted -- there
-  the floor is the owner-accepted dip, ``mpc_cmd.pwm[ch] - ident_amplitude``.
+  the floor is the owner-accepted dip, ``mpc_cmd.pwm[ch] - ident_amplitude``. The
+  floor follows the **running** experiment's own plan (:func:`planned_dip`), not
+  the live config, so a config rebuilt mid-experiment cannot take it away.
 
 What it costs the identification: the levels move with the demand, so the step
 sizes change. The telegraph's own step stays ``ident_amplitude`` except where a
 level clamps at ``pwm_max`` (then the high level is squeezed and, under ``above``
 with the demand at ``pwm_max``, the excitation stops until the demand falls back);
 a rise of ``d`` inside a hold makes the next switch a step of ``A - d`` (down) or
-``A + d`` (up) instead of ``A``. The base drift is slow next to the 60-180 s holds,
-so the regressors keep the high-frequency content the fit lives on; the sim
-numbers are in PROJECT.md section 8.4.
+``A + d`` (up) instead of ``A``, and a fall is confined to the switches, at most
+``d_pwm_max`` each. The base drift is slow next to the 60-180 s holds, so the
+regressors keep the high-frequency content the fit lives on; the sim numbers are
+in PROJECT.md section 8.4.
 
-The abort rules do not know about any of this: :func:`advance` decides the aborts
-of a tick from that tick's estimates, with the same thresholds in the same order,
-*before* it re-plans the next tick's levels, so no re-planned level can make an
-abort later or weaker. A re-planned level is never below the frozen plan's level
-for the same tick, so the enclosure never runs warmer than it would have.
+What the re-plan does **not** touch is the abort decision of a tick:
+:func:`advance` decides that tick's aborts from that tick's estimates, with the
+same thresholds in the same order, *before* it re-plans the next tick's levels, so
+the re-plan cannot weaken the decision itself, and a re-planned level is never
+below the frozen plan's level for the same tick, so no tick of an experiment runs
+the enclosure warmer than the frozen plan would have. Across ticks it does move
+the aborts, and that is the point of the item: a channel followed up cools its
+bay, so an excursion the frozen plan would have ended on the envelope can run to
+completion instead. Fewer envelope aborts are the intended outcome, not a
+weakened rule.
 
 Time: the start is armed between ticks; offset 0 is the tick after the last
 recorded one (``last ts + dt``), or one tick later when the loop has already taken
@@ -233,6 +270,7 @@ __all__ = [
     "levels_at",
     "lost_sensor_zones",
     "new_tracker",
+    "planned_dip",
     "resume_tracker",
     "served_zones",
     "settle_snapshot",
@@ -328,17 +366,28 @@ def _mapping(value: object) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
+def _floats(value: object) -> dict[str, float]:
+    """The finite floats of a diagnostics mapping (empty when absent or malformed)."""
+    if not isinstance(value, Mapping):
+        return {}
+    return {ch: float(v) for ch, v in value.items() if _finite(v)}
+
+
 @dataclass(frozen=True)
 class TickFacts:
     """The facts of one loop tick the experiment machine reads.
 
     ``mode`` is the solver command's mode (``None``: no solver command, e.g. a
-    controller error); ``pwm`` the solver's command per channel; ``demand`` its
-    honest want before the rate limit and the clamp (``diagnostics["target_pwm"]``,
-    what the re-planned levels follow; empty when absent or malformed, which reads
-    as "no demand known this tick"); ``zones``, ``estimates``, ``bays``,
-    ``saturated``, ``fan_stall``, ``sigma_floor`` and ``store`` the matching
-    entries of its diagnostics, empty when absent or malformed.
+    controller error); ``pwm`` the solver's command per channel; ``demand`` its want
+    before the rate limit and the clamp (``diagnostics["target_pwm"]``, what the
+    re-planned levels follow) and ``prev`` the PWM that want was penalised against
+    (``diagnostics["prev_pwm"]``, what the fans were last set to), which is how the
+    experiment's own influence comes back out of the want (module docstring). Both
+    are empty when absent or malformed, and on ticks the supervisor knows no
+    experiment can read them, which reads as "no demand known this tick". ``zones``,
+    ``estimates``, ``bays``, ``saturated``, ``fan_stall``, ``sigma_floor`` and
+    ``store`` are the matching entries of the diagnostics, empty when absent or
+    malformed.
 
     An empty ``zones``, ``estimates``, ``bays``, ``saturated`` or ``fan_stall`` reads as
     **unsafe**: no zone is settled, no bay has an estimate, every channel counts as
@@ -359,6 +408,7 @@ class TickFacts:
     applied: bool
     pwm: dict[str, float] = field(default_factory=dict)
     demand: dict[str, float] = field(default_factory=dict)
+    prev: dict[str, float] = field(default_factory=dict)
     zones: dict[str, Any] = field(default_factory=dict)
     estimates: dict[str, Any] = field(default_factory=dict)
     bays: dict[str, Any] = field(default_factory=dict)
@@ -368,19 +418,28 @@ class TickFacts:
     store: dict[str, Any] = field(default_factory=dict)
 
 
-def facts_from_tick(mpc_cmd: MpcCommand | None, *, ts: float | None, applied: bool) -> TickFacts:
-    """:class:`TickFacts` from the solver command of a tick (before ``compose``)."""
+def facts_from_tick(
+    mpc_cmd: MpcCommand | None, *, ts: float | None, applied: bool, with_demand: bool = False
+) -> TickFacts:
+    """:class:`TickFacts` from the solver command of a tick (before ``compose``).
+
+    ``with_demand`` copies ``demand`` and ``prev`` out of the diagnostics; only a
+    running experiment that re-plans reads those two, so the supervisor asks for them
+    on the ticks of one and no other tick -- ``ident_replan: false`` included -- pays
+    for the copy."""
     ts_out = float(ts) if _finite(ts) else None
     if mpc_cmd is None:
         return TickFacts(ts=ts_out, mode=None, applied=bool(applied))
     diag = mpc_cmd.diagnostics if isinstance(mpc_cmd.diagnostics, Mapping) else {}
-    target = diag.get("target_pwm")
+    target = diag.get("target_pwm") if with_demand else None
+    prev = diag.get("prev_pwm") if with_demand else None
     return TickFacts(
         ts=ts_out,
         mode=mpc_cmd.mode.value,
         applied=bool(applied),
         pwm={ch: float(v) for ch, v in mpc_cmd.pwm.items()},
-        demand={ch: float(v) for ch, v in _mapping(target).items() if _finite(v)},
+        demand=_floats(target),
+        prev=_floats(prev),
         zones=_mapping(diag.get("zones")),
         estimates=_mapping(diag.get("estimates")),
         bays=_mapping(diag.get("bays")),
@@ -565,13 +624,32 @@ def _clamp(value: float, lo: float, hi: float) -> float:
 
 
 def dip_below_solver(cfg: MpcConfig) -> float:
-    """How far below the solver's own command an experiment level may sit, PWM.
+    """How far below the solver's own command an experiment planned *now* would sit, PWM.
 
     ``0`` under ``above`` (the experiment never commands less cooling than the
-    solver), ``ident_amplitude`` under ``symmetric`` (the owner-accepted dip). The
-    floor :meth:`~aqua_bridge.control.supervisor.Supervisor.compose` applies to an
-    experiment channel is ``solver command - this``."""
+    solver), ``ident_amplitude`` under ``symmetric`` (the owner-accepted dip). A
+    *running* experiment is floored by its own plan instead (:func:`planned_dip`)."""
     return cfg.ident_amplitude if cfg.ident_levels == "symmetric" else 0.0
+
+
+def planned_dip(exp: Mapping[str, Any] | None, ch: str, cfg: MpcConfig) -> float:
+    """How far below the solver's command the running experiment's own plan puts ``ch``.
+
+    ``plan_base - low level`` of that channel as the experiment itself planned them:
+    ``0`` under ``above``, ``ident_amplitude`` under ``symmetric``, and less wherever
+    the low level clamped at ``pwm_min`` -- read off the plan, so the floor
+    :meth:`~aqua_bridge.control.supervisor.Supervisor.compose` applies follows the
+    experiment that is running and not a config rebuilt under it. Falls back to
+    :func:`dip_below_solver` when the plan does not carry the two (and never below
+    zero, so the floor is never weaker than the solver's own command)."""
+    if isinstance(exp, Mapping):
+        bases, pairs = exp.get("plan_base"), exp.get("levels")
+        anchor = bases.get(ch) if isinstance(bases, Mapping) else None
+        levels = pairs.get(ch) if isinstance(pairs, Mapping) else None
+        low = levels[0] if isinstance(levels, list | tuple) and levels else None
+        if _finite(anchor) and _finite(low):
+            return max(0.0, float(anchor) - float(low))  # type: ignore[arg-type]
+    return max(0.0, dip_below_solver(cfg))
 
 
 def check_start(
@@ -741,30 +819,65 @@ def start(
         "levels": {ch: list(_levels(cfg, base[ch])) for ch in channels},
         "phases": _schedule(cfg, phases),
         "apply_failures": 0,
+        # the overrides of the tick whose applied PWM the next tick reports as its
+        # ``prev``: empty here, since no experiment ran on the tick before the start
+        "prev_overrides": {},
     }
     exp.update(levels_at(exp, 0.0))
     return exp
 
 
-def _replan(exp: Mapping[str, Any], cfg: MpcConfig, facts: TickFacts) -> dict[str, Any]:
-    """``{"plan_base", "levels"}`` after following the tick's demand up (module docstring).
+def _replan(
+    exp: Mapping[str, Any], cfg: MpcConfig, facts: TickFacts, *, switching: bool
+) -> dict[str, Any]:
+    """``{"plan_base", "levels"}`` after following the tick's demand (module docstring).
 
-    Monotone per channel: the anchor only rises, a demand outside ``[pwm_min, pwm_max]``
-    counts clamped into it, and a channel whose demand this tick is missing or not
-    finite keeps the anchor it has."""
+    Per channel: the tick's want minus the echo of the experiment's own level in it
+    (``min(prev, the override the experiment had on that tick) - plan_base``, never
+    negative), clamped into ``[pwm_min, pwm_max]``. Bounding the echo by the experiment's
+    own override is what keeps the two cases apart: a fan above the anchor because the
+    experiment put it there is an echo and comes off, a fan above the anchor because the
+    solver's own command floored it there is demand and stays. The anchor rises to the
+    result at once; it falls to it only when ``switching`` (this tick ends a hold or a
+    phase), by at most ``d_pwm_max``, and never below the frozen base of the start. A
+    channel whose demand or ``prev`` this tick is missing or not finite keeps its
+    anchor."""
     plan_base = {ch: float(v) for ch, v in exp["plan_base"].items()}
+    base = exp["base"]
+    ran = _mapping(exp.get("prev_overrides"))
     for ch in exp["channels"]:
-        want = facts.demand.get(ch)
-        if not _finite(want):
+        want, prev = facts.demand.get(ch), facts.prev.get(ch)
+        if not _finite(want) or not _finite(prev):
             continue
-        wanted = _clamp(float(want), cfg.pwm_min, cfg.pwm_max)  # type: ignore[arg-type]
+        own = ran.get(ch)
+        echo = 0.0 if not _finite(own) else max(0.0, min(float(prev), float(own)) - plan_base[ch])  # type: ignore[arg-type]
+        wanted = _clamp(float(want) - echo, cfg.pwm_min, cfg.pwm_max)  # type: ignore[arg-type]
         if wanted > plan_base[ch]:
             plan_base[ch] = wanted
+        elif switching:
+            floor = max(wanted, float(base[ch]), plan_base[ch] - cfg.d_pwm_max)
+            plan_base[ch] = min(plan_base[ch], floor)
     levels = {
         ch: [_clamp(v, cfg.pwm_min, cfg.pwm_max) for v in _levels(cfg, plan_base[ch])]
         for ch in exp["channels"]
     }
     return {"plan_base": plan_base, "levels": levels}
+
+
+def _position(exp: Mapping[str, Any], offset_s: float) -> tuple[int, int]:
+    """``(phase index, level)`` of the schedule at ``offset_s`` -- the schedule only,
+    so it says nothing about the levels themselves (they are re-planned around it)."""
+    phases = exp["phases"]
+    index = len(phases) - 1
+    for i, phase in enumerate(phases):
+        if offset_s < phase["end_s"] - _EPS:
+            index = i
+            break
+    level = LEVEL_HIGH
+    for seg_t, seg_level in phases[index]["segments"]:
+        if seg_t <= offset_s + _EPS:
+            level = int(seg_level)
+    return index, level
 
 
 def levels_at(exp: Mapping[str, Any], offset_s: float) -> dict[str, Any]:
@@ -773,17 +886,8 @@ def levels_at(exp: Mapping[str, Any], offset_s: float) -> dict[str, Any]:
     Every channel of the target gets an override: the phase's channels their level,
     the other channels of the group their base (``plan_base``: the frozen start base,
     or the re-planned anchor with ``ident_replan``)."""
-    phases = exp["phases"]
-    index = len(phases) - 1
-    for i, phase in enumerate(phases):
-        if offset_s < phase["end_s"] - _EPS:
-            index = i
-            break
-    phase = phases[index]
-    level = LEVEL_HIGH
-    for seg_t, seg_level in phase["segments"]:
-        if seg_t <= offset_s + _EPS:
-            level = int(seg_level)
+    index, level = _position(exp, offset_s)
+    phase = exp["phases"][index]
     active = set(phase["channels"])
     held = exp.get("plan_base") or exp["base"]
     overrides = {
@@ -850,9 +954,12 @@ def advance(exp: Mapping[str, Any], cfg: MpcConfig, facts: TickFacts) -> Advance
     out = dict(exp)
     out["last_ts"] = ts
     out["apply_failures"] = failures
+    at = max(offset, 0.0)
     if exp.get("replan"):
-        out.update(_replan(exp, cfg, facts))
-    out.update(levels_at(out, max(offset, 0.0)))
+        out["prev_overrides"] = dict(exp["overrides"])  # the level this tick ran at
+        switching = _position(out, at) != (int(exp["phase"]), int(exp["level"]))
+        out.update(_replan(exp, cfg, facts, switching=switching))
+    out.update(levels_at(out, at))
     return Advance(out)
 
 
