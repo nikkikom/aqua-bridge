@@ -12,13 +12,29 @@ with ``u0_m = fan_models.<m>.deadband``, ``L_max,m = fan_models.<m>.noise_db_at_
 and the fan affinity exponent ``n = noise.exponent`` (sound power ~ N^n). ``noise_db``
 is an index; it is absolute only when ``noise_db_at_max`` comes from datasheets at
 ``rpm_max``. A total of zero (every fan below its dead band) reads
-:data:`NOISE_FLOOR_DB` so the value stays finite. ``tools/fit_fans.py`` fits
-``rpm(u)`` per fan model from a recording's ``(u, rpm)`` pairs, offline; its
-output is copied into ``fan_models`` by hand (wiring the fitted curve into the
-model store automatically, ``fan_curves``, is still open, PROJECT.md section 8
-item 14). Until a channel's model is fitted, the configured ``rpm_max`` and
-``deadband`` are the curve, and a tach-less channel uses the curve of its
-model like any other.
+:data:`NOISE_FLOOR_DB` so the value stays finite. A tach-less channel uses the
+curve of its fan model like any other.
+
+Which curve
+-----------
+``u0_m`` follows the curve **in force**: every function here takes ``curves``
+(``solver_memory["fan_curves"]``, the online fit of
+:mod:`aqua_bridge.control.fancurve` with ``mpc.fan_curve_online``) and reads the
+fitted dead band where there is a usable entry for the fan model, the configured
+``fan_models.<m>.deadband`` otherwise -- ``None`` (the legacy path, and the DAS
+with the fit switched off) is always the config. It changes the *objective*, not
+the safety: with a real dead band of 0.25 and a configured 0.1 the surrogate
+charges the solver for noise over a band where the fan does not turn, and its
+gradient sends the command to the wrong place. It also keeps one ``u0`` across
+the controller -- the thermal model, the estimator's airflow and this objective
+plan on the same fan (PROJECT.md section 8 item 107).
+
+Two figures here never follow a fit. ``L_max,m`` (``noise_db_at_max``) is a
+datasheet number at ``rpm_max`` that a PWM -> RPM fit says nothing about. And
+``rpm_max,m`` stays the commissioned one wherever it normalises or scales a
+speed, so a fan that loses speed shows up as less noise rather than being
+normalised away -- the same reason ``model_use_rpm`` keeps it
+(:func:`aqua_bridge.control.thermal._channel_phi`).
 
 ``diagnostics["noise"]`` (:func:`noise_diagnostics`) reports the index from the
 speed the fans turn: a channel's measured rpm where its tachometer reports a finite
@@ -53,6 +69,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from aqua_bridge.control import fancurve
 from aqua_bridge.model import MpcConfig
 
 __all__ = [
@@ -60,6 +77,7 @@ __all__ = [
     "NOISE_FLOOR_DB",
     "RPM_FRAC_MAX",
     "Surrogate",
+    "channel_deadband",
     "channel_power",
     "noise_db",
     "noise_diagnostics",
@@ -90,17 +108,38 @@ def rpm_frac(u: float, deadband: float) -> float:
     return min(1.0, max(0.0, (float(u) - deadband) / (1.0 - deadband)))
 
 
-def rpm_model(cfg: MpcConfig, channel: str, u: float) -> float:
-    """Modelled rpm of the fans on ``channel`` at PWM ``u``."""
+def channel_deadband(
+    cfg: MpcConfig, channel: str, curves: Mapping[str, Any] | None = None
+) -> float:
+    """``u0`` of a channel: the fitted dead band where the online fit has a usable curve
+    for its fan model, else the configured one (module docstring, *Which curve*)."""
     model = cfg.fan_models[cfg.fans[channel].model]
-    return model.rpm_max * rpm_frac(u, model.deadband)
+    if curves is None:
+        return float(model.deadband)
+    u0, _, _ = fancurve.curve_pair(
+        curves.get(cfg.fans[channel].model), model.deadband, model.exponent, model.rpm_max
+    )
+    return u0
 
 
-def _level(cfg: MpcConfig, channel: str) -> tuple[float, float]:
-    """``(count * 10 ** (L_max / 10), deadband)`` of a channel."""
+def rpm_model(
+    cfg: MpcConfig, channel: str, u: float, curves: Mapping[str, Any] | None = None
+) -> float:
+    """Modelled rpm of the fans on ``channel`` at PWM ``u`` (``rpm_max`` always the
+    commissioned one; only ``u0`` follows a fitted curve)."""
+    model = cfg.fan_models[cfg.fans[channel].model]
+    return model.rpm_max * rpm_frac(u, channel_deadband(cfg, channel, curves))
+
+
+def _level(
+    cfg: MpcConfig, channel: str, curves: Mapping[str, Any] | None = None
+) -> tuple[float, float]:
+    """``(count * 10 ** (L_max / 10), u0)`` of a channel. ``L_max`` is the datasheet
+    ``noise_db_at_max``, which no fit touches; ``u0`` follows the curve in force."""
     fan = cfg.fans[channel]
     model = cfg.fan_models[fan.model]
-    return fan.count * 10.0 ** (model.noise_db_at_max / 10.0), model.deadband
+    level = fan.count * 10.0 ** (model.noise_db_at_max / 10.0)
+    return level, channel_deadband(cfg, channel, curves)
 
 
 def _exponent(cfg: MpcConfig) -> float:
@@ -152,9 +191,13 @@ def _derivatives(level: float, deadband: float, n: float, u: float) -> tuple[flo
     )
 
 
-def surrogate(cfg: MpcConfig, u_now: Mapping[str, float]) -> Surrogate:
+def surrogate(
+    cfg: MpcConfig, u_now: Mapping[str, float], curves: Mapping[str, Any] | None = None
+) -> Surrogate:
     """The DAS MPC's noise surrogate at ``u_now`` (module docstring). ``u_now`` is clamped
-    into ``[pwm_min, pwm_max]``; the result excludes ``noise.weight_noise``."""
+    into ``[pwm_min, pwm_max]``; the result excludes ``noise.weight_noise``. ``curves``
+    is ``solver_memory["fan_curves"]``: the fitted ``u0`` where there is one (module
+    docstring, *Which curve*)."""
     n = _exponent(cfg)
     p_ref = reference_power(cfg)
     u0: dict[str, float] = {}
@@ -162,7 +205,7 @@ def surrogate(cfg: MpcConfig, u_now: Mapping[str, float]) -> Surrogate:
     g: dict[str, float] = {}
     h: dict[str, float] = {}
     for ch in cfg.channels:
-        level, deadband = _level(cfg, ch)
+        level, deadband = _level(cfg, ch, curves)
         scale = cfg.fans[ch].noise_weight / p_ref
         u = min(cfg.pwm_max, max(cfg.pwm_min, float(u_now[ch])))
         p, dp, d2p = _derivatives(level, deadband, n, u)
@@ -180,27 +223,36 @@ def noise_diagnostics(
     prev: Mapping[str, float],
     pwm: Mapping[str, float],
     rpm: Mapping[str, float | None],
+    curves: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """``diagnostics["noise"]`` (module docstring): ``db_index`` from the speed the fans
     turn, ``db_index_cmd`` from the curve at the command, per channel the rpm used and its
-    source (``tach`` | ``model``) and the modelled rpm at the command."""
+    source (``tach`` | ``model``), the modelled rpm at the command, and the ``u0`` the
+    index was computed with together with the curve it came from (``curve``: ``fit`` |
+    ``config``), so no one has to guess which curve produced the number."""
     fracs: dict[str, float] = {}
     fracs_cmd: dict[str, float] = {}
     channels: dict[str, Any] = {}
     for ch in cfg.channels:
         model = cfg.fan_models[cfg.fans[ch].model]
+        u0 = channel_deadband(cfg, ch, curves)
+        fitted = curves is not None and fancurve.usable(curves.get(cfg.fans[ch].model))
         measured = rpm.get(ch)
         if _finite(measured) and float(measured) >= 0.0:  # type: ignore[arg-type]
             used, source = float(measured), "tach"  # type: ignore[arg-type]
+            # the commissioned rpm_max normalises the tach, never a fitted one: a fit of
+            # those same readings would make the fraction blind to a fan losing speed
             fracs[ch] = min(RPM_FRAC_MAX, used / model.rpm_max)
         else:
-            fracs[ch] = rpm_frac(prev[ch], model.deadband)
+            fracs[ch] = rpm_frac(prev[ch], u0)
             used, source = model.rpm_max * fracs[ch], "model"
-        fracs_cmd[ch] = rpm_frac(pwm[ch], model.deadband)
+        fracs_cmd[ch] = rpm_frac(pwm[ch], u0)
         channels[ch] = {
             "rpm": used,
             "source": source,
             "rpm_cmd": model.rpm_max * fracs_cmd[ch],
+            "u0": u0,
+            "curve": "fit" if fitted else "config",
         }
     return {
         "db_index": noise_db(cfg, fracs),

@@ -558,9 +558,11 @@ def step(
     if das and cfg.fan_curve_online:
         fit = fancurve.update(mem.get("fan_fit"), cfg, u=prev, rpm=obs.rpm, ts=obs.ts)
         mem["fan_fit"] = fit.memory
-        if fit.curves:
+        if fit.curves or fit.stale:
             stored = mem.get("fan_curves")
             merged = dict(stored) if isinstance(stored, Mapping) else {}
+            for model in fit.stale:  # unconfirmed for fan_curve_max_age_s: back to config
+                merged.pop(model, None)
             merged.update(fit.curves)
             mem["fan_curves"] = merged
         curves = mem.get("fan_curves")
@@ -583,6 +585,7 @@ def step(
                 ts=obs.ts,
                 smart=obs.inputs.get("smart"),
                 calibration=obs.inputs.get("calibration"),
+                curves=fan_curves,
             )
             est_block = est_update.estimates
         except Exception as exc:  # an estimator failure is a fault, never a raise out of step
@@ -952,11 +955,13 @@ def step(
             diagnostics["thermal"] = thermal_summary
         if cfg.fan_curve_online:
             diagnostics["fan_curves"] = fancurve.summary(
-                mem.get("fan_fit"), cfg, mem.get("fan_curves")
+                mem.get("fan_fit"), cfg, mem.get("fan_curves"), ts=obs.ts
             )
         if isinstance(mem.get(STORE_KEY), Mapping):
             diagnostics["store"] = mem[STORE_KEY]
-        diagnostics["noise"] = noise.noise_diagnostics(cfg, prev=prev, pwm=pwm, rpm=obs.rpm)
+        diagnostics["noise"] = noise.noise_diagnostics(
+            cfg, prev=prev, pwm=pwm, rpm=obs.rpm, curves=fan_curves
+        )
     cmd = MpcCommand(pwm=pwm, mode=mode, diagnostics=diagnostics)
 
     # 9. next state (gate rule 5: raw values and cmd.pwm always go into the window)
