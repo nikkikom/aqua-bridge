@@ -215,6 +215,34 @@ def test_discretisation_matches_the_affine_solution():
 
 
 @settings(max_examples=40, deadline=None)
+@given(seed=st.integers(0, 10_000))
+def test_the_pair_update_is_the_joseph_form_with_h_on_two_states(seed):
+    """A proximal member with a placement offset measures ``T_s + c``: the same update a
+    textbook ``H = e_i + e_j`` gives, evaluated through the rank-one structure."""
+    rng = np.random.default_rng(seed)
+    n = int(rng.integers(3, 9))
+    a = rng.normal(size=(n, n))
+    p = a @ a.T + np.eye(n) * 0.01
+    x = rng.normal(size=n) * 10.0
+    i, j = (int(v) for v in rng.choice(n, size=2, replace=False))
+    z, r = float(rng.normal() * 10.0), float(abs(rng.normal()) + 0.01)
+
+    h = np.zeros(n)
+    h[i] = h[j] = 1.0
+    k = (p @ h) / (float(h @ p @ h) + r)
+    ikh = np.eye(n) - np.outer(k, h)
+    x_ref = x + k * (z - float(h @ x))
+    p_ref = ikh @ p @ ikh.T + r * np.outer(k, k)
+
+    xc, pc = x.copy(), p.copy()
+    E._pair_update(xc, pc, i, j, z, r)
+    assert np.allclose(xc, x_ref, atol=1e-12)
+    assert np.allclose(pc, 0.5 * (p_ref + p_ref.T), atol=1e-12)
+    assert np.allclose(pc, pc.T, atol=1e-12)
+    assert np.linalg.eigvalsh(pc).min() >= -1e-9
+
+
+@settings(max_examples=40, deadline=None)
 @given(data=st.data())
 def test_joseph_form_keeps_every_covariance_symmetric_and_psd(data):
     cfg = lcfg()
@@ -399,9 +427,9 @@ def test_repeated_jumps_never_renew_the_settling_window():
     mem = run_ticks(cfg, 30)[-1].memory
     flags, sigmas = [], []
     for i in range(20):
-        up = run_ticks(
-            cfg, 1, mem=mem, t0=30.0 + i, prox_b1=PROX_C + (10.0 if i % 2 else -10.0)
-        )[-1]
+        up = run_ticks(cfg, 1, mem=mem, t0=30.0 + i, prox_b1=PROX_C + (10.0 if i % 2 else -10.0))[
+            -1
+        ]
         mem = up.memory
         flags.append(up.bays["b1"]["settling"])
         sigmas.append(up.estimates["b1"]["sigma"])
