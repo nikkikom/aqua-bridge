@@ -288,7 +288,6 @@ __all__ = [
     "Structure",
     "ThermalParams",
     "ThermalUpdate",
-    "airflow_gradients",
     "cached_structure",
     "current_model",
     "derivatives",
@@ -751,15 +750,6 @@ def _group_phi(gr: Group, phis: Mapping[str, float]) -> float:
     return sum(w * phis[ch] for ch, w in gr.weights.items()) / gr.prior if gr.prior > 0 else 0.0
 
 
-def airflow_gradients(
-    st: Structure, p: ThermalParams, u: Mapping[str, float] | np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """``(dQ/du, dQn/du)`` per zone and channel at the command ``u`` (the pieces of
-    :func:`jacobians`' input matrix that do not depend on the state)."""
-    _, _, dq, dqn = _airflow(st, p, _vec_u(st, u))
-    return dq, dqn
-
-
 def _vec_u(st: Structure, u: Mapping[str, float] | np.ndarray | Any) -> np.ndarray:
     if isinstance(u, Mapping):
         return np.array([float(u[ch]) for ch in st.channels])
@@ -875,8 +865,9 @@ def state_jacobian(
     """``(A, dQ/du, dQn/du)`` at command ``u``, from one airflow evaluation.
 
     ``A = df/dx`` does not depend on the state (every entry is built from the
-    parameters and the airflow alone), and ``dQ/du`` / ``dQn/du`` are what
-    :func:`airflow_gradients` returns, so the DAS MPC's linearisation
+    parameters and the airflow alone), and ``dQ/du`` / ``dQn/du`` are the pieces
+    of :func:`jacobians`' input matrix that do not depend on the state either, so
+    the DAS MPC's linearisation
     (:func:`aqua_bridge.control.solver_das._dynamics`) gets everything it needs
     from this one call instead of a :func:`jacobians` whose input matrix,
     derivatives and affine term it discards (item 73). Same ``A`` as
