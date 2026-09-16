@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from aqua_bridge.config import load_config
+from aqua_bridge.control.intents import Calibrate
 from aqua_bridge.control.mpc import step
 from aqua_bridge.control.supervisor import Supervisor
 from aqua_bridge.model import MpcConfig, MpcState
@@ -160,6 +161,8 @@ def _das_payload_keys() -> set[str]:
     obs = das_obs(cfg, 0.0, pwm=0.5)
     cmd, state = step(obs, sup.effective_config(), state)
     sup.record_tick(obs=obs, mpc_cmd=cmd, cmd=cmd, state=state, applied=True, usb_present=True)
+    # a handheld reading, so /api/model's "manual_calibrations" is populated (item 23)
+    sup.submit(Calibrate(bay="b01", drive_temp_c=41.5))
     # a zone fault, so "fault"/"in_closure"/"channels_under_fallback" are populated
     obs2 = das_obs(cfg, cfg.dt, pwm=cmd.pwm, drop=("air_z3",))
     cmd2, state2 = step(obs2, sup.effective_config(), state)
