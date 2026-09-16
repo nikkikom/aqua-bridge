@@ -668,9 +668,11 @@ def test_per_zone_confirm_ticks_and_independent_timers(dcfg):
     assert dcfg.confirm_ticks == 2
     seq = [das_obs(dcfg, 0.0, air_b=None)]  # zb faults at t=0
     seq += [das_obs(dcfg, 1.0, air_b=None, air_c=None)]  # zc faults at t=1
-    seq += [das_obs(dcfg, 2.0, air_c=None)]  # zb trusted 1/2
-    seq += [das_obs(dcfg, 3.0, air_c=None)]  # zb confirms, zc still out
-    seq += [das_obs(dcfg, 4.0)]  # zc trusted 1/2
+    seq += [das_obs(dcfg, 2.0, air_c=None)]  # air_b returns for the first time: zb trusted 1/2
+    seq += [das_obs(dcfg, 3.0, air_c=None)]  # zb's zone streak confirms, but air_b -- missing
+    # since boot, no reference behind its first reading (item 61) -- runs its own
+    # confirm_ticks like any other return, one tick behind the zone streak
+    seq += [das_obs(dcfg, 4.0)]  # air_b confirms, zb clears; air_c returns: zc trusted 1/2
     seq += [das_obs(dcfg, 5.0)]  # zc confirms
     r = run(dcfg, seq)
     faults = [{z: st.zone_faults[z].in_fault for z in ("za", "zb", "zc")} for _, st in r]
@@ -678,13 +680,14 @@ def test_per_zone_confirm_ticks_and_independent_timers(dcfg):
         {"za": False, "zb": True, "zc": False},
         {"za": False, "zb": True, "zc": True},
         {"za": False, "zb": True, "zc": True},
-        {"za": False, "zb": False, "zc": True},
+        {"za": False, "zb": True, "zc": True},
         {"za": False, "zb": False, "zc": True},
         {"za": False, "zb": False, "zc": False},
     ]
     assert [c.mode for c, _ in r] == [Mode.DEGRADED] * 5 + [Mode.AUTO]
     assert r[2][1].zone_faults["zb"].since_ts == 0.0 and r[2][1].zone_faults["zc"].since_ts == 1.0
-    assert r[3][1].fault_since_ts == 1.0  # zb cleared: the aggregate follows zc
+    assert r[3][1].fault_since_ts == 0.0  # zb: air_b is still confirming its own first reading
+    assert r[4][1].fault_since_ts == 1.0  # zb cleared: the aggregate now follows zc
 
 
 def test_zone_missing_from_state_starts_in_fault_when_global_fault_is_active(dcfg):

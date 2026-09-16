@@ -937,8 +937,15 @@ a frozen reading leaving its band) is *confirming* until it has been
 gate-trusted on `confirm_ticks` consecutive time-valid ticks, the same
 count a zone needs to leave a fault. A dropout (`missing`, `null`,
 `non_finite`) starts nothing, since the value that returns is gated against
-the last good one; a dropout or a time fault while confirming restarts the
-count. A confirming sensor is not fused by the estimator, not in the
+the last good one -- unless there is no last good one to gate it against: a
+name whose slew check passed with neither `last_good_obs` nor a previous raw
+value to compare against, while `last_good_obs` itself already exists (the
+run is past its own cold start), is `no_reference` (a sensor missing since
+boot, item 61); such a first reading has no evidence behind it either, so it
+starts confirming too, on the tick it first appears. The run's genuine first
+tick (`last_good_obs is None`) is exempt and stays bumpless. A dropout or a
+time fault while confirming restarts the count. A confirming sensor is not
+fused by the estimator, not in the
 solver's `temps`, not written into `last_good_obs` and not seen by the
 thermal identification. For zone trust it counts as a trusted group member
 only while its zone is already in fault, so a sole member costs
@@ -4235,9 +4242,15 @@ Owner decision (2026-09-16):
     4` for every window length the config allows, so the legacy and
     default-DAS paths stay bit for bit (`tests/test_gate.py`,
     `tests/test_stuck_sim.py`).
-61. A redundant sensor missing since boot has no reference value, so its
-    first reading passes the slew check and is fused at once without
-    confirmation.
+61. **Done** (2026-09-16): a name whose slew check (gate rule 2) passed
+    with neither a `last_good_obs` value nor a previous raw one to
+    compare against, while the run is past its own cold start
+    (`last_good_obs` already exists for some other sensor), is now
+    `GateResult.no_reference`; `zones.advance_confirmation` starts such
+    a name confirming on the same tick, exactly like a fresh rejection,
+    instead of fusing it on trust alone (`tests/test_sensor_confirm.py`).
+    The whole run's genuine first tick (`last_good_obs is None`) is
+    unaffected and stays bumpless.
 62. `src/aqua_bridge/recorder.py` still records a sensor while it is
     confirming; skip the names in `diagnostics["sensor_confirm"]`.
 63. `diagnostics["gate"]["per_temp"]` shows a confirming sensor as

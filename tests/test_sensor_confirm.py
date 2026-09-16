@@ -159,6 +159,30 @@ def test_a_dropout_starts_no_confirmation(ccfg):
     assert all(cmd.diagnostics["sensor_confirm"] == {} for cmd, _ in rec)
 
 
+def test_a_sensor_missing_since_boot_confirms_on_its_first_reading(ccfg):
+    """Item 61: unlike the dropout above (which returns to a value ``last_good_obs``
+    already remembers), a sensor with no reference at all -- missing since boot, while
+    the rest of the system is already past its own cold start -- gets no free pass: its
+    first reading confirms like any other return instead of fusing on trust alone."""
+    missing_ticks = 3
+
+    def temps(i: int) -> dict[str, float | None]:
+        return patched(ccfg, prox_a1b=None if i < missing_ticks else PROX_C)
+
+    rec = run(ccfg, temps, missing_ticks + ccfg.confirm_ticks + 2)
+    for k, (cmd, state) in enumerate(rec):
+        confirming = cmd.diagnostics["sensor_confirm"]
+        good = state.last_good_obs
+        if missing_ticks <= k < missing_ticks + ccfg.confirm_ticks:
+            assert confirming.get("prox_a1b") == k - missing_ticks, k
+            assert good is None or good.temps.get("prox_a1b") is None, k
+        else:
+            assert "prox_a1b" not in confirming, k
+        assert cmd.mode is Mode.AUTO, k  # bay a1's other member (prox_a1) covers the zone
+    fused_tick = missing_ticks + ccfg.confirm_ticks
+    assert rec[fused_tick][1].last_good_obs.temps["prox_a1b"] == PROX_C  # type: ignore[union-attr]
+
+
 def test_a_dropout_while_confirming_restarts_the_count(ccfg):
     base = settled(ccfg)
     level = PROX_C + JUMP_C
