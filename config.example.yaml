@@ -149,7 +149,9 @@ mpc:
                          # Louder while it runs; with ident_levels: symmetric the whole zone, not
                          # one group of it, may sit ident_amplitude under the solver's command
   ident_require_excitable: false  # true: refuse a start (not_excitable:<ch>) whose channel cannot reach
-                         # the thermal model's PE bound from where the solver parked it
+                         # the thermal model's PE bound from where the solver parked it, at this
+                         # ident_amplitude. The reach it reads is an upper bound: with a hold
+                         # shorter than model_window_s a regression window averages the two levels
   ident_hold_s: [60, 120, 180]  # hold times the seeded sequence draws from (each >= 5 * dt when enabled)
   ident_max_duration_s: 1800    # whole experiment, seconds, (0, 7200]
   ident_settle_s: 600    # every zone served trusted this long before a start (>= confirm_s when enabled)

@@ -913,11 +913,22 @@ def test_pe_diag_is_the_diagonal_of_the_matrix_pe_min_is_the_eigenvalue_of(das_e
 
 
 def test_a_block_with_no_windows_reads_as_no_variation_rather_than_as_nothing(das_example_cfg):
+    """No variation is 0; no *fit* is ``null``. A block that has closed no window still
+    carries the prior's own initial variance in ``P``, so publishing its square root as a
+    standard error would hand the owner a prior dressed as a measurement -- exactly the
+    bays item 111 asks them to read ``se`` for, since ``_reset_swapped_bays`` puts b03 and
+    b10 back to a fresh block on nearly every tick (section 8 item 109)."""
     fresh = thermal.fresh_memory(das_example_cfg)
     summary = thermal.summary(fresh, das_example_cfg)
     for zone in summary["zones"].values():
         assert set(zone["pe_diag"].values()) == {0.0}
     assert thermal.pe_diagonal(fresh["bays"]["b01"]) == [0.0]
+    for b, bay in summary["bays"].items():
+        assert bay["windows"] == bay["excited_windows"] == 0
+        assert set(bay["rel_se"].values()) == {None}, b
+        assert set(bay["se"].values()) == {None}, b
+        assert abs(bay["theta"][f"k.{b}"]) > 0.0  # a prior is there; a measurement is not
+    json.dumps(summary, allow_nan=False)
 
 
 def test_blocked_names_the_gates_the_converged_rule_still_fails(das_example_cfg):
@@ -928,6 +939,8 @@ def test_blocked_names_the_gates_the_converged_rule_still_fails(das_example_cfg)
     run = _closed_loop(on_cfg, 400)
     summary = run.records[-1].cmd.diagnostics["thermal"]
     st = thermal.structure(on_cfg)
+    topo = on_cfg.topology
+    assert topo is not None
     kinds = ("windows:", "pe:", "rel_se:", "pred_err")
     for z, zone in summary["zones"].items():
         blocked = zone["blocked"]
@@ -942,8 +955,16 @@ def test_blocked_names_the_gates_the_converged_rule_still_fails(das_example_cfg)
             assert "pred_err" in blocked
         # exactly the gains of the rule -- the zone's strong ``E`` and every occupied
         # bay's ``k`` -- and exactly the ones whose relative standard error is short
+        # the rule reads the *occupied* bays; this config declares every bay constrained
+        # and the run reports none empty, so that is every bay of the zone here
+        occupied = [
+            b
+            for b in st.zones[z].bays
+            if summary["bays"][b].get("occupancy") != "empty" and topo.bays[b].constrained
+        ]
+        assert occupied == list(st.zones[z].bays)
         gains = {gr.key: zone["rel_se"][gr.key] for gr in st.zones[z].groups if not gr.weak}
-        gains.update({f"k.{b}": summary["bays"][b]["rel_se"][f"k.{b}"] for b in st.zones[z].bays})
+        gains.update({f"k.{b}": summary["bays"][b]["rel_se"][f"k.{b}"] for b in occupied})
         want = {
             key for key, rel in gains.items() if rel is None or rel >= on_cfg.model_converged_rel_se
         }
@@ -959,12 +980,12 @@ def test_a_bay_publishes_the_absolute_standard_error_beside_the_relative_one(das
     for b, bay in summary["bays"].items():
         assert set(bay["se"]) == set(bay["rel_se"])
         for key, se in bay["se"].items():
+            # ``None`` in exactly the same places: no fit, or a coefficient at zero
+            assert (se is None) is (bay["rel_se"][key] is None), (b, key)
+            if se is None:
+                continue
             assert se >= 0.0 and math.isfinite(se)
-            value = abs(bay["theta"][key])
-            if bay["rel_se"][key] is None:
-                assert value < 1e-9
-            else:
-                assert bay["rel_se"][key] == pytest.approx(se / value)
+            assert bay["rel_se"][key] == pytest.approx(se / abs(bay["theta"][key]))
         assert bay["se"][f"k.{b}"] > 0.0
 
 

@@ -492,17 +492,27 @@ mpc:
   # A / (2 (u - d) + A), i.e. it needs A >= 0.576 (u - d): a channel parked past about 0.62
   # PWM cannot clear the bound at any allowed amplitude, and one at pwm_min clears it with
   # 0.06 (section 8 item 110). The experiment status and the start log name the channels that
-  # cannot (snapshot().extra["experiment"]["unexcitable"]), and the model's own pe_diag and
-  # blocked say which group and which gate are short after the fact. One switch acts on it.
+  # cannot at the CONFIGURED amplitude (snapshot().extra["experiment"]["unexcitable"]), and say
+  # per channel whether raising ident_amplitude to its 0.3 cap would reach it (excitable_at_cap)
+  # or only a lower park would. The reach published there is an UPPER BOUND: the monitor
+  # accumulates one weighted mean of the airflow regressor per model_window_s block, so it sees
+  # the telegraph's two levels only while a regression window fits inside one hold. With the
+  # ident_hold_s below (60-180 s) against model_window_s 120 s some windows average the two
+  # levels and the monitor reads less; holds_cover_window in the same status says so, and
+  # lengthening every hold past model_window_s makes the bound tight. The model's own pe_diag
+  # and blocked say which group and which gate are short after the fact. One switch acts on it.
   # Sizing each channel's step to what the bound needs at its own base was measured and
   # NOT kept: over 16 h on three rich seeds it saved 0.004 mean PWM at the aim that keeps
   # the convergence, and below it lost zones, because under "above" the extra cooling comes
   # straight back off the solver's own demand (section 8 item 110).
   ident_require_excitable: false  # true: check_start refuses a start whose channel cannot reach
-                         # the bound (not_excitable:<ch>), the way band: and saturated: refuse.
-                         # Off by default: such a run still informs the E split and the bays'
-                         # g0 / k, and on this example a zone-wide start is widened to channels
-                         # the solver parks high, so refusing gives up the zones that do converge.
+                         # the bound at ident_amplitude (not_excitable:<ch>), the way band: and
+                         # saturated: refuse. Off by default: such a run still informs the E split
+                         # and the bays' g0 / k, and on this example a zone-wide start is widened
+                         # to channels the solver parks high, so refusing gives up the zones that
+                         # do converge. It refuses on the upper bound above, so it never blocks a
+                         # start that could have worked -- but with holds shorter than
+                         # model_window_s it can let one through that still falls short.
   ident_hold_s: [60, 120, 180]  # hold times drawn by the seeded sequence (each >= 5 * dt)
   ident_max_duration_s: 1800    # the whole experiment, seconds
   ident_settle_s: 600    # every zone the group serves trusted this long before a start

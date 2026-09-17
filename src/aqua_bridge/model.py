@@ -129,6 +129,7 @@ from typing import Any
 
 __all__ = [
     "BUILTIN_DRIVE_CLASSES",
+    "IDENT_AMPLITUDE_MAX",
     "IDENT_LEVELS",
     "DAS_SECTIONS",
     "FAULT_COUPLINGS",
@@ -704,6 +705,11 @@ SETPOINT_GROUP_PREFIX = "setpoint:"
 #: ``ident_levels`` values: ``above`` (base and base + amplitude, never less cooling
 #: than the solver's level at start) or ``symmetric`` (base +- amplitude, owner opt-in).
 IDENT_LEVELS: tuple[str, ...] = ("above", "symmetric")
+#: Largest ``ident_amplitude`` the config accepts. The owner-facing ceiling on how much
+#: PWM one experiment may add (``above``) or give up (``symmetric``) on a channel; it is
+#: also what :func:`aqua_bridge.control.ident.excitation` evaluates ``excitable_at_cap``
+#: at, so "no allowed amplitude reaches the PE bound" is computed rather than asserted.
+IDENT_AMPLITUDE_MAX = 0.3
 
 _MIX = "mix"
 
@@ -2374,9 +2380,10 @@ class MpcConfig:
         """Rules for the ``ident_*`` keys of the active experiments (module docstring)."""
         if self.ident_enabled and self.topology is None:
             raise ConfigError("mpc.ident_enabled: true requires mpc.topology (DAS layout)")
-        if not 0.0 < self.ident_amplitude <= 0.3:
+        if not 0.0 < self.ident_amplitude <= IDENT_AMPLITUDE_MAX:
             raise ConfigError(
-                f"mpc.ident_amplitude must be in (0, 0.3], got {self.ident_amplitude}"
+                f"mpc.ident_amplitude must be in (0, {IDENT_AMPLITUDE_MAX}], "
+                f"got {self.ident_amplitude}"
             )
         if not self.ident_hold_s or any(h <= 0 for h in self.ident_hold_s):
             raise ConfigError(
