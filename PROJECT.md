@@ -6485,6 +6485,18 @@ Owner decision (2026-09-16):
     also be refused, to fully match "two independent controllers are not
     supported yet" in the general case, is the owner's call — see
     PROPOSED ITEMS.
+108. `tests/test_bench_budget.py::test_das_mpc_step_p99_within_budget_ms_on_the_pi`
+    is guarded by `@pytest.mark.skipif(platform.machine() != "armv6l", ...)`,
+    so `pytest -m pi` silently skips it on the owner's current board: the
+    move to the Zero 2 W (items 50, 51) made `platform.machine()`
+    `aarch64`, not `armv6l`. It is the one test that checks the absolute
+    `mpc.budget_ms` gate on real Pi hardware, so nothing in `-m pi` catches
+    a regression there any more; item 73's own re-measurement already
+    worked around this by using `tools/bench_step.py` directly rather than
+    `pytest -m pi`, which is evidence, not a fix. Widen the check to the
+    boards this project targets (or key it off a provisioning-set env var)
+    so the gate runs again — `tests/test_mpc_nominal.py` has a tolerance
+    comment with the same `armv6l` assumption to check while at it.
 
 ### 8.3 Open — needs the DAS hardware
 
