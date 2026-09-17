@@ -19,9 +19,10 @@ three things it pins are the point of the item and of that echo:
 * the fit is no worse than the frozen arm's beyond a loose margin, per seed.
 
 The bounds are loose on purpose: this is a regression net for the re-planning, not a
-convergence test. Convergence evidence is ``tests/test_thermal_ident.py`` (open-loop
-excitation); with one experiment at a time and the solver moving a zone's other channels,
-neither arm converges in this scenario.
+convergence test. With one experiment at a time and the solver moving a zone's other
+channels, neither arm converges in this scenario -- ``tests/test_ident_converge_sim.py``
+has the closed-loop scenario that does (a whole zone at once, ``ident_parallel``, section
+8 item 102) and ``tests/test_thermal_ident.py`` the open-loop excitation.
 """
 
 from __future__ import annotations

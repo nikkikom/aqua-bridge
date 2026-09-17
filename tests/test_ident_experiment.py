@@ -85,6 +85,7 @@ def test_ident_defaults_are_the_plan_values_and_legacy_stays_valid(cfg):
     assert cfg.ident_enabled is False
     assert cfg.ident_amplitude == 0.15 and cfg.ident_levels == "above"
     assert cfg.ident_replan is True  # item 52: the levels follow the live demand
+    assert cfg.ident_parallel is False  # item 102: one group at a time unless asked
     assert cfg.ident_hold_s == (60.0, 120.0, 180.0)
     assert cfg.ident_max_duration_s == 1800.0 and cfg.ident_settle_s == 600.0
     assert cfg.ident_max_over_c == 3.0 and cfg.ident_seed == 1
@@ -109,6 +110,7 @@ def test_ident_defaults_are_the_plan_values_and_legacy_stays_valid(cfg):
         ({"ident_seed": 1.5}, "ident_seed"),
         ({"ident_enabled": "yes"}, "ident_enabled"),
         ({"ident_replan": "yes"}, "ident_replan"),
+        ({"ident_parallel": "yes"}, "ident_parallel"),
     ],
 )
 def test_ident_config_rules(changes, match):
@@ -228,6 +230,90 @@ def test_symmetric_levels_straddle_the_base():
     exp = ident.start(cfg, good_facts(cfg), "channel", "fb1")
     assert exp["levels"]["fb1"] == pytest.approx([0.3, 0.7])
     assert [p["channels"] for p in exp["phases"]] == [["fb1"]]
+
+
+# ---------------------------------------------------------------------------
+# ident_parallel: the target's own zones, each channel on its own code (item 102)
+# ---------------------------------------------------------------------------
+
+
+def test_parallel_widens_the_target_to_its_own_zones():
+    cfg = ident_cfg(ident_parallel=True)
+    assert ident.zone_channels(cfg, ("fa1",)) == ("fa1", "fa2")  # za lists both
+    assert ident.zone_channels(cfg, ("fb1",)) == ("fb1",)
+    # zb is only *coupled* to za: coupling is served and aborted on, never excited
+    assert ident.served_zones(cfg, ("fa1",)) == ("za", "zb")
+    assert ident.target_channels(cfg, "channel", "fa1") == ("fa1", "fa2")
+    assert ident.target_channels(cfg, "group", "front") == ("fa1", "fa2")
+    assert ident.target_channels(cfg, "channel", "fc1") == ("fc1",)
+    # off, the target is what it always was
+    off = ident_cfg()
+    assert ident.target_channels(off, "channel", "fa1") == ("fa1",)
+
+
+def test_parallel_runs_one_phase_with_an_independent_code_per_channel():
+    cfg = ident_cfg(ident_parallel=True, ident_max_duration_s=600.0)
+    exp = ident.start(cfg, good_facts(cfg, pwm=0.4), "channel", "fa1")
+    assert exp == ident.start(cfg, good_facts(cfg, pwm=0.4), "channel", "fa1")  # deterministic
+    json.dumps(exp, allow_nan=False)
+    assert [p["channels"] for p in exp["phases"]] == [["fa1", "fa2"]]
+    codes = exp["phases"][0]["codes"]
+    assert set(codes) == {"fa1", "fa2"} and "segments" not in exp["phases"][0]
+    for segs in codes.values():
+        levels = [lvl for _, lvl in segs]
+        assert all(x != y for x, y in zip(levels, levels[1:], strict=False))  # alternates
+        holds = [t2 - t1 for (t1, _), (t2, _) in zip(segs, segs[1:], strict=False)]
+        assert set(holds) <= set(cfg.ident_hold_s)
+    # the two codes are not the same telegraph: different start level or different switches
+    assert codes["fa1"] != codes["fa2"]
+    seen: set[tuple[int, ...]] = set()
+    for offset in range(0, 600):
+        lv = ident.levels_at(exp, float(offset))
+        seen.add(tuple(lv["code"]))
+        for ch, u in lv["overrides"].items():
+            base = exp["base"][ch]
+            assert cfg.pwm_min <= u <= cfg.pwm_max
+            assert base - TOL <= u <= base + cfg.ident_amplitude + TOL  # above: never below
+    assert seen == {(0, 0), (0, 1), (1, 0), (1, 1)}  # all four corners, so not collinear
+    assert ident.hold_sequence(cfg, 600.0) == ident.hold_sequence(ident_cfg(), 600.0)
+
+
+def test_parallel_leaves_a_single_channel_zone_and_the_dip_alone():
+    cfg = ident_cfg(ident_parallel=True, ident_levels="symmetric", ident_amplitude=0.2)
+    exp = ident.start(cfg, good_facts(cfg), "channel", "fb1")
+    assert [p["channels"] for p in exp["phases"]] == [["fb1"]]
+    assert exp["levels"]["fb1"] == pytest.approx([0.3, 0.7])
+    assert ident.planned_dip(exp, "fb1", cfg) == pytest.approx(0.2)
+
+
+def test_parallel_off_leaves_the_schedule_byte_identical():
+    off = ident_cfg()
+    explicit = ident_cfg(ident_parallel=False)
+    facts = good_facts(off, pwm=0.4)
+    assert ident.start(off, facts, "group", "front") == ident.start(
+        explicit, facts, "group", "front"
+    )
+    exp = ident.start(off, facts, "group", "front")
+    assert all("codes" not in p and "segments" in p for p in exp["phases"])
+    assert "code" not in ident.levels_at(exp, 0.0)
+
+
+def test_a_parallel_start_checks_the_band_on_every_channel_it_drives():
+    cfg = ident_cfg(ident_parallel=True, ident_amplitude=0.2)
+    # fa2 alone would leave the band; a start on fa1 now drives fa2 too, so it is refused
+    base = good_facts(cfg, pwm=0.5)
+    facts = dataclasses.replace(base, pwm={**base.pwm, "fa2": 0.9})
+    assert "band:fa2" in ident.check_start(
+        cfg, settled_tracker(cfg), facts, "channel", "fa1", human_control=False
+    )
+    assert not ident.check_start(
+        ident_cfg(ident_amplitude=0.2),
+        settled_tracker(cfg),
+        facts,
+        "channel",
+        "fa1",
+        human_control=False,
+    )
 
 
 # ---------------------------------------------------------------------------
