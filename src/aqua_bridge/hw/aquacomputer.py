@@ -22,8 +22,11 @@ Status report (input report ``0x01``, sent unsolicited about once per second):
   ``+8`` (blocks 1-4 the aquaero's own outputs, 5-8 the outputs of a device on
   its aquabus, a Quadro's outputs 1-4); 3 flow sensors at ``0xF9``. A fan block
   whose speed reads ``0xFFFF`` has no device behind it; a flow sensor reading
-  ``0x7FFF`` has none either. The ``u16`` at ``+0x0A`` of a fan block is not
-  identified and is not decoded (PROJECT.md section 2, 2026-09-17).
+  ``0x7FFF`` has none either. The ``u16`` at ``+0x0A`` of a fan block is **not
+  identified**: it is read into :attr:`FanStatus.unidentified_raw` so a
+  diagnostic tool can show it, carries no unit and is published by nothing
+  (PROJECT.md section 2, 2026-09-17, section 8 item 114; see the end of this
+  docstring).
 * Quadro, 220 bytes: serial at ``0x03``, firmware at ``0x0D``, power-cycle
   count ``u32`` at ``0x18``; temperatures: 4 physical sensors at ``0x34``
   (``temp1..4``) and 16 software sensors at ``0x3C`` (``soft1..16``; the
@@ -125,6 +128,24 @@ for those outputs (:meth:`DeviceKind.reports_rail`) and nothing publishes that
 field as the output's rail. The aquaero's own blocks 1-4 do report their own
 rail and are unaffected.
 
+That "about one report in four" is now a measured number rather than an
+impression: :data:`AQUABUS_REFRESH_REPORTS` (4 reports, :data:`AQUABUS_REFRESH_S`
+= 4 s at the report's own cadence), carried on the kind so a caller can act on
+it (PROJECT.md section 8 item 115). Only the electrical fields follow it; speed
+and output duty are in every report, which is what makes an absent bus device
+judgeable at all -- :func:`aquabus_present` reads the speed fields of the
+aquabus blocks and nothing else.
+
+A bus device can also **leave the bus while the controller runs** (2026-09-15,
+PROJECT.md section 8 item 92): its fan blocks then read speed ``0xFFFF`` and its
+flow slot ``0x7FFF``, but the aquabus temperature slots ``bus1..8`` keep the last
+value they read -- an hour later one still read 24.12 degC. Nothing in such a
+report marks that temperature as old. So the aquabus temperature slots
+(:attr:`DeviceKind.aquabus_temp_names`, :attr:`TempGroup.aquabus`) are a reading
+only while :func:`aquabus_present` says a device answers, and the adapter reports
+them as missing otherwise rather than passing a frozen number on as a
+measurement.
+
 That substitution is also why **absence is judged on the speed field and on
 nothing else** (:attr:`FanStatus.present`, PROJECT.md section 8 items 90, 116).
 An aquabus output with no fan reads **0.00 V** in a report that carries the bus
@@ -141,6 +162,16 @@ reading ``0xFFFF``, or whether a bus hiccup can show it for a single report: all
 of them come from a healthy, uninterrupted bus, and that transition is untested
 hardware work (PROJECT.md section 8 item 96). Pinned on the two fixtures captured
 one second apart (``tests/test_hw_aquacomputer.py``).
+
+The ``u16`` at ``+0x0A`` of a fan block stays unidentified (item 114). What is
+known: it is 0 on every block of the aquaero's own outputs 1-4 and on an aquabus
+block in a report that refreshed nothing, it is not the current (it read 26 with
+the same block's current field at 6 mA) and not the power (7 cW there), and over
+the captures its ratio to the current field is the block's output duty -- 26 at
+duty 20 % against 6 mA, 27 at duty 100 % against 27 mA, the same in the 90-report
+run (22/5, 15/4, 11/3, 3/1 at 20 %). Two duties are not enough to name a field,
+and a third needs a duty change, which is a write. It is therefore decoded raw,
+named ``unidentified``, and no caller may treat it as a measurement.
 """
 
 from __future__ import annotations
@@ -150,6 +181,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 __all__ = [
+    "AQUABUS_REFRESH_REPORTS",
+    "AQUABUS_REFRESH_S",
     "AQUAERO",
     "DUTY_MAX",
     "FAN_ABSENT_RPM",
@@ -176,6 +209,7 @@ __all__ = [
     "StatusReport",
     "TempGroup",
     "active_profile",
+    "aquabus_present",
     "capture_channel",
     "channel_holds",
     "channel_state",
@@ -223,6 +257,21 @@ SOFT_SENSOR_SETTINGS_SIZE = 5
 TEMP_MIN_C = -327.68
 TEMP_MAX_C = 327.66
 
+#: How often the aquaero refreshes one of its aquabus fan blocks with the bus
+#: device's own measurements: once in this many status reports, which at the
+#: report's own ~1 s cadence is :data:`AQUABUS_REFRESH_S` seconds. Measured, not
+#: chosen: 23 of 90 consecutive reports carried measurements over 88.6 s
+#: (2026-09-17), i.e. one in 3.9 reports, 3.85 s (PROJECT.md section 2, "The
+#: aquabus blocks' electrical fields are not a per-report reading", section 8
+#: item 115). A hardware fact of the aquaero, like
+#: :attr:`DeviceKind.aquabus_outputs_report_power`, and not a tunable: no key
+#: changes it and nothing the daemon writes moves it. Only the electrical fields
+#: (voltage, current, power and the unidentified ``u16``) follow this cadence --
+#: speed and output duty are in every report, which is why an absent bus device
+#: is judged from the speed field alone (:func:`aquabus_present`).
+AQUABUS_REFRESH_REPORTS = 4
+AQUABUS_REFRESH_S = 4.0
+
 
 class ReportError(ValueError):
     """A report does not have the id, length or checksum its layout requires."""
@@ -237,6 +286,12 @@ class FanLayout:
     voltage: int
     current: int
     power: int
+    #: Offset of a ``u16`` in the block that is read but **not identified**
+    #: (the aquaero's ``+0x0A``, PROJECT.md section 8 item 114); ``None`` where
+    #: the kind's block has no such field. It is decoded into
+    #: :attr:`FanStatus.unidentified_raw` for diagnostics and is published by
+    #: nothing: see that attribute.
+    unidentified: int | None = None
 
 
 @dataclass(frozen=True)
@@ -248,6 +303,12 @@ class TempGroup:
     count: int
     #: What the group is, for tools and error messages.
     description: str
+    #: The slots belong to a device on the controller's aquabus, not to the
+    #: controller itself (the aquaero's ``bus1..8``). Such a slot keeps the last
+    #: value it read when the device leaves the bus instead of reading
+    #: ``0x7FFF``, so it may only be trusted while :func:`aquabus_present` says a
+    #: device answers (PROJECT.md section 8 item 92).
+    aquabus: bool = False
 
     def names(self) -> tuple[str, ...]:
         return tuple(f"{self.prefix}{i}" for i in range(1, self.count + 1))
@@ -344,6 +405,16 @@ class DeviceKind:
     #: device's rail in a single report (PROJECT.md section 2, 2026-09-17), so the
     #: field may not be published as that output's rail. A hardware fact.
     aquabus_outputs_report_rail: bool = True
+    #: How many status reports pass between two refreshes of one aquabus fan
+    #: block, and how long that is in seconds. Measured on the aquaero, not a
+    #: tunable and nothing the daemon can change: PROJECT.md section 8 item 115.
+    #: ``None`` on a kind with no aquabus outputs. Callers use it as the length
+    #: of the longest gap in which an aquabus block carries no fresh measurement
+    #: -- :meth:`AquacomputerTiming.check_kind
+    #: <aqua_bridge.hw.aquacomputer_adapter.AquacomputerTiming.check_kind>`
+    #: refuses a ``bus_absent_s`` shorter than it.
+    aquabus_refresh_reports: int | None = None
+    aquabus_refresh_s: float | None = None
 
     @property
     def temp_names(self) -> tuple[str, ...]:
@@ -385,6 +456,17 @@ class DeviceKind:
     def aquabus_outputs(self) -> tuple[int, ...]:
         """Output numbers (1-based) that belong to a device on the aquaero's aquabus."""
         return tuple(k + 1 for k, channel in enumerate(self.ctrl_channels) if channel.aquabus)
+
+    @property
+    def aquabus_temp_names(self) -> tuple[str, ...]:
+        """Config names of the temperature inputs a device on aquabus fills
+        (the aquaero's ``bus1..bus8``); empty on a kind with no such group.
+
+        These are the readings that freeze instead of going missing when the bus
+        device leaves, so a caller must judge them against :func:`aquabus_present`
+        (PROJECT.md section 8 item 92).
+        """
+        return tuple(name for group in self.temp_groups if group.aquabus for name in group.names())
 
     def reports_power(self, number: int) -> bool:
         """Output ``number`` (1-based) reports a meaningful current and power.
@@ -456,14 +538,16 @@ AQUAERO = DeviceKind(
     power_cycles_offset=None,
     temp_groups=(
         TempGroup("temp", 0x65, 8, "physical sensors"),
-        TempGroup("bus", 0x75, 8, "aquabus temperature slots"),
+        TempGroup("bus", 0x75, 8, "aquabus temperature slots", aquabus=True),
         TempGroup("soft", 0x85, 8, "software sensors"),
         TempGroup("virt", 0x95, 4, "virtual sensors"),
     ),
     fan_blocks=tuple(
         _AQUAERO_FAN_BLOCK_START + _AQUAERO_FAN_BLOCK_SIZE * k for k in range(_AQUAERO_OUTPUTS)
     ),
-    fan_layout=FanLayout(speed=0x00, duty=0x02, voltage=0x04, current=0x06, power=0x08),
+    fan_layout=FanLayout(
+        speed=0x00, duty=0x02, voltage=0x04, current=0x06, power=0x08, unidentified=0x0A
+    ),
     flow_offsets=(0xF9, 0xFB, 0xFD),
     ctrl_report_id=0x0B,
     ctrl_size=0xA93,
@@ -478,6 +562,8 @@ AQUAERO = DeviceKind(
     own_outputs_report_power=False,
     aquabus_outputs_report_power=False,
     aquabus_outputs_report_rail=False,
+    aquabus_refresh_reports=AQUABUS_REFRESH_REPORTS,
+    aquabus_refresh_s=AQUABUS_REFRESH_S,
 )
 
 QUADRO = DeviceKind(
@@ -537,6 +623,13 @@ class FanStatus:
     voltage_cv: int
     current_ma: int
     power_cw: int
+    #: The ``u16`` of :attr:`FanLayout.unidentified` (``None`` where the kind's
+    #: block has none). **Not a measurement and not a unit**: what it is has not
+    #: been established (PROJECT.md section 8 item 114, module docstring), so it
+    #: is decoded only so that a diagnostic tool can show the raw number, and
+    #: nothing -- not ``fan_readings``, not the recorder, not a health rule --
+    #: may publish or judge it. Naming it needs a duty the owner must set.
+    unidentified_raw: int | None = None
 
     @property
     def present(self) -> bool:
@@ -645,6 +738,7 @@ def decode_status(kind: DeviceKind, data: bytes | bytearray) -> StatusReport:
         for i in range(group.count)
     }
     layout = kind.fan_layout
+    unidentified = layout.unidentified
     fans = tuple(
         FanStatus(
             rpm=_u16(data, base + layout.speed),
@@ -652,6 +746,7 @@ def decode_status(kind: DeviceKind, data: bytes | bytearray) -> StatusReport:
             voltage_cv=_u16(data, base + layout.voltage),
             current_ma=_u16(data, base + layout.current),
             power_cw=_u16(data, base + layout.power),
+            unidentified_raw=(None if unidentified is None else _u16(data, base + unidentified)),
         )
         for base in kind.fan_blocks
     )
@@ -668,6 +763,43 @@ def decode_status(kind: DeviceKind, data: bytes | bytearray) -> StatusReport:
         flows=tuple(_flow(data, offset) for offset in kind.flow_offsets),
         power_cycles=power_cycles,
     )
+
+
+def aquabus_present(kind: DeviceKind, status: StatusReport) -> bool | None:
+    """Whether a device answers on the controller's aquabus, from one status report.
+
+    ``True`` when at least one of the kind's aquabus fan blocks has a device
+    behind it, ``False`` when every one of them reads speed ``0xFFFF``, and
+    ``None`` on a kind with no aquabus outputs (the Quadro), which cannot say.
+
+    The evidence is the speed field alone, and deliberately so. ``0xFFFF`` there
+    means *nothing on aquabus at all*, not an output with no fan: with the
+    Quadro present, its outputs with no fan read 0 rpm (PROJECT.md section 2,
+    2026-09-17). Speed and output duty are in every report, while the blocks'
+    electrical fields carry the bus device's own measurements only once in
+    :data:`AQUABUS_REFRESH_REPORTS` (item 115) -- so a block in a report that
+    refreshed nothing reads 0.00 V and 0 mA with a fan turning, and judging
+    presence on a voltage or a current would call a live device absent in three
+    reports out of four (item 116). Over the 90-report run the speed field never
+    took part in that substitution.
+
+    What this cannot see: a bus device with **no fan outputs** is
+    indistinguishable from an empty bus here, so on such a device it answers
+    ``False`` while the device is in fact answering. In the supported topology
+    the bus device is a Quadro, whose four outputs fill blocks 5-8 (PROJECT.md
+    section 2, "Supported topology").
+
+    The caller that matters is the aquabus temperature slots: they keep the last
+    value they read when the device leaves the bus instead of reading
+    ``0x7FFF``, so they are a reading only while this says ``True``
+    (:attr:`DeviceKind.aquabus_temp_names`, PROJECT.md section 8 item 92).
+    """
+    if status.kind != kind.name:
+        raise ValueError(f"status report of a {status.kind}, not a {kind.name}")
+    outputs = kind.aquabus_outputs
+    if not outputs:
+        return None
+    return any(status.fans[number - 1].present for number in outputs)
 
 
 # ---------------------------------------------------------------------------
