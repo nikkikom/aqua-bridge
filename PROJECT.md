@@ -8235,14 +8235,24 @@ Owner decision (2026-09-16):
     covered (the aquaero's own outputs 1-4, and any sag common to the whole
     supply) and what does not (a rail local to the bus device).
 
-118. The `http` / `mqtt` optional extras (`aiohttp`, `paho-mqtt`) are not
-    installed into the shared dev `.venv` by default: a full-suite run from
-    a clean checkout of that venv fails 6 unrelated tests purely because
-    those extras are missing (found running item 108's own full-suite
-    check). Either install them into the shared venv by default, or
-    document that `pip install -e .[http,mqtt]` is required before running
-    the full suite documented in this file, so a clean checkout does not
-    surprise the next person running it.
+118. **Done** (2026-09-17): the `dev` extra now depends on `http` and
+    `mqtt` (`dev = [..., "aqua-bridge[http,mqtt]"]`, a self-referential
+    extra, `pyproject.toml`), so `pip install -e ".[dev]"` alone pulls
+    `aiohttp` and `paho-mqtt` — the same package set the existing
+    `pip install -e ".[dev,http,mqtt]"` install lines already asked for
+    (§11), now guaranteed rather than merely documented. Verified with
+    `pip install --dry-run -e ".[dev]"` in a clean venv: `aiohttp` and
+    `paho-mqtt` are pulled in. Before this, a clean venv installed only
+    with `.[dev]` (missing the `http`/`mqtt` extras the full suite in §4
+    needs) hit two different failure shapes depending on the test: a
+    bare top-level `import aiohttp` (`tests/test_http_api.py`,
+    `tests/test_http_auth.py`, ...) is a collection error, loud but not
+    named as an extras problem, while `pytest.importorskip("paho.mqtt.client")`
+    (`tests/test_mqtt_ha.py`, `tests/test_ha_check.py`,
+    `tests/test_mqtt_live.py`) is a silent skip — the item 108 shape. Fixing
+    it at the install boundary (nothing that asks for `dev` can end up
+    without `http`/`mqtt`) closes both shapes at once rather than papering
+    over either test file individually.
 128. A sagging aquabus rail from the readings below the window (item
     117's audit). Item 117 accepts that a rail behind a bus device is
     undetected, on the grounds that no per-report marker says which
