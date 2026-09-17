@@ -5281,8 +5281,10 @@ Owner decision (2026-09-16):
 12. **Done** (2026-09-16): a hot-swapped bay's identified coefficients start
     over from the prior. The estimator reports `swapped: true` for one tick on a
     bay whose occupancy crosses the `empty` boundary in either direction or whose
-    **mean** trusted proximal reading steps away from the predicted sensor node
-    by the fast-swap rule's own thresholds (`jump_min_c`, `jump_sigmas`);
+    **mean innovation** over its trusted proximal members passes the fast-swap
+    rule's own thresholds (`jump_min_c`, `jump_sigmas`) — each member predicted
+    where the filter says *it* sits, its node and, on the fused layout, its own
+    placement offset, against the variance of that mean (item 109);
     `step` hands those bays to `thermal.update(reset_bays=...)`, which with
     `model_reset_on_swap` (new flat key, default `true`) resets the bay's `g0`,
     `k`, `q_s`, covariance, counters, PE monitor and window in progress, plus the
@@ -6973,7 +6975,8 @@ Owner decision (2026-09-16):
     moved, no key was added, and nothing was made quieter on a two-sensor bay.**
     A bay with one proximal member is one member, so its statistic is
     arithmetically the old one; the goldens do not move and the `rich` seeds
-    whose pairs never tripped the rule (2 and 5) reproduce to every digit.
+    whose pairs never tripped the rule *in the closed loop* (2 and 5) reproduce
+    to every digit there.
     The three options the item floated were all rejected: a higher threshold
     treats a bug in the statistic as noise; rate-limiting the reset would hide a
     drive genuinely swapped twice; and reporting a bay that resets this often
@@ -6982,12 +6985,16 @@ Owner decision (2026-09-16):
     **False positives, measured.** Closed loop (PI-DAS, `rich`, 4 h = 2880
     ticks, no experiment), `swapped` ticks on b03: **2788 → 0** (seed 3),
     **2391 → 0** (seed 4), **712 → 0** (seed 7); b10 2 → 0 (seed 3). z0's
-    excited windows over the same runs: 0 → 109, 15 → 100, 24 → 105. Open loop
+    excited windows over the same runs: 0 → 109, 15 → 100, 24 → 105. In *this*
+    loop seeds 2 and 5 never tripped the rule at all, and they close identical
+    windows in every zone before and after — the control that shows the change
+    reaches only the bays whose pair actually crossed the thresholds. Open loop
     (`tests/test_estimator.py`, the fans stepped every 120 ticks, 1200 ticks,
-    seeds 2/3/4/5/7) the swing is larger and so is the gap: one or both
-    redundant pairs were reported on **1073–1199 of 1200 ticks** on every one of
-    those seeds, and on none after. Seeds 2 and 5 close identical windows in
-    every zone before and after.
+    seeds 2/3/4/5/7) the swing is larger and so is the gap, and it is *no longer
+    those two seeds that are quiet*: one or both redundant pairs were reported on
+    **1073–1199 of 1200 ticks** on every one of the five, seeds 2 and 5 included
+    (seed 2, pre-fix: b03 1198, b10 1198), and on none after. A seed is a clean
+    control only in the harness it was measured in.
 
     **Detection, measured — the other direction.** A drive replaced in place at
     3600 s of a closed-loop run by one `Δ` degrees from the one that left, the
