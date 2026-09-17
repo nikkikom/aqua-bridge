@@ -1819,8 +1819,9 @@ def update(
     trusted_air = {z: [temps[t] for t in zone.air if t in temps] for z, zone in st.zones.items()}
     smart_arrived: dict[str, bool] = {}
     jumped: dict[str, bool] = {}
-    # Bays whose *mean* trusted proximal reading stepped away from the predicted sensor
-    # node (item 12): the drive in them may be a different one from now on.
+    # Bays whose *mean innovation* over their trusted proximal members stepped away from
+    # zero (items 12, 109) -- each member against its own prediction, its node and, on the
+    # fused layout, its placement offset: the drive in them may be a different one now.
     stepped: dict[str, bool] = {}
     arrays: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     # zone -> (Q, Qn, t_in, the airflow followed a fitted fan curve)
@@ -2240,10 +2241,12 @@ def update(
 
     # The other half of the swap rule -- a bare proximal step, with no occupancy crossing
     # (items 12, 104) -- *inflates* the bay's manual calibration instead of dropping it.
-    # ``stepped`` is one tick's innovation against the predicted node, and a spin-up, an
-    # I/O burst or a fan step raises it as readily as a swap does; deleting on that would
-    # throw away twenty readings the owner took by hand on evidence that thin, and it
-    # would be asymmetric anyway, since the same event leaves a SMART entry alone.
+    # ``stepped`` is one tick's mean innovation over the bay's trusted proximal members,
+    # each against its own prediction -- its node and, on the fused layout, its placement
+    # offset -- and a spin-up, an I/O burst or a fan step raises it as readily as a swap
+    # does; deleting on that would throw away twenty readings the owner took by hand on
+    # evidence that thin, and it would be asymmetric anyway, since the same event leaves
+    # a SMART entry alone.
     # Inflation is the conservative direction: ``sigma_cal`` doubles until ``confirm``
     # further accepted hand readings of that bay clear it, indefinitely without them.
     for b, was_stepped in stepped.items():
