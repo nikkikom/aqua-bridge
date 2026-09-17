@@ -6759,6 +6759,44 @@ Owner decision (2026-09-16):
     currently times the sub-phases -- it is unmeasured, not merely
     un-transcribed here. The owner decision above (regenerate the goldens
     for cheaper arithmetic) is unaffected by this and still open.
+
+    **`bench_step.py --profile-phases` added (2026-09-17), Pi run still
+    outstanding.** The bench tool now takes `--profile-phases`
+    (`--sim-plant das`, `mpc` solver only) and adds a `phases` breakdown to
+    its `mpc` result: `sqp_box_qp_ms` (`solver_das.solve_penalty_qp`, the
+    SQP with its box QPs), `estimator_kalman_ms` (`estimator.update`),
+    `gate_ms` (`mpc.evaluate_gate`) and `bookkeeping_ms` (the residual --
+    everything else `_tick` does: prediction, model checks, disturbance
+    filtering, band snapping, the bumpless offset, the `json.dumps` guards,
+    ...), each with mean/p99/max/n over the solve ticks, matching
+    `solve_p99_ms`'s own denominator. It measures by temporarily
+    monkeypatching those three call sites' own module bindings for the run
+    and restoring them after -- `control/mpc.py` and `control/solver_das.py`
+    are untouched, so this cannot move a golden or change what a tick
+    returns, only how the wall time inside it is reported (`tools/bench_step.py`
+    module docstring, `tests/test_bench_budget.py`). A dev-machine sanity
+    run (`--ticks 60`, 30 solve ticks) shows the wrapper actually reaching
+    every named phase and the phases summing to the tick's own time, e.g.
+    (dev machine, not the Pi, not comparable to the numbers above which use
+    different call boundaries): `sqp_box_qp_ms` mean 0.48 ms,
+    `estimator_kalman_ms` mean 0.71 ms, `gate_ms` mean 0.04 ms,
+    `bookkeeping_ms` mean 0.96 ms, against a 2.6 ms solve-tick max.
+
+    Running it on the board itself -- what this item actually asks for --
+    was not done: `ssh` to the board's host had no route from the
+    environment this work ran in (`ssh: connect to host ... port 22: No
+    route to host`, every address tried, IPv4 and IPv6; concrete hostnames
+    live in `private.md`, not here). Nothing about the aquaero, the Quadro
+    or the heartbeat is implicated; this is a network-reachability gap in
+    the *work* environment, not a board problem. The command to run once
+    the board is reachable is
+    `ssh USER@PI-HOST 'cd /opt/aqua-bridge && PYTHONPATH=/opt/aqua-bridge/src
+    .venv/bin/python tools/bench_step.py --sim-plant das --ticks 600
+    --profile-phases'`, with `vcgencmd measure_temp` and `vcgencmd
+    get_throttled` before and after (module docstring's own caution about a
+    throttled run not being a measurement). The owner decision above is
+    still open either way; this only finishes the tooling item 95 also
+    asked for.
 98. Tune `model_max_air_dist_c_per_min` on the real enclosure (item 66).
     The shipped 8.0 °C/min is set above what the `rich` truth simulator's
     *drawn* physics produce on a healthy enclosure, where the prior's air
