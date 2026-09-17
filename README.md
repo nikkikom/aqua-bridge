@@ -121,8 +121,12 @@ is not yet confirmed on real hardware, on either board.
    with `{pwm: pwmN, rpm: fanN}` per output (with the Quadro on the
    aquaero's aquabus, its outputs are the aquaero's `pwm5..pwm8` and
    `fan5..fan8`), `temp_map` per input actually present (`tempN`
-   physical sensors, `busN` the aquaero's aquabus slots, `softN` software
-   and `virtN` virtual sensors); the optional timing keys and the
+   physical sensors, `busN` the aquaero's aquabus slots, `virtN` virtual
+   sensors — a `softN` software sensor is **refused**: it holds whatever
+   a host wrote into it and its configured fallback for ever after that
+   host stops, which no status report tells apart from a measurement
+   (§8 item 113); every slot's settings and reading are published under
+   `device_health.devices[].software_sensors` instead); the optional timing keys and the
    software-sensor heartbeat (`heartbeat_sensor`, `heartbeat_value_c`,
    off by default — 0 is right only while no software sensor is enabled
    on the controller, §8 item 84) are shown at their defaults,

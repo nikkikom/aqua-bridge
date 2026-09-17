@@ -17,7 +17,10 @@ measure for that output are shown but marked as not measured, since the
 aquaero's are placeholders -- current and power on its own outputs, and on its
 aquabus outputs the voltage as well, which is the aquaero's own rail in three
 reports out of four), flow ``flowN``, and the Quadro's power-cycle
-count -- then the profile the aquaero runs (control report byte 0x06) and each
+count -- then the profile the aquaero runs (control report byte 0x06), each
+software sensor's settings (enabled, fallback temperature, timeout: what makes a
+``softN`` reading readable at all, since an unfed slot shows its fallback and
+nothing in the status report says so) and each
 output's duty in the control report, with the aquaero's
 control source and power limits (the daemon's duty is in effect only while the
 channel follows its own preset with limits 0 / 100 %) and output mode (PWM or
@@ -44,6 +47,7 @@ from typing import TextIO
 
 from aqua_bridge.hw.aquacomputer import (
     KINDS,
+    SOFT_SENSOR_PREFIX,
     DeviceKind,
     ReportError,
     StatusReport,
@@ -54,6 +58,7 @@ from aqua_bridge.hw.aquacomputer import (
     format_channel_state,
     format_percent,
     is_status_report,
+    software_sensor_settings,
 )
 from aqua_bridge.hw.aquacomputer_adapter import AquacomputerTiming
 from aqua_bridge.hw.hidraw import (
@@ -104,6 +109,13 @@ def _print_status(kind: DeviceKind, status: StatusReport, out: TextIO) -> None:
         missing = [name for name in names if status.temp(name) is None]
         if missing:
             print(f"    no data: {' '.join(missing)}", file=out)
+        if group.prefix == SOFT_SENSOR_PREFIX:
+            print(
+                "    (a value here is whatever a host wrote, or the configured fallback "
+                "once nothing has;\n     not a measurement, and no config may bind one -- "
+                "see the control report below)",
+                file=out,
+            )
     print("  outputs (status report):", file=out)
     aquabus = set(kind.aquabus_outputs)
     for n, fan in enumerate(status.fans, start=1):
@@ -137,6 +149,28 @@ def _print_control(kind: DeviceKind, data: bytes, out: TextIO) -> None:
     print("  outputs (control report):", file=out)
     for k in range(kind.pwm_count):
         print(f"    {format_channel_state(channel_state(kind, data, k), k)}", file=out)
+    _print_soft_sensors(kind, data, out)
+
+
+def _print_soft_sensors(kind: DeviceKind, data: bytes, out: TextIO) -> None:
+    """The software sensors' settings, which is what makes a ``softN`` reading
+    readable (PROJECT.md section 8 item 113): an enabled slot shows its fallback
+    once nothing has written it for the timeout, and the status report above cannot
+    be told from a measurement without these three numbers."""
+    settings = software_sensor_settings(kind, data)
+    if not settings:
+        return
+    print(
+        "  software sensors (control report; a softN is written by a host, never measured):",
+        file=out,
+    )
+    for entry in settings:
+        state = "enabled " if entry.enabled else "disabled"
+        print(
+            f"    {entry.name:<7} {state}  fallback {entry.fallback_c:6.2f} degC  "
+            f"timeout {entry.timeout_s:5d} s",
+            file=out,
+        )
 
 
 def _probe_device(

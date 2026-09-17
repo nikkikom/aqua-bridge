@@ -568,6 +568,51 @@ def test_an_aquabus_outputs_rail_is_never_judged_however_the_reports_alternate()
     assert mon.check_channel("xt2", sagging, 1000.0)["problems"] != []
 
 
+def test_a_verdict_names_every_rule_that_did_not_run_for_the_channel() -> None:
+    """Item 117: the rail gap behind an aquabus device is accepted, so the published
+    verdict must say so rather than let an empty ``problems`` read as coverage.
+
+    Every channel's verdict carries ``rail_monitored`` and ``power_monitored`` and an
+    ``unmonitored`` mapping of rule -> why, taken from the adapter's own reason where it
+    has one. An aquaero's aquabus output names both rules; its own output names only
+    power (its rail *is* judged); a Quadro output names neither.
+    """
+    bus = _captured_reading("aquaero-status-aquabus-block7-power.bin", "qd3", 7)
+    own = _captured_reading("aquaero-status-aquabus-block7-power.bin", "xt2", 2)
+    mon = _monitor(FanHealthConfig(settle_s=0.0))
+
+    bus_verdict = mon.check_channel("qd3", bus, 0.0)
+    assert bus_verdict["problems"] == []  # nothing found, and not because nothing is wrong
+    assert bus_verdict["rail_monitored"] is False and bus_verdict["power_monitored"] is False
+    assert sorted(bus_verdict["unmonitored"]) == ["power", "rail"]
+    assert "NOT detected" in bus_verdict["unmonitored"]["rail"]
+    assert "item 117" in bus_verdict["unmonitored"]["rail"]
+
+    own_verdict = mon.check_channel("xt2", own, 0.0)
+    assert own_verdict["rail_monitored"] is True and own_verdict["power_monitored"] is False
+    assert list(own_verdict["unmonitored"]) == ["power"]
+
+    quadro = dict(_reading(), rail_reported=True, power_reported=True, aquabus=False)
+    full = mon.check_channel("exhaust", quadro, 0.0)
+    assert full["rail_monitored"] and full["power_monitored"] and full["unmonitored"] == {}
+
+
+def test_a_source_with_no_reason_of_its_own_still_names_the_rule() -> None:
+    """A recording made before the reasons existed, or a source that is not an Aqua
+    Computer controller: the verdict still says which rule is off, in plain words."""
+    mon = _monitor(FanHealthConfig(settle_s=0.0))
+    bare = {"duty": 0.5, "rpm": 500.0, "rail_reported": False, "power_reported": False}
+    verdict = mon.check_channel("qd3", bare, 0.0)
+    assert sorted(verdict["unmonitored"]) == ["power", "rail"]
+    assert verdict["unmonitored"]["rail"] == (
+        "this output reports no rail voltage of its own, so the rail rule is off for it"
+    )
+    # A source that publishes a rail it measures keeps the old default: judged.
+    measured = dict(bare, voltage_v=12.0)
+    del measured["rail_reported"]
+    assert mon.check_channel("xt2", measured, 0.0)["rail_monitored"] is True
+
+
 def test_the_captured_rails_sit_inside_the_default_window() -> None:
     defaults = FanHealthConfig()
     for name, kind in (

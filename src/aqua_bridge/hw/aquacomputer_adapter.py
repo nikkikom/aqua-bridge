@@ -229,6 +229,7 @@ from aqua_bridge.hw.aquacomputer import (
     patch_duties,
     restore_channel,
     software_sensor_report,
+    software_sensor_settings,
 )
 from aqua_bridge.hw.hidraw import (
     HIDRAW_QUEUE_FULL,
@@ -273,6 +274,19 @@ _T = TypeVar("_T")
 #: Validation bound of ``ctrl_retries``: with ``ctrl_budget_s`` limiting the
 #: time, more retries only add log lines.
 CTRL_RETRIES_MAX = 5
+
+#: Why no ``softN`` may be bound as a temperature input (PROJECT.md section 8 item
+#: 113). One sentence, used by both the config error and the binding's own check, so
+#: the operator reads the same reason wherever the refusal comes from.
+_SOFT_SENSOR_REFUSAL = (
+    "{name!r} is a software sensor, which cannot be bound as a temperature "
+    "(PROJECT.md section 8 item 113): a softN slot holds whatever some host last wrote "
+    "into it, and its configured fallback for ever after that host stops -- a steady "
+    "number that reads exactly like a measurement, never goes stale and never shows "
+    "'no data'. The daemon writes at most one of them itself (heartbeat_sensor), and "
+    "that one carries heartbeat_value_c, its own constant. Bind a physical sensor "
+    "(tempN), or an aquabus slot (busN) of a device that cannot leave the bus"
+)
 
 #: The timing defaults that depend on the device kind (owner decision
 #: 2026-09-15, measured on the Pi: aquaero writes back to back fail with EPIPE
@@ -459,8 +473,14 @@ class DeviceBinding:
     ``pwm_map`` is channel -> output number (``pwmN``), ``fan_map`` channel ->
     tachometer number (``fanN``; keys must be ``pwm_map`` channels), ``temp_map``
     logical temperature -> the kind's temperature input name (``temp1``,
-    ``bus2``, ``soft1``, ``virt1``). Numbers are 1-based as in the config.
+    ``bus2``, ``virt1``). Numbers are 1-based as in the config.
     ``timing`` defaults to :meth:`AquacomputerTiming.for_kind`.
+
+    A ``softN`` name is **refused** here, on every kind (PROJECT.md section 8 item
+    113): a software sensor holds whatever a host wrote and its configured fallback
+    once that host stops, which no status report tells apart from a reading. The
+    check sits in this constructor, not only in the config parser, so no path
+    reaches the estimator with one.
     """
 
     kind: DeviceKind
@@ -486,12 +506,15 @@ class DeviceBinding:
                     raise ValueError(
                         f"{name!r}: {kind.name} has {what}1..{what}{count}, not {what}{number}"
                     )
+        soft = set(kind.soft_sensor_names)
         for name, value in self.temp_map.items():
             if value not in kind.temp_names:
                 raise ValueError(
                     f"{name!r}: {kind.name} has temperature inputs {kind.describe_temps()}, "
                     f"not {value!r}"
                 )
+            if value in soft:
+                raise ValueError(f"{name!r}: {_SOFT_SENSOR_REFUSAL.format(name=value)}")
         for what, mapping in (
             ("pwm", self.pwm_map),
             ("fan", self.fan_map),
@@ -733,8 +756,83 @@ class AquacomputerAdapter:
                 "power_w": fan.power_w if reported else None,
                 "power_reported": reported,
                 "rail_reported": rail,
+                "not_measured": self._not_measured(number, reported=reported, rail=rail),
                 "aquabus": number in self._aquabus,
             }
+        return out
+
+    def _not_measured(self, number: int, *, reported: bool, rail: bool) -> dict[str, str]:
+        """``{health rule: why this output's reading cannot feed it}`` (item 117).
+
+        The hardware module knows *why* a field is not that output's own measurement,
+        so the reason is written here and carried to the health rules rather than
+        guessed there. A rule named in this mapping is one the fan-health check does
+        not run for this channel, which is what the published verdict has to say
+        instead of a silent pass (PROJECT.md section 8 items 79, 117).
+        """
+        out: dict[str, str] = {}
+        aquabus = number in self._aquabus
+        if not rail:
+            out["rail"] = (
+                f"pwm{number} is an output of a device on the {self.kind.name}'s aquabus: the "
+                f"{self.kind.name} puts the bus device's rail in that block in about one "
+                "report in four and its own rail in the rest, and a single report does not "
+                "say which, so no rail is published and the rail rule is off for this output "
+                "-- a rail sagging behind the bus device is NOT detected (PROJECT.md section "
+                "8 item 117)"
+            )
+        if not reported:
+            out["power"] = (
+                f"pwm{number} reports no current or power this daemon may judge: "
+                + (
+                    f"the {self.kind.name} carries the bus device's measurement in about one "
+                    "report in four and 0 mA / 0 W in the rest"
+                    if aquabus
+                    else f"the {self.kind.name} reports 0 mA and 0 W for its own outputs in "
+                    "PWM mode however fast the fan turns"
+                )
+                + " (PROJECT.md section 8 item 79)"
+            )
+        return out
+
+    def software_sensors(self) -> list[dict[str, Any]]:
+        """Every software temperature slot of this controller, as the newest control
+        report configures it and the newest status report reads it (item 113).
+
+        A ``softN`` slot is not a measurement: it holds the value some host last wrote
+        and, once that host has been quiet for ``timeout_s``, the configured
+        ``fallback_c`` for ever -- a steady number that never goes stale and never
+        reads "no data", so nothing in the status report separates it from a live
+        sensor. No config can bind one (:class:`DeviceBinding`), so none of this
+        reaches the estimator, the recorder or a health rule; it is published so that
+        a human reading ``/api/state`` sees the slot for what it is.
+
+        Per slot: ``name``, ``enabled``, ``fallback_c``, ``timeout_s``,
+        ``written_by_daemon`` (this daemon's own ``heartbeat_sensor``, the only slot
+        anything here feeds), ``reading_c`` (what the status report shows, ``None``
+        for a disabled slot's ``0x7FFF``) and ``reads_fallback`` -- the reading is
+        exactly the configured fallback, which on an unfed slot is what it will read
+        for ever. Empty until a control report has been adopted, and on a kind whose
+        settings are not known (the Quadro).
+        """
+        ctrl, status = self._ctrl, self._status
+        if ctrl is None:
+            return []
+        fed = self.timing.heartbeat_sensor if self.timing.heartbeat_on else 0
+        out: list[dict[str, Any]] = []
+        for settings in software_sensor_settings(self.kind, ctrl):
+            reading = None if status is None else status.temps.get(settings.name)
+            out.append(
+                {
+                    "name": settings.name,
+                    "enabled": settings.enabled,
+                    "fallback_c": settings.fallback_c,
+                    "timeout_s": settings.timeout_s,
+                    "written_by_daemon": settings.number == fed,
+                    "reading_c": reading,
+                    "reads_fallback": settings.reads_fallback(reading),
+                }
+            )
         return out
 
     def device_health(self) -> dict[str, Any]:
@@ -747,6 +845,13 @@ class AquacomputerAdapter:
         the page show; it is empty exactly when nothing is wrong. ``active_profile``
         is read defensively -- the aquaero's active profile is another change's
         (PROJECT.md section 8 item 84) and is simply absent until that lands.
+
+        ``heartbeat`` (``on``, ``ok``, ``sensor``, ``value_c``) and
+        ``software_sensors`` (:meth:`software_sensors`) complete item 83's list: the
+        heartbeat was on the adapter for diagnostics only until now, and the software
+        sensors are what item 113 asks a human to be able to see -- which ``softN``
+        slots this controller has enabled, what each one falls back to, which one this
+        daemon feeds, and whether a slot is reading its fallback right now.
         """
         status = self._status
         label = self.binding.label
@@ -769,6 +874,15 @@ class AquacomputerAdapter:
             "flows": (
                 {} if status is None else {f"flow{j}": v for j, v in enumerate(status.flows, 1)}
             ),
+            # The software-sensor heartbeat and the controller's own watchdog
+            # configuration (PROJECT.md section 8 items 83, 84, 113).
+            "heartbeat": {
+                "on": self.heartbeat_on,
+                "ok": self.heartbeat_ok,
+                "sensor": self.timing.heartbeat_sensor if self.heartbeat_on else None,
+                "value_c": self.timing.heartbeat_value_c if self.heartbeat_on else None,
+            },
+            "software_sensors": self._software_sensors_safely(),
         }
         profile = getattr(self, "active_profile", None)  # another change adds it (item 84)
         if profile is not None:
@@ -789,8 +903,49 @@ class AquacomputerAdapter:
             )
         if self._serial_rejected is not None:
             problems.append(self._serial_rejected)
+        problems.extend(self._heartbeat_problems(health["software_sensors"]))
         health["problems"] = problems
         return health
+
+    def _software_sensors_safely(self) -> list[dict[str, Any]]:
+        """:meth:`software_sensors`, but never raising: ``device_health`` is a
+        diagnostics path and a malformed cached report must not cost it."""
+        try:
+            return self.software_sensors()
+        except Exception:  # pragma: no cover - the cached report is validated already
+            _LOG.exception("%s: reading the software-sensor settings failed", self.binding.label)
+            return []
+
+    def _heartbeat_problems(self, sensors: Sequence[Mapping[str, Any]]) -> list[str]:
+        """The two states of the software-sensor watchdog worth a human's attention.
+
+        A heartbeat whose last write failed: the controller's own timeout is running
+        and nothing here has reset it. And a ``heartbeat_sensor`` the controller has
+        **disabled**, which the daemon cannot see any other way -- it writes the slot
+        every tick, the write succeeds, and the sensor the alarm watches stays
+        ``0x7FFF``, so the watchdog that item 84 rests on cannot fire at all. An
+        enabled slot nothing feeds is *not* a problem here: it is a fact about the
+        controller's configuration, it is published in ``software_sensors``, and
+        making it a problem would leave a board with eight enabled sensors
+        permanently not-ok.
+        """
+        if not self.heartbeat_on:
+            return []
+        label, number = self.binding.label, self.timing.heartbeat_sensor
+        out: list[str] = []
+        if self._heartbeat_ok is False:
+            out.append(
+                f"{label}: the last software-sensor heartbeat to soft{number} was not sent; "
+                "the controller's own timeout is running"
+            )
+        slot = next((s for s in sensors if s.get("name") == f"soft{number}"), None)
+        if slot is not None and not slot.get("enabled"):
+            out.append(
+                f"{label}: heartbeat_sensor is soft{number}, which is disabled on the "
+                "controller -- the slot reads 'no data' whatever this daemon writes, so the "
+                "software-sensor watchdog cannot fire (PROJECT.md section 8 item 84)"
+            )
+        return out
 
     def close(self) -> None:
         """Closes the device node (the next call opens it again)."""
@@ -1633,10 +1788,20 @@ def _tachometer_number(where: str, value: Any, kind: DeviceKind) -> int:
 
 
 def _temperature_input(where: str, value: Any, kind: DeviceKind) -> str:
+    soft = kind.soft_sensor_names
+    renamed = _HWMON_ERA_TEMPS[kind.name].get(value) if isinstance(value, str) else None
+    if isinstance(value, str) and value in soft:
+        raise ConfigError(f"{where}: {_SOFT_SENSOR_REFUSAL.format(name=value)}")
+    if renamed is not None and renamed in soft:
+        # The hwmon-era name would have been renamed onto a slot nothing may bind, so
+        # the message says what the name is *and* why the new one is refused too.
+        raise ConfigError(
+            f"{where}: in the hwmon driver's numbering {value!r} is {renamed!r}, and "
+            f"{_SOFT_SENSOR_REFUSAL.format(name=renamed)}"
+        )
     if isinstance(value, str) and value in kind.temp_names:
         return value
     hint = _flow_hint(value)
-    renamed = _HWMON_ERA_TEMPS[kind.name].get(value) if isinstance(value, str) else None
     if renamed is not None:
         group = next(g for g in kind.temp_groups if renamed.startswith(g.prefix))
         hint = (

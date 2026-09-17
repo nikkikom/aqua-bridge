@@ -66,7 +66,7 @@ prefer: hid
 fans:
   radiator: {pwm: pwm4, rpm: fan4}
   intake:   {pwm: pwm2, rpm: fan2}
-temp_map: {coolant: soft16, air: temp4}
+temp_map: {coolant: temp1, air: temp4}
 status_max_age_s: 2.5
 ctrl_gap_ms: 150
 ctrl_retries: 3
@@ -82,7 +82,7 @@ write_deadband: 0
     assert binding.kind is QUADRO and binding.serial == "12345-54321"
     assert binding.pwm_map == {"radiator": 4, "intake": 2}
     assert binding.fan_map == {"radiator": 4, "intake": 2}
-    assert binding.temp_map == {"coolant": "soft16", "air": "temp4"}
+    assert binding.temp_map == {"coolant": "temp1", "air": "temp4"}
     assert binding.timing == AquacomputerTiming(
         status_max_age_s=2.5,
         ctrl_gap_ms=150,
@@ -245,14 +245,40 @@ def test_every_input_name_of_both_kinds_is_accepted() -> None:
             "fans": {
                 f"ch{n}": {"pwm": f"pwm{n}", "rpm": f"fan{n}"} for n in range(1, kind.pwm_count + 1)
             },
-            "temp_map": {f"t_{name}": name for name in kind.temp_names},
+            # softN is never accepted (item 113); it is refused below.
+            "temp_map": {
+                f"t_{name}": name for name in kind.temp_names if name not in kind.soft_sensor_names
+            },
         }
         binding = _parse(section)
         assert binding.pwm_map == {f"ch{n}": n for n in range(1, kind.pwm_count + 1)}
         assert binding.fan_map == binding.pwm_map
-        assert set(binding.temp_map.values()) == set(kind.temp_names)
+        assert set(binding.temp_map.values()) == set(kind.temp_names) - set(kind.soft_sensor_names)
     assert {"bus8", "soft8", "virt4"} <= set(AQUAERO.temp_names)
     assert {"soft16"} <= set(QUADRO.temp_names)
+
+
+@pytest.mark.parametrize(
+    ("device", "name"),
+    [("aquaero", "soft1"), ("aquaero", "soft8"), ("quadro", "soft1"), ("quadro", "soft16")],
+)
+def test_no_software_sensor_can_be_bound_as_a_temperature(device: str, name: str) -> None:
+    """Item 113. A ``softN`` slot holds whatever a host wrote into it and, once that
+    host stops for the configured timeout, the configured fallback -- for ever, as a
+    steady number that never reads 0x7FFF. Nothing in a status report separates that
+    from a measurement, so the estimator may never be handed one. The daemon writes at
+    most one software sensor itself (``heartbeat_sensor``), and that one carries
+    ``heartbeat_value_c``: its own constant, which is no better."""
+    with pytest.raises(ConfigError, match="is a software sensor, which cannot be bound"):
+        _parse(dict(_SECTION, device=device, temp_map={"coolant": name}))
+
+
+def test_the_refusal_holds_below_the_config_parser_too() -> None:
+    """The binding itself refuses, so no code path -- a test, a tool, a future caller --
+    can build one that would reach the estimator (PROJECT.md section 8 item 113)."""
+    with pytest.raises(ValueError, match="'soft1' is a software sensor"):
+        DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"beat": "soft1"})
+    DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"air": "temp1", "coolant": "bus2"})
 
 
 @pytest.mark.parametrize(
@@ -262,9 +288,10 @@ def test_every_input_name_of_both_kinds_is_accepted() -> None:
             "aquaero",
             "temp",
             "temp9",
-            r"numbering 'temp9' is 'soft1' \(the aquaero's software sensors\): use 'soft1'",
+            r"numbering 'temp9' is 'soft1', and 'soft1' is a software sensor, which "
+            r"cannot be bound as a temperature",
         ),
-        ("aquaero", "temp", "temp16", r"use 'soft8'"),
+        ("aquaero", "temp", "temp16", r"'temp16' is 'soft8', and 'soft8' is a software sensor"),
         (
             "aquaero",
             "temp",
@@ -276,9 +303,9 @@ def test_every_input_name_of_both_kinds_is_accepted() -> None:
             "quadro",
             "temp",
             "temp5",
-            r"'temp5' is 'soft1' \(the quadro's software sensors\): use 'soft1'",
+            r"'temp5' is 'soft1', and 'soft1' is a software sensor, which cannot be bound",
         ),
-        ("quadro", "temp", "temp20", r"use 'soft16'"),
+        ("quadro", "temp", "temp20", r"'temp20' is 'soft16', and 'soft16' is a software sensor"),
         (
             "quadro",
             "rpm",

@@ -527,8 +527,12 @@ mpc:
 # Each controller is found under /sys/class/hidraw by USB id; tools/aquacomputer_probe.py
 # lists what is attached. Input names: aquaero pwm1-8 / fan1-8 outputs and their
 # tachometers (1-4 its own, 5-8 the Quadro's outputs 1-4 on its aquabus), temp1-8 physical
-# sensors, bus1-8 aquabus temperature slots (the Quadro's sensors 1-4 in bus1-4), soft1-8
-# software sensors, virt1-4 virtual sensors; Quadro pwm1-4 / fan1-4, temp1-4, soft1-16.
+# sensors, bus1-8 aquabus temperature slots (the Quadro's sensors 1-4 in bus1-4), virt1-4
+# virtual sensors; Quadro pwm1-4 / fan1-4, temp1-4. A softN software sensor cannot be bound
+# in temp_map: it holds whatever a host wrote into it and its configured fallback for ever
+# after that host stops -- a steady number that reads exactly like a measurement and never
+# shows "no data" (PROJECT.md section 8 item 113). Every slot's settings and reading are
+# published in device_health.software_sensors instead, so a human can see what it is.
 # A Quadro on aquabus ignores writes over its own USB, so a config that commands aquaero
 # pwm5-8 and the outputs of a quadro entry is refused either way, with or without serial:
 # a second controlling controller there is not a supported topology (PROJECT.md section 2

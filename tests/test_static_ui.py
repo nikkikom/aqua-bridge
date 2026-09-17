@@ -85,6 +85,29 @@ _DEVICE_HEALTH: dict[str, Any] = {
             "unconfigured_channels": [],
             "flows": {"flow1": 0, "flow2": 0, "flow3": None},
             "active_profile": 1,
+            # the software-sensor heartbeat and the controller's softN slots
+            # (PROJECT.md section 8 items 83, 113)
+            "heartbeat": {"on": True, "ok": True, "sensor": 1, "value_c": 20.0},
+            "software_sensors": [
+                {
+                    "name": "soft1",
+                    "enabled": True,
+                    "fallback_c": 90.0,
+                    "timeout_s": 30,
+                    "written_by_daemon": True,
+                    "reading_c": 20.0,
+                    "reads_fallback": False,
+                },
+                {
+                    "name": "soft2",
+                    "enabled": True,
+                    "fallback_c": 50.0,
+                    "timeout_s": 300,
+                    "written_by_daemon": False,
+                    "reading_c": 50.0,
+                    "reads_fallback": True,
+                },
+            ],
             "problems": ["aquaero: no device on aquabus behind qd1"],
         }
     ],
@@ -97,6 +120,10 @@ _DEVICE_HEALTH: dict[str, Any] = {
             "power_w": 0.0,
             "expected_rpm": 750.0,
             "expected_power_w": None,
+            # which rules ran for this output at all (PROJECT.md section 8 item 117)
+            "rail_monitored": True,
+            "power_monitored": False,
+            "unmonitored": {"power": "pwm1 reports no current or power this daemon may judge"},
             "problems": [],
         }
     },
