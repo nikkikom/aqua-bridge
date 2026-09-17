@@ -42,6 +42,14 @@ function fmt(v, digits) {
   if (typeof v === "number") return v.toFixed(digits === undefined ? 2 : digits);
   return String(v);
 }
+// One measured field of a fan verdict, saying so when the rule that judges it did not
+// run (§8 item 117). The number is kept where there is one -- it is still a reading --
+// and only the claim that something checked it is dropped.
+function note(text, rule, monitored, value) {
+  if (monitored !== false) return text;
+  if (value === null || value === undefined) return rule + " not monitored";
+  return text + " (" + rule + " not monitored)";
+}
 function table(id, rows) {
   document.querySelector("#" + id + " table").innerHTML = rows.join("");
 }
@@ -166,13 +174,14 @@ function renderDevices(health) {
     if (f.expected_rpm !== null && f.expected_rpm !== undefined) {
       parts.push("curve " + fmt(f.expected_rpm, 0));
     }
-    // A field the controller does not measure for this output is published as null
-    // with its rule named in "unmonitored" (§8 item 117). Say "not monitored" rather
-    // than print a dash: a blank must never read as a rule that checked and passed.
-    if (f.rail_monitored === false) parts.push("rail not monitored");
-    else parts.push(fmt(f.voltage_v) + " V");
-    if (f.power_monitored === false) parts.push("power not monitored");
-    else parts.push(fmt(f.current_ma, 0) + " mA", fmt(f.power_w) + " W");
+    // A rule that did not run for this output is named in "unmonitored" (§8 item 117),
+    // whether the controller does not measure the field or the config does not say
+    // what to expect. Say "not monitored" rather than print the number alone: neither
+    // a blank nor a value must read as a rule that checked and passed.
+    if (f.rpm_monitored === false) parts.push("rpm not monitored");
+    parts.push(note(fmt(f.voltage_v) + " V", "rail", f.rail_monitored, f.voltage_v));
+    parts.push(note(fmt(f.current_ma, 0) + " mA, " + fmt(f.power_w) + " W",
+                    "power", f.power_monitored, f.power_w));
     rows.push(row(ch + ((f.problems || []).length ? " DRIFT" : ""), parts.join(", ")));
   }
   // Software sensors: not measurements, and nothing may bind one (§8 item 113). Show

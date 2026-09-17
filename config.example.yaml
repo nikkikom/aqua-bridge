@@ -173,7 +173,9 @@ xt6:
     coolant: temp1       # virt1-4 virtual sensors (Quadro: temp1-4). A softN software sensor is NOT
     air: temp2           # bindable: it holds what a host wrote, then its configured fallback for ever,
                          # which reads exactly like a measurement (PROJECT.md section 8 item 113). The
-                         # slots are published in device_health.software_sensors instead.
+                         # slots are published in device_health.devices[].software_sensors
+                         # instead. Upgrading: a temp_map that binds one must be repointed
+                         # first -- the daemon now refuses to start (exit 2).
   # Timing, defaults shown (PROJECT.md section 3, Track B). Writes take effect at once and
   # are not saved in the controller's memory; a power cycle brings back its saved configuration.
   status_max_age_s: 3.0         # an older status report is no observation: fallback (> 0)

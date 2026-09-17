@@ -872,6 +872,12 @@ def test_a_reading_names_the_health_rules_it_cannot_feed() -> None:
     assert "aquabus" in bus["rail"] and "NOT detected" in bus["rail"]
     assert "one report in four" in bus["power"]
     assert "PWM mode" in own["power"]
+    # Constant text: built once per output and handed out unchanged, not reformatted
+    # for every output on every tick and shipped twice over MQTT.
+    assert (
+        adapter.fan_readings()["qd3"]["not_measured"]
+        is adapter.fan_readings()["qd3"]["not_measured"]
+    )
 
 
 def test_device_health_publishes_the_software_sensor_heartbeat(caplog) -> None:
@@ -925,7 +931,8 @@ def test_device_health_shows_what_each_software_sensor_really_is() -> None:
         sleep=FakeSleep(clock),
         opener=FakeBus(aquabus_aquaero_all_configured(clock)),
     )
-    assert adapter.device_health()["software_sensors"] == []  # no control report yet
+    # not known yet -- null, not the empty list of a device that has no software sensors
+    assert adapter.device_health()["software_sensors"] is None
     adapter.apply(MpcCommand(pwm={"qd3": 0.4}, mode=Mode.AUTO))  # fetches the control report
     adapter.read()  # and the status report carries what each slot reads right now
     sensors = adapter.device_health()["software_sensors"]
@@ -965,6 +972,17 @@ def test_a_heartbeat_sensor_the_controller_has_disabled_is_a_problem() -> None:
     assert sensors[2]["enabled"] is False
     (problem,) = adapter.device_health()["problems"]
     assert "heartbeat_sensor is soft3, which is disabled on the controller" in problem
+    # ... and it holds while the cached control report is invalid (a duty mismatch
+    # invalidates one every time it happens). The slots are the operator's
+    # configuration of the controller, not something a refetch may take away: without
+    # this, the problem and the published slots would flap with the cache and take
+    # /api/health.ok and the Home Assistant problem sensor with them.
+    adapter._invalidate(rewrite=True)
+    assert adapter.control_report is None
+    held = adapter.device_health()
+    assert [s["name"] for s in held["software_sensors"]] == [f"soft{n}" for n in range(1, 9)]
+    assert held["software_sensors"][2]["enabled"] is False
+    assert held["problems"] == [problem]
 
 
 def test_composite_device_health_merges_every_controller_and_its_problems() -> None:

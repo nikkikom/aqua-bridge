@@ -56,7 +56,9 @@ rpm against the fitted curve
     edge. Below ``min_duty`` nothing is judged: inside and just above the deadband
     the curve says little and a stopped fan is normal. A channel whose model is
     not configured (a legacy config with no ``mpc.fans``/``fan_models``) is
-    skipped.
+    skipped -- and says so: its verdict carries ``rpm_monitored`` false with the
+    reason in ``unmonitored``, since a channel nothing judges must not publish the
+    same empty ``problems`` as a fan found healthy.
 
 the 12 V rail
     The block's voltage outside ``[rail_min_v, rail_max_v]``. This one does not
@@ -65,7 +67,10 @@ the 12 V rail
     it matters. A block reporting 0.0 V is not judged: that is what an aquaero's
     empty aquabus slot reads -- an aquabus output with nothing connected, on a bus
     device that is present, reads 0.00 V in the reports that carry that device's
-    own measurements -- not a dead rail.
+    own measurements -- not a dead rail. That block's verdict then carries
+    ``rail_monitored`` false with the reason, like any other rule that did not run:
+    0.00 V is the one rail reading this daemon refuses to interpret, so it must not
+    publish as one it checked and passed.
 
     **The rule cannot fire for an aquaero's aquabus outputs at all**, and that is
     deliberate: a populated aquabus block reads the bus device's rail in about one
@@ -83,12 +88,15 @@ the 12 V rail
     survives inspection: the refresh is not even atomic per report (one capture had
     blocks 5 and 6 refreshed and block 8 not), so there is no per-report or
     per-block marker that says which reading a block is carrying. What the daemon
-    does instead is say so: every channel's verdict carries ``rail_monitored`` and
-    ``power_monitored`` with an ``unmonitored`` mapping naming each rule that is off
-    for that output and why, so an empty ``problems`` list is never readable as
-    coverage the daemon does not have. What *is* still covered on such a system is
-    the aquaero's own outputs 1-4, and with them any sag common to the whole 12 V
-    supply; what is not is a rail local to the bus device.
+    does instead is say so: every channel's verdict carries ``rpm_monitored``,
+    ``rail_monitored`` and ``power_monitored`` with an ``unmonitored`` mapping naming
+    each rule that is off for that output and why, so an empty ``problems`` list is
+    never readable as coverage the daemon does not have. All three rules declare
+    themselves, and each flag means the rule *ran*: what the device does not measure
+    and what the config does not describe are both gaps, and the reason says which.
+    What *is* still covered on such a system is the aquaero's own outputs 1-4, and
+    with them any sag common to the whole 12 V supply; what is not is a rail local
+    to the bus device.
 
 power against the duty
     Only where the device reports power at all: an aquaero reports 0 mA and 0 W
@@ -99,7 +107,12 @@ power against the duty
     fires when the measured power leaves it by more than
     ``power_tolerance_frac``. ``fan_models.<m>.power_w_at_max`` has no default --
     without it the rule is simply off for that model, since the figure depends on
-    the fan and nothing may invent one.
+    the fan and nothing may invent one, and it is unset in both example configs
+    until item 94's measurement. So a measured power is not coverage on its own:
+    ``power_monitored`` is true only when the device reports the power *and* the
+    channel's model says what to expect, and the missing key is named in
+    ``unmonitored`` otherwise -- a seized fan drawing 0 mA at full duty must never
+    publish as a power rule that ran and passed.
 
 Every threshold above is a ``fan_health:`` key with one default declared once in
 :class:`FanHealthConfig`, validated there, shown in both example configs and
@@ -299,28 +312,48 @@ def _finite(value: Any) -> bool:
 #: an Aqua Computer controller). Naming the rule is the point: the verdict must never
 #: look like a rule that ran and found nothing (PROJECT.md section 8 item 117).
 _UNMONITORED_FALLBACK: Mapping[str, str] = {
+    "rpm": "no fitted curve for this channel, so the rpm rule is off for it",
     "rail": "this output reports no rail voltage of its own, so the rail rule is off for it",
     "power": "this output reports no current or power of its own, so the power rule is off for it",
 }
 
+#: The rules a verdict declares, in the order the verdict lists them.
+_RULES: tuple[str, ...] = ("rpm", "rail", "power")
 
-def _unmonitored(reading: Mapping[str, Any], *, rail: bool, power: bool) -> dict[str, str]:
-    """``{rule: why it does not run for this channel}`` for the channel's verdict.
+
+def _unmonitored(
+    reading: Mapping[str, Any],
+    monitored: Mapping[str, bool],
+    local: Mapping[str, str],
+) -> dict[str, str]:
+    """``{rule: why it did not run for this channel}`` for the channel's verdict.
 
     A published verdict has to say which rules it did *not* apply, or a channel whose
-    rail is never read looks exactly like a channel whose rail is fine (item 117). The
-    reason comes from the source where it has one -- the hardware adapter's
-    ``not_measured``, which knows why the field is not that output's own measurement --
-    and falls back to the generic line above otherwise.
+    rail is never read looks exactly like a channel whose rail is fine (item 117).
+    A rule is off for one of two kinds of reason, and both belong here:
+
+    * the *source* cannot feed it -- the hardware adapter's ``not_measured``, which
+      knows why the field is not that output's own measurement, and which wins when
+      it has something to say because it is the more fundamental reason;
+    * this monitor cannot run it on what it got -- no fitted curve or no
+      ``power_w_at_max`` for the channel, or the reading carried no number at all.
+      Those reasons are ``local``, written by :meth:`HealthMonitor.check_channel`.
+
+    The generic line above is the last resort, for a source that gives no reason of
+    its own (a recording made before the reasons existed, a source that is not an Aqua
+    Computer controller).
     """
     reasons = reading.get("not_measured")
     reasons = reasons if isinstance(reasons, Mapping) else {}
     out: dict[str, str] = {}
-    for rule, monitored in (("rail", rail), ("power", power)):
-        if monitored:
+    for rule in _RULES:
+        if monitored.get(rule, True):
             continue
         given = reasons.get(rule)
-        out[rule] = str(given) if isinstance(given, str) and given else _UNMONITORED_FALLBACK[rule]
+        if isinstance(given, str) and given:
+            out[rule] = given
+        else:
+            out[rule] = local.get(rule) or _UNMONITORED_FALLBACK[rule]
     return out
 
 
@@ -817,11 +850,22 @@ class HealthMonitor:
         """One channel's verdict: the measured values, a ``problems`` list, and which
         rules did not run at all.
 
-        ``rail_monitored`` / ``power_monitored`` and the ``unmonitored`` mapping are
-        the second half of the answer (PROJECT.md section 8 item 117): an empty
-        ``problems`` on a channel whose rail is never read must not be readable as "the
-        rail is fine", so the verdict names each rule that is off for this output and
-        why, in the same payload, wherever a human or Home Assistant reads it.
+        ``rpm_monitored`` / ``rail_monitored`` / ``power_monitored`` and the
+        ``unmonitored`` mapping are the second half of the answer (PROJECT.md section 8
+        item 117): an empty ``problems`` on a channel whose rail is never read must not
+        be readable as "the rail is fine", so the verdict names each rule that is off
+        for this output and why, in the same payload, wherever a human or Home
+        Assistant reads it.
+
+        A flag says whether **the rule could run on this reading**, not whether the
+        device measures the field: a rule needs the measurement *and* the configuration
+        it judges it against, so an output that reports power with no
+        ``fan_models.<m>.power_w_at_max`` behind it is ``power_monitored`` false just
+        like an output that reports none. What the flags do not carry is the two
+        transient conditions of the duty-dependent rules -- the ``settle_s`` window
+        still filling after a gap, and a duty below ``min_duty`` -- which hold off a
+        rule for a tick or two rather than for the channel; those are in the module
+        docstring, and neither is a coverage gap.
         """
         s = self.settings
         duty = reading.get("duty")
@@ -833,19 +877,36 @@ class HealthMonitor:
         # value is published as None and the rule below never sees it. The flag is
         # absent from older records and from sources that publish a rail they measure,
         # and the voltage is then taken as given.
-        rail_known = bool(reading.get("rail_reported", True))
-        power_known = bool(reading.get("power_reported"))
+        rail_reported = bool(reading.get("rail_reported", True))
+        # 0.00 V is what an aquaero's empty aquabus slot reads, so the rail rule does
+        # not judge it -- which makes it a rule that did not run, not a rail found
+        # healthy, and the verdict has to say which.
+        rail_known = rail_reported and _finite(volts) and float(volts) > 0.0
+        power_reported = bool(reading.get("power_reported"))
+        power_known = power_reported and self._expected_power(channel, 1.0) is not None
+        rpm_known = expected_rpm(self.cfg, channel, 1.0) is not None and _finite(rpm)
         out: dict[str, Any] = {
             "duty": duty if _finite(duty) else None,
             "rpm": rpm if _finite(rpm) else None,
-            "voltage_v": volts if rail_known and _finite(volts) else None,
+            "voltage_v": volts if rail_reported and _finite(volts) else None,
             "current_ma": reading.get("current_ma") if _finite(reading.get("current_ma")) else None,
             "power_w": power if _finite(power) else None,
             "expected_rpm": None,
             "expected_power_w": None,
+            "rpm_monitored": rpm_known,
             "rail_monitored": rail_known,
             "power_monitored": power_known,
-            "unmonitored": _unmonitored(reading, rail=rail_known, power=power_known),
+            "unmonitored": _unmonitored(
+                reading,
+                {"rpm": rpm_known, "rail": rail_known, "power": power_known},
+                self._local_reasons(
+                    channel,
+                    rpm=rpm,
+                    volts=volts,
+                    rail_reported=rail_reported,
+                    power_reported=power_reported,
+                ),
+            ),
             "problems": [],
         }
         state = self._state(channel)
@@ -854,7 +915,7 @@ class HealthMonitor:
         # the 12 V rail: judged at any duty and never restarted by a duty move, since
         # it does not depend on one (a rail that sags while the solver modulates is
         # exactly the case worth catching)
-        if rail_known and _finite(volts) and float(volts) > 0.0:
+        if rail_known:
             volts = float(volts)
             low, high = s.rail_min_v, s.rail_max_v
             held = self._sustained(channel, "rail", not low <= volts <= high, now)
@@ -923,6 +984,50 @@ class HealthMonitor:
             self._sustained(channel, "power", False, now)
 
         out["problems"] = problems
+        return out
+
+    def _local_reasons(
+        self,
+        channel: str,
+        *,
+        rpm: Any,
+        volts: Any,
+        rail_reported: bool,
+        power_reported: bool,
+    ) -> dict[str, str]:
+        """Why *this monitor* could not run a rule on this channel's reading.
+
+        The counterpart of the source's own ``not_measured`` (:func:`_unmonitored`):
+        the source says what the device does not measure, and this says what the
+        configuration does not describe or what this tick did not carry. Only the
+        reasons that apply are built, so a fully judged channel builds none.
+        """
+        out: dict[str, str] = {}
+        spec = self.cfg.fans.get(channel)
+        model = None if spec is None else self.cfg.fan_models.get(spec.model)
+        named = "" if spec is None else f" (`{spec.model}`)"
+        if expected_rpm(self.cfg, channel, 1.0) is None:
+            out["rpm"] = (
+                f"no fan model with an `rpm_max` is configured for this channel{named} in "
+                "`mpc.fans` / `mpc.fan_models`, so the rpm rule is off for it"
+            )
+        elif not _finite(rpm):
+            out["rpm"] = "this output reported no speed on this tick, so the rpm rule did not run"
+        if rail_reported and not _finite(volts):
+            out["rail"] = (
+                "this output reported no rail voltage on this tick, so the rail rule did not run"
+            )
+        elif rail_reported and not float(volts) > 0.0:
+            out["rail"] = (
+                "the rail reads exactly 0.00 V, which is not judged -- that is what an "
+                "aquaero's empty aquabus slot reads, not a dead rail (PROJECT.md section 2)"
+            )
+        if power_reported and (model is None or model.power_w_at_max is None):
+            out["power"] = (
+                f"no `mpc.fan_models.<model>.power_w_at_max` is configured for this "
+                f"channel{named}, so the power rule has nothing to judge the measured "
+                "power against and is off for it (PROJECT.md section 8 items 79, 94)"
+            )
         return out
 
     def _expected_power(self, channel: str, duty: float) -> float | None:

@@ -579,11 +579,13 @@ def test_a_verdict_names_every_rule_that_did_not_run_for_the_channel() -> None:
     """
     bus = _captured_reading("aquaero-status-aquabus-block7-power.bin", "qd3", 7)
     own = _captured_reading("aquaero-status-aquabus-block7-power.bin", "xt2", 2)
-    mon = _monitor(FanHealthConfig(settle_s=0.0))
+    model = FanModel(rpm_max=1100.0, deadband=0.1, power_w_at_max=2.0)
+    mon = _monitor(FanHealthConfig(settle_s=0.0), case120=model)
 
     bus_verdict = mon.check_channel("qd3", bus, 0.0)
     assert bus_verdict["problems"] == []  # nothing found, and not because nothing is wrong
     assert bus_verdict["rail_monitored"] is False and bus_verdict["power_monitored"] is False
+    assert bus_verdict["rpm_monitored"] is True  # the one rule that does run there
     assert sorted(bus_verdict["unmonitored"]) == ["power", "rail"]
     assert "NOT detected" in bus_verdict["unmonitored"]["rail"]
     assert "item 117" in bus_verdict["unmonitored"]["rail"]
@@ -593,8 +595,54 @@ def test_a_verdict_names_every_rule_that_did_not_run_for_the_channel() -> None:
     assert list(own_verdict["unmonitored"]) == ["power"]
 
     quadro = dict(_reading(), rail_reported=True, power_reported=True, aquabus=False)
-    full = mon.check_channel("exhaust", quadro, 0.0)
-    assert full["rail_monitored"] and full["power_monitored"] and full["unmonitored"] == {}
+    full = mon.check_channel("qd3", quadro, 0.0)
+    assert full["rpm_monitored"] and full["rail_monitored"] and full["power_monitored"]
+    assert full["unmonitored"] == {}
+
+
+def test_a_measured_field_with_nothing_to_judge_it_against_is_not_coverage() -> None:
+    """A rule needs the measurement *and* the configuration it judges it against.
+
+    ``fan_models.<m>.power_w_at_max`` has no default and is unset in both example
+    configs until item 94's measurement, so a controller that does report power (a
+    Quadro on its own USB) still has no power rule. The same for a channel with no
+    fitted curve. Publishing ``power_monitored`` on the measurement alone would claim
+    exactly the coverage item 117 says the daemon must never claim: a seized fan
+    drawing 0 mA at full duty produces this payload.
+    """
+    # measured, and no power_w_at_max in the model (the documented default)
+    mon = _monitor(FanHealthConfig(settle_s=0.0), case120=FanModel(rpm_max=1100.0, deadband=0.1))
+    measuring = dict(_reading(), rail_reported=True, power_reported=True, current_ma=0.0)
+    seized = mon.check_channel("qd3", dict(measuring, rpm=0.0, power_w=0.0), 0.0)
+    assert seized["power_w"] == 0.0 and seized["expected_power_w"] is None
+    assert seized["power_monitored"] is False
+    assert "power_w_at_max" in seized["unmonitored"]["power"]
+    assert seized["rpm_monitored"] is True  # the curve is configured, so this one ran
+
+    # and no fitted curve at all: the rpm rule is off and says so
+    bare = _monitor(FanHealthConfig(settle_s=0.0))
+    nowhere = bare.check_channel("exhaust", measuring, 0.0)
+    assert nowhere["expected_rpm"] is None and nowhere["rpm_monitored"] is False
+    assert "mpc.fan_models" in nowhere["unmonitored"]["rpm"]
+    assert sorted(nowhere["unmonitored"]) == ["power", "rpm"]
+
+
+def test_a_rail_the_rule_skips_is_published_as_a_rule_that_did_not_run() -> None:
+    """The rail rule does not judge 0.00 V (an empty aquabus slot reads that, not a
+    dead rail) and has nothing to judge when the tick carried no voltage at all. Both
+    were silent skips before: the verdict now says which, so the most extreme sag there
+    is -- a rail at 0.00 V -- can never publish as a rail found healthy."""
+    mon = _monitor(FanHealthConfig(settle_s=0.0), case120=FanModel(rpm_max=1100.0, deadband=0.1))
+    dead = mon.check_channel("xt2", dict(_reading(), rail_reported=True, voltage_v=0.0), 0.0)
+    assert dead["voltage_v"] == 0.0  # still published: it is a reading
+    assert dead["rail_monitored"] is False and dead["problems"] == []
+    assert "0.00 V" in dead["unmonitored"]["rail"]
+
+    silent = dict(_reading(), rail_reported=True)
+    del silent["voltage_v"]
+    verdict = mon.check_channel("xt2", silent, 0.0)
+    assert verdict["voltage_v"] is None and verdict["rail_monitored"] is False
+    assert "no rail voltage on this tick" in verdict["unmonitored"]["rail"]
 
 
 def test_a_source_with_no_reason_of_its_own_still_names_the_rule() -> None:

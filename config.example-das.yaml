@@ -532,7 +532,9 @@ mpc:
 # in temp_map: it holds whatever a host wrote into it and its configured fallback for ever
 # after that host stops -- a steady number that reads exactly like a measurement and never
 # shows "no data" (PROJECT.md section 8 item 113). Every slot's settings and reading are
-# published in device_health.software_sensors instead, so a human can see what it is.
+# published in device_health.devices[].software_sensors instead, so a human can see what
+# it is. Upgrading from a config that binds one: repoint it before the upgrade, or the
+# daemon refuses to start (exit 2) and the controller falls back to its saved preset.
 # A Quadro on aquabus ignores writes over its own USB, so a config that commands aquaero
 # pwm5-8 and the outputs of a quadro entry is refused either way, with or without serial:
 # a second controlling controller there is not a supported topology (PROJECT.md section 2

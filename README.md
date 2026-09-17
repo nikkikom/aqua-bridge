@@ -126,7 +126,10 @@ is not yet confirmed on real hardware, on either board.
    a host wrote into it and its configured fallback for ever after that
    host stops, which no status report tells apart from a measurement
    (§8 item 113); every slot's settings and reading are published under
-   `device_health.devices[].software_sensors` instead); the optional timing keys and the
+   `device_health.devices[].software_sensors` instead — **upgrading an
+   older install: if a `temp_map` of yours binds a `softN`, repoint it
+   before you restart, because the daemon now refuses to start (exit 2)
+   and the controller falls back to its own saved preset until you do**); the optional timing keys and the
    software-sensor heartbeat (`heartbeat_sensor`, `heartbeat_value_c`,
    off by default — 0 is right only while no software sensor is enabled
    on the controller, §8 item 84) are shown at their defaults,

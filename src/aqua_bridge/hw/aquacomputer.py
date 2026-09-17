@@ -133,11 +133,14 @@ at all reads -- and the same output reads 12.09 V one second later, so the
 voltage field separates the two in neither direction and would judge one slot
 both ways within a second. The speed field carries no substitute: an absent bus
 reads ``0xFFFF`` and a present one 0 rpm (no fan) or the fan's speed, in the
-measuring and the non-measuring report alike. Absence therefore needs no
-confirmation window -- the sentinel is already invariant across the refresh --
-and a rule keyed on the voltage would both lose a present device and gain an
-absent one. Pinned on the two fixtures captured one second apart
-(``tests/test_hw_aquacomputer.py``).
+measuring and the non-measuring report alike. Absence therefore gets no
+confirmation window -- the sentinel is invariant across the refresh -- while a
+rule keyed on the voltage would both lose a present device and gain an absent
+one. What the captures cannot say is how soon a device that leaves the bus starts
+reading ``0xFFFF``, or whether a bus hiccup can show it for a single report: all
+of them come from a healthy, uninterrupted bus, and that transition is untested
+hardware work (PROJECT.md section 8 item 96). Pinned on the two fixtures captured
+one second apart (``tests/test_hw_aquacomputer.py``).
 """
 
 from __future__ import annotations
@@ -546,7 +549,10 @@ class FanStatus:
         0.00 V too -- so 0.00 V is neither necessary nor sufficient for absence,
         while ``0xFFFF`` is both and does not move between reports. The current and
         the power are substituted the same way. Every absence judgement in this
-        project goes through this property for that reason.
+        project goes through this property for that reason. Every capture behind
+        that comes from a healthy bus, so the *transition* -- how soon a device
+        that leaves shows ``0xFFFF``, whether a hiccup can show it for one report
+        -- is untested (module docstring, item 96).
         """
         return self.rpm != FAN_ABSENT_RPM
 
