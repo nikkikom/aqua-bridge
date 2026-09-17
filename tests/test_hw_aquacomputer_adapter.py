@@ -15,6 +15,7 @@ import subprocess
 import pytest
 
 from aqua_bridge.hw.aquacomputer import (
+    AQUABUS_REFRESH_REPORTS,
     AQUAERO,
     DUTY_MAX,
     QUADRO,
@@ -1475,11 +1476,15 @@ def test_an_output_without_a_device_on_aquabus_faults_only_its_own_channel(caplo
         obs = adapter.read()
     assert obs.rpm == {"xt1": 349.0, "qd1": 0.0} and obs.pwm["qd1"] == pytest.approx(0.3)
     assert adapter.absent_channels == ()
-    (error,) = _messages(caplog, "ERROR")
-    assert error.startswith("aquaero: no device behind pwm5 (qd1), fan5 (qd1)")
-    assert "commands no reachable output" not in error  # xt1 is still commanded
+    absent_error, bus_error = _messages(caplog, "ERROR")
+    assert absent_error.startswith("aquaero: no device behind pwm5 (qd1), fan5 (qd1)")
+    assert "commands no reachable output" not in absent_error  # xt1 is still commanded
+    # The bus device itself is gone for longer than bus_absent_s: item 92's own signal,
+    # which item 90's per-channel line does not carry.
+    assert bus_error.startswith("aquaero: no device has answered on its aquabus")
     assert [m for m in _messages(caplog, "INFO") if "again" in m] == [
-        "aquaero: a device is behind pwm5 (qd1), fan5 (qd1) again"
+        "aquaero: a device is behind pwm5 (qd1), fan5 (qd1) again",
+        "aquaero: a device answers on aquabus again; its temperature slots are readings once more",
     ]
 
 
@@ -1533,6 +1538,204 @@ def test_apply_before_any_status_report_cannot_know_about_aquabus() -> None:
     adapter, device, _bus, _clock, _ = _setup(binding, report_delay_s=1e9)
     adapter.apply(_cmd(qd1=0.5))
     assert len(device.sets()) == 1
+
+
+# --- the device that leaves aquabus (PROJECT.md section 8 item 92) --------------------------
+
+
+def _bus_device_gone(template: bytes) -> bytes:
+    """The status report item 92 saw: every aquabus fan block reads rpm 0xFFFF while the
+    aquabus temperature slots still hold the value they read before the device left.
+
+    Built from the capture rather than captured: on 2026-09-15 the aquaero kept reporting
+    24.12 degC in ``bus2`` for over an hour after the Quadro was unplugged from aquabus,
+    and no capture of that hour exists. Everything else in the report is the live one.
+    """
+    status = bytearray(template)
+    for number in AQUAERO.aquabus_outputs:
+        speed = AQUAERO.fan_blocks[number - 1] + AQUAERO.fan_layout.speed
+        status[speed : speed + 2] = b"\xff\xff"
+    return bytes(status)
+
+
+def _bus_binding() -> DeviceBinding:
+    """An aquaero with the Quadro's output 3 commanded and the Quadro's own thermistor
+    (aquabus slot 2) bound next to one of the aquaero's own."""
+    return DeviceBinding(
+        kind=AQUAERO,
+        pwm_map={"xt1": 1, "qd3": 7},
+        fan_map={"qd3": 7},
+        temp_map={"inlet": "temp6", "quadro_air": "bus2"},
+    )
+
+
+def test_a_bus_device_that_leaves_makes_its_temperature_slots_missing_not_frozen(caplog) -> None:
+    """Item 92 end to end on one controller. While the Quadro answers, its thermistor in
+    ``bus2`` is an ordinary reading. From the first report in which every aquabus block
+    reads rpm 0xFFFF it reads as **missing**, although the aquaero keeps serving its last
+    value there -- that is the whole point: a frozen number would reach the solver as a
+    measurement. The *report* waits for ``bus_absent_s`` of such reports, so one skipped
+    aquabus poll or a Quadro re-enumerating is not announced as a lost device; then one
+    error line, one entry in ``problems``, and both clear when the device answers again.
+    """
+    adapter, device, clock = _aquabus_all_configured(_bus_binding())
+    obs = adapter.read()
+    assert obs.temps["quadro_air"] == pytest.approx(23.68)
+    assert adapter.bus_device["present"] is True and adapter.bus_device["seen"] is True
+    assert adapter.device_health()["problems"] == []
+
+    with caplog.at_level("INFO", logger=LOGGER):
+        device.status_template = _bus_device_gone(device.status_template)
+        clock.advance(1.0)
+        device.emit()
+        obs = adapter.read()
+        # Immediately missing, and only that input: the aquaero's own sensor is untouched.
+        assert obs.temps["quadro_air"] is None
+        assert obs.temps["inlet"] is not None
+        assert obs.pwm["xt1"] is not None and obs.pwm["qd3"] is None
+        health = adapter.device_health()
+        assert health["aquabus"]["present"] is False and health["aquabus"]["lost"] is False
+        assert health["aquabus"]["temps_missing"] == ["quadro_air"]
+        assert [m for m in _messages(caplog, "ERROR") if "item 92" in m] == []
+        # ... until it has read that way for bus_absent_s of live reports.
+        for _ in range(int(AQUAERO_T.bus_absent_s) + 2):
+            clock.advance(1.0)
+            device.emit()
+            assert adapter.read().temps["quadro_air"] is None
+        health = adapter.device_health()
+        assert health["aquabus"]["lost"] is True
+        assert health["aquabus"]["absent_s"] >= AQUAERO_T.bus_absent_s
+        assert health["aquabus"]["refresh_reports"] == AQUABUS_REFRESH_REPORTS
+        (problem,) = [p for p in health["problems"] if "item 92" in p]
+        assert problem == (
+            "aquaero: the device on its aquabus stopped answering; the temperatures it fed "
+            "are reported as missing rather than as the frozen value of their slots: "
+            "quadro_air (PROJECT.md section 8 item 92)"
+        )
+        # The Quadro is back on the bus.
+        device.status_template = fixture_bytes("aquaero-status-aquabus-block7-no-power.bin")
+        clock.advance(1.0)
+        device.emit()
+        assert adapter.read().temps["quadro_air"] == pytest.approx(23.68)
+    assert adapter.bus_device["lost"] is False and adapter.bus_device["present"] is True
+    assert [p for p in adapter.device_health()["problems"] if "item 92" in p] == []
+    bus_errors = [m for m in _messages(caplog, "ERROR") if "item 92" in m]
+    assert len(bus_errors) == 1  # once per state change, not once per tick
+    assert "the device on its aquabus stopped answering" in bus_errors[0]
+    assert "reported as missing from here on: quadro_air" in bus_errors[0]
+    assert "hold or raise" in bus_errors[0]
+    assert [m for m in _messages(caplog, "INFO") if "answers on aquabus again" in m] == [
+        "aquaero: a device answers on aquabus again; its temperature slots are readings once more"
+    ]
+
+
+def test_the_aquabus_refresh_gap_is_never_read_as_a_missing_bus_device() -> None:
+    """The line between item 92 and item 115. The aquaero fills its aquabus blocks with
+    the bus device's measurements about once in four reports and with substitutes in the
+    rest; the two captured reports are one such pair. Over four times ``bus_absent_s`` of
+    them nothing is ever judged absent, because presence is read from the speed field,
+    which every report carries -- not from a voltage or a current (item 116)."""
+    adapter, device, clock = _aquabus_all_configured(_bus_binding())
+    measuring = fixture_bytes("aquaero-status-aquabus-block7-power.bin")
+    substituted = fixture_bytes("aquaero-status-aquabus-block7-no-power.bin")
+    for i in range(4 * int(AQUAERO_T.bus_absent_s)):
+        device.status_template = measuring if i % AQUABUS_REFRESH_REPORTS == 0 else substituted
+        clock.advance(1.0)
+        device.emit()
+        obs = adapter.read()
+        assert obs.temps["quadro_air"] is not None
+        assert adapter.bus_device["present"] is True
+    assert adapter.bus_device == {
+        "present": True,
+        "seen": True,
+        "absent_s": None,
+        "lost": False,
+        "temps_missing": [],
+        "refresh_reports": AQUABUS_REFRESH_REPORTS,
+    }
+    assert adapter.device_health()["problems"] == []
+
+
+def test_one_transient_report_without_the_bus_device_reports_no_loss(caplog) -> None:
+    """A single ``0xFFFF`` costs the aquabus temperatures one tick of ``None`` -- the safe
+    direction, and the same price item 90 pays for rpm and duty -- and is reported as
+    nothing: ``bus_absent_s`` is exactly what keeps a blip out of the health payload."""
+    adapter, device, clock = _aquabus_all_configured(_bus_binding())
+    live = device.status_template
+    with caplog.at_level("INFO", logger=LOGGER):
+        adapter.read()
+        device.status_template = _bus_device_gone(live)
+        clock.advance(1.0)
+        device.emit()
+        assert adapter.read().temps["quadro_air"] is None
+        device.status_template = live
+        for _ in range(3):
+            clock.advance(1.0)
+            device.emit()
+            assert adapter.read().temps["quadro_air"] == pytest.approx(23.68)
+    assert adapter.bus_device["lost"] is False and adapter.bus_device["absent_s"] is None
+    assert adapter.device_health()["problems"] == []
+    assert [m for m in _messages(caplog, "ERROR") if "item 92" in m] == []
+
+
+def test_a_controller_with_nothing_bound_on_aquabus_reports_the_state_but_no_problem(
+    caplog,
+) -> None:
+    """The aquaero's own outputs and thermistors, with nothing of this daemon's on the
+    bus: an empty aquabus is that controller's normal state and no problem of the
+    daemon's. The state is still published, so an owner can see what the bus looks
+    like."""
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1}, temp_map={"inlet": "temp6"})
+    adapter, device, _bus, clock, _ = _setup(binding)  # the plain aquaero: empty aquabus
+    with caplog.at_level("INFO", logger=LOGGER):
+        for _ in range(int(AQUAERO_T.bus_absent_s) + 2):
+            clock.advance(1.0)
+            device.emit()
+            adapter.read()
+    health = adapter.device_health()
+    assert health["aquabus"]["present"] is False and health["aquabus"]["seen"] is False
+    assert health["aquabus"]["lost"] is True and health["aquabus"]["temps_missing"] == []
+    assert health["problems"] == []
+    assert [m for m in _messages(caplog, "ERROR") if "item 92" in m] == []
+
+
+def test_a_bus_that_was_never_there_is_reported_as_that_and_not_as_a_departure(caplog) -> None:
+    """The other half: the daemon starts with the Quadro already off the bus and an
+    aquabus output commanded. It says so -- and says that none has answered since it
+    started reading, which is what the owner needs to tell "unplugged just now" from
+    "never came up"."""
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={"qd1": 5}, temp_map={"inlet": "temp6"})
+    adapter, device, _bus, clock, _ = _setup(binding)
+    with caplog.at_level("INFO", logger=LOGGER):
+        for _ in range(int(AQUAERO_T.bus_absent_s) + 2):
+            clock.advance(1.0)
+            device.emit()
+            adapter.read()
+    health = adapter.device_health()
+    assert health["aquabus"]["seen"] is False and health["aquabus"]["lost"] is True
+    assert [p for p in health["problems"] if "item 92" in p] == [
+        "aquaero: no device answers on its aquabus, and none has since this daemon "
+        "started reading it (PROJECT.md section 8 item 92)"
+    ]
+    (error,) = [m for m in _messages(caplog, "ERROR") if "item 92" in m]
+    assert "no device has answered on its aquabus, and none has since this daemon" in error
+    assert "bus_absent_s = 10" in error
+
+
+def test_the_quadro_itself_never_judges_an_aquabus() -> None:
+    """A kind with no aquabus outputs cannot see a bus at all: it publishes the state as
+    unknown and never reports a loss, whatever its own outputs read."""
+    adapter, _device, _bus, _clock, _ = _setup(_quadro_binding())
+    adapter.read()
+    assert adapter.bus_device == {
+        "present": None,
+        "seen": False,
+        "absent_s": None,
+        "lost": False,
+        "temps_missing": [],
+        "refresh_reports": None,
+    }
+    assert adapter.device_health()["problems"] == []
 
 
 def test_the_stuck_error_carries_the_hint(caplog) -> None:

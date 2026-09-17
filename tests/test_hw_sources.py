@@ -6,6 +6,7 @@ PROJECT.md section 3 (Track B) / the DAS plan section 1 and section 12 Q1
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from aqua_bridge.hw.aquacomputer import (
     AQUAERO,
     QUADRO,
     control_duty,
+    decode_status,
     finalize_control_report,
 )
 from aqua_bridge.hw.aquacomputer_adapter import (
@@ -569,16 +571,18 @@ class _Notifier:
         return True
 
 
-def _aquabus_loop(cfg, device: FakeController):
+def _aquabus_loop(cfg, device: FakeController, temp_map=None):
     """The example config's channels on the aquaero: radiator on its own output 1,
-    intake on aquabus output 5 (with its tachometer)."""
+    intake on aquabus output 5 (with its tachometer). ``temp_map`` binds the two
+    temperatures; by default both are the aquaero's own thermistors."""
+    temp_map = {"coolant": "temp6", "air": "temp7"} if temp_map is None else temp_map
     clock = device.clock
     adapter = AquacomputerAdapter(
         DeviceBinding(
             kind=AQUAERO,
             pwm_map={"radiator": 1, "intake": 5},
             fan_map={"intake": 5},
-            temp_map={"coolant": "temp6", "air": "temp7"},
+            temp_map=dict(temp_map),
         ),
         clock=clock,
         sleep=FakeSleep(clock),
@@ -595,7 +599,12 @@ def _aquabus_loop(cfg, device: FakeController):
         notifier=notifier,
     )
 
-    physical = next(g for g in AQUAERO.temp_groups if g.prefix == "temp").offset
+    groups = {group.prefix: group for group in AQUAERO.temp_groups}
+    moving = [
+        groups[name.rstrip("0123456789")].offset
+        + 2 * (int(name.lstrip("abcdefghijklmnopqrstuvwxyz")) - 1)
+        for name in temp_map.values()
+    ]
 
     def run(ticks: int) -> list[TickResult]:
         results = []
@@ -603,7 +612,7 @@ def _aquabus_loop(cfg, device: FakeController):
             clock.advance(cfg.dt)
             # A frozen temperature while the fans move would be the gate's stuck case.
             status = bytearray(device.status_template)
-            for offset in (physical + 2 * 5, physical + 2 * 6):  # temp6, temp7
+            for offset in moving:  # every bound input, the aquabus slots included
                 value = 3000 + 5 * (loop.tick_count % 2)
                 status[offset : offset + 2] = value.to_bytes(2, "big")
             device.status_template = bytes(status)
@@ -612,6 +621,56 @@ def _aquabus_loop(cfg, device: FakeController):
         return results
 
     return adapter, loop, notifier, run
+
+
+def _bus_gone(template: bytes) -> bytes:
+    """The Quadro off aquabus: every aquabus fan block reads rpm 0xFFFF, while the
+    aquabus temperature slots keep the value they last read (PROJECT.md item 92)."""
+    status = bytearray(template)
+    for number in AQUAERO.aquabus_outputs:
+        speed = AQUAERO.fan_blocks[number - 1] + AQUAERO.fan_layout.speed
+        status[speed : speed + 2] = b"\xff\xff"
+    return bytes(status)
+
+
+def test_a_lost_bus_device_never_takes_a_fan_down_with_it(fast_cfg, caplog) -> None:
+    """Item 92 through the loop, with the enclosure air bound to the Quadro's own
+    thermistor in aquabus slot 2 -- the binding PROJECT.md used to warn against.
+
+    The Quadro leaves the bus mid-run. The aquaero keeps serving that slot's last value,
+    the adapter reports it as missing instead, the gate stops trusting the tick and the
+    loop holds and then ramps: no tick after the loss ever commands a channel below what
+    it commanded before it. That is the half of item 92 that is not a diagnosis -- a lost
+    bus device is less evidence, so cooling may only stay or rise.
+    """
+    device = aquabus_aquaero(FakeClock(), node="/dev/hidraw2")
+    adapter, loop, _notifier, run = _aquabus_loop(
+        fast_cfg, device, temp_map={"coolant": "temp6", "air": "bus2"}
+    )
+    good = run(20)
+    assert all(r.ok for r in good[-3:])
+    assert good[-1].obs.temps["air"] is not None
+    held = {ch: good[-1].cmd.pwm[ch] for ch in ("radiator", "intake")}
+
+    with caplog.at_level("ERROR", logger="aqua_bridge.hw.aquacomputer"):
+        device.status_template = _bus_gone(device.status_template)
+        gone = run(20)
+    # The slot still holds its last value in the report; the observation says "missing".
+    frozen = decode_status(AQUAERO, device.status())
+    assert frozen.temp("bus2") is not None
+    assert all(r.obs.temps["air"] is None for r in gone)
+    assert all(r.obs.temps["coolant"] is not None for r in gone)
+    # Never lower, and the fans end up at the fallback, not at the quiet duty.
+    for result in gone:
+        for ch, before in held.items():
+            assert result.cmd.pwm[ch] >= before - 1e-9
+    assert gone[-1].cmd.mode is Mode.FALLBACK
+    fallback = fast_cfg.fallback_pwm
+    expected = fallback["radiator"] if isinstance(fallback, Mapping) else fallback
+    assert gone[-1].cmd.pwm["radiator"] == pytest.approx(expected)
+    health = adapter.device_health()
+    assert health["aquabus"]["lost"] is True and health["aquabus"]["temps_missing"] == ["air"]
+    assert any("item 92" in p for p in health["problems"])
 
 
 def test_an_empty_aquabus_slot_does_not_blind_the_rest_of_the_controller(fast_cfg, caplog) -> None:
@@ -645,9 +704,13 @@ def test_an_empty_aquabus_slot_does_not_blind_the_rest_of_the_controller(fast_cf
     assert all(r.ok for r in back) and adapter.absent_channels == ()
     assert back[-1].obs.rpm["intake"] is not None
     errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
-    assert len(errors) == 1 and "no device behind pwm5 (intake), fan5 (intake)" in errors[0]
+    # One line per state change from each rule: item 90's channels, item 92's bus device.
+    assert len(errors) == 2
+    assert "no device behind pwm5 (intake), fan5 (intake)" in errors[0]
+    assert "the device on its aquabus stopped answering" in errors[1]
     assert [m for m in _messages(caplog, "INFO") if "again" in m] == [
-        "aquaero: a device is behind pwm5 (intake), fan5 (intake) again"
+        "aquaero: a device is behind pwm5 (intake), fan5 (intake) again",
+        "aquaero: a device answers on aquabus again; its temperature slots are readings once more",
     ]
     assert loop.shutdown() is True
 
