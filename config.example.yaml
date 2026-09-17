@@ -170,8 +170,10 @@ xt6:
     radiator: {pwm: pwm1, rpm: fan1}   # aquaero pwm1-4 its own outputs, pwm5-8 a Quadro on its aquabus; Quadro pwm1-4
     intake:   {pwm: pwm2, rpm: fan2}
   temp_map:              # logical temperature -> input: temp1-8 physical sensors, bus1-8 aquabus slots,
-    coolant: temp1       # soft1-8 software sensors, virt1-4 virtual sensors (Quadro: temp1-4, soft1-16)
-    air: temp2
+    coolant: temp1       # virt1-4 virtual sensors (Quadro: temp1-4). A softN software sensor is NOT
+    air: temp2           # bindable: it holds what a host wrote, then its configured fallback for ever,
+                         # which reads exactly like a measurement (PROJECT.md section 8 item 113). The
+                         # slots are published in device_health.software_sensors instead.
   # Timing, defaults shown (PROJECT.md section 3, Track B). Writes take effect at once and
   # are not saved in the controller's memory; a power cycle brings back its saved configuration.
   status_max_age_s: 3.0         # an older status report is no observation: fallback (> 0)

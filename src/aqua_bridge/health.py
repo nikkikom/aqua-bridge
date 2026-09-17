@@ -76,6 +76,20 @@ the 12 V rail
     behind a bus device is therefore *not* detected here; it would take a device
     that reports its own outputs' rails (the Quadro does, for its own).
 
+    That gap is **accepted and declared**, not hidden (PROJECT.md section 8 item
+    117). Closing it needs a controller that reports its own outputs' rails to this
+    daemon -- a Quadro on its own USB -- which the supported topology does not have
+    (owner decision 2026-09-16), and no substitute signal in the aquaero's report
+    survives inspection: the refresh is not even atomic per report (one capture had
+    blocks 5 and 6 refreshed and block 8 not), so there is no per-report or
+    per-block marker that says which reading a block is carrying. What the daemon
+    does instead is say so: every channel's verdict carries ``rail_monitored`` and
+    ``power_monitored`` with an ``unmonitored`` mapping naming each rule that is off
+    for that output and why, so an empty ``problems`` list is never readable as
+    coverage the daemon does not have. What *is* still covered on such a system is
+    the aquaero's own outputs 1-4, and with them any sag common to the whole 12 V
+    supply; what is not is a rail local to the bus device.
+
 power against the duty
     Only where the device reports power at all: an aquaero reports 0 mA and 0 W
     for its *own* outputs in PWM mode however fast the fan turns, so absence of
@@ -278,6 +292,36 @@ def expected_rpm(cfg: MpcConfig, channel: str, duty: float) -> float | None:
 
 def _finite(value: Any) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+
+
+#: What a channel's verdict says about a rule it cannot run, when the source gives no
+#: reason of its own (a recording made before the reasons existed, a source that is not
+#: an Aqua Computer controller). Naming the rule is the point: the verdict must never
+#: look like a rule that ran and found nothing (PROJECT.md section 8 item 117).
+_UNMONITORED_FALLBACK: Mapping[str, str] = {
+    "rail": "this output reports no rail voltage of its own, so the rail rule is off for it",
+    "power": "this output reports no current or power of its own, so the power rule is off for it",
+}
+
+
+def _unmonitored(reading: Mapping[str, Any], *, rail: bool, power: bool) -> dict[str, str]:
+    """``{rule: why it does not run for this channel}`` for the channel's verdict.
+
+    A published verdict has to say which rules it did *not* apply, or a channel whose
+    rail is never read looks exactly like a channel whose rail is fine (item 117). The
+    reason comes from the source where it has one -- the hardware adapter's
+    ``not_measured``, which knows why the field is not that output's own measurement --
+    and falls back to the generic line above otherwise.
+    """
+    reasons = reading.get("not_measured")
+    reasons = reasons if isinstance(reasons, Mapping) else {}
+    out: dict[str, str] = {}
+    for rule, monitored in (("rail", rail), ("power", power)):
+        if monitored:
+            continue
+        given = reasons.get(rule)
+        out[rule] = str(given) if isinstance(given, str) and given else _UNMONITORED_FALLBACK[rule]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -770,7 +814,15 @@ class HealthMonitor:
         return held if held >= window else None
 
     def check_channel(self, channel: str, reading: Mapping[str, Any], now: float) -> dict[str, Any]:
-        """One channel's verdict: the measured values plus a ``problems`` list."""
+        """One channel's verdict: the measured values, a ``problems`` list, and which
+        rules did not run at all.
+
+        ``rail_monitored`` / ``power_monitored`` and the ``unmonitored`` mapping are
+        the second half of the answer (PROJECT.md section 8 item 117): an empty
+        ``problems`` on a channel whose rail is never read must not be readable as "the
+        rail is fine", so the verdict names each rule that is off for this output and
+        why, in the same payload, wherever a human or Home Assistant reads it.
+        """
         s = self.settings
         duty = reading.get("duty")
         rpm = reading.get("rpm")
@@ -782,6 +834,7 @@ class HealthMonitor:
         # absent from older records and from sources that publish a rail they measure,
         # and the voltage is then taken as given.
         rail_known = bool(reading.get("rail_reported", True))
+        power_known = bool(reading.get("power_reported"))
         out: dict[str, Any] = {
             "duty": duty if _finite(duty) else None,
             "rpm": rpm if _finite(rpm) else None,
@@ -790,6 +843,9 @@ class HealthMonitor:
             "power_w": power if _finite(power) else None,
             "expected_rpm": None,
             "expected_power_w": None,
+            "rail_monitored": rail_known,
+            "power_monitored": power_known,
+            "unmonitored": _unmonitored(reading, rail=rail_known, power=power_known),
             "problems": [],
         }
         state = self._state(channel)
@@ -845,7 +901,7 @@ class HealthMonitor:
         out["expected_power_w"] = expected_w
         if (
             judge
-            and bool(reading.get("power_reported"))
+            and power_known
             and expected_w is not None
             and expected_w >= s.power_min_w
             and _finite(power)

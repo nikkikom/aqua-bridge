@@ -67,7 +67,7 @@ def _aquaero_binding(**timing) -> DeviceBinding:
         kind=AQUAERO,
         pwm_map={"xt1": 1, "xt2": 2},
         fan_map={"xt2": 2},
-        temp_map={"inlet": "temp6", "software": "soft1", "open": "temp1"},
+        temp_map={"inlet": "temp6", "open": "temp1"},
         timing=_timing(AQUAERO, **timing),
     )
 
@@ -101,11 +101,7 @@ def _messages(caplog, level: str) -> list[str]:
 def test_read_maps_the_aquaero_status_report() -> None:
     adapter, _device, _bus, clock, _ = _setup(_aquaero_binding())
     obs = adapter.read()
-    assert obs.temps == {
-        "inlet": pytest.approx(22.26),
-        "software": pytest.approx(40.0),
-        "open": None,
-    }
+    assert obs.temps == {"inlet": pytest.approx(22.26), "open": None}
     assert obs.rpm == {"xt2": 120.0}
     # Output duty from the status report (firmware controllers: 100 %, preset: 14.12 %).
     assert obs.pwm == {"xt1": 1.0, "xt2": pytest.approx(0.1412)}
@@ -1085,7 +1081,6 @@ def _heartbeat_aquaero(**timing):
     binding = DeviceBinding(
         kind=AQUAERO,
         pwm_map={"xt1": 1, "xt2": 2},
-        temp_map={"beat": "soft1"},
         timing=_timing(AQUAERO, **{**HEARTBEAT, **timing}),
     )
     return _setup(binding)
@@ -1110,7 +1105,11 @@ def test_the_heartbeat_report_carries_the_configured_sensor_only(caplog) -> None
     assert device.soft_sensors == {1: 20.0}  # and the device reports it back
     clock.advance(1.0)
     device.emit()
-    assert adapter.read().temps == {"beat": pytest.approx(20.0)}
+    # It reads back in the status report -- but as softN, which no config may bind
+    # (PROJECT.md section 8 item 113), so it arrives nowhere near an observation.
+    adapter.read()
+    assert adapter.last_status is not None
+    assert adapter.last_status.temp("soft1") == pytest.approx(20.0)
     assert [m for m in _messages(caplog, "INFO") if "heartbeat" in m] == [
         "aquaero: writing the software-sensor heartbeat of 20.00 degC to soft1 every write"
     ]
@@ -1319,14 +1318,14 @@ _QUADRO_ON_AQUABUS = DeviceBinding(
     kind=AQUAERO,
     pwm_map={"xt1": 1, "qd1": 5, "qd2": 6, "qd3": 7, "qd4": 8},
     fan_map={"qd3": 7},
-    temp_map={"quadro_t2": "bus2", "software": "soft2"},
+    temp_map={"quadro_t2": "bus2"},
 )
 
 
 def test_aquabus_outputs_read_like_the_aquaeros_own() -> None:
     adapter, _device, _clock = _aquabus(_QUADRO_ON_AQUABUS)
     obs = adapter.read()
-    assert obs.temps == {"quadro_t2": pytest.approx(24.14), "software": pytest.approx(50.0)}
+    assert obs.temps == {"quadro_t2": pytest.approx(24.14)}
     assert obs.rpm == {"qd3": 1105.0}
     assert obs.pwm == {
         "xt1": 0.25,
@@ -1570,7 +1569,7 @@ def test_binding_rejects_numbers_outside_the_kind() -> None:
         DeviceBinding(kind=QUADRO, pwm_map={}, temp_map={"t": "bus1"})
     with pytest.raises(ValueError, match="share one"):
         DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"t": "bus1", "u": "bus1"})
-    DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"t": "bus1", "u": "virt4", "v": "soft8"})
+    DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"t": "bus1", "u": "virt4"})
     with pytest.raises(ValueError, match="share one"):
         DeviceBinding(kind=AQUAERO, pwm_map={"a": 1, "b": 1})
     with pytest.raises(ValueError, match="not pwm_map channels"):

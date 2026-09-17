@@ -135,7 +135,9 @@ function renderModel(model, diag) {
 // Controllers: /api/state's "device_health" -- per controller what the adapter
 // found (stuck outputs, absent aquabus slots, outputs not in PWM mode, the flow
 // sensors, the active profile when one is published) and per channel the fan
-// health: rpm and power against the fitted curve, and the 12 V rail.
+// health: rpm and power against the fitted curve, and the 12 V rail -- with the
+// rules that do not run for an output named as such rather than left blank
+// (§8 item 117), and the software-sensor slots nothing feeds (§8 item 113).
 function renderDevices(health) {
   const h = health || {};
   const rows = [];
@@ -164,8 +166,25 @@ function renderDevices(health) {
     if (f.expected_rpm !== null && f.expected_rpm !== undefined) {
       parts.push("curve " + fmt(f.expected_rpm, 0));
     }
-    parts.push(fmt(f.voltage_v) + " V", fmt(f.current_ma, 0) + " mA", fmt(f.power_w) + " W");
+    // A field the controller does not measure for this output is published as null
+    // with its rule named in "unmonitored" (§8 item 117). Say "not monitored" rather
+    // than print a dash: a blank must never read as a rule that checked and passed.
+    if (f.rail_monitored === false) parts.push("rail not monitored");
+    else parts.push(fmt(f.voltage_v) + " V");
+    if (f.power_monitored === false) parts.push("power not monitored");
+    else parts.push(fmt(f.current_ma, 0) + " mA", fmt(f.power_w) + " W");
     rows.push(row(ch + ((f.problems || []).length ? " DRIFT" : ""), parts.join(", ")));
+  }
+  // Software sensors: not measurements, and nothing may bind one (§8 item 113). Show
+  // the slots this daemon does not feed that are sitting on their configured fallback.
+  for (const d of (h.devices || [])) {
+    const unfed = (d.software_sensors || [])
+      .filter(s => s.enabled && !s.written_by_daemon && s.reads_fallback)
+      .map(s => s.name + " " + fmt(s.fallback_c) + " degC");
+    if (unfed.length) {
+      rows.push(row((d.label || d.device) + " software sensors",
+                    "reading their configured fallback, nothing feeds them: " + unfed.join(", ")));
+    }
   }
   for (const p of (h.problems || [])) rows.push(row("problem", p));
   if (!rows.length) rows.push(row("Controllers", "no device health yet"));

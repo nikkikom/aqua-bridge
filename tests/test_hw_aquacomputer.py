@@ -51,6 +51,7 @@ from aqua_bridge.hw.aquacomputer import (
     patch_duties,
     restore_channel,
     software_sensor_report,
+    software_sensor_settings,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "aquacomputer"
@@ -310,6 +311,96 @@ def test_the_aquabus_mode_word_is_read_but_never_interpreted() -> None:
     assert [m.name for m in modes] == ["pwm"] * 4 + ["unknown"] * 4
     assert not any(m.is_pwm for m in modes[4:])
     assert [channel_state(AQUAERO, data, k).mode for k in range(8)] == modes
+
+
+def test_only_the_speed_field_says_whether_a_bus_device_is_there() -> None:
+    """Item 116: an aquabus block in a non-measuring report looks exactly like an empty
+    slot on the voltage field, and only on that field.
+
+    The three captures together separate the two cases the voltage cannot. With **no
+    device on aquabus**, blocks 5-8 read rpm 0xFFFF and 0.00 V. With the **Quadro
+    present**, its three outputs with no fan read 0.00 V in the report that carries the
+    bus device's measurements -- byte for byte what an empty slot reads -- and 12.09 V
+    one second later, at the same duty, with nothing having changed on the bus. So
+    0.00 V is neither necessary nor sufficient for absence, and a rule keyed on it
+    would call a present device absent in one report and present in the next.
+
+    The speed field carries no substitute in either report: absent is 0xFFFF in both
+    captures with nothing on the bus, present is 0 rpm (no fan) or the fan's 255 rpm in
+    both captures with the Quadro on it. That is why absence needs no confirmation
+    window: the sentinel already outlasts the refresh. Every absence judgement in this
+    project reads :attr:`FanStatus.present`, which reads only that field.
+    """
+    empty_bus = [
+        decode_status(AQUAERO, _bin(f"aquaero-status{s}.bin")) for s in ("", "-no-aquabus")
+    ]
+    measuring = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-power.bin"))
+    substituted = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-no-power.bin"))
+    aquabus = [n - 1 for n in AQUAERO.aquabus_outputs]
+    assert aquabus == [4, 5, 6, 7]
+
+    for report in empty_bus:  # nothing on the bus: the sentinel, and 0.00 V with it
+        assert [report.fans[k].rpm for k in aquabus] == [FAN_ABSENT_RPM] * 4
+        assert [report.fans[k].voltage_cv for k in aquabus] == [0] * 4
+        assert [report.fans[k].present for k in aquabus] == [False] * 4
+
+    # The Quadro is on the bus in both of these, one second apart at an unchanged duty.
+    assert [measuring.fans[k].rpm for k in aquabus] == [0, 0, 255, 0]
+    assert [substituted.fans[k].rpm for k in aquabus] == [0, 0, 255, 0]
+    assert [measuring.fans[k].present for k in aquabus] == [True] * 4
+    assert [substituted.fans[k].present for k in aquabus] == [True] * 4
+    # ... while the voltage of those same present outputs reads both ways within a second
+    assert [measuring.fans[k].voltage_cv for k in aquabus] == [0, 0, 1210, 0]
+    assert [substituted.fans[k].voltage_cv for k in aquabus] == [1209, 1209, 1209, 1209]
+    # 0.00 V on a present output is indistinguishable from 0.00 V on an absent one.
+    assert measuring.fans[4].voltage_cv == empty_bus[0].fans[4].voltage_cv == 0
+    assert measuring.fans[4].present and not empty_bus[0].fans[4].present
+
+
+def test_the_software_sensor_settings_of_five_captured_control_reports() -> None:
+    """Item 113: five bytes per sensor from 0x177 -- enabled, fallback temperature,
+    timeout -- and what they explain about the status reports beside them.
+
+    In the 2026-09-17 capture all eight sensors are enabled: sensor 1 carries the
+    owner's watchdog (30 s, falling back to 90.00 degC, the alarm that drives every
+    output to 100 %) and the other seven a 300 s / 50.00 degC fallback that nothing
+    writes -- which is exactly the steady 50.00 degC their status reports show. In the
+    earlier captures sensor 1 holds the 300 s / 40.00 degC of item 84's experiment, and
+    sensors 3-8 are disabled, which is why those status reports show 0x7FFF for them.
+    A disabled slot is therefore the only one a status report marks; an enabled slot
+    nothing feeds reads its fallback and nothing says so.
+    """
+    live = software_sensor_settings(AQUAERO, _bin("aquaero-ctrl-aquabus-all-on-preset1.bin"))
+    assert [s.name for s in live] == [f"soft{n}" for n in range(1, 9)]
+    assert all(s.enabled for s in live)
+    assert (live[0].fallback_c, live[0].timeout_s) == (pytest.approx(90.0), 30)
+    assert [(s.fallback_c, s.timeout_s) for s in live[1:]] == [(pytest.approx(50.0), 300)] * 7
+
+    status = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-no-power.bin"))
+    # The fed slot does not read its fallback; the seven unfed ones read exactly theirs.
+    assert not live[0].reads_fallback(status.temp("soft1"))
+    assert all(s.reads_fallback(status.temp(s.name)) for s in live[1:])
+    assert live[0].reads_fallback(None) is False
+
+    earlier = software_sensor_settings(AQUAERO, _bin("aquaero-ctrl-firmware.bin"))
+    assert [s.enabled for s in earlier] == [True, True] + [False] * 6
+    assert (earlier[0].fallback_c, earlier[0].timeout_s) == (pytest.approx(40.0), 300)
+    old_status = decode_status(AQUAERO, _bin("aquaero-status.bin"))
+    # Disabled is the one state the status report shows: 0x7FFF, decoded as None.
+    for s in earlier:
+        assert (old_status.temp(s.name) is None) is not s.enabled
+    # Enabled-and-unfed still reads a plain number: soft2 shows its 50.00 degC fallback.
+    assert old_status.temp("soft2") == pytest.approx(earlier[1].fallback_c)
+
+    # A kind whose settings are not known simply has none, and names no soft slot.
+    assert software_sensor_settings(QUADRO, _bin("quadro-ctrl-firmware.bin")) == ()
+    assert AQUAERO.soft_sensor_names == tuple(f"soft{n}" for n in range(1, 9))
+    assert QUADRO.soft_sensor_names == tuple(f"soft{n}" for n in range(1, 17))
+
+
+def test_software_sensor_settings_reject_a_report_that_is_not_one() -> None:
+    with pytest.raises(ReportError):
+        software_sensor_settings(AQUAERO, _bin("aquaero-status.bin"))
 
 
 def test_quadro_status_output_duty_and_power_cycles() -> None:

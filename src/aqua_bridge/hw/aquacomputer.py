@@ -74,6 +74,21 @@ every tick is the heartbeat of a hardware watchdog: the device falls back to the
 configured temperature when the host stops, and an alarm on it can select a safe
 profile. The Quadro's software-sensor report is not known.
 
+Those three settings are in the control report, five bytes per sensor from
+``0x177``: enabled (``u8``), fallback temperature (``s16``, centi-degC), timeout
+(``u16``, s) -- :func:`software_sensor_settings`. **A software sensor is not a
+measurement.** The status report shows one of three things in a ``softN`` slot
+and only tells two of them apart: ``0x7FFF`` while the sensor is *disabled*, the
+value a host last wrote, and -- once that host stops for longer than the
+timeout -- the *configured fallback*, which is a steady number that never goes
+stale and never reads ``0x7FFF``. On the owner's aquaero all eight sensors are
+enabled, one is fed, and ``soft2..soft8`` read their configured 50.00 degC
+through all 90 reports of the 2026-09-17 run (PROJECT.md section 2, section 8
+item 113). Nothing in a status report separates that from a live reading, so no
+``softN`` may be bound as a temperature input: the adapter refuses the binding
+and publishes each slot's settings, its reading and whether the two are the same
+number, so a human can see what the slot is.
+
 The aquaero controller block also holds the output mode, a ``u16`` at
 ``+0x0E``: low byte ``0x01`` drives the output as a DC voltage, ``0x02`` as PWM
 (verified on the Pi 2026-09-15 by switching one output; the high byte is not
@@ -109,6 +124,20 @@ whose rail its aquabus block holds, so :attr:`DeviceKind.reports_rail` is False
 for those outputs (:meth:`DeviceKind.reports_rail`) and nothing publishes that
 field as the output's rail. The aquaero's own blocks 1-4 do report their own
 rail and are unaffected.
+
+That substitution is also why **absence is judged on the speed field and on
+nothing else** (:attr:`FanStatus.present`, PROJECT.md section 8 items 90, 116).
+An aquabus output with no fan reads **0.00 V** in a report that carries the bus
+device's measurements -- exactly what an aquabus slot with no device on the bus
+at all reads -- and the same output reads 12.09 V one second later, so the
+voltage field separates the two in neither direction and would judge one slot
+both ways within a second. The speed field carries no substitute: an absent bus
+reads ``0xFFFF`` and a present one 0 rpm (no fan) or the fan's speed, in the
+measuring and the non-measuring report alike. Absence therefore needs no
+confirmation window -- the sentinel is already invariant across the refresh --
+and a rule keyed on the voltage would both lose a present device and gain an
+absent one. Pinned on the two fixtures captured one second apart
+(``tests/test_hw_aquacomputer.py``).
 """
 
 from __future__ import annotations
@@ -124,7 +153,9 @@ __all__ = [
     "KINDS",
     "QUADRO",
     "SENSOR_NOT_CONNECTED",
+    "SOFT_SENSOR_PREFIX",
     "SOFT_SENSOR_REPORT_ID",
+    "SOFT_SENSOR_SETTINGS_SIZE",
     "SOURCE_UNCONFIGURED",
     "STATUS_REPORT_ID",
     "TEMP_MAX_C",
@@ -138,6 +169,7 @@ __all__ = [
     "FanStatus",
     "OutputMode",
     "ReportError",
+    "SoftSensorSettings",
     "StatusReport",
     "TempGroup",
     "active_profile",
@@ -157,6 +189,7 @@ __all__ = [
     "patch_duties",
     "restore_channel",
     "software_sensor_report",
+    "software_sensor_settings",
 ]
 
 #: USB vendor id of Aqua Computer GmbH & Co. KG.
@@ -175,6 +208,13 @@ DUTY_MAX = 10000
 #: HID OUTPUT report that sets the aquaero's software temperature sensors
 #: (:func:`software_sensor_report`); the Quadro's is not known.
 SOFT_SENSOR_REPORT_ID = 0x07
+#: Config-name prefix of the software temperature sensors (``soft1``, ``soft2``, ...).
+#: A slot under this prefix is whatever a host last wrote or the device's configured
+#: fallback, never a measurement, so no config may bind one (module docstring).
+SOFT_SENSOR_PREFIX = "soft"
+#: Bytes per software-sensor entry in the aquaero's control report: enabled (``u8``),
+#: fallback temperature (``s16`` centi-degC), timeout (``u16`` s).
+SOFT_SENSOR_SETTINGS_SIZE = 5
 #: Temperature range a centi-degC ``s16`` field can carry. The top value
 #: (``0x7FFF``) is :data:`SENSOR_NOT_CONNECTED`, so 327.66 degC is the largest.
 TEMP_MIN_C = -327.68
@@ -280,6 +320,9 @@ class DeviceKind:
     soft_sensor_report_id: int | None = None
     #: How many software sensors that report carries (``None`` with no report).
     soft_sensor_count: int | None = None
+    #: Offset of the software-sensor settings in the control report, five bytes per
+    #: sensor (:func:`software_sensor_settings`); ``None`` where they are not known.
+    soft_sensor_settings_offset: int | None = None
     #: Offset of the active-profile byte in the control report (``None`` where
     #: the kind has no profiles or the byte is not known).
     profile_offset: int | None = None
@@ -307,6 +350,20 @@ class DeviceKind:
     @property
     def temp_count(self) -> int:
         return sum(group.count for group in self.temp_groups)
+
+    @property
+    def soft_sensor_names(self) -> tuple[str, ...]:
+        """Config names of this kind's software sensors (``soft1``, ``soft2``, ...).
+
+        These are the host-written slots: a value some host put there, or the
+        configured fallback once that host stopped, and a status report does not say
+        which (module docstring). Nothing may bind one as a temperature input, so this
+        is the list the config validation refuses.
+        """
+        for group in self.temp_groups:
+            if group.prefix == SOFT_SENSOR_PREFIX:
+                return group.names()
+        return ()
 
     @property
     def fan_count(self) -> int:
@@ -413,6 +470,7 @@ AQUAERO = DeviceKind(
     save_verified=True,
     soft_sensor_report_id=SOFT_SENSOR_REPORT_ID,
     soft_sensor_count=8,
+    soft_sensor_settings_offset=0x177,
     profile_offset=0x06,
     own_outputs_report_power=False,
     aquabus_outputs_report_power=False,
@@ -479,7 +537,17 @@ class FanStatus:
 
     @property
     def present(self) -> bool:
-        """False when the block has no device behind it (speed ``0xFFFF``)."""
+        """False when the block has no device behind it (speed ``0xFFFF``).
+
+        **The speed field is the only one that answers this** (module docstring,
+        PROJECT.md section 8 items 90, 116). The voltage cannot: an aquabus output
+        with no fan reads 0.00 V in a report carrying the bus device's measurements
+        and 12.09 V in the next one, and an aquabus slot with no device at all reads
+        0.00 V too -- so 0.00 V is neither necessary nor sufficient for absence,
+        while ``0xFFFF`` is both and does not move between reports. The current and
+        the power are substituted the same way. Every absence judgement in this
+        project goes through this property for that reason.
+        """
         return self.rpm != FAN_ABSENT_RPM
 
     @property
@@ -642,6 +710,78 @@ def software_sensor_report(kind: DeviceKind, values: Mapping[int, float]) -> byt
             )
         struct.pack_into(">h", buf, 1 + 2 * (number - 1), _centi_degrees(value))
     return bytes(buf)
+
+
+@dataclass(frozen=True)
+class SoftSensorSettings:
+    """How the device has one software sensor configured (from the control report).
+
+    ``number`` is 1-based, as in the config name ``soft{number}``. A **disabled**
+    sensor shows ``0x7FFF`` ("no data") in every status report. An **enabled** one
+    shows the value a host last wrote until ``timeout_s`` passes with no write, and
+    ``fallback_c`` for ever after -- a steady number that reads exactly like a
+    measurement (module docstring, PROJECT.md section 8 item 113).
+    """
+
+    number: int
+    enabled: bool
+    #: The temperature the device shows once nothing has written the sensor for
+    #: ``timeout_s``, degC.
+    fallback_c: float
+    #: How long a written value survives without a refresh, seconds.
+    timeout_s: int
+
+    @property
+    def name(self) -> str:
+        """The config name of the slot, ``soft1`` .. ``soft8``."""
+        return f"{SOFT_SENSOR_PREFIX}{self.number}"
+
+    def reads_fallback(self, value: float | None) -> bool:
+        """``value`` (a ``softN`` reading in degC) is exactly the configured fallback.
+
+        Both sides are the same centi-degC field, so the comparison is exact at that
+        quantisation and needs no tolerance -- and therefore no config key. True is a
+        strong hint that nothing is feeding the slot and not a proof: a host writing
+        that very number would read the same.
+        """
+        if value is None:
+            return False
+        return round(value * 100.0) == round(self.fallback_c * 100.0)
+
+
+def software_sensor_settings(
+    kind: DeviceKind, data: bytes | bytearray
+) -> tuple[SoftSensorSettings, ...]:
+    """Every software sensor's settings from a control report, ``soft1`` first.
+
+    Five bytes per sensor from :attr:`DeviceKind.soft_sensor_settings_offset`:
+    enabled (``u8``), fallback temperature (``s16`` centi-degC), timeout (``u16``
+    seconds). Empty for a kind whose settings are not known (the Quadro).
+
+    Read against five captured aquaero control reports (PROJECT.md section 2,
+    2026-09-17): the owner's watchdog sensor reads enabled with a 30 s timeout and a
+    90.00 degC fallback -- the alarm that drives every output to 100 % -- while the
+    earlier captures show the same sensor at the 300 s / 40.00 degC of the item 84
+    experiment and the sensors the owner had not enabled yet reading disabled, which
+    is exactly what those status reports show as ``0x7FFF``.
+    """
+    offset, count = kind.soft_sensor_settings_offset, kind.soft_sensor_count
+    if offset is None or count is None:
+        return ()
+    _check_report(data, kind.ctrl_report_id, kind.ctrl_size, f"{kind.name} control report")
+    out = []
+    for i in range(count):
+        base = offset + SOFT_SENSOR_SETTINGS_SIZE * i
+        (fallback,) = struct.unpack_from(">h", data, base + 1)
+        out.append(
+            SoftSensorSettings(
+                number=i + 1,
+                enabled=data[base] != 0,
+                fallback_c=fallback / 100.0,
+                timeout_s=_u16(data, base + 3),
+            )
+        )
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------

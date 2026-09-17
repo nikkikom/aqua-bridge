@@ -18,7 +18,11 @@ from aqua_bridge.hw.aquacomputer import (
     control_duty,
     finalize_control_report,
 )
-from aqua_bridge.hw.aquacomputer_adapter import AquacomputerAdapter, DeviceBinding
+from aqua_bridge.hw.aquacomputer_adapter import (
+    AquacomputerAdapter,
+    AquacomputerTiming,
+    DeviceBinding,
+)
 from aqua_bridge.hw.hidraw import DeviceUnavailable
 from aqua_bridge.hw.onewire import W1Source
 from aqua_bridge.hw.sources import CompositeSource, build_composite_from_config
@@ -29,6 +33,7 @@ from aquacomputer_fakes import (
     FakeController,
     FakeSleep,
     aquabus_aquaero,
+    aquabus_aquaero_all_configured,
     fixture_bytes,
 )
 
@@ -847,6 +852,119 @@ def test_the_fan_readings_report_the_bound_tachometer_not_the_output_block() -> 
     # 0 V it holds here is the aquaero's substitute, not pwm5's rail.
     assert reading["duty"] == pytest.approx(0.8861)
     assert reading["voltage_v"] is None and reading["rail_reported"] is False
+
+
+def test_a_reading_names_the_health_rules_it_cannot_feed() -> None:
+    """Item 117: an aquabus output's rail is never read, so the fan-health rules must
+    never look as if they had checked it. The adapter says which rules a reading cannot
+    feed and why, in the reading itself, and the aquaero's own outputs -- whose rail it
+    does measure -- carry only the power entry."""
+    clock = FakeClock()
+    adapter = AquacomputerAdapter(
+        DeviceBinding(kind=AQUAERO, pwm_map={"qd3": 7, "radiator": 2}, fan_map={"qd3": 7}),
+        clock=clock,
+        sleep=FakeSleep(clock),
+        opener=FakeBus(aquabus_aquaero(clock)),
+    )
+    readings = adapter.read().inputs["fans"]
+    bus, own = readings["qd3"]["not_measured"], readings["radiator"]["not_measured"]
+    assert sorted(bus) == ["power", "rail"] and sorted(own) == ["power"]
+    assert "aquabus" in bus["rail"] and "NOT detected" in bus["rail"]
+    assert "one report in four" in bus["power"]
+    assert "PWM mode" in own["power"]
+
+
+def test_device_health_publishes_the_software_sensor_heartbeat(caplog) -> None:
+    """Item 83's last unpublished pair: heartbeat_on / heartbeat_ok were on the adapter
+    for diagnostics only. A heartbeat that could not be sent is a problem -- the
+    controller's own timeout is running -- and a fresh adapter reports neither."""
+    clock = FakeClock()
+    device = FakeController(AQUAERO, clock)
+    adapter = AquacomputerAdapter(
+        DeviceBinding(
+            kind=AQUAERO,
+            pwm_map={"radiator": 2},
+            timing=AquacomputerTiming.for_kind(AQUAERO, heartbeat_sensor=1, heartbeat_value_c=20.0),
+        ),
+        clock=clock,
+        sleep=FakeSleep(clock),
+        opener=FakeBus(device),
+    )
+    assert adapter.device_health()["heartbeat"] == {
+        "on": True,
+        "ok": None,
+        "sensor": 1,
+        "value_c": 20.0,
+    }
+    adapter.apply(MpcCommand(pwm={"radiator": 0.4}, mode=Mode.AUTO))
+    health = adapter.device_health()
+    assert health["heartbeat"]["ok"] is True and health["problems"] == []
+
+    device.write_failures = [OSError(32, "EPIPE")]
+    with caplog.at_level("WARNING", logger="aqua_bridge.hw.aquacomputer"):
+        adapter.apply(MpcCommand(pwm={"radiator": 0.5}, mode=Mode.AUTO))
+    health = adapter.device_health()
+    assert health["heartbeat"]["ok"] is False
+    assert any("heartbeat to soft1 was not sent" in p for p in health["problems"])
+
+
+def test_device_health_shows_what_each_software_sensor_really_is() -> None:
+    """Item 113: the aquaero's control report says which softN slots are enabled, what
+    each falls back to and after how long, and the daemon knows which one it feeds
+    itself. Published together, the steady 50.00 degC of the owner's soft2..soft8 reads
+    as the configured fallback it is instead of as a temperature.
+
+    The fixtures here are the 2026-09-17 capture: all eight enabled, soft1 carrying the
+    watchdog the heartbeat service feeds (30 s, 90.00 degC fallback) and reading
+    20.00 degC, the other seven reading exactly their 50.00 degC fallback.
+    """
+    clock = FakeClock()
+    adapter = AquacomputerAdapter(
+        DeviceBinding(kind=AQUAERO, pwm_map={"qd3": 7}),
+        clock=clock,
+        sleep=FakeSleep(clock),
+        opener=FakeBus(aquabus_aquaero_all_configured(clock)),
+    )
+    assert adapter.device_health()["software_sensors"] == []  # no control report yet
+    adapter.apply(MpcCommand(pwm={"qd3": 0.4}, mode=Mode.AUTO))  # fetches the control report
+    adapter.read()  # and the status report carries what each slot reads right now
+    sensors = adapter.device_health()["software_sensors"]
+    assert [s["name"] for s in sensors] == [f"soft{n}" for n in range(1, 9)]
+    assert all(s["enabled"] for s in sensors)
+    assert (sensors[0]["fallback_c"], sensors[0]["timeout_s"]) == (pytest.approx(90.0), 30)
+    # Nothing in this daemon writes any of them (heartbeat_sensor is off by default),
+    # and seven of the eight are sitting on their fallback right now.
+    assert [s["written_by_daemon"] for s in sensors] == [False] * 8
+    assert [s["reads_fallback"] for s in sensors] == [False] + [True] * 7
+    assert sensors[0]["reading_c"] == pytest.approx(20.0)
+    assert [s["reading_c"] for s in sensors[1:]] == [pytest.approx(50.0)] * 7
+    # A fact about the controller's configuration, not a daemon fault: eight enabled
+    # sensors must not leave /api/health permanently not-ok.
+    assert adapter.device_health()["problems"] == []
+
+
+def test_a_heartbeat_sensor_the_controller_has_disabled_is_a_problem() -> None:
+    """The one software-sensor state the daemon cannot see any other way (item 84): it
+    writes the slot every tick, the write succeeds, and the sensor the alarm watches
+    stays 0x7FFF -- so the watchdog cannot fire. The captured firmware report has
+    sensors 3-8 disabled, which is what makes this checkable offline."""
+    clock = FakeClock()
+    adapter = AquacomputerAdapter(
+        DeviceBinding(
+            kind=AQUAERO,
+            pwm_map={"radiator": 2},
+            timing=AquacomputerTiming.for_kind(AQUAERO, heartbeat_sensor=3),
+        ),
+        clock=clock,
+        sleep=FakeSleep(clock),
+        opener=FakeBus(FakeController(AQUAERO, clock)),
+    )
+    adapter.apply(MpcCommand(pwm={"radiator": 0.4}, mode=Mode.AUTO))
+    sensors = adapter.device_health()["software_sensors"]
+    assert [s["written_by_daemon"] for s in sensors] == [False, False, True] + [False] * 5
+    assert sensors[2]["enabled"] is False
+    (problem,) = adapter.device_health()["problems"]
+    assert "heartbeat_sensor is soft3, which is disabled on the controller" in problem
 
 
 def test_composite_device_health_merges_every_controller_and_its_problems() -> None:
