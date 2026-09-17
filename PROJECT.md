@@ -7126,6 +7126,44 @@ Owner decision (2026-09-16):
     time to answer a move before a flat proximal sensor is called stuck. The old experiment release happened to mask this on the
     experiment path (it pinned the solver at the same stale value), which is how
     it surfaced.
+119. A zone that converges on its air block plus the bays that have
+    informed themselves, rather than all-or-nothing (item 111's own
+    question, left to the owner because it is a policy call about acting
+    on a partly identified model, not an identification problem). At 36 h
+    it would add z2 on seeds 2 and 3 and z0 on seed 4, but 4 of those 5
+    blockers are item 109's swap-damaged bays, so a partial rule would
+    mostly paper over item 109 rather than buy a better model. The safety
+    asymmetry to weigh: an *under*-estimated `k` makes the DAS MPC believe
+    airflow helps that bay less than it does, so it runs the fans higher —
+    safe; an over-estimated one runs them lower. `pred_err_c` still gates
+    zone-wide and the bay blocks' residuals feed it, the empirical check
+    `rel_se` is the parametric version of. A candidate key:
+    `model_converged_bays_frac` (default 1.0, today's rule) or a bound on
+    `se(k)` rather than on `rel_se(k)`.
+120. Size the telegraph to the headroom under `ident_levels: symmetric`
+    (item 110). Under `above` the amplitude is cooling *added* and the
+    solver gives it straight back, which is why sizing it down buys only
+    0.004 mean PWM (measured, item 110). Under `symmetric` the amplitude
+    is cooling *given up* — `compose` floors each experiment channel at
+    its own solver command minus `ident_amplitude` — so sizing each
+    channel's step to the smallest that reaches the PE bound would
+    directly shrink the accepted dip, on the one path where that dip is
+    the owner's stated worst case. Not measured in item 110's PR: every
+    run there was `above`.
+121. Put the new diagnostics in front of the owner. `pe_diag`, `blocked`
+    and `excitation` (items 110, 111) are published in
+    `diagnostics["thermal"]` and `snapshot().extra["experiment"]`, but
+    nothing on the HTML page (§5/§6 Model panel) or in MQTT shows them.
+    A zone that has sat in `learning` for a day still looks the same on
+    the page; one line naming the gate and the group or bay it waits on
+    would put items 110 and 111's answer where it is read.
+122. The nightly cost and the third seed. `test_ident_converge_sim.py` is
+    now 9 cases at ~12.5 min: the 36 h item-111 case is ~60 s per seed and
+    the 16 h A/B two runs per seed. Since item 112, seed 3 converges
+    nothing in either arm at 16 h, so it no longer separates the two arms
+    — only seeds 2 and 4 do. Worth deciding together whether to drop the
+    36 h case to one seed, and whether to add a fourth seed so the A/B
+    keeps three separating ones.
 
 ### 8.3 Open — needs the DAS hardware
 
