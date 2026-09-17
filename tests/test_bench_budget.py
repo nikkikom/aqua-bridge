@@ -404,3 +404,60 @@ def test_bench_tool_reports_the_sim_preset_it_actually_ran(capsys):
     # basic: --sim-preset is unused and never validated
     assert tool.main(["--sim-plant", "basic", "--ticks", "6", "--sim-preset", "bogus"]) == 0
     assert "preset" not in json.loads(capsys.readouterr().out)["plant"]
+
+
+def _load_bench_tool():
+    spec = importlib.util.spec_from_file_location(
+        "bench_step", REPO_ROOT / "tools" / "bench_step.py"
+    )
+    assert spec is not None and spec.loader is not None
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    return tool
+
+
+def test_bench_tool_profile_phases_add_up_to_the_solve_tick(capsys):
+    """Item 95: ``--profile-phases`` breaks a DAS MPC solve tick into the SQP and
+    its box QPs, the estimator's Kalman update, the sensor gate and bookkeeping
+    (PROJECT.md section 4 "Budget at `dt = 5 s`", coarsened to what the item asks
+    the bench tool to add), and the four add up to that tick's own step time."""
+    tool = _load_bench_tool()
+    assert tool.main(["--sim-plant", "das", "--ticks", "40", "--profile-phases"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    mpc = report["results"]["mpc"]
+    phases = mpc["phases"]
+    assert set(phases) == {"gate_ms", "estimator_kalman_ms", "sqp_box_qp_ms", "bookkeeping_ms"}
+    for stats in phases.values():
+        assert stats["n"] == mpc["solve_ticks"] > 0
+        assert stats["mean_ms"] >= 0.0
+        assert stats["p99_ms"] >= 0.0
+        assert stats["max_ms"] >= stats["mean_ms"] - 1e-9
+
+    # every named phase actually ran (a phase stuck at 0 would mean the wrapper
+    # never reached the function it claims to time, not that the phase is free)
+    assert phases["sqp_box_qp_ms"]["mean_ms"] > 0.0
+    assert phases["estimator_kalman_ms"]["mean_ms"] > 0.0
+
+    # bookkeeping_ms is defined per tick as elapsed - (the three named phases),
+    # so their means sum to (at most, floating point) the mean elapsed time over
+    # solve ticks; that mean is itself at most the run's own max_ms
+    named = ("gate_ms", "estimator_kalman_ms", "sqp_box_qp_ms")
+    named_mean_sum = sum(phases[p]["mean_ms"] for p in named)
+    assert named_mean_sum <= mpc["max_ms"]
+    assert named_mean_sum + phases["bookkeeping_ms"]["mean_ms"] <= mpc["max_ms"] + 1e-6
+
+    # pi never solves an SQP: no phases reported for it
+    assert "phases" not in report["results"]["pi"]
+
+    # step() is untouched: the wrapper is undone, so a plain run right after
+    # gives the same shape of report as always
+    assert tool.main(["--sim-plant", "das", "--ticks", "6"]) == 0
+    plain = json.loads(capsys.readouterr().out)
+    assert "phases" not in plain["results"]["mpc"]
+
+
+def test_bench_tool_profile_phases_needs_das(capsys):
+    tool = _load_bench_tool()
+    with pytest.raises(SystemExit):
+        tool.main(["--profile-phases", "--ticks", "6"])
+    assert "--profile-phases needs --sim-plant das" in capsys.readouterr().err

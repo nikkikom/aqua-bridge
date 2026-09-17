@@ -35,11 +35,29 @@ over the ticks on which the MPC solved (``mpc_every_ticks``), ``budget_ms`` /
 ``mpc.budget_alarm_ms``, at ``dt = 5 s`` in the DAS example) -- read from the
 loaded config, same as the runtime alarm in ``control/loop.py``, and not
 enforced in ``step`` itself.
+
+``--profile-phases`` (``--sim-plant das`` only, ``mpc`` solver) adds a
+``phases`` breakdown to the ``mpc`` result: per-tick wall time inside a few
+already-named pieces of a **solve** tick -- the SQP and its box QPs
+(``solver_das.solve_penalty_qp``), the estimator's Kalman update
+(``estimator.update``), the sensor gate (``mpc.evaluate_gate``), and
+``bookkeeping_ms`` (the rest of the solve tick: everything ``_tick`` does
+around those three -- prediction, model checks, disturbance filtering, band
+snapping, the bumpless offset, the ``json.dumps`` guards, ...), so the four
+add up to the tick's own measured time -- the same split PROJECT.md section 4
+"Budget at `dt = 5 s`" names for the development-machine profile, coarsened to
+what item 95 asks the bench tool to add. It measures by temporarily
+monkeypatching those three call sites' own module bindings for the run and
+restoring them after (never editing ``control/mpc.py`` or
+``control/solver_das.py``): ``step()`` keeps calling exactly the code it
+ships with, so this cannot move a golden or change what a tick returns, only
+how the wall time inside it is reported.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import math
@@ -58,12 +76,83 @@ from aqua_bridge.sim.plant import Plant, PlantParams
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# Phase name -> (module, attribute) wrapped by _PhaseTimer, in the order a solve
+# tick reaches them. Kept as one place so the bench tool's own --help / docstring
+# and the wrapping code cannot name different functions.
+_PHASE_TARGETS = (
+    ("gate_ms", "aqua_bridge.control.mpc", "evaluate_gate"),
+    ("estimator_kalman_ms", "aqua_bridge.control.estimator", "update"),
+    ("sqp_box_qp_ms", "aqua_bridge.control.solver_das", "solve_penalty_qp"),
+)
+
+
+class _PhaseTimer:
+    """Times a few named functions of a DAS MPC solve tick, in place, for the
+    duration of one benchmark run.
+
+    Each target is patched on the *module that calls it* (module docstring):
+    ``control/mpc.py`` binds ``evaluate_gate`` into its own namespace with a
+    ``from ... import``, so the call resolves that module's global, not
+    ``control/gate.py``'s; ``estimator.update`` and
+    ``solver_das.solve_penalty_qp`` are looked up on their defining module at
+    call time either way. Patching each one where the call actually resolves
+    it, and restoring the original on exit, is what keeps this a benchmark-only
+    wrapper: nothing about ``step()``'s own code changes, so it stays exactly
+    as pure, deterministic and bit-identical (legacy path) as it was --
+    the wrapper only counts wall time around the same call, it never touches
+    arguments or the return value.
+    """
+
+    def __init__(self) -> None:
+        self.tick_ms: dict[str, float] = {}
+        self._restore: list[tuple[object, str, object]] = []
+
+    def __enter__(self) -> _PhaseTimer:
+        import importlib
+
+        for phase, module_name, attr in _PHASE_TARGETS:
+            module = importlib.import_module(module_name)
+            original = getattr(module, attr)
+
+            def timed(*args, __orig=original, __phase=phase, **kwargs):
+                t0 = time.perf_counter()
+                try:
+                    return __orig(*args, **kwargs)
+                finally:
+                    self.tick_ms[__phase] = (
+                        self.tick_ms.get(__phase, 0.0) + (time.perf_counter() - t0) * 1e3
+                    )
+
+            setattr(module, attr, timed)
+            self._restore.append((module, attr, original))
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        for module, attr, original in reversed(self._restore):
+            setattr(module, attr, original)
+
+    def reset_tick(self) -> None:
+        self.tick_ms = {}
+
 
 def percentile(samples: list[float], q: float) -> float:
     """Nearest-rank percentile (``q`` in [0, 100])."""
     ordered = sorted(samples)
     k = max(0, min(len(ordered) - 1, int(round(q / 100.0 * (len(ordered) - 1)))))
     return ordered[k]
+
+
+def _phase_stats(samples: dict[str, list[float]]) -> dict[str, dict[str, float]]:
+    return {
+        phase: {
+            "mean_ms": statistics.fmean(values),
+            "p99_ms": percentile(values, 99),
+            "max_ms": max(values),
+            "n": len(values),
+        }
+        for phase, values in samples.items()
+        if values
+    }
 
 
 def bench_solver(
@@ -134,9 +223,15 @@ def das_plant(
 
 
 def bench_das_solver(
-    cfg: MpcConfig, ticks: int, *, seed: int, preset: str = "basic"
+    cfg: MpcConfig, ticks: int, *, seed: int, preset: str = "basic", profile_phases: bool = False
 ) -> dict[str, object]:
-    """Closed loop of ``ticks`` steps on the DAS truth plant (module docstring)."""
+    """Closed loop of ``ticks`` steps on the DAS truth plant (module docstring).
+
+    ``profile_phases`` adds the ``phases`` breakdown described in the module
+    docstring; it costs a little overhead of its own (a few Python-level calls
+    per solve tick), which is why it defaults off and ``phases_overhead_note``
+    says so in the report.
+    """
     plant = das_plant(cfg, ticks, seed, preset=preset)
     state = MpcState.cold()
     times_ms: list[float] = []
@@ -146,32 +241,43 @@ def bench_das_solver(
     active = 0
     noise_power = 0.0
     worst_margin = math.inf
-    for _ in range(ticks):
-        obs = plant.observe()
-        smart = plant.observe_smart()
-        if smart:
-            obs = dataclasses.replace(obs, inputs={"smart": smart})
-        t0 = time.perf_counter()
-        cmd, state = step(obs, cfg, state)
-        elapsed = (time.perf_counter() - t0) * 1e3
-        times_ms.append(elapsed)
-        modes[cmd.mode.value] += 1
-        diag = cmd.diagnostics.get("solver_diag", {})
-        if diag.get("solved"):
-            solve_ms.append(elapsed)
-        it = diag.get("iterations")
-        if isinstance(it, int):
-            iterations.append(it)
-        if diag.get("model", {}).get("active") == "mpc":
-            active += 1
-        noise_power += 10.0 ** (plant.noise_db() / 10.0)
-        margins = [m for m in plant.margins().values() if m is not None]
-        if margins:
-            worst_margin = min(worst_margin, min(margins))
-        plant.apply(cmd.pwm)
-        plant.advance()
+    phase_samples: dict[str, list[float]] = {}
+    profiler = _PhaseTimer() if profile_phases else contextlib.nullcontext()
+    with profiler:
+        for _ in range(ticks):
+            obs = plant.observe()
+            smart = plant.observe_smart()
+            if smart:
+                obs = dataclasses.replace(obs, inputs={"smart": smart})
+            if profile_phases:
+                profiler.reset_tick()
+            t0 = time.perf_counter()
+            cmd, state = step(obs, cfg, state)
+            elapsed = (time.perf_counter() - t0) * 1e3
+            times_ms.append(elapsed)
+            modes[cmd.mode.value] += 1
+            diag = cmd.diagnostics.get("solver_diag", {})
+            solved = bool(diag.get("solved"))
+            if solved:
+                solve_ms.append(elapsed)
+                if profile_phases:
+                    named = dict(profiler.tick_ms)
+                    named["bookkeeping_ms"] = max(0.0, elapsed - sum(named.values()))
+                    for phase, value in named.items():
+                        phase_samples.setdefault(phase, []).append(value)
+            it = diag.get("iterations")
+            if isinstance(it, int):
+                iterations.append(it)
+            if diag.get("model", {}).get("active") == "mpc":
+                active += 1
+            noise_power += 10.0 ** (plant.noise_db() / 10.0)
+            margins = [m for m in plant.margins().values() if m is not None]
+            if margins:
+                worst_margin = min(worst_margin, min(margins))
+            plant.apply(cmd.pwm)
+            plant.advance()
     p99 = percentile(times_ms, 99)
-    return {
+    report: dict[str, object] = {
         "ticks": ticks,
         "mean_ms": statistics.fmean(times_ms),
         "p50_ms": percentile(times_ms, 50),
@@ -190,6 +296,15 @@ def bench_das_solver(
         "budget_ms": cfg.budget_ms,
         "budget_alarm_ms": cfg.budget_alarm_ms,
     }
+    if profile_phases:
+        report["phases"] = _phase_stats(phase_samples)
+        report["phases_overhead_note"] = (
+            "measured with the phase wrappers active (module docstring); mean_ms / "
+            "p99_ms / max_ms over the same solve ticks as solve_p99_ms; "
+            "'bookkeeping_ms' is elapsed - (the three named phases), so the phases "
+            "sum to that tick's own step time by construction"
+        )
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -216,6 +331,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--noise", type=float, default=0.2, help="sensor noise sigma, degrees C")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--heat-w", type=float, default=100.0, help="plant heat load, W")
+    parser.add_argument(
+        "--profile-phases",
+        action="store_true",
+        help=(
+            "--sim-plant das, solver mpc only: add a per-solve-tick phase breakdown "
+            "(SQP + box QPs, estimator/Kalman update, sensor gate, bookkeeping) to "
+            "the mpc result's 'phases' (module docstring, PROJECT.md section 8 item 95)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     das = args.sim_plant == "das"
@@ -224,6 +348,8 @@ def main(argv: list[str] | None = None) -> int:
     base = load_config(config_path).mpc
     if das and not base.regulates_drive_limits:
         parser.error("--sim-plant das needs a zoned config without setpoints (mpc.topology)")
+    if args.profile_phases and not das:
+        parser.error("--profile-phases needs --sim-plant das")
     if das:
         from aqua_bridge.sim.das import PRESETS
 
@@ -237,7 +363,11 @@ def main(argv: list[str] | None = None) -> int:
             if kind is SolverKind.MPC:
                 cfg = dataclasses.replace(cfg, model_accept_prior=True)
             results[kind.value] = bench_das_solver(
-                cfg, args.ticks, seed=args.seed, preset=args.sim_preset
+                cfg,
+                args.ticks,
+                seed=args.seed,
+                preset=args.sim_preset,
+                profile_phases=args.profile_phases and kind is SolverKind.MPC,
             )
         else:
             results[kind.value] = bench_solver(
