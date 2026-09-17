@@ -7172,6 +7172,45 @@ Owner decision (2026-09-16):
     another bay's reading followed the air, so a wrong value costs coverage,
     not false faults.
 
+113. The aquaero's software sensors that nothing feeds report their
+    configured fallback as a confident temperature (items 35, 89): `soft2..
+    soft8` read a steady 50.00 °C through all 90 reports of the 2026-09-17
+    run, indistinguishable in the decoder from a real reading. Binding one
+    as a drive or air temperature would hand the estimator a plausible
+    constant that never goes stale and never reads `0x7FFF`. Decide whether
+    the daemon should refuse to bind a `softN` it does not itself write, or
+    mark such a slot in `device_health`; the fallback values are in the
+    control report from `0x177`, so the check can be made from what is
+    already read.
+
+114. Identify the `u16` at `+0x0A` of a fan block, or decide it stays
+    undecoded for good (item 89). It tracks current and power on an
+    aquabus block without matching either (26 against 6 mA / 7 cW, 22
+    against 5 / 6, 15 against 4 / 4, 11 against 3 / 3, 3 against 1 / 1) and
+    reads 0 on the aquaero's own blocks. Worth one look at the aquaero's
+    own outputs in DC mode, where they do report current, before it is
+    written off.
+
+115. Find out why the aquaero refreshes its aquabus fan blocks only about
+    once in four status reports (item 89), and whether the interval is a
+    device setting (aquabus poll rate) the owner could raise. If it is, an
+    aquabus output's current becomes a usable health signal again and
+    `aquabus_outputs_report_power` could go back to True for a controller
+    configured that way.
+
+116. Item 90's per-slot absence judgement and this finding overlap (item
+    89): an aquabus block in a non-measuring report looks exactly like an
+    empty slot on the voltage field (0.00 V) while its rpm still reads.
+    Check that no absence rule anywhere keys on a zero voltage rather than
+    on rpm `0xFFFF`.
+
+117. A rail sagging behind an aquabus device is now knowingly undetected
+    (item 89: the voltage field there is not that output's rail). Decide
+    whether that gap is worth closing — it would take a bus device that
+    reports its own outputs' rails to the daemon, e.g. a Quadro on its own
+    USB in a topology the project supports — or whether it is accepted and
+    simply documented.
+
 ### 8.4 Open — Zero 2 W upgrade
 
 50. **Done** (2026-09-16): the owner moved the controller itself from the
