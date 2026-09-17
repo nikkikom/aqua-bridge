@@ -1011,10 +1011,67 @@ def _dmap_row_var(entry: Mapping[str, Any], rise: float) -> float:
     return rise * (rise * p[0][0] + p[0][1]) + rise * p[1][0] + p[1][1]
 
 
-def _dmap_absorb(entry: dict[str, Any], rise: float, z: float, r: float) -> None:
-    """One RLS row ``z = ds * rise + db`` (item 101), no forgetting, Joseph not needed
-    (the two parameters are the whole state and ``P`` stays symmetric by construction)."""
+def _dmap_bound(
+    entry: dict[str, Any],
+    rise: float,
+    ds: tuple[float, float],
+    db: tuple[float, float],
+) -> None:
+    """Hold ``(ds, db)`` inside the box the config and the bay's own map allow, sliding it
+    along the one direction its rows cannot see (item 101).
+
+    A row ``z = ds * rise + db`` identifies only the *combination*: ``(ds, db)`` may walk
+    along ``(1, -rise)`` for ever and still fit every reading it has ever taken, and under
+    regulation the rise barely moves, so that is what it does. Left alone the pair leaves
+    the box and the map has to be truncated one coordinate at a time, which throws the
+    combination away with it -- the member then predicts a temperature no reading ever
+    supported. Sliding it back along the same null direction keeps the member predicting
+    exactly what the evidence says it reads and changes only the *split* between slope and
+    offset; the componentwise clip afterwards is the fallback for a line that misses the
+    box entirely (no rise, or a box too narrow for the combination).
+    """
+    th = entry["th"]
+    lo, hi = ds[0] - th[0], ds[1] - th[0]
+    if rise > 0.0:
+        lo, hi = max(lo, (th[1] - db[1]) / rise), min(hi, (th[1] - db[0]) / rise)
+    elif rise < 0.0:
+        lo, hi = max(lo, (th[1] - db[0]) / rise), min(hi, (th[1] - db[1]) / rise)
+    elif not db[0] <= th[1] <= db[1]:
+        lo, hi = 1.0, -1.0  # no rise: nothing to slide along
+    if lo <= hi:
+        t = min(max(0.0, lo), hi)
+        th[0] += t
+        th[1] -= t * rise
+    th[0] = min(max(th[0], ds[0]), ds[1])
+    th[1] = min(max(th[1], db[0]), db[1])
+
+
+def _dmap_absorb(
+    entry: dict[str, Any],
+    rise: float,
+    z: float,
+    r: float,
+    *,
+    q: float,
+    ds: tuple[float, float],
+    db: tuple[float, float],
+) -> None:
+    """One RLS row ``z = ds * rise + db`` (item 101), Joseph not needed (the two parameters
+    are the whole state and ``P`` stays symmetric by construction).
+
+    ``q`` is the *offset* difference's random walk for this row, ``estimator.q_offset``
+    scaled to the tick, and it is the one thing that keeps this from being strictly worse
+    than the fused layout it replaces: there the disagreement was a random-walk state, and
+    fouling, a loosening sensor and a thermistor ageing all move it. Without ``q`` the
+    RLS has no forgetting, ``P`` collapses and a drifting placement can never be followed
+    again -- the residual would have nowhere to go but the shared drive estimate, which is
+    a failure that *reduces* cooling (plan section 2). The slope difference gets none: a
+    placement's geometry does not drift, which is also why its own bound below is the
+    config's prior spread. ``ds`` / ``db`` are the box :func:`_dmap_bound` holds the pair
+    in, both sides of each.
+    """
     th, p = entry["th"], entry["P"]
+    p[1][1] += q
     ph = (rise * p[0][0] + p[0][1], rise * p[1][0] + p[1][1])
     s = rise * ph[0] + ph[1] + r
     if not s > 0:
@@ -1028,6 +1085,7 @@ def _dmap_absorb(entry: dict[str, Any], rise: float, z: float, r: float) -> None
     off = 0.5 * ((p[0][1] - k[0] * ph[1]) + (p[1][0] - k[1] * ph[0]))
     entry["P"] = [[p00, off], [off, p11]]
     entry["n"] += 1
+    _dmap_bound(entry, rise, ds, db)
 
 
 def _parse_calibration_entry(raw: object) -> dict[str, Any]:
@@ -1392,6 +1450,40 @@ def _offsets_view(
     }
 
 
+def _proximal_map_view(
+    bay: _Bay,
+    dmap: Mapping[str, Mapping[str, Any]],
+    member_map: Any,
+    bay_map: tuple[float, float],
+) -> dict[str, dict[str, Any]]:
+    """What ``/api/state`` says about the map each further proximal member was learned to
+    sit on (item 101).
+
+    ``slope_delta`` / ``offset_delta_c`` are the learned difference from the bay's own map;
+    ``slope`` / ``offset_c`` are the map the filter actually predicts that member with,
+    which is the difference added to the bay's map and clipped to :data:`CAL_SLOPE_BOUNDS`
+    and :data:`CAL_OFFSET_BOUNDS`. ``clipped`` says whether that clip bit -- without it a
+    reader works out why a bay under-reads from numbers the filter is not using.
+    """
+    s_bay, b_bay = bay_map
+    out: dict[str, dict[str, Any]] = {}
+    for name, entry in dmap.items():
+        raw_s, raw_b = s_bay + entry["th"][0], b_bay + entry["th"][1]
+        s_eff, b_eff = member_map(bay, name, s_bay, b_bay)
+        out[name] = {
+            "slope_delta": entry["th"][0],
+            "offset_delta_c": entry["th"][1],
+            "slope": s_eff,
+            "offset_c": b_eff,
+            "clipped": not (
+                CAL_SLOPE_BOUNDS[0] <= raw_s <= CAL_SLOPE_BOUNDS[1]
+                and CAL_OFFSET_BOUNDS[0] <= raw_b <= CAL_OFFSET_BOUNDS[1]
+            ),
+            "samples": entry["n"],
+        }
+    return out
+
+
 def _seed_sensor(bay: _Bay, temps: Mapping[str, float]) -> tuple[str, float]:
     """The member a bay's sensor node starts from and its reading: the anchor if that one
     is trusted, else the hottest trusted member (conservative). The offsets of the others
@@ -1564,6 +1656,25 @@ def update(
         if entry is None:
             entry = entries[name] = _fresh_dmap(spec)
         return entry
+
+    def dmap_box(s_bay: float, b_bay: float) -> tuple[tuple[float, float], tuple[float, float]]:
+        """The box a member's learned ``(ds, db)`` is held in, given the bay's own map.
+
+        The slope difference is bounded by ``estimator.proximal_slope_spread`` -- the
+        operator's statement of how far apart two placements of one bay may sit -- and by
+        what keeps the member's map inside :data:`CAL_SLOPE_BOUNDS`; the offset difference
+        by what keeps it inside :data:`CAL_OFFSET_BOUNDS`. So the clip in
+        :func:`member_map` is a backstop for a stored entry or a bay map that moved under
+        it, not the normal end state (item 101).
+        """
+        spread = spec.proximal_slope_spread
+        return (
+            (
+                max(-spread, CAL_SLOPE_BOUNDS[0] - s_bay),
+                min(spread, CAL_SLOPE_BOUNDS[1] - s_bay),
+            ),
+            (CAL_OFFSET_BOUNDS[0] - b_bay, CAL_OFFSET_BOUNDS[1] - b_bay),
+        )
 
     def member_map(bay: _Bay, name: str, s_bay: float, b_bay: float) -> tuple[float, float]:
         """``(s, b)`` of one proximal member: the bay's map for the anchor, and for every
@@ -1830,6 +1941,7 @@ def update(
                 # SMART (item 101). Not on a jump tick, where the drive itself moved.
                 anchor_v = float(temps[bay.primary])
                 anchor_r = _sensor_var(cfg, bay.primary)
+                ds_box, db_box = dmap_box(s_map, b_map)
                 for name, value, _r, _nu, _big, _k, _idx in members:
                     if name == bay.primary:
                         continue
@@ -1838,6 +1950,9 @@ def update(
                         rise,
                         value - anchor_v,
                         anchor_r + _sensor_var(cfg, name) + CAL_ROW_VAR,
+                        q=spec.q_offset * q_scale,
+                        ds=ds_box,
+                        db=db_box,
                     )
             for name, value, r, nu, big, k_off, idx in members:
                 if jump and big:
@@ -2057,7 +2172,7 @@ def update(
             if bay.zone in arrays:
                 x, _ = arrays[bay.zone]
                 n = len(st.zones[bay.zone].bays)
-                bay_y[b] = float(x[2 + len(st.zones[bay.zone].bays) + bay.node] - x[0])
+                bay_y[b] = float(x[2 + n + bay.node] - x[0])
             else:
                 bay_y[b] = None
         zone_air = {z: (float(arrays[z][0][0]) if z in arrays else None) for z in st.zones}
@@ -2159,14 +2274,7 @@ def update(
             "observed": observed.get(b, False),
             "seeded": bool(bm["init"]),
             "offsets_c": _offsets_view(st.zones[bay.zone], bay, arrays.get(bay.zone), per_sensor),
-            "proximal_map": {
-                name: {
-                    "slope_delta": entry["th"][0],
-                    "offset_delta_c": entry["th"][1],
-                    "samples": entry["n"],
-                }
-                for name, entry in bm["dmap"].items()
-            },
+            "proximal_map": _proximal_map_view(bay, bm["dmap"], member_map, sensor_map(b)[:2]),
             "class": cls,
             "class_source": cls_source,
             "serial": serial,
