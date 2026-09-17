@@ -888,6 +888,86 @@ def test_shadow_learns_and_predicts_without_acting(das_example_cfg):
     )
 
 
+# ---------------------------------------------------------------------------
+# why a zone is still learning (section 8 items 110, 111)
+# ---------------------------------------------------------------------------
+
+
+def test_pe_diag_is_the_diagonal_of_the_matrix_pe_min_is_the_eigenvalue_of(das_example_cfg):
+    """``pe_min`` says *some* direction is not excited; ``pe_diag`` says which group. They
+    come from one matrix, so the eigenvalue can never exceed the smallest diagonal -- a
+    group whose own entry sits at or under ``PE_MIN`` shuts its zone's gate by itself."""
+    on_cfg = dataclasses.replace(das_example_cfg, model_shadow=True, model_window_s=60.0)
+    run = _closed_loop(on_cfg, 400)
+    summary = run.records[-1].cmd.diagnostics["thermal"]
+    mem = run.records[-1].state.solver_memory["thermal"]
+    st = thermal.structure(on_cfg)
+    for z, zone in summary["zones"].items():
+        strong = [gr.key for gr in st.zones[z].groups if not gr.weak]
+        assert list(zone["pe_diag"]) == strong
+        diag = list(zone["pe_diag"].values())
+        assert diag == thermal.pe_diagonal(mem["zones"][z]["air"])
+        assert all(0.0 <= v <= 1.0 for v in diag)
+        assert zone["pe_min"] <= min(diag) + 1e-9
+    json.dumps(summary, allow_nan=False)
+
+
+def test_a_block_with_no_windows_reads_as_no_variation_rather_than_as_nothing(das_example_cfg):
+    fresh = thermal.fresh_memory(das_example_cfg)
+    summary = thermal.summary(fresh, das_example_cfg)
+    for zone in summary["zones"].values():
+        assert set(zone["pe_diag"].values()) == {0.0}
+    assert thermal.pe_diagonal(fresh["bays"]["b01"]) == [0.0]
+
+
+def test_blocked_names_the_gates_the_converged_rule_still_fails(das_example_cfg):
+    """One function decides and publishes, so the list cannot drift from the decision.
+    A zone that sits in ``learning`` for hours says which group is not moving and which
+    bay's gain has not been pinned down, instead of leaving the owner to guess."""
+    on_cfg = dataclasses.replace(das_example_cfg, model_shadow=True, model_window_s=60.0)
+    run = _closed_loop(on_cfg, 400)
+    summary = run.records[-1].cmd.diagnostics["thermal"]
+    st = thermal.structure(on_cfg)
+    kinds = ("windows:", "pe:", "rel_se:", "pred_err")
+    for z, zone in summary["zones"].items():
+        blocked = zone["blocked"]
+        assert all(any(r.startswith(k) for k in kinds) for r in blocked), blocked
+        # empty exactly when the zone is converged or frozen; non-empty otherwise
+        assert bool(blocked) is (zone["status"] not in ("converged", "frozen"))
+        if zone["pe_min"] <= thermal.PE_MIN:
+            assert f"pe:{z}" in blocked
+        if zone["excited_windows"] < thermal.MIN_WINDOWS:
+            assert f"windows:{z}" in blocked
+        if zone["pred_err_c"] is None or zone["pred_err_c"] >= on_cfg.model_max_pred_err_c:
+            assert "pred_err" in blocked
+        # exactly the gains of the rule -- the zone's strong ``E`` and every occupied
+        # bay's ``k`` -- and exactly the ones whose relative standard error is short
+        gains = {gr.key: zone["rel_se"][gr.key] for gr in st.zones[z].groups if not gr.weak}
+        gains.update({f"k.{b}": summary["bays"][b]["rel_se"][f"k.{b}"] for b in st.zones[z].bays})
+        want = {
+            key for key, rel in gains.items() if rel is None or rel >= on_cfg.model_converged_rel_se
+        }
+        assert {r.split(":", 1)[1] for r in blocked if r.startswith("rel_se:")} == want
+
+
+def test_a_bay_publishes_the_absolute_standard_error_beside_the_relative_one(das_example_cfg):
+    """``rel_se(k)`` is ``se / |k|``, so a bay whose airflow sensitivity is genuinely small
+    fails the relative gate on a fit no worse than its neighbours' (section 8 item 111)."""
+    on_cfg = dataclasses.replace(das_example_cfg, model_shadow=True, model_window_s=60.0)
+    run = _closed_loop(on_cfg, 400)
+    summary = run.records[-1].cmd.diagnostics["thermal"]
+    for b, bay in summary["bays"].items():
+        assert set(bay["se"]) == set(bay["rel_se"])
+        for key, se in bay["se"].items():
+            assert se >= 0.0 and math.isfinite(se)
+            value = abs(bay["theta"][key])
+            if bay["rel_se"][key] is None:
+                assert value < 1e-9
+            else:
+                assert bay["rel_se"][key] == pytest.approx(se / value)
+        assert bay["se"][f"k.{b}"] > 0.0
+
+
 def test_a_thermal_exception_is_status_error_and_never_touches_the_command(
     das_example_cfg, monkeypatch
 ):

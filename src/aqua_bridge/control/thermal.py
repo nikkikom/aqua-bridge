@@ -217,6 +217,24 @@ centred and normalised by their means, so it reads as the squared relative
 variation in the least excited direction (``[0, 1]``). With several groups moving
 together (a regulator drives them from the same drive) it is ~0.
 
+``pe_diag`` is the **diagonal** of that same matrix, one entry per strong group: the
+group's own squared relative variation. The eigenvalue can never exceed the smallest
+diagonal, so a group whose entry sits at or under ``PE_MIN`` shuts its zone's gate on
+its own, and ``pe_diag`` is what says *which* group that is. It is the measured half of
+section 8 item 110: the relative normalisation is deliberate -- a fan already near
+``pwm_max`` really does have less airflow information to give per unit of PWM than one
+near ``pwm_min``, and normalising by something else would relabel it rather than inform
+it -- so the headroom a channel has is published (``pe_diag`` here after the fact,
+:func:`aqua_bridge.control.ident.excitation` before a start) instead of hidden.
+
+**Why a zone is still learning** ``blocked``: the parts of the ``converged`` rule the
+zone still fails, in the rule's own words -- ``windows:<zone|bay>``, ``pe:<zone|bay>``,
+``rel_se:<coefficient>`` and ``pred_err``. It comes from the same function the status
+machine decides with, so the published list and the decision cannot drift apart. A bay
+block also publishes ``se``, the absolute standard error beside ``rel_se``: ``rel_se(k)``
+is ``se / |k|``, so a bay whose airflow sensitivity is genuinely small fails the relative
+gate on a fit no worse than its neighbours' (section 8 item 111).
+
 **Prediction error** ``pred_err_c``: the one-window-ahead prediction error of the
 regressions, i.e. the a-priori residual before the window updates the
 coefficients, in degC (proximal: kelvin of the weighted window, where a change of
@@ -332,6 +350,7 @@ __all__ = [
     "MIN_WINDOWS",
     "PARAMETERS",
     "PE_MIN",
+    "PE_SCALE_FLOOR",
     "PRED_ERR_FLOOR_C",
     "RIDGE_VAR",
     "STATUSES",
@@ -355,6 +374,7 @@ __all__ = [
     "model_params",
     "overall_status",
     "parameter_keys",
+    "pe_diagonal",
     "phi",
     "prior_theta",
     "project",
@@ -397,6 +417,10 @@ TRUST_REGION = 0.05
 HUBER_SIGMAS = 5.0
 PE_WINDOWS = 30
 PE_MIN = 0.05
+#: Floor on the running mean the PE monitor normalises a fan regressor by, so a
+#: regressor whose mean sits at zero (a fan inside its dead band the whole time) reads
+#: as a bounded relative variation instead of an unbounded one.
+PE_SCALE_FLOOR = 0.05
 MIN_WINDOWS = 30
 PRED_ERR_FLOOR_C = 0.1
 SUSPECT_FACTOR = 3.0
@@ -1421,28 +1445,67 @@ def _joseph(
     return psi + k * residual, ikh @ p @ ikh.T + var * np.outer(k, k)
 
 
-def _pe_min(mean: np.ndarray, second: np.ndarray, windows: int) -> float:
+def _pe_normalised(mean: np.ndarray, second: np.ndarray, windows: int) -> np.ndarray | None:
+    """The symmetric, mean-normalised covariance of the fan regressors, or ``None`` when
+    there is nothing to read yet.
+
+    Its smallest eigenvalue is ``pe_min`` and its diagonal is each regressor's own
+    squared relative variation (:func:`pe_diagonal`). Both come from the same matrix on
+    purpose: the eigenvalue can never exceed the smallest diagonal, so a regressor whose
+    own diagonal sits under :data:`PE_MIN` closes the zone's gate by itself."""
     if mean.size == 0 or windows < 2:
-        return 0.0
+        return None
     # undo the start-up bias of the exponential weights
     bias = 1.0 - (1.0 - 1.0 / PE_WINDOWS) ** windows
     m = mean / bias
     s = second / bias
     cov = s - np.outer(m, m)
-    scale = np.maximum(np.abs(m), 0.05)
+    scale = np.maximum(np.abs(m), PE_SCALE_FLOOR)
     norm = cov / np.outer(scale, scale)
-    vals = np.linalg.eigvalsh(0.5 * (norm + norm.T))
+    return 0.5 * (norm + norm.T)
+
+
+def _pe_min(mean: np.ndarray, second: np.ndarray, windows: int) -> float:
+    norm = _pe_normalised(mean, second, windows)
+    if norm is None:
+        return 0.0
+    vals = np.linalg.eigvalsh(norm)
     return float(min(1.0, max(0.0, vals[0])))
+
+
+def pe_diagonal(block: Mapping[str, Any]) -> list[float]:
+    """Each fan regressor's own squared relative variation over the PE monitor's memory.
+
+    The diagonal of the matrix whose smallest eigenvalue is the block's ``pe_min``, in
+    the order of the block's fan regressors (a zone air block: its strong groups, in
+    :attr:`ZoneStruct.groups` order; a proximal block: the one ``Qn_z`` entry). It says
+    *which* group is not moving where ``pe_min`` only says that some direction is not:
+    a group whose own entry is at or under :data:`PE_MIN` holds its zone's gate shut on
+    its own, whatever the others do, because the eigenvalue is bounded by it (section 8
+    item 110)."""
+    norm = _pe_normalised(
+        np.array(block["m"], dtype=float), np.array(block["S"], dtype=float), int(block["w"])
+    )
+    if norm is None:
+        return [0.0] * len(block["m"])
+    return [float(min(1.0, max(0.0, v))) for v in np.diag(norm)]
+
+
+def _standard_errors(block: Mapping[str, Any], spec: _BlockSpec) -> list[float]:
+    """Standard error per coefficient, in the coefficient's own units (rows are
+    normalised by the residual RMS, so ``P`` is the covariance in scaled units)."""
+    p = np.array(block["P"], dtype=float)
+    return [
+        float(spec.scale[i]) * math.sqrt(max(float(p[i, i]), 0.0)) for i in range(len(spec.keys))
+    ]
 
 
 def _rel_se(block: Mapping[str, Any], spec: _BlockSpec) -> list[float | None]:
     """Relative standard error per coefficient (rows are normalised by the residual
     RMS, so ``P`` is the covariance in scaled units); ``None`` for a zero value."""
     theta = np.array(block["theta"], dtype=float)
-    p = np.array(block["P"], dtype=float)
     out: list[float | None] = []
-    for i in range(len(spec.keys)):
-        se = spec.scale[i] * math.sqrt(max(float(p[i, i]), 0.0))
+    for i, se in enumerate(_standard_errors(block, spec)):
         value = abs(float(theta[i]))
         out.append(None if value < 1e-9 else se / value)
     return out
@@ -2052,6 +2115,43 @@ def _reset_swapped_bays(
         mem["zones"][z]["air"]["acc"] = None
 
 
+def _zone_converge_blockers(
+    mem: Mapping[str, Any],
+    cfg: MpcConfig,
+    st: Structure,
+    z: str,
+    occupied: Mapping[str, bool],
+    zone_specs: Mapping[str, _BlockSpec],
+    bay_specs: Mapping[str, _BlockSpec],
+) -> list[str]:
+    """Every part of the ``converged`` rule the zone's blocks still fail, named.
+
+    ``windows:<block>`` (fewer than :data:`MIN_WINDOWS` excited windows), ``pe:<block>``
+    (``pe_min`` at or under :data:`PE_MIN`) and ``rel_se:<coefficient>`` (a gain whose
+    relative standard error has not reached ``model_converged_rel_se``), with
+    ``<block>`` the zone name for its air block and the bay name for a proximal one.
+    Empty exactly when :func:`_zone_blocks_converged` would be true, so the list the
+    diagnostics publish and the decision the status machine takes cannot drift apart
+    (section 8 items 110, 111). The prediction error is the caller's own check and is
+    not in here."""
+    checks = [(z, mem["zones"][z]["air"], zone_specs[z])]
+    checks += [(b, mem["bays"][b], bay_specs[b]) for b in st.zones[z].bays if occupied[b]]
+    out: list[str] = []
+    for name, block, spec in checks:
+        rel = block["rel"]
+        if int(block["n"]) < MIN_WINDOWS:
+            out.append(f"windows:{name}")
+        if float(block["pe"]) <= PE_MIN:
+            out.append(f"pe:{name}")
+        if rel is None:
+            out.extend(f"rel_se:{spec.keys[i]}" for i in spec.gain)
+            continue
+        for i in spec.gain:
+            if rel[i] is None or rel[i] >= cfg.model_converged_rel_se:  # type: ignore[operator]
+                out.append(f"rel_se:{spec.keys[i]}")
+    return out
+
+
 def _zone_blocks_converged(
     mem: Mapping[str, Any],
     cfg: MpcConfig,
@@ -2061,16 +2161,7 @@ def _zone_blocks_converged(
     zone_specs: Mapping[str, _BlockSpec],
     bay_specs: Mapping[str, _BlockSpec],
 ) -> bool:
-    checks = [(mem["zones"][z]["air"], zone_specs[z])]
-    checks += [(mem["bays"][b], bay_specs[b]) for b in st.zones[z].bays if params.occupied[b]]
-    for block, spec in checks:
-        rel = block["rel"]
-        if int(block["n"]) < MIN_WINDOWS or float(block["pe"]) <= PE_MIN or rel is None:
-            return False
-        for i in spec.gain:
-            if rel[i] is None or rel[i] >= cfg.model_converged_rel_se:  # type: ignore[operator]
-                return False
-    return True
+    return not _zone_converge_blockers(mem, cfg, st, z, params.occupied, zone_specs, bay_specs)
 
 
 def _advance_status(
@@ -2364,6 +2455,33 @@ def model_status(memory: Mapping[str, Any]) -> str:
     return overall_status([zm["status"] for zm in memory["zones"].values()])
 
 
+def _blocked_reasons(
+    memory: Mapping[str, Any],
+    cfg: MpcConfig,
+    st: Structure,
+    z: str,
+    occupied: Mapping[str, bool],
+    zone_specs: Mapping[str, _BlockSpec],
+    bay_specs: Mapping[str, _BlockSpec],
+    pred: float | None,
+) -> list[str]:
+    """``zones.<z>["blocked"]``: what still stands between this zone and ``converged``.
+
+    The blockers of :func:`_zone_converge_blockers` plus ``pred_err`` when the zone's
+    one-window prediction error has not reached ``model_max_pred_err_c``, in the rule's
+    own words -- so a zone that sits in ``learning`` for hours says *which* gate is shut
+    (a group that is not moving, a bay whose ``k`` has not been pinned down) instead of
+    leaving the owner to guess (section 8 items 110, 111). Empty for a zone that is
+    ``converged`` or ``frozen``; for a ``suspect`` or ``error`` zone it reads the same
+    blocks and says what would have to hold again."""
+    if memory["zones"][z]["status"] in ("converged", "frozen"):
+        return []
+    out = list(_zone_converge_blockers(memory, cfg, st, z, occupied, zone_specs, bay_specs))
+    if pred is None or pred >= cfg.model_max_pred_err_c:
+        out.append("pred_err")
+    return out
+
+
 def summary(
     memory: Mapping[str, Any],
     cfg: MpcConfig,
@@ -2372,7 +2490,25 @@ def summary(
     occupancy: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """``diagnostics["thermal"]``: status, prediction error and the coefficients (plain JSON)."""
-    st = _derived(cfg).st if st is None else st
+    derived = _derived(cfg)
+    st = derived.st if st is None else st
+    if st is derived.st:
+        zone_specs, bay_specs = derived.zone_specs, derived.bay_specs
+    else:  # a caller's own structure (tools/fit_model.py, tools/replay.py)
+        block_prior = prior_theta(cfg, st)
+        zone_specs = {
+            z: _block_spec(zone.air_keys, block_prior, {gr.key for gr in zone.groups if gr.weak})
+            for z, zone in st.zones.items()
+        }
+        bay_specs = {b: _block_spec(bay.keys, block_prior, ()) for b, bay in st.bays.items()}
+    topo = cfg.topology
+    declared = {} if topo is None else topo.bays
+    occupied = {
+        b: (occupancy[b] != EMPTY)
+        if occupancy is not None and b in occupancy
+        else (b not in declared or declared[b].constrained)
+        for b in st.bays
+    }
     zones_out: dict[str, Any] = {}
     worst: float | None = None
     for z, zone in st.zones.items():
@@ -2389,8 +2525,18 @@ def summary(
             "windows": block["w"],
             "excited_windows": block["n"],
             "pe_min": block["pe"],
+            # which group is not moving, not only that some direction is not (item 110)
+            "pe_diag": dict(
+                zip(
+                    [gr.key for gr in zone.groups if not gr.weak],
+                    pe_diagonal(block),
+                    strict=True,
+                )
+            ),
             "theta": theta,
             "rel_se": dict(zip(zone.air_keys, rel, strict=True)),
+            # why this zone is still learning, in the words of the rule itself
+            "blocked": _blocked_reasons(memory, cfg, st, z, occupied, zone_specs, bay_specs, pred),
         }
         if any(gr.splits for gr in zone.groups):
             # what the split says each channel contributes, W/K (module docstring, *Split*)
@@ -2402,6 +2548,7 @@ def summary(
     for b, bay in st.bays.items():
         block = memory["bays"][b]
         rel = block.get("rel") or [None] * len(bay.keys)
+        se = _standard_errors(block, bay_specs[b])
         bays_out[b] = {
             "zone": bay.zone,
             "windows": block["w"],
@@ -2409,6 +2556,10 @@ def summary(
             "pe_min": block["pe"],
             "theta": dict(zip(bay.keys, block["theta"], strict=True)),
             "rel_se": dict(zip(bay.keys, rel, strict=True)),
+            # the absolute standard error beside the relative one: ``rel_se(k)`` is
+            # ``se / |k|``, so a bay whose airflow sensitivity is genuinely small fails
+            # the relative gate on a fit no worse than its neighbours' (section 8 item 111)
+            "se": dict(zip(bay.keys, se, strict=True)),
         }
         if occupancy is not None and b in occupancy:
             bays_out[b]["occupancy"] = occupancy[b]

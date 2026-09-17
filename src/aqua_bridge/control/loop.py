@@ -41,10 +41,18 @@ The solver rate-limits against ``state.last_cmd``. The command the sink
 receives can differ from the solver's (manual overrides, failed apply), so
 after every tick the loop rewrites ``state.last_cmd`` -- and the newest
 ``WindowSample.cmd_pwm`` (stuck detection compares net *commanded* PWM) --
-to the applied command. Channels the supervisor released from a manual
+to the applied command. That happens on an emergency tick too: the
+controller's own state is left exactly as it was (nothing a broken tick
+computed is committed), but the emergency ramp did move the fans, so the
+mirror follows them -- otherwise the next tick's rate limit would be
+measured against a command the fans no longer carry and a fan the
+emergency walked up toward ``fallback_pwm`` would come back down in one
+step. Channels the supervisor released from a manual
 override have their integrator entry dropped for one tick; ``step`` then
 re-initialises the solver bumplessly (its first output equals what is on
-the fan).
+the fan). An identification experiment's channels are *not* released
+(section 8 item 112): the solver ran on every tick of the experiment and
+its integrator is its own.
 
 Shutdown (section 9 "Stop path")
 --------------------------------
@@ -307,6 +315,13 @@ class Loop:
             self.applied_cmd = cmd
         if controller_error is None:
             self.state = self._with_applied(new_state, self.applied_cmd)
+        elif applied:
+            # The controller's own state stays exactly as it was -- nothing a broken tick
+            # computed is committed -- but the applied-command mirror follows the fans,
+            # because the emergency ramp *did* move them. Without this the next tick's
+            # rate limit is measured from a command the fans no longer carry, and a fan
+            # the emergency walked up to ``fallback_pwm`` comes back down in one step.
+            self.state = self._with_applied(self.state, self.applied_cmd)
 
         watchdog_sent = False
         if controller_error is None:

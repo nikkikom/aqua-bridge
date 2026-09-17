@@ -40,11 +40,11 @@ group of the zone has to move, independently of the others, inside the monitor's
 the rest excites one direction of that matrix at a time, and the others only as
 far as the solver happens to move them: measured over 16 h on the DAS example, a
 round robin over **every** channel does push a zone's ``pe_min`` past ``PE_MIN``
-now and then -- peaks of 0.13 to 0.21 against the 0.05 bound -- but it does not
-hold it there, and over three seeds exactly one zone of twelve latched
-``converged`` that way, its live ``pe_min`` back at 0.008 by the end. A coded
-zone-wide phase peaks at 0.11 to 0.36 and still sits at 0.08 to 0.17 at the end
-of the run (section 8 item 102 has the eigenvalues and the per-seed numbers).
+now and then -- peaks of 0.15 to 0.22 against the 0.05 bound -- but it does not
+hold it there, and over three seeds it latches ``converged`` on no zone of twelve.
+A coded zone-wide phase peaks at 0.24 to 0.32 on the zones it converges and still
+sits at 0.20 to 0.22 at the end of the run (section 8 item 102 has the eigenvalues
+and the per-seed numbers, item 112 what moved them).
 
 ``ident_parallel: true`` changes the channel set and the schedule, nothing else:
 
@@ -70,8 +70,12 @@ identified* that is arithmetic-neutral -- one zone-wide experiment does the work
 of the ``G`` sequential ones its zone needs, in a ``G``-times shorter window --
 but that is arithmetic, not what was measured: in the A/B of
 ``tests/test_ident_converge_sim.py`` both arms run the same 16 h of experiment,
-and the zone-wide arm costs **+0.036 to +0.050 mean PWM** over the whole run. It
-never costs temperature under ``above``.
+and the zone-wide arm costs **-0.007 to +0.025 mean PWM** over the whole run -- since
+section 8 item 112 it is the quieter of the two on one seed of three. ``above``
+never commands less cooling than the solver *on the tick*, which is a per-tick
+statement and not a claim about two 16 h trajectories: the zone-wide arm ends with
+the larger worst true margin on two seeds of three and 0.27 degC below the round
+robin on the third, both above 4 degC with no limit crossed.
 
 What it costs under ``symmetric``: more than it used to, and this is the one
 accepted worst case the key widens. ``compose`` floors an experiment channel at
@@ -92,6 +96,33 @@ tick before the start. The two levels are ``ident_levels``:
   never commands less than the solver does (the safe direction);
 * ``symmetric`` (owner opt-in): ``u_base - A`` and ``u_base + A``, so the low level
   is a deliberate dip of at most ``ident_amplitude`` below the solver.
+
+How far a channel can move the PE monitor from where it sits (section 8 item 110)
+----------------------------------------------------------------------------------
+``pe_min`` is a **relative** measure: the thermal model's monitor normalises each fan
+regressor by its own running mean, so the ``converged`` rule wants a relative airflow
+variation of ``sqrt(PE_MIN)`` = 0.224 in the least excited direction. A 50/50 telegraph
+at base ``u`` with dead band ``d`` gives ``A / (2 (u - d) + A)`` under ``above``, so it
+needs ``A >= 0.576 (u - d)``: a channel parked past about 0.62 PWM cannot clear the bound
+at any amplitude the ``(0, 0.3]`` cap allows, and one parked at ``pwm_min`` clears it with
+0.06 while the schedule spends whatever ``ident_amplitude`` says.
+
+That normalisation stays as it is. It is what makes the monitor read as *information*
+rather than as PWM: a fan already near ``pwm_max`` really does move proportionally less
+extra air per unit of PWM, and dividing by something else would relabel an uninformative
+channel, not inform it. What changes is that the arithmetic is no longer invisible.
+:func:`excitation` publishes it per channel -- ``rel_swing``, the ``pe_reach`` it implies
+and whether that clears :data:`~aqua_bridge.control.thermal.PE_MIN` -- in
+``snapshot().extra["experiment"]`` and in the start log line, so a channel that cannot be
+excited is **visible** instead of leaving its zone silently pending; the measured half is
+the thermal model's own ``pe_diag``, the diagonal beside ``pe_min``, which names the group
+that is short after the fact, and its ``blocked`` list, which names the gate.
+
+``ident_require_excitable`` (default false) turns it into a refusal: ``check_start`` then
+rejects a start whose channel cannot clear the bound (``not_excitable:<ch>``), the way
+``band:`` and ``saturated:`` reject. It is off by default deliberately -- such a run still
+informs the ``E`` split and the bays' ``g0`` / ``k``, and a zone-wide start is widened to
+channels the solver parks high, so refusing gives up the zones that do converge.
 
 A start is refused when a level would leave ``[pwm_min, pwm_max]`` (``band``),
 so no level is ever clipped at the start. The sequence is a two-level random
@@ -289,11 +320,26 @@ intent (``human_intent:<kind>``, by the supervisor). A daemon restart never resu
 running experiment: it lives only in the supervisor's memory. The settle timers do
 survive one, through the model store (above).
 
-Release: the supervisor hands the experiment's channels to the loop as
-``TickPlan.released``, which drops their integrator entries so the solver
-re-initialises bumplessly (its first output equals the level on the fan), and the
-fan moves at most ``d_pwm_max`` per tick from there; there is no separate return
-ramp.
+Release: the solver keeps its own integrator (section 8 item 112)
+-----------------------------------------------------------------
+An experiment is an override *after* ``mpc.step``, so the solver ran normally on every
+one of its ticks and its integrator is its own: at the release it already holds the
+command the solver would have given had no experiment run. The supervisor therefore
+**does not** put the experiment's channels into ``TickPlan.released``. It used to, and
+that dropped their integrator entries, which made ``step`` re-initialise the solver
+bumplessly -- its first output equal to *the PWM on the fan*, i.e. the experiment's own
+level. A channel released on its high level was handed that level as the solver's
+starting point and stayed there until the integral wound it back down, and a later start
+that took the inflated command as its base stepped up by another ``ident_amplitude``
+(measured on the zone-wide schedule: qd1 ran 0.44-0.99 PWM where the sequential schedule
+kept it at 0.2-0.69).
+
+Nothing steps: ``step`` still rate-limits the command against the PWM on the fan, so the
+return to the solver's own demand takes ``d_pwm_max`` per tick like every other move, and
+under ``ident_levels: symmetric`` -- where the old release could hand the solver the
+*low* level, below what it wanted -- the correction is now upward. A human override of
+the same channel is released as before: there the fan was parked by somebody outside the
+loop and bumpless transfer is the right transfer.
 """
 
 from __future__ import annotations
@@ -303,6 +349,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from aqua_bridge.control import thermal
 from aqua_bridge.control.estimator import CAL_MIN_SAMPLES, EMPTY, UNKNOWN
 from aqua_bridge.model import MpcCommand, MpcConfig
 
@@ -322,6 +369,7 @@ __all__ = [
     "check_start",
     "dip_below_solver",
     "envelope_violations",
+    "excitation",
     "facts_from_tick",
     "group_channels",
     "groups",
@@ -330,6 +378,7 @@ __all__ = [
     "lost_sensor_zones",
     "new_tracker",
     "planned_dip",
+    "rel_swing",
     "resume_tracker",
     "served_zones",
     "settle_snapshot",
@@ -337,6 +386,7 @@ __all__ = [
     "status",
     "target_channels",
     "track",
+    "unexcitable",
     "zone_channels",
 ]
 
@@ -690,6 +740,28 @@ def lost_sensor_zones(facts: TickFacts, zones: tuple[str, ...]) -> list[str]:
     return reasons
 
 
+def _curve(cfg: MpcConfig, ch: str) -> tuple[float, float]:
+    """``(deadband, exponent)`` of ``ch``'s fan model, from the commissioned
+    ``fan_models`` entry (:data:`aqua_bridge.control.fancurve.READERS`)."""
+    spec = cfg.fan_models[cfg.fans[ch].model]
+    return float(spec.deadband), float(spec.exponent)
+
+
+def rel_swing(cfg: MpcConfig, ch: str, lo: float, hi: float) -> float:
+    """Relative airflow variation of a 50/50 telegraph between PWM ``lo`` and ``hi``.
+
+    The two levels are clamped into ``[pwm_min, pwm_max]`` first (a level the rail eats
+    moves no air), turned into airflow with :func:`aqua_bridge.control.thermal.phi` on
+    the channel's commissioned curve, and divided by their mean with the PE monitor's
+    own floor under it -- so this is exactly the quantity whose square the monitor
+    reports as that group's ``pe_diag`` entry, on the telegraph alone."""
+    deadband, exponent = _curve(cfg, ch)
+    p_lo = thermal.phi(_clamp(lo, cfg.pwm_min, cfg.pwm_max), deadband, exponent)
+    p_hi = thermal.phi(_clamp(hi, cfg.pwm_min, cfg.pwm_max), deadband, exponent)
+    mean = 0.5 * (p_lo + p_hi)
+    return 0.5 * abs(p_hi - p_lo) / max(mean, thermal.PE_SCALE_FLOOR)
+
+
 def _levels(cfg: MpcConfig, base: float) -> tuple[float, float]:
     """The two levels around ``base``, unclamped (the start refuses a base whose levels
     would leave the band; a re-planned base clamps them, :func:`_replan`)."""
@@ -697,6 +769,36 @@ def _levels(cfg: MpcConfig, base: float) -> tuple[float, float]:
     if cfg.ident_levels == "symmetric":
         return base - a, base + a
     return base, base + a
+
+
+def excitation(cfg: MpcConfig, levels: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Per channel of ``levels`` (``{channel: [low, high]}``), how much airflow variation
+    that telegraph can put into the thermal model's PE monitor.
+
+    ``rel_swing`` is :func:`rel_swing` of the two levels, ``pe_reach`` its square -- the
+    entry the monitor would report on ``pe_diag`` for a group of this one channel, from
+    the telegraph alone -- and ``excitable`` whether that clears
+    :data:`aqua_bridge.control.thermal.PE_MIN`, the bound the ``converged`` rule asks the
+    zone's smallest eigenvalue to pass. A channel whose ``excitable`` is false cannot
+    carry its zone over that bound at any allowed amplitude from where it sits, and the
+    zone will wait for ever unless the solver parks it lower (section 8 item 110)."""
+    out: dict[str, dict[str, Any]] = {}
+    for ch, pair in levels.items():
+        if not (isinstance(pair, list | tuple) and len(pair) == 2):
+            continue
+        swing = rel_swing(cfg, ch, float(pair[0]), float(pair[1]))
+        out[ch] = {
+            "rel_swing": swing,
+            "pe_reach": swing * swing,
+            "pe_min": thermal.PE_MIN,
+            "excitable": swing * swing > thermal.PE_MIN,
+        }
+    return out
+
+
+def unexcitable(cfg: MpcConfig, levels: Mapping[str, Any]) -> list[str]:
+    """The channels of ``levels`` whose telegraph cannot reach ``PE_MIN`` (in order)."""
+    return [ch for ch, e in excitation(cfg, levels).items() if not e["excitable"]]
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -764,6 +866,8 @@ def check_start(
         lo, hi = _levels(cfg, float(base))  # type: ignore[arg-type]
         if lo < cfg.pwm_min - _EPS or hi > cfg.pwm_max + _EPS:
             reasons.append(f"band:{ch}")
+        elif cfg.ident_require_excitable and not excitation(cfg, {ch: (lo, hi)})[ch]["excitable"]:
+            reasons.append(f"not_excitable:{ch}")
     for ch in cfg.channels:
         if facts.fan_stall.get(ch):
             reasons.append(f"fan_stall:{ch}")
@@ -1115,9 +1219,11 @@ def status(
     (``high`` | ``low``), ``overrides``, ``base`` (the frozen base at the start),
     ``plan_base`` (the anchor the levels are drawn around now) and ``levels``
     (``{channel: [low, high]}``) with ``replan`` (whether this experiment follows the
-    live demand), ``elapsed_s``, ``remaining_s``, and from the last experiment that
-    ended: ``last_result`` (``completed`` | ``aborted``), ``last_abort_reason`` and
-    ``last_target``.
+    live demand), ``excitation`` / ``unexcitable`` (:func:`excitation`: how far each
+    channel's telegraph can move the PE monitor from where it sits, and the channels
+    that cannot clear its bound at all -- section 8 item 110), ``elapsed_s``,
+    ``remaining_s``, and from the last experiment that ended: ``last_result``
+    (``completed`` | ``aborted``), ``last_abort_reason`` and ``last_target``.
     """
     last = last or {}
     out: dict[str, Any] = {
@@ -1135,6 +1241,8 @@ def status(
         "base": {},
         "plan_base": {},
         "levels": {},
+        "excitation": {},
+        "unexcitable": [],
         "elapsed_s": None,
         "remaining_s": None,
         "last_result": last.get("result"),
@@ -1158,6 +1266,8 @@ def status(
             "base": dict(exp["base"]),
             "plan_base": dict(exp.get("plan_base") or exp["base"]),
             "levels": {ch: list(v) for ch, v in exp["levels"].items()},
+            "excitation": excitation(cfg, exp["levels"]),
+            "unexcitable": unexcitable(cfg, exp["levels"]),
             "replan": bool(exp.get("replan")),
             "elapsed_s": elapsed,
             "remaining_s": max(0.0, float(exp["duration_s"]) - elapsed),

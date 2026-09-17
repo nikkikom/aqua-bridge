@@ -106,7 +106,8 @@ choice for cooling:
   ``ident_max_over_c > 0``, ``ident_abort_below_limit_c > 0``,
   ``ident_settle_resume_max_gap_s >= 0``, ``ident_seed >= 0``, ``ident_hold_s``
   a non-empty list of positive numbers, ``ident_levels`` ``above`` |
-  ``symmetric``, ``ident_replan`` and ``ident_parallel`` bools); the
+  ``symmetric``, ``ident_replan``, ``ident_parallel`` and
+  ``ident_require_excitable`` bools); the
   rules that depend on ``dt`` and ``confirm_s`` (every hold ``>= 5 * dt``,
   ``ident_settle_s >= confirm_s``) are checked only with ``ident_enabled`` so a
   default never invalidates a legacy config with a long ``dt``. There is no
@@ -1800,7 +1801,7 @@ class MpcConfig:
       ``stale``, and how long a stale model must stay converged with its prediction
       error in bounds before it may act again. Inert in legacy mode.
     * ``ident_enabled`` / ``ident_amplitude`` / ``ident_levels`` / ``ident_replan`` /
-      ``ident_parallel`` /
+      ``ident_parallel`` / ``ident_require_excitable`` /
       ``ident_hold_s`` / ``ident_max_duration_s`` / ``ident_settle_s`` /
       ``ident_start_band_c`` / ``ident_max_over_c`` / ``ident_abort_below_limit_c`` /
       ``ident_settle_resume_max_gap_s`` / ``ident_seed`` -- active identification
@@ -1809,6 +1810,8 @@ class MpcConfig:
       the two levels, whether the levels follow the live solver demand every tick,
       whether one experiment excites every channel of the target's own zones at once
       with an independent code each (what the thermal model's PE monitor needs),
+      whether a start is refused when a channel's telegraph cannot reach that monitor's
+      bound from where the solver parked it,
       the hold times the seeded sequence draws from, the total
       duration, how long every zone the experiment serves must have been trusted,
       the start band and the envelope above each drive's soft target, how far below
@@ -1906,6 +1909,7 @@ class MpcConfig:
     ident_levels: str = "above"
     ident_replan: bool = True
     ident_parallel: bool = False
+    ident_require_excitable: bool = False
     ident_hold_s: tuple[float, ...] = (60.0, 120.0, 180.0)
     ident_max_duration_s: float = 1800.0
     ident_settle_s: float = 600.0
@@ -2034,6 +2038,7 @@ class MpcConfig:
         _cfg_bool("ident_enabled", self.ident_enabled)
         _cfg_bool("ident_replan", self.ident_replan)
         _cfg_bool("ident_parallel", self.ident_parallel)
+        _cfg_bool("ident_require_excitable", self.ident_require_excitable)
         s(self, "ident_levels", _choice("ident_levels", self.ident_levels, IDENT_LEVELS))
         holds = _cfg_list("ident_hold_s", self.ident_hold_s)
         s(

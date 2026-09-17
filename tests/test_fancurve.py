@@ -342,6 +342,7 @@ def test_every_reader_of_the_fan_curve_data_has_a_decision() -> None:
         "model_use_rpm",
         "fan_health",
         "stuck_airflow",
+        "ident_excitation",
     }
     assert set(fancurve.READERS.values()) == {"curve", "config"}
 

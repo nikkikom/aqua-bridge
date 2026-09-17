@@ -40,7 +40,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from aqua_bridge.control import ident
+from aqua_bridge.control import ident, thermal
 from aqua_bridge.control import supervisor as supervisor_mod
 from aqua_bridge.control.intents import (
     ClearOverride,
@@ -1138,27 +1138,62 @@ def test_an_experiment_runs_as_a_composed_override_in_auto():
     assert rig.status["target"] == {"kind": "group", "name": "front"}
 
 
-def test_a_group_runs_its_phases_then_completes_and_releases_bumplessly():
+def test_a_group_runs_its_phases_then_completes_and_keeps_the_solvers_own_level():
+    """Item 112. The solver ran on every tick of the experiment -- the levels are an
+    override applied after it -- so at the end its integrator already holds the command
+    it would have given without one. The channels are therefore **not** released: a
+    release would drop that integrator entry and re-initialise the solver bumplessly at
+    the PWM the experiment left on the fan."""
     rig = started_rig()
     phases_seen = set()
-    released_at = None
+    ended_at = None
     for i in range(200):
-        (r,) = rig.ticks(1)
+        rig.ticks(1)
         st_ = rig.status
+        assert {"fa1", "fa2"} <= set(rig.loop.state.integrator)  # never dropped
         if st_["running"]:
             phases_seen.add(st_["phase"])
             continue
-        released_at = i
+        ended_at = i
         break
-    assert released_at is not None
+    assert ended_at is not None
     assert phases_seen == {0, 1, 2}
     assert rig.status["last_result"] == "completed"
-    prev = dict(rig.pwm)
+    assert not {"fa1", "fa2"} & rig.sup.plan_tick().released
     (r,) = rig.ticks(1)
-    # bumpless: the solver re-initialises on the released channels (first target = prev)
-    for ch in ("fa1", "fa2"):
-        assert r.mpc_cmd.diagnostics["target_pwm"][ch] == pytest.approx(prev[ch])
     assert "experiment" not in r.cmd.diagnostics["supervisor"]
+    assert {"fa1", "fa2"} <= set(rig.loop.state.integrator)
+
+
+def test_an_experiment_stopped_on_its_high_level_hands_back_the_solvers_level():
+    """Item 112, the case the old release got wrong: a run that ends while the fan is a
+    step above the anchor. The solver's own want is the anchor; before this item the
+    release re-initialised it at the level on the fan and the enclosure stayed loud."""
+    rig = started_rig()
+    high = None
+    for _ in range(40):
+        rig.ticks(1)
+        st_ = rig.status
+        if st_["level"] == "high" and rig.pwm["fa1"] > st_["plan_base"]["fa1"] + 0.1:
+            high = dict(rig.pwm)
+            break
+    assert high is not None
+    anchor = dict(rig.status["plan_base"])
+    rig.sup.submit(Ident("stop"))
+    assert rig.status["last_abort_reason"] == "stop"
+    (r,) = rig.ticks(1)
+    want = r.mpc_cmd.diagnostics["target_pwm"]
+    for ch in ("fa1", "fa2"):
+        # what the solver asks for, not what the experiment left on the fan
+        assert want[ch] == pytest.approx(anchor[ch], abs=0.02)
+        assert want[ch] < high[ch] - 0.1
+        # and nothing steps: the rate limit walks it back at d_pwm_max
+        assert r.cmd.pwm[ch] >= high[ch] - rig.cfg.d_pwm_max - TOL
+    # the walk back is monotone and lands on the solver's own level
+    for _ in range(6):
+        (r,) = rig.ticks(1)
+    for ch in ("fa1", "fa2"):
+        assert r.cmd.pwm[ch] == pytest.approx(anchor[ch], abs=0.02)
 
 
 def _warming_run(replan: bool) -> tuple[Rig, int, list[float]]:
@@ -1321,6 +1356,99 @@ def test_the_demand_is_read_out_of_the_diagnostics_only_for_a_running_experiment
     assert frozen.sup._ident_facts.demand == {} and frozen.sup._ident_facts.prev == {}
 
 
+# ---------------------------------------------------------------------------
+# how far a channel can move the PE monitor from where it sits (item 110)
+# ---------------------------------------------------------------------------
+
+
+def test_the_relative_airflow_swing_a_telegraph_reaches_is_the_pe_arithmetic():
+    """``pe_min`` is relative, so what a telegraph can reach depends on where the channel
+    sits. ``rel_swing`` is that number, on the fan's own curve and with the PE monitor's
+    own scale floor, so its square is exactly the ``pe_diag`` entry the monitor would
+    report for a group of this one channel (section 8 item 110)."""
+    cfg = ident_cfg()  # fa1: p12, deadband 0.1, exponent 1.0
+    deadband, exponent = 0.1, 1.0
+
+    def by_hand(lo: float, hi: float) -> float:
+        p_lo = thermal.phi(lo, deadband, exponent)
+        p_hi = thermal.phi(hi, deadband, exponent)
+        return 0.5 * (p_hi - p_lo) / max(0.5 * (p_hi + p_lo), thermal.PE_SCALE_FLOOR)
+
+    for base in (0.2, 0.35, 0.5, 0.8):
+        lo, hi = base, base + cfg.ident_amplitude
+        assert ident.rel_swing(cfg, "fa1", lo, hi) == pytest.approx(by_hand(lo, hi))
+    # the plan's own closed form: above needs A >= 0.576 (u - deadband) to clear the bound
+    want = math.sqrt(thermal.PE_MIN)
+    for base in (0.2, 0.3, 0.45, 0.6):
+        a = 2.0 * want * (base - deadband) / (1.0 - want)
+        assert ident.rel_swing(cfg, "fa1", base, base + a) == pytest.approx(want, abs=1e-6)
+    # monotone in the amplitude and falling with the base, which is the whole point
+    swings = [ident.rel_swing(cfg, "fa1", 0.5, 0.5 + a) for a in (0.05, 0.15, 0.3)]
+    assert swings == sorted(swings)
+    bases = [ident.rel_swing(cfg, "fa1", u, u + 0.15) for u in (0.2, 0.4, 0.6, 0.8)]
+    assert bases == sorted(bases, reverse=True)
+    # a level the rail would eat does not move air: the swing is read off the clamped pair
+    assert ident.rel_swing(cfg, "fa1", 0.95, 1.3) == pytest.approx(
+        ident.rel_swing(cfg, "fa1", 0.95, cfg.pwm_max)
+    )
+
+
+def test_excitation_names_the_channels_that_cannot_reach_the_pe_bound():
+    cfg = ident_cfg()
+    levels = {"fa1": [0.2, 0.35], "fa2": [0.5, 0.65]}
+    out = ident.excitation(cfg, levels)
+    assert out["fa1"]["excitable"] is True and out["fa2"]["excitable"] is False
+    for ch, entry in out.items():
+        assert entry["pe_reach"] == pytest.approx(entry["rel_swing"] ** 2)
+        assert entry["pe_min"] == thermal.PE_MIN
+        assert entry["excitable"] is (entry["pe_reach"] > thermal.PE_MIN)
+        assert entry["rel_swing"] == pytest.approx(ident.rel_swing(cfg, ch, *levels[ch]))
+    assert ident.unexcitable(cfg, levels) == ["fa2"]
+    assert ident.excitation(cfg, {"fa1": "nonsense", "fa2": [0.5]}) == {}
+
+
+def test_a_running_experiment_publishes_what_its_channels_can_reach():
+    """The fixture parks the front group at 0.5 PWM, where a 0.15 step reaches 0.158 of
+    relative airflow variation against the 0.224 the rule needs. That is published, so a
+    zone waiting on the PE gate is visible rather than silently pending."""
+    rig = started_rig()
+    st_ = rig.status
+    assert sorted(st_["unexcitable"]) == ["fa1", "fa2"]
+    for ch in ("fa1", "fa2"):
+        entry = st_["excitation"][ch]
+        assert entry["excitable"] is False
+        assert entry["rel_swing"] == pytest.approx(0.1579, abs=1e-3)
+    assert rig.sup.snapshot().extra["experiment"]["unexcitable"] == st_["unexcitable"]
+    # and it is gone with the experiment
+    rig.sup.submit(Ident("stop"))
+    assert rig.status["excitation"] == {} and rig.status["unexcitable"] == []
+
+
+def test_ident_require_excitable_refuses_a_start_that_cannot_inform_the_pe_gate():
+    """``not_excitable:<ch>``, the way ``band:`` and ``saturated:`` refuse -- off by
+    default, because such a run still informs the ``E`` split and the bays."""
+    rig = started_rig()  # the default: 0.5 PWM is not excitable and the start went ahead
+    assert rig.status["running"] and rig.status["unexcitable"]
+    rig.sup.submit(Ident("stop"))
+
+    strict = Rig(ident_cfg(ident_require_excitable=True))
+    strict.ticks(8)
+    with pytest.raises(IntentConflict, match=r"not_excitable:fa1, not_excitable:fa2"):
+        strict.sup.submit(Ident("start", group="front"))
+    # the same config with the fans parked low: the telegraph reaches the bound and runs
+    facts = strict.sup._ident_facts
+    low = dataclasses.replace(facts, pwm=dict.fromkeys(strict.cfg.channels, 0.2))
+    assert "not_excitable:fa1" not in ident.check_start(
+        strict.cfg, strict.sup._ident_tracker, low, "group", "front", human_control=False
+    )
+    # a channel the band already refuses is not also reported unexcitable: one reason each
+    high = dataclasses.replace(facts, pwm=dict.fromkeys(strict.cfg.channels, 0.95))
+    reasons = ident.check_start(
+        strict.cfg, strict.sup._ident_tracker, high, "group", "front", human_control=False
+    )
+    assert "band:fa1" in reasons and "not_excitable:fa1" not in reasons
+
+
 def _all_intents(cfg: MpcConfig) -> list[Any]:
     return [
         SetMode(ControlMode.MIXED),
@@ -1335,7 +1463,7 @@ def _all_intents(cfg: MpcConfig) -> list[Any]:
 
 
 @pytest.mark.parametrize("index", range(8))
-def test_every_human_intent_aborts_and_releases(index):
+def test_every_human_intent_aborts_and_the_solver_keeps_its_integrator(index):
     rig = started_rig()
     rig.ticks(3)
     intent = _all_intents(rig.cfg)[index]
@@ -1345,8 +1473,12 @@ def test_every_human_intent_aborts_and_releases(index):
     assert rig.status["last_result"] == "aborted"
     assert rig.status["last_abort_reason"].startswith("human_intent:")
     plan = rig.sup.plan_tick()
-    assert {"fa1", "fa2"} <= plan.released
+    # item 112: the experiment's own channels are never released; a human override the
+    # same intent then cleared is (``ClearOverride`` at index 5 has nothing to clear here)
+    assert not {"fa1", "fa2"} & plan.released
     assert plan.experiment is None
+    rig.ticks(1)
+    assert {"fa1", "fa2"} <= set(rig.loop.state.integrator)
 
 
 def test_stop_intent_aborts_and_stop_without_an_experiment_is_a_no_op():
