@@ -249,17 +249,30 @@ an empty bay has no case-to-drive offset, so with the prior ``b`` its plain
 a zone over a removed drive; the zone trust groups stay those of the declared config.
 
 A bay whose occupancy crosses the ``empty`` boundary in either direction, or whose
-**mean** trusted proximal reading steps away from the predicted sensor node by the
-fast-swap rule's own thresholds, reports ``swapped: true`` for that one tick: the
-drive in it may be a different one from now on. The mean is the point. The per-sensor
-test above runs sequentially, so with two members one of them jumps whenever the two
-disagree -- which is placement, not a swap, and happens on almost every tick of a
-bay with a redundant sensor under fan excitation (5689 of 5760 ticks measured on the
-truth simulator, the same pathology plan section 3 records for the ``rich`` preset).
-The mean of a disagreeing pair sits where the node already is, and a drive that is
-pulled or pushed in moves both. ``mpc.step`` hands those
-bays to :func:`aqua_bridge.control.thermal.update`, which resets their identified
-coefficients to the prior (plan section 8 item 12).
+**mean innovation** over its trusted proximal members passes the fast-swap rule's own
+thresholds, reports ``swapped: true`` for that one tick: the drive in it may be a
+different one from now on. The mean is the point. The per-sensor test above runs
+sequentially, so with two members one of them jumps whenever the two disagree --
+which is placement, not a swap, and happens on almost every tick of a bay with a
+redundant sensor under fan excitation (5689 of 5760 ticks measured on the truth
+simulator, the same pathology plan section 3 records for the ``rich`` preset). A swap
+moves every member of the bay together and so survives the mean, while a disagreement
+between placements cancels in it.
+
+It cancels only if each member is predicted **where the filter says that member sits**
+(plan section 8 item 109). Two placements differ by ``ds (T_d - T_a) + db``, so the
+mean reading of a pair is *not* the bay's node: it is the node plus the mean of the
+members' placement offsets, and the innovation variance of that mean carries the
+offsets' variance with it. Taking the mean reading against the bare node instead left
+half the pair's disagreement inside the statistic and none of its uncertainty, so a
+pair more than ``2 * jump_min_c`` apart -- a gap that *grows with the load*, since it
+is proportional to the drive-to-air rise -- was a swap on every tick. Both layouts
+now form the same quantity out of the same per-member innovations the rule already
+computes: the fused layout's node-plus-offset, the per-sensor layout's own nodes and
+maps. A bay with one proximal sensor is one member, so its statistic is unchanged.
+
+``mpc.step`` hands those bays to :func:`aqua_bridge.control.thermal.update`, which
+resets their identified coefficients to the prior (plan section 8 item 12).
 
 The per-bay output shows a change in progress: ``pending_empty_s`` (seconds of
 evidence toward ``empty`` counted so far), ``pending_occupied_ticks`` (ticks of
@@ -1967,30 +1980,6 @@ def update(
                 for k in sorted(set(bay.nodes.values())):
                     _reset_state(x, p, i_s + k, float(x[i_s + k]), spec.p0_t_sensor)
                 bm["init"] = True
-            node = i_s + bay.node
-            if present and occ != EMPTY:
-                # The bay-level test, before any of this tick's updates: the mean of the
-                # bay's trusted readings against the predicted nodes and the variance of
-                # that mean. Per-sensor jumps below are sequential, so with two sensors
-                # one of them jumps whenever the two disagree, which is placement, not a
-                # swap; the mean of a pair that disagrees sits where the nodes already are.
-                mean_v = sum(float(temps[name]) for name in present) / len(present)
-                mean_r = sum(_sensor_var(cfg, name) for name in present) / len(present) ** 2
-                if per_sensor:
-                    mean_x = sum(float(x[i_s + bay.nodes[nm]]) for nm in present) / len(present)
-                    mean_p = (
-                        sum(
-                            float(p[i_s + bay.nodes[a], i_s + bay.nodes[c]])
-                            for a in present
-                            for c in present
-                        )
-                        / len(present) ** 2
-                    )
-                else:
-                    mean_x, mean_p = float(x[node]), float(p[node, node])
-                nu_bay = mean_v - mean_x
-                if abs(nu_bay) > spec.jump_min_c and nu_bay * nu_bay > jump_var * (mean_p + mean_r):
-                    stepped[b] = True
             # The fast-swap test runs on the nodes before any member of the bay has
             # updated one, and the members have to agree (module docstring): one bay,
             # one drive, so a swap moves every proximal sensor of the bay the same way.
@@ -2016,6 +2005,28 @@ def update(
                     s_innov = p[idx, idx] + 2.0 * p[idx, off] + p[off, off] + r
                 big = abs(nu) > spec.jump_min_c and nu * nu > jump_var * s_innov
                 members.append((name, value, r, nu, big, k_off, idx))
+            if members and occ != EMPTY:
+                # The bay-level test (item 12), on the very innovations above and before
+                # any of this tick's updates: the *mean innovation* of the bay's trusted
+                # members against the variance of that mean. Per-sensor jumps are
+                # sequential, so with two sensors one of them jumps whenever the two
+                # disagree, which is placement, not a swap; a swap moves every member of
+                # the bay together, so it survives the mean while a disagreement cancels.
+                # Each member is predicted where the filter says *it* sits -- its own node
+                # and, on the fused layout, its own placement offset -- and the variance
+                # of the mean is that same prediction's, so a placement the filter is
+                # still unsure of cannot look like a swap either (item 109).
+                # the states each member's prediction is built from: its node, plus its
+                # offset where the fused layout carries one
+                rows = [(m[6],) if m[5] is None else (m[6], i_off + m[5]) for m in members]
+                nu_bay = sum(m[3] for m in members) / len(members)
+                var_bay = sum(m[2] for m in members)
+                for row_a in rows:
+                    for row_c in rows:
+                        var_bay += sum(float(p[a, c]) for a in row_a for c in row_c)
+                s_bay = var_bay / len(members) ** 2
+                if abs(nu_bay) > spec.jump_min_c and nu_bay * nu_bay > jump_var * s_bay:
+                    stepped[b] = True
             jump = any(m[4] for m in members) and not (
                 any(m[3] > spec.jump_min_c for m in members)
                 and any(m[3] < -spec.jump_min_c for m in members)

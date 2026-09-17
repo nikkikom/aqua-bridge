@@ -1,4 +1,4 @@
-"""Closed-loop identification on the daemon's own path (section 8 items 102, 111, 112).
+"""Closed-loop identification on the daemon's own path (section 8 items 102, 109, 111, 112).
 
 Nightly, because each case runs the real ``Loop`` + ``Supervisor`` + ``control/ident``
 over the DAS truth simulator (``sim/das.py``, ``rich`` preset) for 16 simulated hours,
@@ -31,26 +31,36 @@ zone regresses one airflow regressor per fan group of that zone, and ``converged
 the smallest eigenvalue of their information matrix to pass ``thermal.PE_MIN``
 (:mod:`aqua_bridge.control.thermal`, *PE monitor*): every group of the zone has to move
 independently of the others inside the monitor's ~30-window memory. Telegraphing one
-group while the solver carries the rest excites one direction at a time -- the round
-robin's own ``pe_diag`` shows it, one group of a zone at 0.004 to 0.04 while another sits
-at 0.18 to 0.43. It is *not* true that it never clears the bound: the round robin peaks
-at 0.15 to 0.22 on some zone of every seed (asserted below). What the zone-wide
-excitation buys is that the bound is *held*.
+group while the solver carries the rest excites one direction at a time. It is *not*
+true that it never clears the bound: the round robin peaks at 0.19 to 0.48 on some zone
+of every seed (asserted below), and on seed 4 that is enough for z0 to latch
+``converged`` *and hold* the bound there (``pe_min`` 0.209 at the end) -- z0 is the one
+zone of the example with two fan groups rather than three, so it has one direction fewer
+to separate. What the zone-wide excitation buys is a zone more per seed on all three
+seeds, and the bound held on every zone it converges.
 
 Observed over 16 h, zone-wide against the round robin (converged zones; the zone-wide
 arm's ``pe_min`` peak and its value at the end of the run; mean PWM of each arm). These
 numbers moved with section 8 item 112: with the fans no longer left elevated after each
 experiment the channels park lower, where a fixed 0.25 step is a *larger* relative
-airflow swing, so ``pe_min`` roughly doubles on the zones that converge -- and on seed 3
-z1 loses the race on one bay's ``rel_se(k)`` instead of winning it.
+airflow swing, so ``pe_min`` roughly doubles on the zones that converge. They moved again
+with section 8 item 109: on the fused layout a redundant pair's bay statistic had a
+standing bias that read as `swapped` on almost every tick for bay b03 (2788 and 2391 of
+2880 ticks on seeds 3 and 4 pre-fix), and ``model_reset_on_swap`` threw away not just the
+bay's block but its **zone's** air accumulator with it, so z0 closed 0 windows on seed 3
+and stayed short on seed 4. With the statistic corrected the bay is never reported
+swapped on either seed and z0 converges on both.
 
 * seed 2 -- z0 and z3 against nothing; 0.282 and 0.238 peak, 0.216 and 0.205 at the
-  end; 467 and 471 excited windows; mean PWM 0.3587 against 0.3660;
-* seed 3 -- nothing against nothing (z0 closes no window at all, item 109), pinned
-  exactly rather than as a lower bound, so that case stays a no-regression test instead
-  of a tautology; mean PWM 0.2636 / 0.2387;
-* seed 4 -- z3 against nothing; 0.316 peak, 0.201 at the end; 468 windows;
-  0.2969 / 0.2794.
+  end; 467 and 471 excited windows; mean PWM 0.3587 against 0.3660; unaffected by
+  item 109 (b03's pair never tripped the rule on this seed, before or after);
+* seed 3 -- z0 and z2 against nothing; 0.320 and 0.344 peak, 0.280 and 0.090 at the
+  end; 466 and 471 excited windows; mean PWM 0.2636 / 0.2387; z0 was dead before
+  item 109 (pinned exactly, so a zone going dead again is visible instead of silent)
+  and now converges;
+* seed 4 -- z0 and z3 against z0; 0.292 and 0.316 peak, 0.096 and 0.201 at the end;
+  474 and 468 excited windows; mean PWM 0.2969 / 0.2794; the round robin now also
+  converges (and holds) z0, which item 109's fix stopped resetting.
 
 The scenario, and why each knob is where it is:
 
@@ -89,27 +99,28 @@ ORDER = ("xt1", "xt3", "xt2", "xt4")
 SEQUENTIAL_ORDER = ("xt1", "qd1", "xt3", "qd3", "xt2", "qd2", "xt4", "qd4")
 TOL = 1e-9
 #: What each arm reached per seed (module docstring). ``dead`` are the zones that close
-#: **no** regression window in 16 h: on seed 3 bay b03's redundant proximal pair is read
-#: as ``swapped`` on nearly every tick and ``model_reset_on_swap`` resets z0's air
-#: accumulator with it, so that zone can never converge for reasons no excitation
-#: reaches. It is pinned here so a zone going dead is visible instead of silent.
+#: **no** regression window in 16 h -- none do since item 109's fix, and it is pinned
+#: here so a zone going dead is visible instead of silent. ``held`` are the zones the
+#: *round robin* converged whose ``pe_min`` is still above ``PE_MIN`` at the end of the
+#: run rather than latched from a burst.
 MEASURED: dict[int, dict[str, tuple[str, ...]]] = {
-    2: {"parallel": ("z0", "z3"), "sequential": (), "dead": ()},
-    3: {"parallel": (), "sequential": (), "dead": ("z0",)},
-    4: {"parallel": ("z3",), "sequential": (), "dead": ()},
+    2: {"parallel": ("z0", "z3"), "sequential": (), "dead": (), "held": ()},
+    3: {"parallel": ("z0", "z2"), "sequential": (), "dead": (), "held": ()},
+    4: {"parallel": ("z0", "z3"), "sequential": ("z0",), "dead": (), "held": ("z0",)},
 }
 #: What 36 h of the *same* schedule reaches, and what still blocks each zone that does
-#: not converge even then (section 8 item 111). Every remaining blocker but one is a bay
-#: the estimator reports ``swapped`` on nearly every tick (b03, b10 -- section 8 item
-#: 109), which closes no regression window and which no excitation can reach.
+#: not converge even then (section 8 item 111). With item 109's fix, b03 and b10 are no
+#: longer reported ``swapped`` on almost every tick and close windows like any other
+#: bay; the one remaining blocker is b15 on seed 3, whose fitted ``k`` is under half the
+#: prior, so even its ``se`` of 0.109 is half of it.
 MEASURED_LONG: dict[int, dict[str, Any]] = {
-    2: {"converged": ("z0", "z1", "z3"), "blocked_bays": {"z2": ("b10",)}},
-    3: {"converged": ("z1",), "blocked_bays": {"z0": ("b03",), "z2": ("b10",), "z3": ("b15",)}},
-    4: {"converged": ("z1", "z2", "z3"), "blocked_bays": {"z0": ("b03",)}},
+    2: {"converged": ("z0", "z1", "z2", "z3"), "blocked_bays": {}},
+    3: {"converged": ("z0", "z1", "z2"), "blocked_bays": {"z3": ("b15",)}},
+    4: {"converged": ("z0", "z1", "z2", "z3"), "blocked_bays": {}},
 }
 LONG_HOURS = 36.0
-#: Floors on the converged zones, from the runs above (peak 0.24-0.32, end 0.20-0.22,
-#: 467-471 windows) rather than from the ``converged`` rule's own 0.05 / 30, which
+#: Floors on the converged zones, from the runs above (peak 0.24-0.34, end 0.09-0.28,
+#: 466-474 windows) rather than from the ``converged`` rule's own 0.05 / 30, which
 #: ``status == "converged"`` already implies.
 PE_PEAK_FLOOR = 0.10
 WINDOWS_FLOOR = 300
@@ -251,10 +262,10 @@ def test_a_zone_wide_experiment_converges_a_zone_that_one_channel_at_a_time_does
 
     # 1. the answer, per seed and per zone: the zone-wide arm converges the zones it
     #    converged, one channel at a time converges no more than it did, and never more
-    #    than the zone-wide arm. A seed whose zone-wide arm converged *nothing* (seed 3
-    #    since item 112) is pinned exactly, both ways: ``>= set()`` is a tautology, so
-    #    without this the case would assert nothing at all about the behaviour its name
-    #    claims and only seeds 2 and 4 would separate the arms.
+    #    than the zone-wide arm. With item 109's fix every seed's zone-wide arm converges
+    #    something, but the empty branch stays: a seed converging *nothing* would assert
+    #    nothing at all about the behaviour the test's name claims (``>= set()`` is a
+    #    tautology) if it were only ever checked the other way.
     if want["parallel"]:
         assert set(parallel["converged"]) >= set(want["parallel"]), {
             z: v["status"] for z, v in parallel["zones"].items()
@@ -270,11 +281,13 @@ def test_a_zone_wide_experiment_converges_a_zone_that_one_channel_at_a_time_does
         assert parallel["zones"][z]["pe_min"] >= thermal.PE_MIN  # still standing at the end
         assert parallel["zones"][z]["excited_windows"] >= WINDOWS_FLOOR
         assert parallel["zones"][z]["pred_err_c"] < das_example_cfg.model_max_pred_err_c
-    # one channel at a time does clear the bound in bursts -- what it cannot do is hold
-    # it, so a zone it converges ends below what the zone-wide arm holds there.
+    # one channel at a time does clear the bound, in bursts on a three-group zone and
+    # for good on the two-group z0 of seed 4: which of its converged zones still stand
+    # above the bound at the end of the run is per-seed data, not a rule.
     assert max(sequential["pe_max"].values()) > thermal.PE_MIN
     for z in sequential["converged"]:
-        assert sequential["zones"][z]["pe_min"] < parallel["zones"][z]["pe_min"]
+        held = float(sequential["zones"][z]["pe_min"]) >= thermal.PE_MIN
+        assert held == (z in want["held"]), (z, sequential["zones"][z]["pe_min"])
 
     # 3. a zone that closes no regression window at all is a defect, not a result: it is
     #    named per seed, so a new one fails here instead of quietly shrinking the test.
@@ -357,18 +370,20 @@ def test_the_bays_second_gate_closes_on_observations_not_on_more_excitation(das_
     airflow sensitivity to measure, on a fit no worse than their neighbours'.
 
     ``se(k)`` falls as ``1 / sqrt(excited windows)``, so the answer is time, and this
-    test measures how much: the same schedule at 36 h instead of 16 h closes 900 to 1000
-    excited windows per bay instead of 390 to 450, ``se(k)`` falls from 0.10-0.16 to
-    0.07-0.11, and the converged zones go from 3 of 12 to 7 of 12. Amplitude cannot
-    substitute: reaching the same gain that way needs about five times the ``Qn_z``
-    variance, a relative zone-flow swing of 0.55 to 1.1 against the 0.24 to 0.51
-    measured, which no ``ident_amplitude`` in ``(0, 0.3]`` produces.
+    test measures how much: the same schedule at 36 h instead of 16 h closes about 900 to
+    1075 excited windows per bay, ``se(k)`` lands at 0.03-0.12, and the converged zones go
+    from 6 of 12 at 16 h to 11 of 12 at 36 h (section 8 item 109's fix on top of this:
+    before it, b03 and b10 -- the two bays with a redundant second proximal sensor --
+    were reported ``swapped`` on nearly every tick, closing 0 to 22 windows in 36 h and
+    holding z0 on seeds 3 and 4 back with them; fixed, both bays close as many windows as
+    any other and z0 converges on both seeds). Amplitude cannot substitute: reaching the
+    same gain that way needs about five times the ``Qn_z`` variance, a relative zone-flow
+    swing of 0.55 to 1.1 against the 0.24 to 0.51 measured, which no ``ident_amplitude``
+    in ``(0, 0.3]`` produces.
 
-    Of the five zones that still do not converge at 36 h, four are blocked by b03 or b10
-    -- the two bays with a redundant second proximal sensor, reported ``swapped`` on
-    nearly every tick, which close 0 to 22 windows in 36 h (section 8 item 109). The
-    fifth is b15 on seed 3, whose fitted ``k`` is 0.215: less than half the prior, so
-    even an ``se`` of 0.109 is 50 % of it.
+    The one zone that still does not converge at 36 h is z3 on seed 3, blocked on b15
+    alone: its fitted ``k`` is 0.215, less than half the prior, so even an ``se`` of
+    0.109 is half of it -- more observations narrow ``se`` but cannot inflate ``k``.
     """
     want = MEASURED_LONG[seed]
     long_run = _run(_config(das_example_cfg, parallel=True), seed, ORDER, hours=LONG_HOURS)
@@ -384,7 +399,7 @@ def test_the_bays_second_gate_closes_on_observations_not_on_more_excitation(das_
     #    blocked by an ``E``'s relative standard error
     for z, zone in long_run["zones"].items():
         if not zone["excited_windows"]:
-            continue  # item 109's dead zone, named by MEASURED
+            continue  # defensive: no zone is dead any more since item 109's fix
         assert not [r for r in zone["blocked"] if r.startswith("rel_se:E.")], (z, zone["blocked"])
 
     # 3. what does hold the rest back, named bay by bay -- and it is a bay's ``k``
@@ -399,7 +414,7 @@ def test_the_bays_second_gate_closes_on_observations_not_on_more_excitation(das_
     # 4. the mechanism: the standard error is what fell, and it fell with the windows
     for b, bay in long_run["bays"].items():
         if bay["excited_windows"] < WINDOWS_FLOOR:
-            continue  # item 109's swap-reset bays close almost none
+            continue  # defensive: every bay clears this floor since item 109's fix
         assert bay["se"][f"k.{b}"] <= 0.12
         assert bay["rel_se"][f"k.{b}"] == pytest.approx(
             bay["se"][f"k.{b}"] / abs(bay["theta"][f"k.{b}"]), rel=1e-6

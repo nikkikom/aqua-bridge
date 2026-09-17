@@ -1786,6 +1786,82 @@ def test_swapped_is_a_step_of_the_bay_s_mean_reading_not_of_one_sensor():
     assert all(not up.bays[b]["swapped"] for up in (one, both) for b in ("a2", "b1"))
 
 
+def test_a_standing_gap_between_two_members_is_not_a_swap_on_any_tick():
+    """Item 109. The mean of the readings is only *where the drive is* once every member
+    is predicted where the filter says it sits: on the fused layout that is the bay's node
+    plus the member's own placement offset. Comparing the mean reading with the bare node
+    left half the pair's disagreement in the statistic, so a pair more than
+    ``2 * jump_min_c`` apart was reported swapped on every settled tick -- and the gap is
+    ``ds * (T_d - T_a) + db``, which grows with the load.
+    """
+    _, ups = _disagreeing_run(60, 4.0)
+    assert not any(up.bays["a1"]["swapped"] for up in ups)
+    assert not any(up.bays[b]["swapped"] for up in ups for b in ("a2", "b1"))
+
+
+def test_a_step_both_members_of_a_disagreeing_pair_see_is_still_a_swap():
+    """The other direction of item 109: the gap cancels in the mean, a step both members
+    take does not. Same tick, same run, no waiting."""
+    cfg, ups = _disagreeing_run(30, 4.0)
+    swap = tick(
+        cfg,
+        ups[-1].memory,
+        30.0 * cfg.dt,
+        prox_a1=PROX_C + 6.0,
+        prox_a1b=PROX_C - 4.0 + 6.0,
+        smart={"A": {"temp_c": 44.0, "age_s": 0.0, "model": "M"}},
+    )
+    assert swap.bays["a1"]["swapped"] is True
+
+
+#: ``rich`` seeds on which at least one of the DAS example's two redundant proximal pairs
+#: (b03, b10) sits far enough apart for the placement gap to cross the fast-swap rule's
+#: thresholds. Before item 109 that bay was reported ``swapped`` on 1073 to 1199 of these
+#: 1200 ticks, so ``model_reset_on_swap`` restarted its zone's regression on nearly every
+#: tick and the zone could never converge (item 102's dead zones).
+REDUNDANT_SEEDS = (2, 3, 4, 5, 7)
+
+
+@pytest.mark.parametrize("seed", REDUNDANT_SEEDS)
+def test_a_redundant_proximal_pair_is_never_reported_swapped(seed):
+    """Item 109 on the truth simulator: realistic placements (``beta`` 0.3 +- 0.05, offset
+    -2.1 +- 0.3 degC drawn per sensor), the fans stepped every 120 ticks so the
+    drive-to-air rise moves, and no drive ever leaves a bay. Nothing is a swap."""
+    cfg = example_cfg()
+    plant = truth_plant(cfg, preset="rich", seed=seed)
+    counts: dict[str, int] = {}
+
+    def on_tick(i, plant, up, counts=counts):
+        for bay, block in up.bays.items():
+            if block["swapped"]:
+                counts[bay] = counts.get(bay, 0) + 1
+
+    run_truth(cfg, plant, 1200, smart=True, on_tick=on_tick)
+    assert counts == {}
+
+
+@pytest.mark.parametrize("bay", ["b03", "b10", "b02"])
+def test_a_hot_swap_is_caught_as_fast_with_a_redundant_pair_as_without(bay):
+    """The cost side of item 109, on the same plant: a drive replaced in place by one
+    12 degC hotter is reported on the first tick the step reaches the sensors, whether the
+    bay has one proximal sensor (b02) or a redundant pair at different placements (b03,
+    b10). The pair is not the slower of the two -- it is the quieter one."""
+    cfg = example_cfg()
+    plant = truth_plant(cfg, preset="rich", seed=3)
+    swap_at = 600
+    seen: list[int] = []
+
+    def on_tick(i, plant, up, seen=seen):
+        if i > swap_at and up.bays[bay]["swapped"]:
+            seen.append(i - swap_at)
+        if i == swap_at:
+            drive = plant.drives[plant._bi[bay]]
+            plant.insert(bay, drive, temp_c=plant.t_drive()[bay] + 12.0)
+
+    run_truth(cfg, plant, swap_at + 30, smart=True, on_tick=on_tick)
+    assert seen and seen[0] <= 2, seen
+
+
 def test_swapped_on_the_edge_of_empty(as_empty):
     cfg, mem = as_empty()
     quiet = run_ticks(cfg, 3, mem=mem, t0=100.0, prox_b1=SP + 0.1)
