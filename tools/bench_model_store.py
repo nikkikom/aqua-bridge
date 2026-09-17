@@ -132,6 +132,9 @@ def bench_writes(cfg, path: Path, *, warm_ticks: int, seed: int, preset: str, re
     ts = memory.get("last_ts")
     ts = float(ts) if isinstance(ts, int | float) else None
     wall = time.time()
+    # ident_settle=None: this warm-up loop never runs an identification experiment, so
+    # the document's "ident_settle" section is unconditionally empty here too, alongside
+    # fan_curves/calibration/bays (module docstring, PROJECT.md item 48's floor-size caveat).
     doc = build_document(cfg, memory, ts=ts, wall=wall, bays=bays, ident_settle=None)
     data = json.dumps(doc, allow_nan=False, separators=(",", ":")).encode()
 
