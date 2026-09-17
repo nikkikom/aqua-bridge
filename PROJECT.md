@@ -6980,7 +6980,7 @@ Owner decision (2026-09-16):
     would have documented the defect instead of removing it.
 
     **False positives, measured.** Closed loop (PI-DAS, `rich`, 4 h = 2880
-    ticks, no experiment), `swapped` ticks on b03 → **2788 → 0** (seed 3),
+    ticks, no experiment), `swapped` ticks on b03: **2788 → 0** (seed 3),
     **2391 → 0** (seed 4), **712 → 0** (seed 7); b10 2 → 0 (seed 3). z0's
     excited windows over the same runs: 0 → 109, 15 → 100, 24 → 105. Open loop
     (`tests/test_estimator.py`, the fans stepped every 120 ticks, 1200 ticks,
