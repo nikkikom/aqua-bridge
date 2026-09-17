@@ -683,9 +683,16 @@ bus is empty, 0 rpm for a present output with no fan, 255 rpm for the one
 with a fan, identically in the measuring and the non-measuring report.
 `FanStatus.present` therefore reads that field and only that field, every
 absence judgement in the project goes through it, and **no confirmation
-window is needed** — the sentinel already outlasts the refresh interval, so
-a present bus device is never judged absent and an absent one is judged
-absent on the first report that shows it.
+window is added** — the sentinel already outlasts the refresh interval, so
+a present bus device is never judged absent, and an absent one is judged
+absent on the first report that shows `0xFFFF`. What the captures cannot
+say is *when* the aquaero starts showing it, or whether a bus hiccup can
+show it for a single report: all three come from a healthy, uninterrupted
+bus, and the absent→present transition itself is untested hardware work
+(item 96, which needs the Quadro physically off aquabus). So the no-window
+decision rests on the sentinel being invariant, not on a measured latency;
+a spurious single report would cost a false "no device on aquabus behind
+qdN" and a None reading for that tick, never a wrong number.
 
 What this wiring cannot answer, and what it would take:
 
@@ -3191,17 +3198,25 @@ a model converges only with them.
   be one of the kind's outputs (aquaero `pwm1..8`, 5–8 a Quadro on its
   aquabus; Quadro `pwm1..4`), `rpm` one of its tachometers (aquaero
   `fan1..8`, Quadro `fan1..4`), `temp_map` values one of its temperature
-  inputs (aquaero `temp1..8`, `bus1..8`, `soft1..8`, `virt1..4`; Quadro
-  `temp1..4`, `soft1..16`), and two names on one input are rejected. **Do not
+  inputs (aquaero `temp1..8`, `bus1..8`, `virt1..4`; Quadro `temp1..4`),
+  and two names on one input are rejected. A `softN` **software** sensor is
+  not on that list and cannot be bound anywhere: it holds what a host last
+  wrote and its configured fallback for ever after, which no status report
+  tells apart from a measurement, so both `parse_device_section` and
+  `DeviceBinding.__post_init__` refuse it — see "Fan and device health"
+  below and §8 item 113 for what is published instead. **Do not
   bind a `busN` of a device that can leave aquabus yet**: such a slot keeps
   the last value it read instead of reading as missing (§8 item 92), and since
   item 90 `read()` no longer fails the controller for the empty output slots
   next to it, so a frozen temperature would reach the solver as an ordinary
   reading. Nothing in the config model checks that (the check is item 92). A
   name of the hwmon driver's numbering that means another input now is
-  rejected with the new name: aquaero `temp9..16` (`soft1..8`) and
-  `temp17..20` (`virt1..4`), Quadro `temp5..20` (`soft1..16`), and the
-  Quadro's flow sensor `fan5`, which is not a tachometer. Any tachometer
+  rejected with the new name: aquaero `temp17..20` (`virt1..4`) and the
+  Quadro's flow sensor `fan5`, which is not a tachometer. The hwmon names
+  of the software sensors — aquaero `temp9..16`, Quadro `temp5..20` — are
+  rejected saying which `softN` they used to mean **and** that the modern
+  name is refused too, since renaming them would only move the same
+  unbindable input. Any tachometer
   may be bound to any output; the aquaero's hwmon `fan5`/`fan6` were its
   flow sensors and are its aquabus tachometers now, so an old config that
   bound flow as `rpm` fails its reads with "no device behind fan5" unless a
@@ -3321,7 +3336,14 @@ a model converges only with them.
     diagnostics only until now) and `software_sensors`, one entry per
     `softN` slot of the controller with `enabled`, `fallback_c`,
     `timeout_s`, `written_by_daemon`, `reading_c` and `reads_fallback`
-    (item 113, below).
+    (item 113, below). The settings come from the control report and are
+    **kept once decoded**: `null` means no control report has been read
+    yet, `[]` means a device with no software sensors this daemon knows
+    how to read (the Quadro), and neither the invalidation of the cached
+    report after a duty mismatch nor a close takes the slots away — they
+    are the operator's configuration of the controller, and publishing
+    them only while a report happens to be cached would make them, and
+    the disabled-`heartbeat_sensor` problem that reads them, flap.
 
   `health.HealthMonitor` is a `Loop.on_tick` observer (like the recorder
   and the MQTT publisher): it never raises, only reads, and never changes a
@@ -3359,9 +3381,19 @@ a model converges only with them.
     because the refresh is not even atomic per report (one capture had
     blocks 5 and 6 refreshed and block 8 not), so nothing says which
     reading a block is carrying. What the daemon does instead is say so:
-    every channel's verdict carries `rail_monitored` and `power_monitored`
-    with an `unmonitored` mapping of rule → reason, so an empty `problems`
-    is never readable as coverage the daemon does not have. What stays
+    every channel's verdict carries `rpm_monitored`, `rail_monitored` and
+    `power_monitored` with an `unmonitored` mapping of rule → reason, so an
+    empty `problems` is never readable as coverage the daemon does not
+    have. **All three rules declare themselves, and a flag means the rule
+    ran** — not that the device measures the field: a rule needs the
+    measurement *and* the configuration it is judged against, so an output
+    that reports power with no `power_w_at_max` behind it, a channel with
+    no fitted curve, and a rail of exactly 0.00 V (which this rule refuses
+    to interpret, below) are all `*_monitored` false with the reason. What
+    the flags do not carry is the two transient conditions of the
+    duty-dependent rules — the `settle_s` window still filling after a gap,
+    and a duty below `min_duty` — which hold a rule off for a tick or two
+    rather than for the channel. What stays
     covered is the aquaero's own outputs 1–4, and with them any sag common
     to the whole 12 V supply; what is not is a rail local to the bus
     device. This rule does not
@@ -3377,7 +3409,11 @@ a model converges only with them.
     `count * power_w_at_max * phi(duty) ** power_exponent` over the same
     band; `fan_models.<m>.power_w_at_max` has no default (the figure
     depends on the fan), so without it this rule is simply off for that
-    model.
+    model — and it is unset in both example configs until item 94's
+    measurement, so a measured power is **not** coverage on its own:
+    `power_monitored` is true only when the device reports the power *and*
+    the channel's model says what to expect, and the missing key is named
+    in `unmonitored` otherwise.
 
   Nothing is judged below `min_duty` (inside and just above the deadband
   the curve says little). An aquabus fan's rpm in the aquaero's status
@@ -3412,7 +3448,7 @@ a model converges only with them.
   refused too. What a human gets instead is the slots themselves:
   `aquacomputer.software_sensor_settings()` decodes the five bytes per
   sensor the control report holds from `0x177` — enabled, fallback
-  temperature, timeout — and `device_health.software_sensors` publishes
+  temperature, timeout — and `device_health.devices[].software_sensors` publishes
   each slot with its reading and `reads_fallback`, which is true exactly
   when the reading *is* the configured fallback (an exact centi-degC
   comparison: both sides are the same field, so no tolerance and no config
@@ -3435,9 +3471,11 @@ a model converges only with them.
   present output reads 12.09 V one second later — so a rule keyed on it
   would call a present device absent in one report and present in the
   next. Nothing in the project keys on it, and no confirmation window is
-  needed either: the sentinel is already invariant across the refresh, so
-  a present bus device is never judged absent and an absent one is judged
-  absent on the first report. Pinned on the three captures in
+  added either: the sentinel is invariant across the refresh, so a present
+  bus device is never judged absent, and an absent one is judged absent on
+  the first report that shows `0xFFFF` — how soon the aquaero shows it,
+  and whether a bus hiccup can show it for one report only, no capture
+  says (item 96). Pinned on the three captures in
   `tests/test_hw_aquacomputer.py`.
 - **The board itself** (`health.py`, item 103). The Raspberry Pi the daemon
   runs on is a **health signal, never a model input** (owner decision,
@@ -4812,12 +4850,15 @@ Config `http:` (parsed and validated by `HttpSettings` in
   controller `label`, `device`, `serial`, `firmware`, `power_cycles`,
   `open`, `status_age_s`, `stuck_channels`, `absent_channels`,
   `not_pwm_channels`, `unconfigured_channels`, `flows`, `heartbeat`,
-  `software_sensors` (§8 items 83, 113) and
-  `active_profile` once one is published), `fans` (per channel `duty`,
+  `software_sensors` (§8 items 83, 113 — `null` until a control report has
+  been decoded, `[]` on a device with no software sensors this daemon
+  reads) and `active_profile` once one is published), `fans` (per channel `duty`,
   `rpm`, `voltage_v`, `current_ma`, `power_w`, `expected_rpm`,
-  `expected_power_w`, `rail_monitored`, `power_monitored`, `unmonitored`
-  — the rules that did not run for that output and why, §8 item 117 — and
-  `problems`), `host` (§8 item 103: the board's own
+  `expected_power_w`, `rpm_monitored`, `rail_monitored`,
+  `power_monitored`, `unmonitored` — the rules that did not run for that
+  output and why, §8 item 117; a flag is true only when that rule actually
+  ran, which needs the measurement *and* the configuration it is judged
+  against — and `problems`), `host` (§8 item 103: the board's own
   `cpu_temp_c`, the `air_c` reference it is compared against with the
   `air_temps` it was averaged from, the signed `divergence_c`, `load1`,
   `idle`, the `throttled` reading and this board's own `faults`,
@@ -6273,7 +6314,11 @@ Owner decision (2026-09-16):
     wide guesses**, with `fan_models.<m>.power_w_at_max` unset in both
     example configs (so the power rule is off until it is measured) and the
     DAS example's placeholder `rpm_max` not yet the real curve — that is
-    item 94, which needs the Pi and the fans and is the owner's.
+    item 94, which needs the Pi and the fans and is the owner's. The last
+    of those is declared, not just written here: a channel whose model has
+    no `power_w_at_max` publishes `power_monitored` false with that as the
+    reason, so a controller that *does* measure power (a Quadro on its own
+    USB) cannot publish an unjudged 0 W as a rule that passed (item 117).
 84. **Done** (2026-09-16): fan control without wearing the controllers'
     memory (item 77), with the controller's own watchdog behind it. The
     adapter writes a **software-sensor heartbeat** and watches the **active
@@ -7810,12 +7855,23 @@ Owner decision (2026-09-16):
     a `softN` in `temp_map` with the reason, and `DeviceBinding.__post_init__`
     refuses it again so no path below the config parser can build one; the
     hwmon-era hint that used to say "use `soft1`" now says why `soft1` is
-    refused too. Nothing `softN` reaches the estimator, the recorder or a
-    health rule.
+    refused too, and no message offers a `softN` as a choice of input any
+    more. Nothing `softN` reaches the estimator, the recorder or a health
+    rule.
+    **This is a breaking config change with an upgrade action**: a
+    `temp_map` that binds a `softN` parsed yesterday and exits 2 today, so
+    the daemon does not start and the controller runs on its own saved
+    preset until someone reads the journal. Fail-safe, but an outage if it
+    is a surprise — so the README's config step, both example configs and
+    this item all say it: repoint such a binding (a physical `tempN`, or a
+    `busN` of a device that cannot leave the bus) **before** upgrading. On
+    the owner's board no binding is affected (`soft1` is the heartbeat slot
+    the daemon writes, not a bound input), but the board was unreachable
+    while this was written and that could not be checked live.
     What a human gets instead: `aquacomputer.software_sensor_settings()`
     decodes the five bytes per sensor the control report holds from `0x177`
     (enabled `u8`, fallback `s16` centi-°C, timeout `u16` s) and
-    `device_health.software_sensors` publishes each slot with
+    `device_health.devices[].software_sensors` publishes each slot with
     `written_by_daemon`, its current `reading_c` and `reads_fallback` — the
     reading *is* the configured fallback, compared exactly at centi-°C
     (same field on both sides, so no tolerance and no config key).
@@ -7864,9 +7920,16 @@ Owner decision (2026-09-16):
     at all: `0xFFFF` for an empty bus, 0 rpm for a present output with no
     fan, the fan's speed otherwise, identically in both reports. Because
     the sentinel is invariant across the refresh, **no confirmation window
-    is needed** — a present bus device is never judged absent and an absent
-    one is judged absent on the first report that shows it, which is what a
-    window would have cost.
+    is added** — a present bus device is never judged absent, and an absent
+    one is judged absent on the first report that shows `0xFFFF`, which is
+    the promptness a window would have cost. What the captures do *not*
+    show is the absent→present transition itself: all three come from a
+    healthy, uninterrupted bus, so how soon the aquaero starts showing
+    `0xFFFF`, and whether a single dropped aquabus poll can show it for one
+    report, is untested and stays item 96's hardware work. That is why the
+    decision is stated as "the sentinel is invariant", not as a measured
+    latency; a spurious single report would cost a false `absent_channels`
+    line and a `None` reading for that tick, never a wrong number.
     The audit found no rule keyed on the voltage, current or power: every
     absence judgement in the project goes through `FanStatus.present`
     (`_empty_slot` in the adapter, and `fan_readings` through it). What is
@@ -7906,13 +7969,28 @@ Owner decision (2026-09-16):
       device's rail and must not be presented as such.
     So the decision is the second branch of this item, and what it adds is
     the declaration. Each channel's published verdict now carries
-    `rail_monitored`, `power_monitored` and an `unmonitored` mapping of
-    rule → why it did not run, the reason written by the hardware adapter
-    (which knows why the field is not that output's own measurement) and
-    carried through `fan_readings`'s `not_measured` into
-    `HealthMonitor.check_channel`. An empty `problems` list on an aquabus
-    output is therefore no longer readable as "the rail is fine", in
-    `/api/state`, the MQTT attributes or the page. `health.py`'s module
+    `rpm_monitored`, `rail_monitored`, `power_monitored` and an
+    `unmonitored` mapping of rule → why it did not run, the reason written
+    by the hardware adapter (which knows why the field is not that output's
+    own measurement) and carried through `fan_readings`'s `not_measured`
+    into `HealthMonitor.check_channel`. An empty `problems` list on an
+    aquabus output is therefore no longer readable as "the rail is fine",
+    in `/api/state`, the MQTT attributes or the page.
+    **A flag says the rule ran, not that the device measures the field** —
+    the distinction the first version of this change got wrong. A rule
+    needs the measurement *and* the configuration it is judged against, so
+    all four of these publish as not monitored, each with its own reason:
+    an output whose field the controller substitutes (the aquabus rail, the
+    aquaero's own 0 mA / 0 W); an output that reports power on a model with
+    no `power_w_at_max`, which is the state of **both example configs**
+    until item 94 — a seized fan drawing 0 mA at full duty would otherwise
+    publish as a power rule that ran and passed; a channel with no fitted
+    curve in `mpc.fans` / `mpc.fan_models`, where the rpm rule is off (a
+    legacy config, or a channel left out); and a rail of exactly 0.00 V,
+    the one rail reading this daemon refuses to interpret, which was a
+    silent skip before. The value is still published where there is one —
+    0.00 V is a reading — and the page prints it with "rail not monitored"
+    beside it rather than as a number something checked. `health.py`'s module
     docstring, §2 and §3 state the same thing in words, naming what stays
     covered (the aquaero's own outputs 1-4, and any sag common to the whole
     supply) and what does not (a rail local to the bus device).

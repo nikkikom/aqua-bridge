@@ -121,6 +121,7 @@ _DEVICE_HEALTH: dict[str, Any] = {
             "expected_rpm": 750.0,
             "expected_power_w": None,
             # which rules ran for this output at all (PROJECT.md section 8 item 117)
+            "rpm_monitored": True,
             "rail_monitored": True,
             "power_monitored": False,
             "unmonitored": {"power": "pwm1 reports no current or power this daemon may judge"},

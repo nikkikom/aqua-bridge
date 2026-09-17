@@ -1565,7 +1565,7 @@ def test_binding_rejects_numbers_outside_the_kind() -> None:
     with pytest.raises(ValueError, match="pwm1..pwm8"):
         DeviceBinding(kind=AQUAERO, pwm_map={"a": 9})
     DeviceBinding(kind=AQUAERO, pwm_map={"a": 8}, fan_map={"a": 8})
-    with pytest.raises(ValueError, match="temperature inputs temp1..temp4, soft1..soft16"):
+    with pytest.raises(ValueError, match="temperature inputs temp1..temp4, not"):
         DeviceBinding(kind=QUADRO, pwm_map={}, temp_map={"t": "bus1"})
     with pytest.raises(ValueError, match="share one"):
         DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"t": "bus1", "u": "bus1"})

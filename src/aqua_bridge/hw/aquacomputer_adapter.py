@@ -211,12 +211,14 @@ from typing import Any, TypeVar
 from aqua_bridge.hw.aquacomputer import (
     DUTY_MAX,
     KINDS,
+    SOFT_SENSOR_PREFIX,
     SOURCE_UNCONFIGURED,
     TEMP_MAX_C,
     TEMP_MIN_C,
     ChannelSnapshot,
     DeviceKind,
     ReportError,
+    SoftSensorSettings,
     StatusReport,
     active_profile,
     capture_channel,
@@ -510,7 +512,7 @@ class DeviceBinding:
         for name, value in self.temp_map.items():
             if value not in kind.temp_names:
                 raise ValueError(
-                    f"{name!r}: {kind.name} has temperature inputs {kind.describe_temps()}, "
+                    f"{name!r}: {kind.name} has temperature inputs {_bindable_temps(kind)}, "
                     f"not {value!r}"
                 )
             if value in soft:
@@ -586,6 +588,18 @@ class AquacomputerAdapter:
         #: Cached control report; ``None`` means invalid (GET before the next write).
         self._ctrl: bytes | None = None
         self._ctrl_t: float | None = None
+        #: The software-sensor settings of the last control report that was decoded,
+        #: kept across an invalidation and a close: they are the operator's
+        #: configuration of the controller, which no write of this daemon changes, and
+        #: dropping them with the cached report would make the published slots -- and
+        #: the disabled-heartbeat problem that reads them -- flap (item 113).
+        #: ``None`` until one has been decoded, which is *not* the same as the empty
+        #: tuple of a kind whose settings are unknown (the Quadro).
+        self._soft_settings: tuple[SoftSensorSettings, ...] | None = None
+        #: Output number -> the ``not_measured`` mapping published for it, built once
+        #: (:meth:`_not_measured`): constant prose that would otherwise be reformatted
+        #: for every output on every tick and is read-only downstream.
+        self._not_measured_cache: dict[int, dict[str, str]] = {}
         #: The next write sends every configured channel, held or not.
         self._rewrite = False
         #: End of the last control operation, failed ones included (ctrl_gap_ms).
@@ -769,33 +783,42 @@ class AquacomputerAdapter:
         guessed there. A rule named in this mapping is one the fan-health check does
         not run for this channel, which is what the published verdict has to say
         instead of a silent pass (PROJECT.md section 8 items 79, 117).
+
+        The text depends on nothing that moves -- the output number and what the kind
+        reports for it -- so each output's mapping is built once per adapter and the
+        same object is handed out every tick. Nothing may mutate it: it goes straight
+        into ``PlantObservation.inputs['fans']``, and from there into the published
+        verdict, on a path that only reads.
         """
+        cached = self._not_measured_cache.get(number)
+        if cached is not None:
+            return cached
         out: dict[str, str] = {}
         aquabus = number in self._aquabus
         if not rail:
             out["rail"] = (
-                f"pwm{number} is an output of a device on the {self.kind.name}'s aquabus: the "
-                f"{self.kind.name} puts the bus device's rail in that block in about one "
-                "report in four and its own rail in the rest, and a single report does not "
-                "say which, so no rail is published and the rail rule is off for this output "
-                "-- a rail sagging behind the bus device is NOT detected (PROJECT.md section "
-                "8 item 117)"
+                f"pwm{number} is an output of a device on the {self.kind.name}'s aquabus: "
+                "that block holds the bus device's rail in about one report in four and the "
+                f"{self.kind.name}'s own in the rest, with nothing to tell them apart, so no "
+                "rail is published and a rail sagging behind the bus device is NOT detected "
+                "(PROJECT.md section 8 item 117)"
             )
         if not reported:
             out["power"] = (
                 f"pwm{number} reports no current or power this daemon may judge: "
                 + (
-                    f"the {self.kind.name} carries the bus device's measurement in about one "
-                    "report in four and 0 mA / 0 W in the rest"
+                    "that block carries the bus device's measurement in about one report in "
+                    "four and 0 mA / 0 W in the rest"
                     if aquabus
                     else f"the {self.kind.name} reports 0 mA and 0 W for its own outputs in "
                     "PWM mode however fast the fan turns"
                 )
                 + " (PROJECT.md section 8 item 79)"
             )
+        self._not_measured_cache[number] = out
         return out
 
-    def software_sensors(self) -> list[dict[str, Any]]:
+    def software_sensors(self) -> list[dict[str, Any]] | None:
         """Every software temperature slot of this controller, as the newest control
         report configures it and the newest status report reads it (item 113).
 
@@ -812,15 +835,24 @@ class AquacomputerAdapter:
         anything here feeds), ``reading_c`` (what the status report shows, ``None``
         for a disabled slot's ``0x7FFF``) and ``reads_fallback`` -- the reading is
         exactly the configured fallback, which on an unfed slot is what it will read
-        for ever. Empty until a control report has been adopted, and on a kind whose
-        settings are not known (the Quadro).
+        for ever.
+
+        ``None`` while no control report has been decoded yet, which is *not* the
+        empty list of a kind whose settings are not known (the Quadro): "not known
+        yet" and "this device has none" must not read alike. The settings survive an
+        invalidation of the cached control report (a duty mismatch invalidates one
+        every time it happens) and a close, because they are the operator's
+        configuration of the controller and no write of this daemon changes them --
+        without that, these slots and the disabled-heartbeat problem below would
+        vanish and come back with every refetch, and the Home Assistant problem
+        sensor with them.
         """
-        ctrl, status = self._ctrl, self._status
-        if ctrl is None:
-            return []
+        settings_all, status = self._soft_sensor_settings(), self._status
+        if settings_all is None:
+            return None
         fed = self.timing.heartbeat_sensor if self.timing.heartbeat_on else 0
         out: list[dict[str, Any]] = []
-        for settings in software_sensor_settings(self.kind, ctrl):
+        for settings in settings_all:
             reading = None if status is None else status.temps.get(settings.name)
             out.append(
                 {
@@ -852,6 +884,8 @@ class AquacomputerAdapter:
         sensors are what item 113 asks a human to be able to see -- which ``softN``
         slots this controller has enabled, what each one falls back to, which one this
         daemon feeds, and whether a slot is reading its fallback right now.
+        ``software_sensors`` is ``null`` until a control report has been decoded and
+        ``[]`` on a kind with no software sensors this daemon knows how to read.
         """
         status = self._status
         label = self.binding.label
@@ -907,16 +941,33 @@ class AquacomputerAdapter:
         health["problems"] = problems
         return health
 
-    def _software_sensors_safely(self) -> list[dict[str, Any]]:
+    def _soft_sensor_settings(self) -> tuple[SoftSensorSettings, ...] | None:
+        """The controller's software-sensor configuration, decoded from the cached
+        control report and **kept** once decoded (``self._soft_settings``).
+
+        The cache is not an optimisation: ``self._ctrl`` is dropped on every duty
+        mismatch, every close and every refresh, and what it holds here -- which slots
+        the operator enabled, their fallbacks and timeouts -- does not change with it.
+        Publishing it only while a report happens to be cached would make the slots and
+        the disabled-heartbeat problem appear and disappear on a rhythm that has
+        nothing to do with the controller (item 113).
+        """
+        ctrl = self._ctrl
+        if ctrl is not None:
+            self._soft_settings = software_sensor_settings(self.kind, ctrl)
+        return self._soft_settings
+
+    def _software_sensors_safely(self) -> list[dict[str, Any]] | None:
         """:meth:`software_sensors`, but never raising: ``device_health`` is a
-        diagnostics path and a malformed cached report must not cost it."""
+        diagnostics path and a malformed cached report must not cost it. A failure
+        publishes ``None`` (not known), never ``[]`` (this device has none)."""
         try:
             return self.software_sensors()
         except Exception:  # pragma: no cover - the cached report is validated already
             _LOG.exception("%s: reading the software-sensor settings failed", self.binding.label)
-            return []
+            return None
 
-    def _heartbeat_problems(self, sensors: Sequence[Mapping[str, Any]]) -> list[str]:
+    def _heartbeat_problems(self, sensors: Sequence[Mapping[str, Any]] | None) -> list[str]:
         """The two states of the software-sensor watchdog worth a human's attention.
 
         A heartbeat whose last write failed: the controller's own timeout is running
@@ -928,6 +979,10 @@ class AquacomputerAdapter:
         controller's configuration, it is published in ``software_sensors``, and
         making it a problem would leave a board with eight enabled sensors
         permanently not-ok.
+
+        ``sensors`` is ``None`` only while no control report has ever been decoded:
+        the settings are kept across an invalidation (:meth:`_soft_sensor_settings`),
+        so the disabled-heartbeat verdict holds instead of flapping with the cache.
         """
         if not self.heartbeat_on:
             return []
@@ -938,7 +993,7 @@ class AquacomputerAdapter:
                 f"{label}: the last software-sensor heartbeat to soft{number} was not sent; "
                 "the controller's own timeout is running"
             )
-        slot = next((s for s in sensors if s.get("name") == f"soft{number}"), None)
+        slot = next((s for s in sensors or () if s.get("name") == f"soft{number}"), None)
         if slot is not None and not slot.get("enabled"):
             out.append(
                 f"{label}: heartbeat_sensor is soft{number}, which is disabled on the "
@@ -1787,6 +1842,19 @@ def _tachometer_number(where: str, value: Any, kind: DeviceKind) -> int:
     )
 
 
+def _bindable_temps(kind: DeviceKind) -> str:
+    """The kind's temperature inputs a config may bind, for the messages that offer a
+    choice: everything :meth:`DeviceKind.describe_temps` lists *except* the software
+    sensors, which no config may bind (item 113). Offering ``softN`` as a valid answer
+    to "which input did you mean" would send an operator straight into the refusal.
+    """
+    return ", ".join(
+        f"{g.prefix}1..{g.prefix}{g.count}"
+        for g in kind.temp_groups
+        if g.prefix != SOFT_SENSOR_PREFIX
+    )
+
+
 def _temperature_input(where: str, value: Any, kind: DeviceKind) -> str:
     soft = kind.soft_sensor_names
     renamed = _HWMON_ERA_TEMPS[kind.name].get(value) if isinstance(value, str) else None
@@ -1809,7 +1877,7 @@ def _temperature_input(where: str, value: Any, kind: DeviceKind) -> str:
             f"{group.description}): use {renamed!r}"
         )
     raise ConfigError(
-        f"{where} must be one of the {kind.name}'s temperature inputs {kind.describe_temps()}, "
+        f"{where} must be one of the {kind.name}'s temperature inputs {_bindable_temps(kind)}, "
         f"got {value!r}{hint}"
     )
 

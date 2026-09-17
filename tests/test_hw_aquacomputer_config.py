@@ -227,7 +227,9 @@ def test_quadro_ranges_differ_from_the_aquaero() -> None:
     with pytest.raises(ConfigError, match="quadro's outputs pwm1..pwm4, got 'pwm5'"):
         _parse(dict(quadro, fans={"radiator": {"pwm": "pwm5"}}))
     with pytest.raises(
-        ConfigError, match="quadro's temperature inputs temp1..temp4, soft1..soft16, got 'bus1'"
+        # softN is not offered as a choice: nothing may bind one (item 113)
+        ConfigError,
+        match="quadro's temperature inputs temp1..temp4, got 'bus1'",
     ):
         _parse(dict(quadro, temp_map={"coolant": "bus1"}))
     with pytest.raises(ConfigError, match="got 'virt1'"):
