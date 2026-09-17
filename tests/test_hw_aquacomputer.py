@@ -212,8 +212,9 @@ def test_the_aquabus_blocks_electrical_fields_are_not_a_per_report_reading() -> 
     255 rpm in both. One report carries the bus device's own measurements -- block 7 at
     6 mA / 0.07 W, the three outputs with no fan at 0.00 V -- and the next carries
     substitutes: the rail voltage on all four and 0 mA / 0 W on the turning fan. So a
-    single report says nothing about an aquabus output's draw, and
-    ``reports_power`` is False for the aquaero's aquabus outputs as well as its own.
+    single report says nothing about an aquabus output's draw *or its rail*, and both
+    ``reports_power`` and ``reports_rail`` are False for the aquaero's aquabus outputs
+    (``reports_power`` for its own four as well; their rail it does measure).
     """
     with_power = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-power.bin"))
     without = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-no-power.bin"))
@@ -231,9 +232,16 @@ def test_the_aquabus_blocks_electrical_fields_are_not_a_per_report_reading() -> 
     assert [AQUAERO.reports_power(n) for n in range(1, 9)] == [False] * 8
     assert not AQUAERO.own_outputs_report_power and not AQUAERO.aquabus_outputs_report_power
     assert all(QUADRO.reports_power(n) for n in range(1, 5))
+    # The rail goes the same way: block 7's 1210 is the Quadro's and 1209 the aquaero's
+    # own, one second apart, at one unchanged duty -- so no aquabus block's voltage is
+    # that output's rail, while the aquaero's own blocks 1-4 report theirs.
+    assert [AQUAERO.reports_rail(n) for n in range(1, 9)] == [True] * 4 + [False] * 4
+    assert not AQUAERO.aquabus_outputs_report_rail
+    assert all(QUADRO.reports_rail(n) for n in range(1, 5))
+    assert [with_power.fans[k].voltage_cv for k in range(4)] == [1205, 1206, 1207, 1205]
 
 
-def test_the_aquabus_blocks_dont_carry_the_aquaeros_own_current() -> None:
+def test_the_aquaeros_own_blocks_report_no_current() -> None:
     """The aquaero's own outputs 1-4 in PWM mode report 0 mA and 0 W however fast the
     fan turns -- three of the four were turning in both captures (item 79)."""
     for name in (
@@ -251,10 +259,14 @@ def test_the_live_temperature_groups_and_their_not_connected_sentinel() -> None:
     """2026-09-17, the final wiring: one thermistor on the aquaero's sensor 6, the
     Quadro's sensor 2 in aquabus slot 2, all eight software sensors enabled (sensor 1
     fed by the daemon's heartbeat at 20.00 degC, the others at their 50.00 degC
-    fallback), no virtual sensor configured. Every other slot of every group reads the
-    0x7FFF sentinel and decodes as None."""
+    fallback), no virtual sensor configured. So 10 of the aquaero's 28 temperature
+    slots carry a value and the other 18 read the 0x7FFF sentinel and decode as None
+    -- the count the table in PROJECT.md section 2 states."""
     report = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-no-power.bin"))
     assert report.firmware == 2104
+    populated = sorted(name for name, value in report.temps.items() if value is not None)
+    assert len(report.temps) == 28 and len(populated) == 10
+    assert populated == ["bus2", *(f"soft{n}" for n in range(1, 9)), "temp6"]
     assert report.temp("temp6") == pytest.approx(23.05)
     assert [report.temp(f"temp{n}") for n in (1, 2, 3, 4, 5, 7, 8)] == [None] * 7
     assert report.temp("bus2") == pytest.approx(23.68)

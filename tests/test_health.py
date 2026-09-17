@@ -31,6 +31,7 @@ from aqua_bridge.health import (
 )
 from aqua_bridge.hostinfo import decode_throttled, read_rpi_volt_hwmon
 from aqua_bridge.hw.aquacomputer import AQUAERO, QUADRO, decode_status
+from aqua_bridge.hw.aquacomputer_adapter import AquacomputerAdapter, DeviceBinding
 from aqua_bridge.model import ConfigError, FanModel, FanSpec, MpcConfig, PlantObservation
 from aquacomputer_fakes import fixture_bytes
 
@@ -494,13 +495,21 @@ def test_a_repeated_problem_is_logged_at_most_once_per_log_interval_s(
 # --- against the captured reports -----------------------------------------------------
 
 
-def test_no_aquaero_output_reports_power_the_power_rule_can_judge() -> None:
+def _captured_reading(name: str, channel: str, number: int) -> dict[str, Any]:
+    """``channel``'s reading as the adapter publishes it from a captured report."""
+    adapter = AquacomputerAdapter(DeviceBinding(kind=AQUAERO, pwm_map={channel: number}))
+    status = decode_status(AQUAERO, fixture_bytes(name))
+    return adapter.fan_readings(status)[channel]
+
+
+def test_no_aquaero_output_gives_the_power_rule_a_number_to_judge() -> None:
     """Neither the aquaero's own outputs (0 mA in PWM mode) nor its aquabus blocks
     (the bus device's current in about one report in four, 0 mA in the rest,
     2026-09-17) give the power rule anything to judge; the Quadro's own outputs do.
     The same fan block reads 27 mA in one capture and 0 mA in another at the same
-    duty and speed, which is why a number there may never reach the rule
-    (PROJECT.md section 8 item 89)."""
+    duty and speed, which is why a number there may never reach the rule -- so the
+    rule is run here over the captured readings and must stay silent whatever the
+    model expects (PROJECT.md section 8 item 89)."""
     status = decode_status(AQUAERO, fixture_bytes("aquaero-status-aquabus-fan7-100.bin"))
     assert not any(AQUAERO.reports_power(n) for n in range(1, 9))
     assert (status.fans[0].current_ma, status.fans[0].power_cw) == (0, 0)  # own output, 349 rpm
@@ -508,6 +517,55 @@ def test_no_aquaero_output_reports_power_the_power_rule_can_judge() -> None:
     turning = decode_status(AQUAERO, fixture_bytes("aquaero-status-aquabus-block7-no-power.bin"))
     assert turning.rpm(7) == 255 and turning.fans[6].current_ma == 0
     assert all(QUADRO.reports_power(n) for n in range(1, 5))
+    # the rule itself, over the reading that report produces: the aquabus block at
+    # 100 % duty reports 0.32 W where the model expects 2 W, so the only thing
+    # keeping the rule quiet is power_reported -- forcing it on fires the rule.
+    model = FanModel(rpm_max=1200.0, deadband=0.1, power_w_at_max=2.0)
+    settings = FanHealthConfig(settle_s=0.0, power_fault_s=0.0001)
+    reading = _captured_reading("aquaero-status-aquabus-fan7-100.bin", "qd3", 7)
+    assert reading["power_reported"] is False and reading["duty"] == pytest.approx(1.0)
+    assert reading["current_ma"] is None and reading["power_w"] is None
+    mon = _monitor(settings, case120=model)
+    mon.check_channel("qd3", reading, 0.0)
+    verdict = mon.check_channel("qd3", reading, 1000.0)
+    assert verdict["expected_power_w"] == pytest.approx(2.0) and verdict["problems"] == []
+    as_measured = dict(reading, power_reported=True, power_w=0.32, current_ma=27.0)
+    ungated = _monitor(settings, case120=model)
+    ungated.check_channel("qd3", as_measured, 0.0)
+    assert [p for p in ungated.check_channel("qd3", as_measured, 1000.0)["problems"] if "W" in p]
+
+
+def test_an_aquabus_outputs_rail_is_never_judged_however_the_reports_alternate() -> None:
+    """The aquaero puts the bus device's rail in an aquabus block in about one report
+    in four and its *own* rail there in the rest, and nothing in a single report tells
+    them apart, so the block's voltage is published as unknown and the rail rule never
+    sees it: it neither fires on the aquaero's rail nor has its timer reset by one
+    (PROJECT.md section 2, 2026-09-17; section 8 item 89). The aquaero's own outputs
+    report their own rail and are judged as before."""
+    measuring = _captured_reading("aquaero-status-aquabus-block7-power.bin", "qd3", 7)
+    substitute = _captured_reading("aquaero-status-aquabus-block7-no-power.bin", "qd3", 7)
+    assert [r["rail_reported"] for r in (measuring, substitute)] == [False, False]
+    assert [r["voltage_v"] for r in (measuring, substitute)] == [None, None]
+    mon = _monitor(FanHealthConfig(settle_s=0.0, rail_fault_s=0.0001))
+    for tick in range(10):  # alternating, well past rail_fault_s
+        reading = measuring if tick % 4 == 0 else substitute
+        verdict = mon.check_channel("qd3", reading, 100.0 * tick)
+        assert verdict["voltage_v"] is None and verdict["problems"] == []
+    # and why publishing it would be worse than useless: a bus device whose rail
+    # really sagged would be judged 8 V in the measuring reports and the aquaero's
+    # own 12.09 V in the rest, so the timer would be reset about every second and
+    # the dead rail would never be reported at all.
+    published = _monitor(FanHealthConfig(settle_s=0.0, rail_fault_s=120.0))
+    for tick in range(200):
+        volts = 8.0 if tick % 4 == 0 else 12.09
+        reading = dict(substitute, rail_reported=True, voltage_v=volts)
+        assert published.check_channel("qd3", reading, 1.0 * tick)["problems"] == []
+    # the same rule does judge an own output, and a sagging one is reported
+    own = _captured_reading("aquaero-status-aquabus-block7-power.bin", "xt2", 2)
+    assert own["rail_reported"] is True and own["voltage_v"] == pytest.approx(12.06)
+    sagging = dict(own, voltage_v=8.0)
+    mon.check_channel("xt2", sagging, 0.0)
+    assert mon.check_channel("xt2", sagging, 1000.0)["problems"] != []
 
 
 def test_the_captured_rails_sit_inside_the_default_window() -> None:

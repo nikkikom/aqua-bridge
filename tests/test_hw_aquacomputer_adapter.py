@@ -1361,34 +1361,83 @@ def test_all_eight_aquaero_outputs_go_out_in_one_set() -> None:
     assert all(channel_holds(AQUAERO, device.ctrl, k, (k + 1) * 1000) for k in range(8))
 
 
-def test_aquabus_modes_get_no_warning_and_a_block_without_a_source_is_refused(caplog) -> None:
+def test_aquabus_modes_get_no_warning_and_a_block_without_a_source_is_left_out(caplog) -> None:
     """Blocks 5-7 read mode 0x0500 (not interpreted): no "not PWM" warning. Block 8 has
-    no control source (0xFFFF): the daemon refuses to command it rather than writing the
-    block blind, so nothing is written at all (PROJECT.md section 8 item 89)."""
+    no control source (0xFFFF): the daemon will not write that block blind, so it leaves
+    *that channel* out of the write -- the other three go out in the same SET, block 8
+    keeps every field the controller held, and the channel is logged once and reported
+    (PROJECT.md section 8 item 89)."""
     binding = DeviceBinding(kind=AQUAERO, pwm_map={f"qd{n}": n + 4 for n in range(1, 5)})
     adapter, device, _clock = _aquabus(binding)
-    with (
-        caplog.at_level("WARNING", logger=LOGGER),
-        pytest.raises(DeviceUnavailable, match="no control source"),
-    ):
+    with caplog.at_level("WARNING", logger=LOGGER):
         adapter.apply(_cmd(qd1=0.5, qd2=0.5, qd3=0.5, qd4=0.5))
     assert not [m for m in _messages(caplog, "WARNING") if "not PWM" in m]
-    assert device.sets() == [] and device.saves() == []
-    assert adapter.unconfigured_channels == ("qd4",)
-    assert any("no control source" in p for p in adapter.device_health()["problems"])
-    state = channel_state(AQUAERO, device.ctrl, 7)
+    assert len(device.sets()) == 1 and device.saves() == []
+    assert [channel_holds(AQUAERO, device.ctrl, k, 5000) for k in (4, 5, 6)] == [True] * 3
+    state = channel_state(AQUAERO, device.ctrl, 7)  # untouched: no source, no duty written
     assert (state.duty, state.source, state.on_duty) == (10000, SOURCE_UNCONFIGURED, False)
+    errors = [m for m in _messages(caplog, "ERROR") if "no control source" in m]
+    assert len(errors) == 1 and "pwm8 (qd4)" in errors[0]
+    assert adapter.unconfigured_channels == ("qd4",)
+    assert any("not commanded" in p for p in adapter.device_health()["problems"])
+    # and it stays out, without a second log line, while the block reads that way
+    with caplog.at_level("WARNING", logger=LOGGER):
+        adapter.apply(_cmd(qd1=0.6, qd2=0.6, qd3=0.6, qd4=0.6))
+    assert len(device.sets()) == 2
+    assert channel_state(AQUAERO, device.ctrl, 7).source == SOURCE_UNCONFIGURED
+    assert len([m for m in _messages(caplog, "ERROR") if "no control source" in m]) == 1
+
+
+def test_a_block_without_a_source_never_stops_the_heartbeat_or_the_other_channels() -> None:
+    """One unconfigured block must not take a whole controller to the aquaero's watchdog
+    fallback: ``apply()`` does not raise, the seven configured outputs are written, and
+    the software-sensor heartbeat that keeps the watchdog quiet still goes out
+    (PROJECT.md section 8 item 89)."""
+    binding = DeviceBinding(
+        kind=AQUAERO,
+        pwm_map={f"o{n}": n for n in range(1, 9)},
+        timing=_timing(AQUAERO, **HEARTBEAT),
+    )
+    adapter, device, _clock = _aquabus(binding)
+    adapter.apply(_cmd(**{f"o{n}": n / 10 for n in range(1, 9)}))
+    assert len(device.sets()) == 1 and len(device.writes()) == 1  # duties, then heartbeat
+    assert device.last_set_duties()[:7] == [n * 1000 for n in range(1, 8)]
+    assert channel_state(AQUAERO, device.ctrl, 7).source == SOURCE_UNCONFIGURED
+    assert adapter.unconfigured_channels == ("o8",)
 
 
 def test_a_block_without_a_source_that_is_not_commanded_is_no_problem() -> None:
-    """Only a *commanded* channel is refused: the same controller with its aquabus
-    outputs 5-7 bound and block 8 left out works normally."""
+    """Only a *commanded* channel is left out: the same controller with its aquabus
+    outputs 5-7 bound and block 8 left out of the config works normally."""
     binding = DeviceBinding(kind=AQUAERO, pwm_map={f"qd{n}": n + 4 for n in range(1, 4)})
     adapter, device, _clock = _aquabus(binding)
     adapter.apply(_cmd(qd1=0.5, qd2=0.5, qd3=0.5))
     assert len(device.sets()) == 1
     assert adapter.unconfigured_channels == ()
     assert adapter.device_health()["problems"] == []
+
+
+def test_control_snapshot_shows_a_block_without_a_source_instead_of_raising() -> None:
+    """``control_snapshot()`` is the commissioning tool whose job is to show the owner
+    the block that is wrong (item 88): it returns that report, and the channel is in
+    ``unconfigured_channels`` for the caller to print."""
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={f"qd{n}": n + 4 for n in range(1, 5)})
+    adapter, device, _clock = _aquabus(binding)
+    snapshot = adapter.control_snapshot()
+    assert snapshot == bytes(device.ctrl) and device.sets() == []
+    assert adapter.unconfigured_channels == ("qd4",)
+
+
+def test_release_restores_and_reports_success_with_an_unconfigured_block(caplog) -> None:
+    """A restore that went out is a success even when the controller still holds a block
+    with no control source: the adopt of the restored report raises nothing (item 89)."""
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={f"qd{n}": n + 4 for n in range(1, 5)})
+    adapter, device, _clock = _aquabus(binding)
+    adapter.apply(_cmd(qd1=0.5, qd2=0.5, qd3=0.5, qd4=0.5))
+    with caplog.at_level("INFO", logger=LOGGER):
+        adapter.release()
+    assert len(device.sets()) == 2
+    assert any("restored the captured control settings" in m for m in _messages(caplog, "INFO"))
 
 
 def test_an_output_without_a_device_on_aquabus_faults_only_its_own_channel(caplog) -> None:

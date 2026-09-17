@@ -164,9 +164,10 @@ def test_decodes_the_quadro_on_the_aquaeros_aquabus(tmp_path: Path) -> None:
     text = out.getvalue()
     assert "  aquabus temperature slots (bus1..bus8, degC):\n    bus2      24.14\n" in text
     # The aquaero measures neither its own nor its aquabus outputs dependably (item 89):
-    # the raw figures are shown, marked as not measured.
+    # the raw figures are shown, marked as not measured -- on an aquabus block that
+    # includes the voltage, which is the aquaero's own rail in three reports out of four.
     assert (
-        "pwm7/fan7   1105 rpm  duty 100.00 %  12.10 V  not measured (27 mA, 0.32 W)  "
+        "pwm7/fan7   1105 rpm  duty 100.00 %  not measured (12.10 V, 27 mA, 0.32 W)  "
         "(aquabus)" in text
     )
     assert "pwm5/fan5      0 rpm" in text and "no device" not in text

@@ -604,10 +604,11 @@ What every decoder assumption now stands at:
 | `bus1..8` at `0x75` | confirmed for slot 2 | `bus2` 23.64–23.69 °C = the Quadro's sensor 2; slots 1, 3, 4 read `0x7FFF` because the Quadro has no thermistor there, so the claimed 1:1 sensor→slot map is **unobservable** for 1, 3 and 4 |
 | `soft1..8` at `0x85` | confirmed | `soft1` = 20.00 °C, the heartbeat service's value; `soft2..8` = 50.00 °C, their configured fallback (all eight sensors are enabled now; a *disabled* one reads `0x7FFF`, `aquaero-status-no-aquabus.bin`) |
 | `virt1..4` at `0x95` | confirmed as a group | all four `0x7FFF`; no virtual sensor is configured, so a populated one stays **unobservable** |
-| `0x7FFF` = not connected, in every temperature group | confirmed | 23 of the 28 slots held it in all 90 reports |
+| `0x7FFF` = not connected, in every temperature group | confirmed | 18 of the 28 slots held it in all 90 reports; the 10 that carried a value are `temp6`, `bus2` and `soft1..soft8` (pinned against the fixtures in `tests/test_hw_aquacomputer.py`) |
 | fan blocks at `0x167 + 12k`, rpm +0, duty +2, voltage +4 | confirmed, blocks 1-8 | rpm agrees with the fans that turn; duty 2000 on all eight = preset 1's 20.00 %; voltage 12.04–12.10 V |
 | rpm `0xFFFF` = no device behind the block | confirmed, and narrower than it reads | it means *no device on aquabus at all*: with the Quadro present, its outputs with no fan read 0 rpm, not `0xFFFF` |
 | fan block current +6 and power +8 | **contradicted as a per-report reading** | see below |
+| fan block voltage +4 = *that output's* 12 V rail | confirmed on blocks 1-4, **contradicted on the aquabus blocks 5-8** | block 7 read 12.10 V (the Quadro's rail) in a measuring report and 12.09 V (the aquaero's own) one second later at an unchanged duty, and the outputs with no fan read 0.00 V then 12.09 V; nothing in a single report tells the two apart, so `DeviceKind.reports_rail` is False for 5-8 and the adapter publishes no rail for them |
 | the `u16` at `+0x0A` of a fan block = current in mA (item 89's guess) | **contradicted** | it read 26 while the same block's current field read 6 mA; over the run it tracked current and power but matched neither (26↔6 mA/7 cW, 22↔5/6, 15↔4/4, 11↔3/3, 3↔1/1). Unidentified; the decoder does not read it |
 | flow `flow1..3` at `0xF9`, `flow3` from aquabus | confirmed | all three read 0 with the Quadro present; `flow3` read `0x7FFF` without it (2026-09-15), so `0x7FFF` is the absent-slot sentinel and 0 is "present, nothing connected" |
 | control report: feature id `0x0B`, 2707 bytes, no checksum | confirmed | one GET, 2707 bytes |
@@ -631,15 +632,33 @@ turning at 255 rpm**. The refresh is not atomic either: one report had current 6
 mA with power 0, another had blocks 5 and 6 refreshed and block 8 not. So on the
 aquaero neither its own outputs (PWM mode, always 0 mA) nor its aquabus outputs
 give a current a health rule may judge, and `DeviceKind.reports_power` is False
-for all eight. The 12 V rail rule was already safe here: it does not judge a
-block reading 0.0 V.
+for all eight.
+
+**The voltage field of an aquabus block is not that output's rail either.** It
+is the bus device's rail in the measuring reports and the aquaero's own in the
+rest — 12.10 V and 12.09 V one second apart on block 7 at an unchanged duty —
+and a single report does not say which. Published as the output's rail it would
+be a placeholder standing in for a measurement in about three ticks out of four,
+and the rail rule would be *worse* than off: a bus device whose rail really
+sagged would be judged 8 V in one report and the aquaero's 12.09 V in the next,
+which restarts the rule's timer about every second, so `rail_fault_s` would
+never be reached and the dead rail would never be reported. `DeviceKind`
+therefore carries `aquabus_outputs_report_rail` (False on the aquaero) next to
+`aquabus_outputs_report_power`, `fan_readings` publishes `voltage_v` as `None`
+with `rail_reported` false for those outputs, and the rail rule is honestly off
+for an aquaero's aquabus outputs (§3 "Fan and device health"): a sagging rail
+behind a bus device is **not detected**, and it would take a controller that
+reports its own outputs' rails to detect it. The aquaero's own outputs 1–4 are
+unaffected and are judged as before. An empty aquabus slot reading 0.00 V in a
+measuring report is what the rule's "0.0 V is not judged" clause is for.
 
 What this wiring cannot answer, and what it would take:
 
 - whether writing a controller block with **no control source** makes its output
   follow. It needs a block deliberately left unconfigured *and* a fan on that
-  output, i.e. a write the owner must authorise; until then the adapter refuses
-  to command such a channel (item 89).
+  output, i.e. a write the owner must authorise; until then the adapter leaves
+  that one channel out of its writes and reports it, while every other channel of
+  the same controller is written as usual (item 89).
 - the preset id `0x5C + k` for k = 1..5 and 7, and that writing min / max power
   takes effect: both need a control-report SET.
 - the aquabus sensor→slot map for the Quadro's sensors 1, 3 and 4: it needs
@@ -2938,13 +2957,19 @@ a model converges only with them.
     commanded output of the aquaero's own (1–4) not in PWM mode and none
     for an aquabus output (5–8, mode word not interpreted); the adapter
     never writes the mode. A commanded channel whose controller block has
-    **no control source** (`0xFFFF`) is refused, not written blind: adopting
-    such a control report raises `DeviceUnavailable` naming the channel and
-    telling the owner to give the output a source or drop it from the
-    config, because nothing on the device drives that output and no capture
-    shows that writing the block the way a configured one is written would
-    change that (§8 item 89). `unconfigured_channels` and the
-    `device_health` problem stay, as the reason reads and writes fail. A stuck channel's error
+    **no control source** (`0xFFFF`) is left out of the write instead of
+    being written blind, because nothing on the device drives that output
+    and no capture shows that writing the block the way a configured one is
+    written would change that (§8 item 89). The refusal is **per channel**:
+    `apply()` writes every other channel of that controller in the same SET
+    and sends the software-sensor heartbeat as usual, and `read()` is
+    unaffected (it never adopts a control report), so one unconfigured block
+    cannot take a whole controller — or the heartbeat that keeps the
+    aquaero's watchdog quiet — down with it. The channel is logged once per
+    open as an error, and stays in `unconfigured_channels` and in the
+    `device_health` problem list, telling the owner to give the output a
+    source in the controller's own software or drop it from the config, for
+    as long as the block reads that way. A stuck channel's error
     carries the adapter's `stuck_hint` when it returns one
     (`CompositeSource` sets it on a Quadro, below);
     (b) *power cycles* — a change of the Quadro's power-cycle count from
@@ -3133,9 +3158,12 @@ a model converges only with them.
   - the measurements ride the observation.
     `AquacomputerAdapter.fan_readings()` returns
     `{channel: {device, output, tach, rpm, duty, voltage_v, current_ma,
-    power_w, power_reported, aquabus}}` — `current_ma` and `power_w` are
-    `None`, not a number, wherever `power_reported` is false, so a
-    placeholder can never be read as a measurement (§8 item 89); `rpm` from
+    power_w, power_reported, rail_reported, aquabus}}` — `current_ma` and
+    `power_w` are `None`, not a number, wherever `power_reported` is false,
+    and `voltage_v` is `None` wherever `rail_reported` is false (the
+    aquaero's aquabus outputs, whose voltage field is the aquaero's own rail
+    in about three reports out of four), so a placeholder can never be read
+    as a measurement (§8 item 89); `rpm` from
     the channel's *bound*
     tachometer (`fans.<ch>.rpm`, named in `tach`), the one `obs.rpm` and a
     `tools/fit_fans.py` fit describe, which the config may deliberately put
@@ -3181,9 +3209,14 @@ a model converges only with them.
     `rpm_fault_s`.
   - **the 12 V rail.** Outside `[rail_min_v, rail_max_v]` for
     `rail_fault_s`. A block reading 0.0 V is not judged: that is an
-    aquaero's empty aquabus slot -- and also a *populated* aquabus block in
-    the reports that carry the bus device's own measurements (§2,
-    2026-09-17) -- not a dead rail. This rule does not
+    aquaero's empty aquabus slot — an aquabus output with nothing connected,
+    on a bus device that is present, reads 0.00 V in the reports that carry
+    that device's own measurements (§2, 2026-09-17) — not a dead rail. The
+    rule is off altogether for an aquaero's **aquabus** outputs, whose
+    voltage field is the aquaero's own rail in about three reports out of
+    four and is therefore published as unknown (§2, 2026-09-17): a rail
+    sagging behind a bus device is not detected, and judging the substituted
+    value would have been worse than not judging at all. This rule does not
     depend on the duty, so it is judged at every duty and a duty move never
     restarts it: a rail that sags while the solver modulates is exactly the
     case worth catching.
@@ -3371,13 +3404,14 @@ a model converges only with them.
   every discovered aquaero and Quadro (kind, serial, USB interface, node),
   then prints each one's status report (temperatures by group under their
   config names; rpm, duty, voltage, current and power per output, the
-  aquaero's outputs 5–8 marked aquabus and "no device" without one; on a
-  kind and output that measures neither, current and power are printed but
-  marked as not measured; flow, "no data" for an absent slot;
+  aquaero's outputs 5–8 marked aquabus and "no device" without one; a field
+  the kind does not measure for that output is printed but marked as not
+  measured — current and power on the aquaero's own outputs, and on its
+  aquabus outputs the voltage too; flow, "no data" for an absent slot;
   the Quadro's power cycles) and each output's control-report duty with the
   aquaero's control source, power limits and output mode (PWM or DC
   voltage; not interpreted on aquabus outputs; a block with no control
-  source marked, which the daemon refuses to command).
+  source marked, which the daemon leaves out of its writes).
   Read-only: it never sends a SET or the save report. `--device`, `--serial`,
   `--timeout` (default: the `status_max_age_s` default).
 - Unit tests against captured HID reports, a **fake controller**
@@ -3993,7 +4027,14 @@ the board.
   `0x7FFF`, the slot it lands in read back as `softN`, a bad sensor number or
   a temperature the field cannot carry, none for the Quadro) and the
   active-profile byte (profile 1 in every capture, every raw value, none for
-  the Quadro); Hypothesis round trips of patched duties.
+  the Quadro); Hypothesis round trips of patched duties. The 2026-09-17
+  verification captures (§2 "aquabus fields checked against the live devices")
+  pin what that read found: the aquabus blocks' electrical fields in both of
+  their states one second apart (so neither the current nor the voltage is that
+  output's own), the aquaero's own blocks reporting no current whatever the
+  fan does, the live temperature groups with 10 of 28 slots populated and the
+  rest at the `0x7FFF` sentinel, the live control report with every block on
+  preset 1, and the aquabus mode word read but never interpreted.
 - `tests/test_hw_hidraw.py` — discovery on a fake sysfs tree (interface
   selection, serial selection, ambiguity naming the serials, not found,
   uevent lines without `=`), the ioctl request numbers, draining reports
@@ -4024,8 +4065,13 @@ the board.
   one within tolerance or one without a new report does not fire; another
   channel changing every tick does not hold it off; a change of the
   channel itself restarts it), the rewrite-then-stuck escalation and its
-  hint, the aquaero output mode warning (none for aquabus outputs, one per
-  adapter for an unconfigured block), aquabus outputs 5–8 (read, the output
+  hint, the aquaero output mode warning (none for aquabus outputs), a
+  commanded block with no control source left out of the write (the other
+  channels of the same controller still written in one SET, the block's own
+  fields untouched, the heartbeat still sent, one error per open, the channel
+  in `unconfigured_channels` and in `device_health`; `control_snapshot()`
+  showing it instead of raising; `release()` still reporting success; a block
+  nobody commands no problem at all), aquabus outputs 5–8 (read, the output
   7 write with the hardware's bytes, all eight in one SET, an output or
   tachometer with no device behind it reported as `None` while the rest of
   the controller still reads and every channel is still written,
@@ -4075,7 +4121,11 @@ the board.
   window; nothing judged
   below `min_duty` (the captured 9.02 % duty / 128 rpm aquabus report);
   0 V never a rail fault; 0 W never a fault on an aquaero's own output but a
-  fault on one that reports power; the power rule off without
+  fault on one that reports power; no aquaero output giving the power rule a
+  number to judge, shown by running the rule over the captured readings and by
+  the same readings firing it once `power_reported` is forced on; an aquabus
+  output's rail never judged however the measuring and substituting reports
+  alternate, while an own output's is (§8 item 89); the power rule off without
   `power_w_at_max` and following the fan law and `fans.<ch>.count` with one;
   `on_tick` publishing both halves, never raising on a broken result, source
   or publisher, and rate-limiting its log. The captured reports supply the
@@ -6999,13 +7049,27 @@ Owner decision (2026-09-16):
       outputs as well as its own, and `fan_readings` publishes `current_ma`
       and `power_w` as `None` rather than a 0.0 the health rules could act
       on.
+    - **the aquabus blocks' voltage** — contradicted the same way, and found
+      in review of this item's own change: the field holds the bus device's
+      rail in the measuring reports and the aquaero's own in the rest
+      (12.10 V and 12.09 V on block 7 one second apart at an unchanged
+      duty), so it is not that output's rail. `DeviceKind` now carries
+      `aquabus_outputs_report_rail` (False on the aquaero), `fan_readings`
+      publishes `voltage_v` as `None` with `rail_reported` false there, and
+      the rail rule is off for those outputs rather than judging — and
+      resetting its own timer on — a substituted value (§2, 2026-09-17).
     - **writing the unconfigured control block** — still unobservable: block
       8 is configured in this wiring (source `0x5C`), so nothing can be
-      learned read-only. Instead of writing it blind, the adapter now
-      **refuses** a commanded channel whose block has no control source,
-      raising `DeviceUnavailable` that names the channel and says what to do.
-      To answer it for real the owner must deliberately leave a block
-      unconfigured with a fan on that output and allow a write.
+      learned read-only. Instead of writing it blind, the adapter now leaves
+      a commanded channel whose block has no control source **out of its
+      writes**, logs it once per open and reports it in
+      `unconfigured_channels` and `device_health`. The refusal is per
+      channel by design: every other channel of that controller is written
+      in the same SET and the heartbeat still goes out, because taking a
+      whole controller to the aquaero's watchdog fallback over one
+      unconfigured block would raise every fan on it to 100 % indefinitely.
+      To answer the question for real the owner must deliberately leave a
+      block unconfigured with a fan on that output and allow a write.
     - **the rpm lag of an aquabus fan (item 75)** — still open: the lag shows
       only after a duty change, which is a write, so this wiring cannot
       measure it.
