@@ -148,6 +148,8 @@ mpc:
                          # once, each on its own code -- what the thermal model needs to converge.
                          # Louder while it runs; with ident_levels: symmetric the whole zone, not
                          # one group of it, may sit ident_amplitude under the solver's command
+  ident_require_excitable: false  # true: refuse a start (not_excitable:<ch>) whose channel cannot reach
+                         # the thermal model's PE bound from where the solver parked it
   ident_hold_s: [60, 120, 180]  # hold times the seeded sequence draws from (each >= 5 * dt when enabled)
   ident_max_duration_s: 1800    # whole experiment, seconds, (0, 7200]
   ident_settle_s: 600    # every zone served trusted this long before a start (>= confirm_s when enabled)

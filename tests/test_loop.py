@@ -356,8 +356,35 @@ def test_controller_exception_applies_emergency_ramp_and_skips_watchdog(fast_cfg
     for ch in fast_cfg.channels:
         want = fast_cfg.fallback_pwm[ch]
         assert abs(r2.cmd.pwm[ch] - want) <= abs(r1.cmd.pwm[ch] - want)  # toward fallback
-    assert loop.state is state_before  # not half-updated
+    # Not half-updated: nothing the broken tick computed is committed. The applied-command
+    # mirror does follow the fans, because the emergency ramp moved them -- the next tick
+    # rate-limits from what is on them, not from the command they no longer carry.
+    assert dataclasses.replace(loop.state, last_cmd=None, window=()) == dataclasses.replace(
+        state_before, last_cmd=None, window=()
+    )
+    assert loop.state.last_cmd is r2.cmd
     assert notifier.watchdog_n == 1  # only the healthy tick kicked it
+
+
+def test_a_good_tick_after_an_emergency_ramp_rate_limits_from_the_fans(fast_cfg, monkeypatch):
+    """The emergency ramp moves the fans while the controller's own state stands still.
+    The next healthy tick must measure ``d_pwm_max`` from where the fans actually are,
+    or a fan the emergency walked up comes back down in one step (uncovered by the
+    section 8 item 112 change, which stopped masking it on the experiment path)."""
+    loop, sink, notifier, sup = make_loop(fast_cfg, good_source(fast_cfg))
+    loop.tick()
+
+    def boom(*a, **k):
+        raise ZeroDivisionError("bug")
+
+    monkeypatch.setattr(sup, "compose", boom)
+    for _ in range(6):  # ramp the fans well away from the last command the solver chose
+        emergency = loop.tick()
+    monkeypatch.undo()
+    good = loop.tick()
+    for ch in fast_cfg.channels:
+        assert abs(good.cmd.pwm[ch] - emergency.cmd.pwm[ch]) <= fast_cfg.d_pwm_max + 1e-9
+    assert good.mpc_cmd.diagnostics["prev_pwm"] == pytest.approx(emergency.cmd.pwm)
 
 
 def test_emergency_command_ramps_and_clamps(fast_cfg):

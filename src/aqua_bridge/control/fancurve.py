@@ -170,6 +170,9 @@ READERS: dict[str, str] = {
     "model_use_rpm": "config",  # thermal._channel_phi, same reason as noise_rpm_max
     "fan_health": "config",  # health.py rpm and power rules: the deviation must show
     "stuck_airflow": "config",  # gate rule 3, derived from the config once at load
+    # ident.excitation: a planning figure for a start, on the supervisor's side, where
+    # the fitted curve is not in hand; the measured answer is the model's own pe_diag
+    "ident_excitation": "config",
 }
 
 _EPS = 1e-12

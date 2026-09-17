@@ -65,7 +65,9 @@ Rules (section 6 "Control", section 4.8, section 5 "Modes")
   in ``manual`` the mode becomes ``mixed``.
 * Released channels are handed to the loop once (``TickPlan.released``) so
   it can drop their integrator entries and the solver re-initialises
-  bumplessly (its first output equals the override that was on the fan).
+  bumplessly (its first output equals the override that was on the fan). A
+  **human** override is released this way; an identification experiment's channels
+  are not (section 8 item 112, below).
 
 ``compose`` (section 6 "Do not bypass ``d_pwm_max``")
 -----------------------------------------------------
@@ -144,8 +146,13 @@ Identification experiments (DAS plan section 5, :mod:`aqua_bridge.control.ident`
   (conservative: the fans go back to the solver).
 * After every tick (:meth:`Supervisor.record_tick`) the settle tracker advances and
   a running experiment is checked against the abort list and armed for the next
-  tick; an end (completed or aborted) puts the experiment's channels into
-  ``released``, so the solver re-initialises bumplessly on them. A tick whose applied
+  tick. **An end (completed or aborted) returns the channels to the solver as it
+  found them**: they are *not* put into ``released``, because the solver ran on every
+  tick of the experiment and its integrator already holds the command it would have
+  given without one. Releasing them would re-initialise the solver bumplessly at the
+  PWM on the fan -- the experiment's own level -- and hand a channel released high
+  exactly that level (section 8 item 112); the rate limit still moves the fan at most
+  ``d_pwm_max`` per tick on the way back. A tick whose applied
   command is the loop's emergency fallback while the solver's command was not
   (``compose`` raised) counts as a tick without a solver command: it aborts with
   ``fallback`` and restarts the settle count. An unexpected error
@@ -888,6 +895,7 @@ class Supervisor:
         self._experiment = ident.start(
             cfg, facts, kind, name, skip_ticks=1 if self._plan_pending else 0
         )
+        blind = ident.unexcitable(cfg, self._experiment["levels"])
         _LOG.info(
             "experiment started on %s %r: channels %s, base %s",
             kind,
@@ -895,13 +903,36 @@ class Supervisor:
             self._experiment["channels"],
             self._experiment["base"],
         )
+        if blind:
+            # section 8 item 110: pe_min is relative, so a channel parked high cannot
+            # reach it at any allowed amplitude. Say so instead of leaving the zone
+            # pending for ever with nothing in the log.
+            _LOG.warning(
+                "experiment on %s %r: %s cannot reach the model's PE bound from this "
+                "base (mpc.ident_amplitude %.3f); the air block of any zone they serve "
+                "cannot converge while they sit there",
+                kind,
+                name,
+                ", ".join(blind),
+                cfg.ident_amplitude,
+            )
 
     def _end_experiment(self, result: str, reason: str | None) -> None:
+        """End the running experiment: drop its overrides and remember how it went.
+
+        The channels are **not** released (section 8 item 112). Releasing one drops its
+        integrator entry, which makes ``step`` re-initialise the solver bumplessly at the
+        PWM on the fan -- the experiment's own level -- and a channel released high was
+        then handed that level as the solver's starting point. The solver ran on every
+        tick of the experiment (the levels are an override applied after it), so its
+        integrator already holds the command it would have given without one; keeping it
+        returns control there, and ``step``'s rate limit still moves the fan at most
+        ``d_pwm_max`` per tick. A human override of the same channel is unaffected: it is
+        released by :meth:`_clear_override` as before."""
         exp = self._experiment
         if exp is None:
             return
         self._experiment = None
-        self._released.update(ch for ch in exp["channels"] if ch not in self._overrides)
         self._ident_last = {"result": result, "reason": reason, "target": dict(exp["target"])}
         if result == ident.RESULT_COMPLETED:
             _LOG.info("experiment on %s %r completed", exp["target"]["kind"], exp["target"]["name"])
