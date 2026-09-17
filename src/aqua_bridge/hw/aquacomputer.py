@@ -89,8 +89,9 @@ is not known.
 A block whose control source reads ``0xFFFF`` has nothing assigned to drive its
 output (:attr:`ChannelState.unconfigured`; seen on block 8 with a Quadro on
 aquabus, 2026-09-15). Whether writing such a block the way a configured one is
-written makes the output follow has never been observed, so the adapter refuses
-to command that channel rather than writing it blind.
+written makes the output follow has never been observed, so the adapter leaves
+that one channel out of its writes, and reports it, rather than writing it blind
+-- the other channels of the same controller are written as usual.
 
 An aquabus fan block's electrical fields are not a per-report reading: over 90
 consecutive reports (2026-09-17, Quadro on aquabus, a fan on its output 3) the
@@ -99,6 +100,15 @@ reports and with substitutes -- the rail voltage and 0 mA / 0 W -- in the other
 67, so a turning fan reported 0 mA in three reports out of four and an idle
 output reported 0.00 V in one in four. :attr:`DeviceKind.reports_power` is
 therefore False for the aquaero's aquabus outputs as well as its own.
+
+The voltage field goes the same way, and for the same reason: in a report that
+carries the bus device's measurements block 7 read 12.10 V (the Quadro's rail)
+and the three outputs with no fan read 0.00 V, while in the other 67 all four
+read the aquaero's own rail, 12.09 V. A single report therefore does not say
+whose rail its aquabus block holds, so :attr:`DeviceKind.reports_rail` is False
+for those outputs (:meth:`DeviceKind.reports_rail`) and nothing publishes that
+field as the output's rail. The aquaero's own blocks 1-4 do report their own
+rail and are unaffected.
 """
 
 from __future__ import annotations
@@ -282,6 +292,12 @@ class DeviceKind:
     #: substitutes (the rail voltage, 0 mA, 0 W) in the rest, so a single report's
     #: current says nothing (PROJECT.md section 2, 2026-09-17). A hardware fact.
     aquabus_outputs_report_power: bool = True
+    #: The voltage field of an aquabus block is that *output's* 12 V rail. False on
+    #: the aquaero for the same reason: in the reports that carry no measurement it
+    #: substitutes its own rail there, which is indistinguishable from the bus
+    #: device's rail in a single report (PROJECT.md section 2, 2026-09-17), so the
+    #: field may not be published as that output's rail. A hardware fact.
+    aquabus_outputs_report_rail: bool = True
 
     @property
     def temp_names(self) -> tuple[str, ...]:
@@ -324,6 +340,22 @@ class DeviceKind:
         if self.ctrl_channels[number - 1].aquabus:
             return self.aquabus_outputs_report_power
         return self.own_outputs_report_power
+
+    def reports_rail(self, number: int) -> bool:
+        """Output ``number`` (1-based) reports its *own* 12 V rail voltage.
+
+        False only for the aquaero's aquabus outputs 5-8: the same substitution
+        that makes their current meaningless puts the aquaero's own rail in the
+        voltage field of the reports that carry no measurement, and nothing in a
+        single report tells the two apart (module docstring; PROJECT.md section 2,
+        2026-09-17, section 8 item 89). A kind always reports the rail of its own
+        outputs.
+        """
+        if not 1 <= number <= self.pwm_count:
+            raise IndexError(f"{self.name} has pwm1..pwm{self.pwm_count}, not pwm{number}")
+        if self.ctrl_channels[number - 1].aquabus:
+            return self.aquabus_outputs_report_rail
+        return True
 
     def describe_temps(self) -> str:
         """``temp1..temp8, bus1..bus8, ...``, for messages."""
@@ -384,6 +416,7 @@ AQUAERO = DeviceKind(
     profile_offset=0x06,
     own_outputs_report_power=False,
     aquabus_outputs_report_power=False,
+    aquabus_outputs_report_rail=False,
 )
 
 QUADRO = DeviceKind(
@@ -717,7 +750,8 @@ class ChannelState:
         ``0x0000`` as well; the source alone decides here, because a block with no source
         is unconfigured whatever else it holds. Writing such a block the way a configured
         one is written has never been observed to make the output follow, so the adapter
-        refuses to command the channel (PROJECT.md section 8 item 89).
+        leaves *that channel* out of its writes and reports it, while every other channel
+        of the same controller is written as usual (PROJECT.md section 8 item 89).
         """
         return self.source == SOURCE_UNCONFIGURED
 

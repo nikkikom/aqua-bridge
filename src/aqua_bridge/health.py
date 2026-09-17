@@ -63,9 +63,18 @@ the 12 V rail
     depend on the duty at all, so it is judged at every duty and a duty move never
     restarts it -- a rail that sags while the solver is modulating is exactly when
     it matters. A block reporting 0.0 V is not judged: that is what an aquaero's
-    empty aquabus slot reads, and what a *populated* aquabus block reads in the
-    reports that carry the bus device's own measurements (PROJECT.md section 2,
-    2026-09-17), not a dead rail.
+    empty aquabus slot reads -- an aquabus output with nothing connected, on a bus
+    device that is present, reads 0.00 V in the reports that carry that device's
+    own measurements -- not a dead rail.
+
+    **The rule cannot fire for an aquaero's aquabus outputs at all**, and that is
+    deliberate: a populated aquabus block reads the bus device's rail in about one
+    report in four and the *aquaero's own* rail in the rest, with nothing in a
+    single report to tell them apart (PROJECT.md section 2, 2026-09-17), so the
+    adapter publishes ``voltage_v`` as ``None`` there with ``rail_reported``
+    false, and a reading with no voltage is skipped like any other. A sagging rail
+    behind a bus device is therefore *not* detected here; it would take a device
+    that reports its own outputs' rails (the Quadro does, for its own).
 
 power against the duty
     Only where the device reports power at all: an aquaero reports 0 mA and 0 W
@@ -196,8 +205,9 @@ class FanHealthConfig:
     #: An rpm deviation held this long is reported, seconds (> 0).
     rpm_fault_s: float = 120.0
     #: Low end of the 12 V rail window, volts; a block reading 0.0 V is not judged
-    #: (that is what an empty aquabus slot reads, and what a populated aquabus
-    #: block reads in about one report in four, not a dead rail).
+    #: (that is what an empty aquabus slot reads, not a dead rail), and neither is
+    #: one with no voltage at all (an aquaero's aquabus outputs, whose rail reading
+    #: is the aquaero's own in three reports out of four).
     rail_min_v: float = 11.0
     #: High end of the 12 V rail window, volts (> ``rail_min_v``).
     rail_max_v: float = 13.0
@@ -766,10 +776,16 @@ class HealthMonitor:
         rpm = reading.get("rpm")
         volts = reading.get("voltage_v")
         power = reading.get("power_w")
+        # A source that says the voltage field is not that output's own rail carries no
+        # rail at all (an aquaero's aquabus blocks, PROJECT.md section 8 item 89): the
+        # value is published as None and the rule below never sees it. The flag is
+        # absent from older records and from sources that publish a rail they measure,
+        # and the voltage is then taken as given.
+        rail_known = bool(reading.get("rail_reported", True))
         out: dict[str, Any] = {
             "duty": duty if _finite(duty) else None,
             "rpm": rpm if _finite(rpm) else None,
-            "voltage_v": volts if _finite(volts) else None,
+            "voltage_v": volts if rail_known and _finite(volts) else None,
             "current_ma": reading.get("current_ma") if _finite(reading.get("current_ma")) else None,
             "power_w": power if _finite(power) else None,
             "expected_rpm": None,
@@ -782,7 +798,7 @@ class HealthMonitor:
         # the 12 V rail: judged at any duty and never restarted by a duty move, since
         # it does not depend on one (a rail that sags while the solver modulates is
         # exactly the case worth catching)
-        if _finite(volts) and float(volts) > 0.0:
+        if rail_known and _finite(volts) and float(volts) > 0.0:
             volts = float(volts)
             low, high = s.rail_min_v, s.rail_max_v
             held = self._sustained(channel, "rail", not low <= volts <= high, now)

@@ -12,16 +12,19 @@ report -- temperatures by group (physical sensors ``tempN``, the aquaero's
 aquabus temperature slots ``busN``, software sensors ``softN``, the aquaero's
 virtual sensors ``virtN``), each output's rpm, output duty, voltage, current
 and power (the aquaero's outputs 5-8 belong to a device on its aquabus, and
-read "no device" without one; on a kind and output that does not measure
-current and power the raw figures are shown but marked as not measured, since
-the aquaero's are placeholders), flow ``flowN``, and the Quadro's power-cycle
+read "no device" without one; the raw figures of a field the kind does not
+measure for that output are shown but marked as not measured, since the
+aquaero's are placeholders -- current and power on its own outputs, and on its
+aquabus outputs the voltage as well, which is the aquaero's own rail in three
+reports out of four), flow ``flowN``, and the Quadro's power-cycle
 count -- then the profile the aquaero runs (control report byte 0x06) and each
 output's duty in the control report, with the aquaero's
 control source and power limits (the daemon's duty is in effect only while the
 channel follows its own preset with limits 0 / 100 %) and output mode (PWM or
 DC voltage; not interpreted on the aquabus outputs; a block with no control
-source says so, and the daemon refuses to command it). Use it to pick the input
-names for the config and a ``serial:`` when several of one kind are attached.
+source says so, and the daemon leaves that channel out of its writes). Use it to
+pick the input names for the config and a ``serial:`` when several of one kind
+are attached.
 
 It never writes: it reads input reports and fetches the control report
 (``HIDIOCGFEATURE``), nothing else -- no control report SET and no save report.
@@ -108,14 +111,19 @@ def _print_status(kind: DeviceKind, status: StatusReport, out: TextIO) -> None:
         if not fan.present:
             print(f"    pwm{n}/fan{n}  no device (rpm 0xFFFF){where}", file=out)
             continue
-        draw = (
-            f"{fan.current_ma:5d} mA  {fan.power_w:6.2f} W"
-            if kind.reports_power(n)
-            else f"not measured ({fan.current_ma} mA, {fan.power_w:.2f} W)"
-        )
+        if kind.reports_power(n):
+            electrical = f"{fan.voltage_v:5.2f} V  {fan.current_ma:5d} mA  {fan.power_w:6.2f} W"
+        elif kind.reports_rail(n):
+            electrical = (
+                f"{fan.voltage_v:5.2f} V  not measured ({fan.current_ma} mA, {fan.power_w:.2f} W)"
+            )
+        else:  # an aquaero's aquabus block: not even the rail is that output's own
+            electrical = (
+                f"not measured ({fan.voltage_v:.2f} V, {fan.current_ma} mA, {fan.power_w:.2f} W)"
+            )
         print(
             f"    pwm{n}/fan{n}  {fan.rpm:5d} rpm  duty {format_percent(fan.duty):>8}  "
-            f"{fan.voltage_v:5.2f} V  {draw}{where}",
+            f"{electrical}{where}",
             file=out,
         )
     for j, flow in enumerate(status.flows, start=1):

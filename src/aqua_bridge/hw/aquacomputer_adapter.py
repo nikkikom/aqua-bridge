@@ -168,8 +168,12 @@ Keeping the cache honest
        its own (1-4) not in PWM mode gets one warning per open and an aquabus
        output (5-8, mode word not interpreted) none; the mode is never written.
        A commanded channel whose controller block has no control source
-       (``0xFFFF``) is *refused*, not written blind: adopting such a report
-       raises ``DeviceUnavailable`` naming the channel (item 89). Both lists
+       (``0xFFFF``) is left out of the write instead of being written blind:
+       ``apply()`` writes every other channel of that controller and sends the
+       heartbeat as usual, the channel is named in ``unconfigured_channels``
+       and in ``device_health``'s ``problems`` for as long as it reads that way,
+       and it is logged once per open (item 89). ``read()`` is unaffected --
+       it never adopts a control report. Both lists
        are recomputed from
        every control report the adapter adopts (so a mode changed in aquasuite
        mid-run reaches ``device_health`` at the next refresh), only the warnings
@@ -583,10 +587,13 @@ class AquacomputerAdapter:
         #: daemon's back shows up at the next periodic control read.
         self._not_pwm_channels: tuple[str, ...] = ()
         self._unconfigured_channels: tuple[str, ...] = ()
-        #: Non-PWM blocks already logged, once per open (the lists above are state,
-        #: this one only gates the log). An unconfigured block is not logged and
-        #: kept: it is refused outright, every time it is read.
+        #: The same blocks by channel index: apply() leaves them out of its write.
+        self._unconfigured_ks: frozenset[int] = frozenset()
+        #: Blocks already logged, once per open (the lists above are state, these two
+        #: only gate the log): outputs not in PWM mode, and the channels left out of
+        #: a write for having no control source.
         self._not_pwm_reported: set[int] = set()
+        self._unconfigured_reported: set[int] = set()
         #: Output numbers that belong to a device on the aquaero's aquabus.
         self._aquabus = frozenset(binding.kind.aquabus_outputs)
         #: The absent inputs read() found last ("pwm5 (qd1)", ...), logged when it changes.
@@ -665,8 +672,15 @@ class AquacomputerAdapter:
     @property
     def unconfigured_channels(self) -> tuple[str, ...]:
         """Commanded outputs whose aquaero controller block has no control source
-        (``0xFFFF``). The daemon refuses to command them (module docstring, item 89),
-        so this is the reason ``read()`` and ``apply()`` are failing, not a warning."""
+        (``0xFFFF``), as the newest adopted control report showed them.
+
+        The daemon leaves exactly those channels out of its writes (module docstring,
+        item 89) and writes every other channel of the controller as usual, so this
+        is not a failure of ``read()`` or of ``apply()``: it is the list of outputs
+        this daemon is *not* commanding, and the reason belongs in front of the owner
+        (``device_health``'s ``problems``). Empty until a control report has been
+        adopted -- an open clears it and the first report of that open recomputes
+        it -- and on the Quadro, whose blocks carry no control source."""
         return self._unconfigured_channels
 
     def fan_readings(self, status: StatusReport | None = None) -> dict[str, dict[str, Any]]:
@@ -681,16 +695,20 @@ class AquacomputerAdapter:
         than the output -- a splitter, or a fan whose tach lead is on a different
         header -- and which is therefore the only speed the fitted curve of
         ``mpc.fan_models`` describes; without a binding the output's own block is
-        used. ``voltage_v`` is the 12 V rail as the *output's* block reports it, and
-        ``current_ma`` / ``power_w`` that block's electrical draw -- ``None``, not a
-        number, wherever ``power_reported`` is false, because the figure there is a
-        placeholder and not a measurement: an aquaero reports 0 mA and 0 W for its own
-        outputs in PWM mode, and fills its aquabus blocks 5-8 with the bus device's
-        current in about one report in four and with 0 mA in the rest (PROJECT.md
-        section 2, 2026-09-17, section 8 item 89). An aquabus slot with no device
-        behind it is left out entirely: its whole block is meaningless; a bound
-        tachometer on such a slot leaves ``rpm`` ``None`` rather than publishing its
-        ``0xFFFF``.
+        used. ``voltage_v`` is the 12 V rail as the *output's* block reports it and
+        ``current_ma`` / ``power_w`` that block's electrical draw -- each ``None``, not
+        a number, where the device does not measure it for that output, because the
+        figure there is a placeholder and not a measurement. Two flags say which:
+        ``power_reported`` (an aquaero reports 0 mA and 0 W for its own outputs in PWM
+        mode, and fills its aquabus blocks 5-8 with the bus device's current in about
+        one report in four and with 0 mA in the rest) and ``rail_reported`` (the same
+        aquabus blocks hold the *aquaero's own* rail in those other three reports out
+        of four, indistinguishable from the bus device's in a single report, so an
+        aquabus output's rail is published as unknown rather than as the aquaero's
+        -- PROJECT.md section 2, 2026-09-17, section 8 item 89). An aquabus slot with
+        no device behind it is left out entirely: its whole block is meaningless; a
+        bound tachometer on such a slot leaves ``rpm`` ``None`` rather than publishing
+        its ``0xFFFF``.
         """
         if status is None:
             status = self._status
@@ -703,16 +721,18 @@ class AquacomputerAdapter:
             fan = status.fans[number - 1]
             tach = self.binding.fan_map.get(ch, number)
             reported = self.kind.reports_power(number)
+            rail = self.kind.reports_rail(number)
             out[ch] = {
                 "device": self.kind.name,
                 "output": f"pwm{number}",
                 "tach": f"fan{tach}",
                 "rpm": None if self._empty_slot(status, tach) else float(status.fans[tach - 1].rpm),
                 "duty": fan.duty / DUTY_MAX,
-                "voltage_v": fan.voltage_v,
+                "voltage_v": fan.voltage_v if rail else None,
                 "current_ma": float(fan.current_ma) if reported else None,
                 "power_w": fan.power_w if reported else None,
                 "power_reported": reported,
+                "rail_reported": rail,
                 "aquabus": number in self._aquabus,
             }
         return out
@@ -765,7 +785,7 @@ class AquacomputerAdapter:
         if self._unconfigured_channels:
             problems.append(
                 f"{label}: the controller block of {', '.join(self._unconfigured_channels)} "
-                "has no control source; the daemon refuses to command it"
+                "has no control source; those outputs are not commanded (the others are)"
             )
         if self._serial_rejected is not None:
             problems.append(self._serial_rejected)
@@ -803,8 +823,12 @@ class AquacomputerAdapter:
         self._ctrl = None
         self._mismatch_since.clear()
         self._not_pwm_reported.clear()
+        self._unconfigured_reported.clear()
+        # Both lists are per-open state, like the cached control report they come
+        # from: the first report this open adopts recomputes them (_scan_modes).
         self._not_pwm_channels = ()
         self._unconfigured_channels = ()
+        self._unconfigured_ks = frozenset()
         _LOG.info("%s: opened %s", self.binding.label, transport.info.node)
         return transport
 
@@ -1079,10 +1103,11 @@ class AquacomputerAdapter:
         """Takes a fresh control report as the cache. Returns the channels whose held
         duty is no longer the one this adapter knew (external changes).
 
-        Raises :class:`~aqua_bridge.hw.hidraw.DeviceUnavailable` when a commanded
-        channel's controller block has no control source: that output is not
-        commandable by any means this project has observed, and the daemon refuses
-        it rather than writing the block blind (PROJECT.md section 8 item 89)."""
+        Adopting never refuses anything: a commanded block with no control source is
+        only recorded here (:meth:`_scan_modes`), and :meth:`_apply_once` leaves that
+        one channel out of the write. Refusing here would take every other channel of
+        the same controller -- and the software-sensor heartbeat -- down with it
+        (PROJECT.md section 8 item 89)."""
         self._check_profile(data)
         now = self._clock()
         drifted: list[int] = []
@@ -1104,17 +1129,6 @@ class AquacomputerAdapter:
                 self._changed_t[k] = now
         self._ctrl, self._ctrl_t = data, now
         self._scan_modes(data)
-        if self._unconfigured_channels:
-            raise DeviceUnavailable(
-                f"{self.binding.label}: the aquaero controller block of "
-                f"{', '.join(self._unconfigured_channels)} has no control source "
-                f"(0x{SOURCE_UNCONFIGURED:04X}): nothing on the device drives that output, and "
-                "writing the block the way a configured one is written has never been seen to "
-                "make the output follow, so this daemon refuses to command it. Give the output "
-                "any control source in the controller's own software (the daemon replaces it "
-                "with its own preset) or drop the channel from the config "
-                "(PROJECT.md section 8 item 89)"
-            )
         return drifted
 
     def _write(self, transport: HidTransport, report: bytes, deadline: float) -> float:
@@ -1270,6 +1284,13 @@ class AquacomputerAdapter:
         is no error here: ``read()`` reports it as ``None`` and lists it in
         ``absent_channels`` (module docstring, Reading).
 
+        A channel whose controller block has no control source is the one thing
+        this call does not write: it is dropped from the duties, the rest of the
+        controller is written in the same SET, and the channel is reported through
+        ``unconfigured_channels`` and ``device_health`` (item 89). No exception --
+        one such block must not take a whole controller to the aquaero's watchdog
+        fallback.
+
         With ``heartbeat_sensor`` configured, the software-sensor heartbeat goes
         out after the duty work, once per call and whatever the duties do -- and
         *not at all* when this call cannot command the duties (module docstring).
@@ -1295,10 +1316,12 @@ class AquacomputerAdapter:
         open: the owner can switch an output to DC voltage in aquasuite at any time,
         and :meth:`device_health` promises what the controller looks like *now*
         (PROJECT.md section 8 item 83). The mode itself is only reported, never
-        changed (items 81, 85). An unconfigured block is only collected here;
-        :meth:`_adopt` turns it into the refusal (item 89)."""
+        changed (items 81, 85). A commanded block with no control source is collected
+        here, by channel index as well as by name; :meth:`_apply_once` leaves those
+        channels out of the write (item 89)."""
         not_pwm: list[str] = []
         unconfigured: list[str] = []
+        unconfigured_ks: list[int] = []
         for k in sorted(self._names):
             state = channel_state(self.kind, ctrl, k)
             mode = state.mode
@@ -1306,6 +1329,7 @@ class AquacomputerAdapter:
                 continue
             if state.unconfigured:
                 unconfigured.append(self._names[k])
+                unconfigured_ks.append(k)
                 continue
             if state.aquabus or mode.is_pwm:
                 self._not_pwm_reported.discard(k)  # back in PWM: say so again if it leaves
@@ -1325,6 +1349,7 @@ class AquacomputerAdapter:
             )
         self._not_pwm_channels = tuple(sorted(not_pwm))
         self._unconfigured_channels = tuple(sorted(unconfigured))
+        self._unconfigured_ks = frozenset(unconfigured_ks)
 
     def _falls_may_be_written(self) -> bool:
         last = self._last_write_t
@@ -1363,6 +1388,40 @@ class AquacomputerAdapter:
             out[k] = max(duty, held)
         return out
 
+    def _without_unconfigured(self, duties: Mapping[int, int]) -> Mapping[int, int]:
+        """``duties`` without the channels whose controller block has no control source.
+
+        Nothing on the device drives such an output, and no capture shows that writing
+        the block the way a configured one is written would change that, so the daemon
+        will not write it blind (PROJECT.md section 8 item 89). The refusal is per
+        channel: every other channel of the controller goes out in the same write, and
+        the software-sensor heartbeat still follows it -- a controller with one
+        unconfigured block must not take the whole device to the watchdog fallback.
+        The channel stays in ``unconfigured_channels`` and in ``device_health``'s
+        ``problems`` for as long as the controller reads that way, and is logged once
+        per open."""
+        if not self._unconfigured_ks:
+            return duties
+        refused = sorted(k for k in duties if k in self._unconfigured_ks)
+        if not refused:
+            return duties
+        fresh = [k for k in refused if k not in self._unconfigured_reported]
+        if fresh:
+            self._unconfigured_reported.update(fresh)
+            _LOG.error(
+                "%s: %s: the controller block has no control source (0x%04X), so nothing on "
+                "the device drives that output and writing the block the way a configured one "
+                "is written has never been seen to change that; the daemon leaves the channel "
+                "out of its writes (the other channels are written as usual). Give the output "
+                "any control source in the controller's own software (the daemon replaces it "
+                "with its own preset) or drop the channel from the config "
+                "(PROJECT.md section 8 item 89)",
+                self.binding.label,
+                ", ".join(f"pwm{k + 1} ({self._names.get(k, '?')})" for k in fresh),
+                SOURCE_UNCONFIGURED,
+            )
+        return {k: duty for k, duty in duties.items() if k not in self._unconfigured_ks}
+
     def _apply_once(
         self,
         transport: HidTransport,
@@ -1383,6 +1442,7 @@ class AquacomputerAdapter:
             self._adopt(self._fetch(transport, deadline))
         ctrl = self._ctrl
         assert ctrl is not None
+        duties = self._without_unconfigured(duties)
         if never_lower:
             duties = self._not_below_held(ctrl, duties)
         send = self._plan(ctrl, duties)

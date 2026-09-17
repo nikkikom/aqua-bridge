@@ -709,11 +709,12 @@ def test_read_merges_the_fan_readings_of_every_controller() -> None:
     assert set(obs.temps) == {"air_z0", "air_z1"} and set(obs.rpm) == {"radiator"}
 
 
-def test_an_aquabus_outputs_current_and_power_are_published_as_unknown() -> None:
-    """The aquaero fills its aquabus blocks with the bus device's current in about one
-    report in four and with 0 mA in the rest (PROJECT.md section 2, 2026-09-17), so a
-    single report's figure is not a measurement: rpm and duty are published, current
-    and power are None, and ``power_reported`` says why (item 89)."""
+def test_an_aquabus_outputs_electrical_fields_are_published_as_unknown() -> None:
+    """The aquaero fills its aquabus blocks with the bus device's measurements in about
+    one report in four and with substitutes -- its own rail voltage, 0 mA, 0 W -- in the
+    rest (PROJECT.md section 2, 2026-09-17), so a single report's figure is not a
+    measurement: rpm and duty are published, voltage, current and power are None, and
+    ``power_reported`` / ``rail_reported`` say why (item 89)."""
     clock = FakeClock()
     device = aquabus_aquaero(clock)
     adapter = AquacomputerAdapter(
@@ -724,7 +725,8 @@ def test_an_aquabus_outputs_current_and_power_are_published_as_unknown() -> None
     )
     reading = adapter.read().inputs["fans"]["qd3"]
     assert reading["aquabus"] is True and reading["power_reported"] is False
-    assert reading["rpm"] == 1105.0 and reading["voltage_v"] == pytest.approx(12.10)
+    assert reading["rpm"] == 1105.0 and reading["duty"] == pytest.approx(1.0)
+    assert reading["rail_reported"] is False and reading["voltage_v"] is None
     assert reading["current_ma"] is None and reading["power_w"] is None
 
 
@@ -840,9 +842,11 @@ def test_the_fan_readings_report_the_bound_tachometer_not_the_output_block() -> 
     reading = obs.inputs["fans"]["qd3"]
     assert reading["output"] == "pwm5" and reading["tach"] == "fan7"
     assert reading["rpm"] == obs.rpm["qd3"] == 1105.0  # block 7's fan, not pwm5's 0 rpm
-    # the electrical fields stay the output's own block: pwm5 drives 88.61 % and, with
-    # nothing wired to its own header, reports 0 V / 0 mA
-    assert reading["duty"] == pytest.approx(0.8861) and reading["voltage_v"] == 0.0
+    # the electrical fields stay the output's own block: pwm5 drives 88.61 %. The block
+    # is an aquabus one, so its voltage is published as unknown (item 89) -- the raw
+    # 0 V it holds here is the aquaero's substitute, not pwm5's rail.
+    assert reading["duty"] == pytest.approx(0.8861)
+    assert reading["voltage_v"] is None and reading["rail_reported"] is False
 
 
 def test_composite_device_health_merges_every_controller_and_its_problems() -> None:
