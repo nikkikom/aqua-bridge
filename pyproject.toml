@@ -41,7 +41,7 @@ markers = [
   "slow: long-running test (closed-loop sims, long fuzz runs)",
   "nightly: heavy sweeps and long simulations; excluded from PR/main CI, run by nightly-fuzz",
   "solver_cases(*cases): restrict the solver_kind parametrisation (pi, mpc, pi_das, mpc_das)",
-  "pi: runs only on the Raspberry Pi (armv6l), e.g. the absolute step budget; skipped elsewhere",
+  "pi: runs only on a recognised Raspberry Pi board (tests/test_bench_budget.py::PI_MACHINES, currently armv6l/aarch64), e.g. the absolute step budget; skipped elsewhere with a reason naming what platform.machine() saw",
   "mqtt_live: opt-in integration test against a real MQTT broker; runs only when $AQUA_BRIDGE_MQTT_TEST_HOST names one AND -m mqtt_live selects it, so CI stays offline",
 ]
 
