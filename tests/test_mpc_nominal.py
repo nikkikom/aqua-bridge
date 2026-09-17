@@ -26,8 +26,8 @@ from invariants import TOL, checked_step, make_obs
 
 GOLDEN_DIR = Path(__file__).resolve().parent / "golden"
 REGEN_ENV = "AQUA_BRIDGE_REGEN_GOLDEN"
-# Numeric, not bitwise: the Pi (armv6l, numpy 2.2) and the dev machine may
-# round differently in the last bits.
+# Numeric, not bitwise: the Pi (any of tests/test_bench_budget.py's PI_MACHINES,
+# numpy 2.2) and the dev machine may round differently in the last bits.
 GOLDEN_PWM_ATOL = 1e-6
 GOLDEN_TEMP_ATOL = 1e-4
 

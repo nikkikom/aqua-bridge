@@ -20,10 +20,27 @@ Two gates on ``mpc.step`` in a closed loop, timed like ``tools/bench_step.py``:
   high percentile rather than the single worst repeat, so one outlier repeat does
   not flake the gate while a real regression across most repeats still trips it.
 
-* **absolute, only on the Pi** (``armv6l``, marker ``pi``): the DAS MPC's p99 step
-  time is at most ``mpc.budget_ms`` of ``config.example-das.yaml`` (the per-tick gate
-  at ``dt = 5 s``; §8.1 owner decision 2026-09-14, was 500 ms). Run it there with
+* **absolute, only on the Pi** (marker ``pi``): the DAS MPC's p99 step time is at
+  most ``mpc.budget_ms`` of ``config.example-das.yaml`` (the per-tick gate at
+  ``dt = 5 s``; §8.1 owner decision 2026-09-14, was 500 ms; re-derived to 250 ms on
+  the Zero 2 W, §8 item 73, 2026-09-17). Run it there with
   ``pytest tests/test_bench_budget.py -m pi``.
+
+  "On the Pi" is ``platform.system() == "Linux"`` and ``platform.machine()`` one of
+  :data:`PI_MACHINES` -- every board this project has actually measured the gate on
+  (the Zero W's ``armv6l``, the Zero 2 W's ``aarch64``; §8 item 108). A board change
+  that gets a new ``platform.machine()`` string needs a one-line addition here, same
+  as the last one did; §8 item 108 chose this over a provisioning-set environment
+  variable because an architecture check needs nothing from the owner to work --
+  ``pytest -m pi`` on the actual board just runs -- while an env var the Pi's own run
+  sets is one more thing to remember to export by hand each session, i.e. exactly the
+  kind of silent, easy-to-forget precondition item 108 is about. Either mechanism can
+  go stale when the board changes; the difference is what happens next. A stale env
+  var stays unset and skips silently, same as today's bug. A stale architecture list
+  also skips -- but :data:`PI_SKIP_REASON` names the actual ``platform.system()`` /
+  ``platform.machine()`` seen and what :data:`PI_MACHINES` expects, so the terminal
+  output of the very next ``pytest -m pi`` run says exactly why, and a silent pass is
+  not possible.
 
 The plan's second relative line (the gate with 30 sensors within 3x the solver-free step)
 is not a separate test here: the gate is part of both steps measured above, a gate alone
@@ -75,6 +92,28 @@ FALLBACK_TICKS = 140
 ZERO_W_FALLBACK = {"budget_ms": 1000.0, "budget_alarm_ms": 1250.0, "mpc_every_ticks": 3}
 #: How ``config.example-das.yaml`` marks the value to write for a fallback key.
 FALLBACK_COMMENT = re.compile(r"item 73 fallback: ([0-9]+(?:\.[0-9]+)?)")
+
+#: §8 item 108: ``platform.machine()`` of every board this project has actually run
+#: the absolute ``mpc.budget_ms`` gate on -- not an exhaustive list of Raspberry Pi
+#: architectures, just the ones measured (PROJECT.md §8 items 73, 95): ``armv6l`` is
+#: the Zero W (32-bit, the original board the budget was set for), ``aarch64`` is the
+#: Zero 2 W (64-bit trixie, the owner's current board, items 50/51). Add the new
+#: string here the next time the board changes; forgetting it is caught, not silent
+#: -- see :data:`PI_SKIP_REASON`.
+PI_MACHINES = frozenset({"armv6l", "aarch64"})
+_PI_SYSTEM = platform.system()
+_PI_MACHINE = platform.machine()
+#: Whether this process is running on a board named in :data:`PI_MACHINES`.
+ON_PI = _PI_SYSTEM == "Linux" and _PI_MACHINE in PI_MACHINES
+#: Names the exact check that failed and what it saw, so ``pytest -m pi`` on a board
+#: this file does not recognise reports *why* the absolute gate did not run instead of
+#: reporting nothing (§8 item 108 -- a hardcoded ``armv6l`` check skipped silently on
+#: the owner's own Zero 2 W).
+PI_SKIP_REASON = (
+    f"absolute budget: Raspberry Pi only -- platform.system() == {_PI_SYSTEM!r} "
+    f"(want 'Linux') and platform.machine() == {_PI_MACHINE!r} "
+    f"(want one of {sorted(PI_MACHINES)}); add this board to PI_MACHINES if it is one"
+)
 #: A ``key: value`` line of a YAML mapping (``value`` without its trailing comment).
 YAML_KEY = re.compile(r"^(?P<head>\s*(?P<key>[A-Za-z_][A-Za-z0-9_]*):\s*)(?P<value>[^#\s]\S*)")
 
@@ -220,7 +259,7 @@ def test_das_mpc_step_p99_within_the_relative_budget():
 
 
 @pytest.mark.pi
-@pytest.mark.skipif(platform.machine() != "armv6l", reason="absolute budget: Raspberry Pi only")
+@pytest.mark.skipif(not ON_PI, reason=PI_SKIP_REASON)
 def test_das_mpc_step_p99_within_budget_ms_on_the_pi():
     cfg = das_mpc_config()
     times = das_mpc_times(cfg, ticks=200)
