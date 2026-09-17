@@ -7773,6 +7773,55 @@ Owner decision (2026-09-16):
 47. Move the spare thermistor inputs to the bays `tools/fit_model.py` ranks
     tightest.
 48. Time `model.json` writes on the Pi's SD card.
+
+    **Tool added (2026-09-17), Pi run still outstanding.**
+    `tools/bench_model_store.py` builds one realistic snapshot -- a DAS
+    closed loop of `--warm-ticks` steps against `config.example-das.yaml`
+    (`--sim-preset rich` by default), so the estimator's calibration, the
+    thermal model and whatever else a running daemon actually accumulates
+    are in `solver_memory` before anything is timed -- then serialises it
+    exactly as `ModelPersister.save` does (`modelstore.build_document`,
+    then `json.dumps(doc, allow_nan=False, separators=(",", ":"))`) and
+    times `modelstore.write_atomic` (open, write, `fsync`, `os.replace`,
+    `fsync` of the directory -- the same call the daemon makes) against
+    `--path` for `--repeats` repeats, reporting the size in bytes, min /
+    mean / median / p99 / max write time, the spread over the repeats, and
+    that p99 as a fraction of `dt` and of `mpc.model_store_interval_s`.
+    Refuses anything but a path under a scratch directory
+    (`tempfile.gettempdir()` or `/tmp`) before running anything, and
+    deletes its own scratch file afterwards unless `--keep` is given
+    (`tests/test_bench_model_store.py`).
+
+    Dev-machine sanity run only (not the Pi's SD card, not what this item
+    asks for): `--warm-ticks 600 --repeats 20` against `config.example-das.yaml`
+    on the development machine's filesystem -- `size_bytes` **1424**, `min_ms`
+    2.84, `median_ms` 2.85, `mean_ms` 2.96, `p99_ms` 4.46, `max_ms` 4.46,
+    `spread_ms` 1.62 over the 20 writes. The 1424-byte size is this run's
+    document, not a representative one: `config.example-das.yaml` ships
+    `fan_curve_online: false`, so `fan_curves` stays empty, and the DAS
+    truth-plant closed loop here never accumulated a SMART calibration
+    a real drive's agent would, so `calibration` and `bays` are empty too
+    -- what's actually in the 1424 bytes is close to the store's floor
+    (`fingerprint`, `ident_settle`, the empty sections), not its steady
+    state on a populated enclosure. The size and the write time both need
+    the Pi run to mean anything for this item: SSD-class dev-machine
+    storage says nothing about a microSD card's write and fsync latency,
+    and only a board running against the real topology (drives reporting
+    SMART, calibrations accepted, fan curves fit if enabled) reaches the
+    store's real size.
+
+    Running it on the board -- what this item actually asks for -- was not
+    done, for the same reason as item 95's tooling addendum: `ssh` to the
+    board's host had no route from the environment this work ran in
+    (concrete hostnames live in `private.md`, not here). The command to
+    run once the board is reachable, writing only under `/tmp` on the
+    board and never over its own store at `/opt/aqua-bridge`'s
+    `$STATE_DIRECTORY/model.json`, is
+    `ssh USER@PI-HOST 'cd /opt/aqua-bridge && PYTHONPATH=/opt/aqua-bridge/src
+    .venv/bin/python tools/bench_model_store.py --warm-ticks 1200
+    --sim-preset rich --repeats 30 --path /tmp/model-store-bench.json'`
+    (the tool deletes that scratch file itself when it finishes; `--keep`
+    only if the owner wants to inspect it first).
 49. Digole: protocol, pages (Overview, Drives, Zones/Fans, Model, Host),
     touch, hit-test.
 75. Fan stall and restart: a fan below its stall duty stops and starts
