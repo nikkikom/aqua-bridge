@@ -2462,7 +2462,8 @@ low level on the same tick (10 % of the ticks of a three-channel phase on the
 scenario's knobs, 20 % of a two-channel one), where the old schedule could only
 ever dip one group of it. The envelope, the abort list and the floor itself are
 unchanged; `above`, the default, gives up no cooling at all.
- **Start preconditions**, each refused with a
+
+**Start preconditions**, each refused with a
 named reason: control mode `auto` without human overrides
 (`control_mode`), last command `auto` (`mode:<m>`), no saturation, band
 or stall on the target (`saturated:`, `band:`, `no_command:`,
