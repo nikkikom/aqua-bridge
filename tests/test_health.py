@@ -494,12 +494,20 @@ def test_a_repeated_problem_is_logged_at_most_once_per_log_interval_s(
 # --- against the captured reports -----------------------------------------------------
 
 
-def test_the_captured_aquaero_own_outputs_report_no_power_and_the_aquabus_one_does() -> None:
+def test_no_aquaero_output_reports_power_the_power_rule_can_judge() -> None:
+    """Neither the aquaero's own outputs (0 mA in PWM mode) nor its aquabus blocks
+    (the bus device's current in about one report in four, 0 mA in the rest,
+    2026-09-17) give the power rule anything to judge; the Quadro's own outputs do.
+    The same fan block reads 27 mA in one capture and 0 mA in another at the same
+    duty and speed, which is why a number there may never reach the rule
+    (PROJECT.md section 8 item 89)."""
     status = decode_status(AQUAERO, fixture_bytes("aquaero-status-aquabus-fan7-100.bin"))
-    assert not AQUAERO.reports_power(1) and AQUAERO.reports_power(7)
+    assert not any(AQUAERO.reports_power(n) for n in range(1, 9))
     assert (status.fans[0].current_ma, status.fans[0].power_cw) == (0, 0)  # own output, 349 rpm
     assert (status.fans[6].current_ma, status.fans[6].power_w) == (27, pytest.approx(0.32))
-    assert QUADRO.reports_power(1)
+    turning = decode_status(AQUAERO, fixture_bytes("aquaero-status-aquabus-block7-no-power.bin"))
+    assert turning.rpm(7) == 255 and turning.fans[6].current_ma == 0
+    assert all(QUADRO.reports_power(n) for n in range(1, 5))
 
 
 def test_the_captured_rails_sit_inside_the_default_window() -> None:

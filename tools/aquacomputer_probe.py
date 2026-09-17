@@ -12,14 +12,16 @@ report -- temperatures by group (physical sensors ``tempN``, the aquaero's
 aquabus temperature slots ``busN``, software sensors ``softN``, the aquaero's
 virtual sensors ``virtN``), each output's rpm, output duty, voltage, current
 and power (the aquaero's outputs 5-8 belong to a device on its aquabus, and
-read "no device" without one), flow ``flowN``, and the Quadro's power-cycle
+read "no device" without one; on a kind and output that does not measure
+current and power the raw figures are shown but marked as not measured, since
+the aquaero's are placeholders), flow ``flowN``, and the Quadro's power-cycle
 count -- then the profile the aquaero runs (control report byte 0x06) and each
 output's duty in the control report, with the aquaero's
 control source and power limits (the daemon's duty is in effect only while the
 channel follows its own preset with limits 0 / 100 %) and output mode (PWM or
-DC voltage; not interpreted on the aquabus outputs; an unconfigured block
-says so). Use it to pick the input names for the config and a ``serial:`` when
-several of one kind are attached.
+DC voltage; not interpreted on the aquabus outputs; a block with no control
+source says so, and the daemon refuses to command it). Use it to pick the input
+names for the config and a ``serial:`` when several of one kind are attached.
 
 It never writes: it reads input reports and fetches the control report
 (``HIDIOCGFEATURE``), nothing else -- no control report SET and no save report.
@@ -39,7 +41,6 @@ from typing import TextIO
 
 from aqua_bridge.hw.aquacomputer import (
     KINDS,
-    SENSOR_NOT_CONNECTED,
     DeviceKind,
     ReportError,
     StatusReport,
@@ -107,14 +108,18 @@ def _print_status(kind: DeviceKind, status: StatusReport, out: TextIO) -> None:
         if not fan.present:
             print(f"    pwm{n}/fan{n}  no device (rpm 0xFFFF){where}", file=out)
             continue
+        draw = (
+            f"{fan.current_ma:5d} mA  {fan.power_w:6.2f} W"
+            if kind.reports_power(n)
+            else f"not measured ({fan.current_ma} mA, {fan.power_w:.2f} W)"
+        )
         print(
             f"    pwm{n}/fan{n}  {fan.rpm:5d} rpm  duty {format_percent(fan.duty):>8}  "
-            f"{fan.voltage_v:5.2f} V  {fan.current_ma:5d} mA  {fan.power_w:6.2f} W{where}",
+            f"{fan.voltage_v:5.2f} V  {draw}{where}",
             file=out,
         )
     for j, flow in enumerate(status.flows, start=1):
-        value = "no data" if flow == SENSOR_NOT_CONNECTED else str(flow)
-        print(f"    flow{j}  {value}", file=out)
+        print(f"    flow{j}  {'no data' if flow is None else flow}", file=out)
 
 
 def _print_control(kind: DeviceKind, data: bytes, out: TextIO) -> None:

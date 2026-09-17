@@ -63,7 +63,9 @@ the 12 V rail
     depend on the duty at all, so it is judged at every duty and a duty move never
     restarts it -- a rail that sags while the solver is modulating is exactly when
     it matters. A block reporting 0.0 V is not judged: that is what an aquaero's
-    empty aquabus slot reads, not a dead rail.
+    empty aquabus slot reads, and what a *populated* aquabus block reads in the
+    reports that carry the bus device's own measurements (PROJECT.md section 2,
+    2026-09-17), not a dead rail.
 
 power against the duty
     Only where the device reports power at all: an aquaero reports 0 mA and 0 W
@@ -194,7 +196,8 @@ class FanHealthConfig:
     #: An rpm deviation held this long is reported, seconds (> 0).
     rpm_fault_s: float = 120.0
     #: Low end of the 12 V rail window, volts; a block reading 0.0 V is not judged
-    #: (that is what an empty aquabus slot reads, not a dead rail).
+    #: (that is what an empty aquabus slot reads, and what a populated aquabus
+    #: block reads in about one report in four, not a dead rail).
     rail_min_v: float = 11.0
     #: High end of the 12 V rail window, volts (> ``rail_min_v``).
     rail_max_v: float = 13.0

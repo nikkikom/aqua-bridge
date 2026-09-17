@@ -21,7 +21,9 @@ Status report (input report ``0x01``, sent unsolicited about once per second):
   with speed ``+0``, output duty ``+2``, voltage ``+4``, current ``+6``, power
   ``+8`` (blocks 1-4 the aquaero's own outputs, 5-8 the outputs of a device on
   its aquabus, a Quadro's outputs 1-4); 3 flow sensors at ``0xF9``. A fan block
-  whose speed reads ``0xFFFF`` has no device behind it.
+  whose speed reads ``0xFFFF`` has no device behind it; a flow sensor reading
+  ``0x7FFF`` has none either. The ``u16`` at ``+0x0A`` of a fan block is not
+  identified and is not decoded (PROJECT.md section 2, 2026-09-17).
 * Quadro, 220 bytes: serial at ``0x03``, firmware at ``0x0D``, power-cycle
   count ``u32`` at ``0x18``; temperatures: 4 physical sensors at ``0x34``
   (``temp1..4``) and 16 software sensors at ``0x3C`` (``soft1..16``; the
@@ -75,10 +77,28 @@ profile. The Quadro's software-sensor report is not known.
 The aquaero controller block also holds the output mode, a ``u16`` at
 ``+0x0E``: low byte ``0x01`` drives the output as a DC voltage, ``0x02`` as PWM
 (verified on the Pi 2026-09-15 by switching one output; the high byte is not
-interpreted). On the aquabus blocks 5-8 the low byte is 0 and not interpreted
-(the device on the bus drives the output). Block 8 read unconfigured (source
-``0xFFFF``, mode ``0x0000``) with a Quadro on aquabus. The mode is decoded for
-diagnostics only; nothing here writes it. The Quadro's mode field is not known.
+interpreted). On the aquabus blocks 5-8 the word does not describe the output:
+the four blocks of one Quadro's four identical PWM outputs read ``0x0000`` on
+block 5 and ``0x0002`` on blocks 6-8 in the same report, and ``0x0500`` on
+blocks 5-7 in an earlier capture (PROJECT.md section 2, 2026-09-17), so
+:func:`output_mode` marks an aquabus block's word *uninterpreted* and its
+:attr:`OutputMode.name` is ``"unknown"`` whatever the low byte holds. The mode
+is decoded for diagnostics only; nothing here writes it. The Quadro's mode field
+is not known.
+
+A block whose control source reads ``0xFFFF`` has nothing assigned to drive its
+output (:attr:`ChannelState.unconfigured`; seen on block 8 with a Quadro on
+aquabus, 2026-09-15). Whether writing such a block the way a configured one is
+written makes the output follow has never been observed, so the adapter refuses
+to command that channel rather than writing it blind.
+
+An aquabus fan block's electrical fields are not a per-report reading: over 90
+consecutive reports (2026-09-17, Quadro on aquabus, a fan on its output 3) the
+aquaero filled blocks 5-8 with the bus device's own voltage and current in 23
+reports and with substitutes -- the rail voltage and 0 mA / 0 W -- in the other
+67, so a turning fan reported 0 mA in three reports out of four and an idle
+output reported 0.00 V in one in four. :attr:`DeviceKind.reports_power` is
+therefore False for the aquaero's aquabus outputs as well as its own.
 """
 
 from __future__ import annotations
@@ -255,9 +275,13 @@ class DeviceKind:
     profile_offset: int | None = None
     #: The status report carries real current and power for the kind's *own* outputs.
     #: False on the aquaero: its own outputs 1-4 report 0 mA and 0 W in PWM mode
-    #: (verified on the Pi, PROJECT.md section 2), while its aquabus blocks 5-8 carry
-    #: what the device on the bus measures. A hardware fact, not a tunable.
+    #: (verified on the Pi, PROJECT.md section 2). A hardware fact, not a tunable.
     own_outputs_report_power: bool = True
+    #: The same for the kind's aquabus outputs. False on the aquaero: its blocks 5-8
+    #: carry the bus device's voltage and current in about one report in four and
+    #: substitutes (the rail voltage, 0 mA, 0 W) in the rest, so a single report's
+    #: current says nothing (PROJECT.md section 2, 2026-09-17). A hardware fact.
+    aquabus_outputs_report_power: bool = True
 
     @property
     def temp_names(self) -> tuple[str, ...]:
@@ -291,11 +315,15 @@ class DeviceKind:
 
         Absence of current is only evidence of a fault where the answer is True:
         an aquaero drives its own outputs 1-4 as PWM and reports 0 mA / 0 W for
-        them however fast the fan turns (PROJECT.md section 8 item 79).
+        them however fast the fan turns (PROJECT.md section 8 item 79), and its
+        aquabus blocks 5-8 carry the bus device's current only in about one
+        report in four (module docstring; PROJECT.md section 8 item 89).
         """
         if not 1 <= number <= self.pwm_count:
             raise IndexError(f"{self.name} has pwm1..pwm{self.pwm_count}, not pwm{number}")
-        return self.own_outputs_report_power or self.ctrl_channels[number - 1].aquabus
+        if self.ctrl_channels[number - 1].aquabus:
+            return self.aquabus_outputs_report_power
+        return self.own_outputs_report_power
 
     def describe_temps(self) -> str:
         """``temp1..temp8, bus1..bus8, ...``, for messages."""
@@ -355,6 +383,7 @@ AQUAERO = DeviceKind(
     soft_sensor_count=8,
     profile_offset=0x06,
     own_outputs_report_power=False,
+    aquabus_outputs_report_power=False,
 )
 
 QUADRO = DeviceKind(
@@ -441,8 +470,9 @@ class StatusReport:
     temps: Mapping[str, float | None]
     #: ``fans[k]`` is tachometer ``fan{k+1}`` and output ``pwm{k+1}``.
     fans: tuple[FanStatus, ...]
-    #: ``flows[j]`` is ``flow{j+1}``.
-    flows: tuple[int, ...]
+    #: ``flows[j]`` is ``flow{j+1}``, raw; ``None`` where the field holds no data
+    #: (``0x7FFF``: the aquaero's flow 3 with nothing on its aquabus, 2026-09-15).
+    flows: tuple[int | None, ...]
     #: Quadro only: increments when the device is power-cycled.
     power_cycles: int | None
 
@@ -457,8 +487,8 @@ class StatusReport:
         """Speed of tachometer ``fanN`` (1-based), rpm; ``0xFFFF`` without a device."""
         return self._fan(number, "fan").rpm
 
-    def flow(self, number: int) -> int:
-        """Flow sensor ``flowN`` (1-based), raw."""
+    def flow(self, number: int) -> int | None:
+        """Flow sensor ``flowN`` (1-based), raw; ``None`` where it holds no data."""
         if not 1 <= number <= len(self.flows):
             raise IndexError(f"{self.kind} has flow1..flow{len(self.flows)}, not flow{number}")
         return self.flows[number - 1]
@@ -494,6 +524,11 @@ def _temperature(data: bytes | bytearray, offset: int) -> float | None:
     return signed / 100.0
 
 
+def _flow(data: bytes | bytearray, offset: int) -> int | None:
+    raw = _u16(data, offset)
+    return None if raw == SENSOR_NOT_CONNECTED else raw
+
+
 def decode_status(kind: DeviceKind, data: bytes | bytearray) -> StatusReport:
     """Decodes one status report; :class:`ReportError` for a wrong id or length."""
     _check_report(data, STATUS_REPORT_ID, kind.status_size, f"{kind.name} status report")
@@ -523,7 +558,7 @@ def decode_status(kind: DeviceKind, data: bytes | bytearray) -> StatusReport:
         firmware=_u16(data, kind.firmware_offset),
         temps=temps,
         fans=fans,
-        flows=tuple(_u16(data, offset) for offset in kind.flow_offsets),
+        flows=tuple(_flow(data, offset) for offset in kind.flow_offsets),
         power_cycles=power_cycles,
     )
 
@@ -634,12 +669,22 @@ OUTPUT_MODE_PWM = 0x02
 
 @dataclass(frozen=True)
 class OutputMode:
-    """An aquaero output's mode word: ``name`` is ``"pwm"``, ``"dc"`` or ``"unknown"``."""
+    """An aquaero output's mode word: ``name`` is ``"pwm"``, ``"dc"`` or ``"unknown"``.
+
+    ``interpreted`` is False where the word is read but means nothing about the
+    output -- the aquabus blocks 5-8, whose word was measured taking different
+    values on four identical outputs of one Quadro (module docstring). The name
+    of an uninterpreted word is ``"unknown"`` whatever its low byte holds, so
+    nothing downstream can mistake it for a drive mode.
+    """
 
     raw: int
+    interpreted: bool = True
 
     @property
     def name(self) -> str:
+        if not self.interpreted:
+            return "unknown"
         low = self.raw & 0xFF
         return {OUTPUT_MODE_PWM: "pwm", OUTPUT_MODE_DC: "dc"}.get(low, "unknown")
 
@@ -665,9 +710,16 @@ class ChannelState:
 
     @property
     def unconfigured(self) -> bool:
-        """An aquaero block with source ``0xFFFF`` and mode word 0 (seen on block 8 with
-        a Quadro on aquabus); writing it like the others is not verified."""
-        return self.source == SOURCE_UNCONFIGURED and self.mode is not None and self.mode.raw == 0
+        """An aquaero block with no control source assigned (``0xFFFF``): nothing on the
+        device drives that output.
+
+        Seen on block 8 with a Quadro on aquabus (2026-09-15), where the mode word was
+        ``0x0000`` as well; the source alone decides here, because a block with no source
+        is unconfigured whatever else it holds. Writing such a block the way a configured
+        one is written has never been observed to make the output follow, so the adapter
+        refuses to command the channel (PROJECT.md section 8 item 89).
+        """
+        return self.source == SOURCE_UNCONFIGURED
 
 
 def control_duty(kind: DeviceKind, data: bytes | bytearray, k: int) -> int:
@@ -717,8 +769,8 @@ def format_channel_state(state: ChannelState, k: int, *, name: str = "") -> str:
             )
         line += "  (follows its preset)" if state.on_duty else "  (does not follow its preset)"
     if state.unconfigured:
-        line += "  (unconfigured)"
-    elif state.aquabus and state.mode is not None:
+        line += "  (unconfigured: no control source, not commanded)"
+    elif state.mode is not None and not state.mode.interpreted:
         line += f"  mode 0x{state.mode.raw:04X} (aquabus, not interpreted)"
     elif state.mode is not None:
         line += f"  mode {state.mode.name} (0x{state.mode.raw:04X})"
@@ -740,9 +792,16 @@ def active_profile(kind: DeviceKind, data: bytes | bytearray) -> int | None:
 
 
 def output_mode(kind: DeviceKind, data: bytes | bytearray, k: int) -> OutputMode | None:
-    """Channel ``k``'s output mode, or ``None`` where the kind has no known mode field."""
-    offset = _channel(kind, k).mode
-    return None if offset is None else OutputMode(_u16(data, offset))
+    """Channel ``k``'s output mode, or ``None`` where the kind has no known mode field.
+
+    On an aquabus channel the word is returned uninterpreted (module docstring):
+    it is read for diagnostics and names no drive mode.
+    """
+    channel = _channel(kind, k)
+    offset = channel.mode
+    if offset is None:
+        return None
+    return OutputMode(_u16(data, offset), interpreted=not channel.aquabus)
 
 
 def channel_holds(kind: DeviceKind, data: bytes | bytearray, k: int, duty: int) -> bool:

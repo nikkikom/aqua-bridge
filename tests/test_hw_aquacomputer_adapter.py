@@ -18,6 +18,7 @@ from aqua_bridge.hw.aquacomputer import (
     AQUAERO,
     DUTY_MAX,
     QUADRO,
+    SOURCE_UNCONFIGURED,
     DeviceKind,
     capture_channel,
     channel_holds,
@@ -41,6 +42,7 @@ from aquacomputer_fakes import (
     FakeController,
     FakeSleep,
     aquabus_aquaero,
+    aquabus_aquaero_all_configured,
     fixture_bytes,
 )
 
@@ -1305,6 +1307,14 @@ def _aquabus(binding: DeviceBinding, **fields):
     return adapter, device, clock
 
 
+def _aquabus_all_configured(binding: DeviceBinding, **fields):
+    clock = FakeClock()
+    sleep = FakeSleep(clock)
+    device = aquabus_aquaero_all_configured(clock, **fields)
+    adapter = AquacomputerAdapter(binding, clock=clock, sleep=sleep, opener=FakeBus(device))
+    return adapter, device, clock
+
+
 _QUADRO_ON_AQUABUS = DeviceBinding(
     kind=AQUAERO,
     pwm_map={"xt1": 1, "qd1": 5, "qd2": 6, "qd3": 7, "qd4": 8},
@@ -1342,7 +1352,7 @@ def test_aquabus_output_7_write_reproduces_the_hardware_bytes() -> None:
 
 def test_all_eight_aquaero_outputs_go_out_in_one_set() -> None:
     binding = DeviceBinding(kind=AQUAERO, pwm_map={f"o{n}": n for n in range(1, 9)})
-    adapter, device, _clock = _aquabus(binding)
+    adapter, device, _clock = _aquabus_all_configured(binding)
     adapter.read()
     duties = {f"o{n}": n / 10 for n in range(1, 9)}
     adapter.apply(_cmd(**duties))
@@ -1351,25 +1361,34 @@ def test_all_eight_aquaero_outputs_go_out_in_one_set() -> None:
     assert all(channel_holds(AQUAERO, device.ctrl, k, (k + 1) * 1000) for k in range(8))
 
 
-def test_aquabus_modes_get_no_warning_and_the_unconfigured_block_is_reported_once(caplog) -> None:
-    """Blocks 5-7 read mode 0x0500 (not interpreted): no "not PWM" warning. Block 8 is
-    unconfigured (source 0xFFFF, mode 0): written the same way, one warning per adapter."""
+def test_aquabus_modes_get_no_warning_and_a_block_without_a_source_is_refused(caplog) -> None:
+    """Blocks 5-7 read mode 0x0500 (not interpreted): no "not PWM" warning. Block 8 has
+    no control source (0xFFFF): the daemon refuses to command it rather than writing the
+    block blind, so nothing is written at all (PROJECT.md section 8 item 89)."""
     binding = DeviceBinding(kind=AQUAERO, pwm_map={f"qd{n}": n + 4 for n in range(1, 5)})
-    adapter, device, clock = _aquabus(binding)
-    with caplog.at_level("WARNING", logger=LOGGER):
+    adapter, device, _clock = _aquabus(binding)
+    with (
+        caplog.at_level("WARNING", logger=LOGGER),
+        pytest.raises(DeviceUnavailable, match="no control source"),
+    ):
         adapter.apply(_cmd(qd1=0.5, qd2=0.5, qd3=0.5, qd4=0.5))
-        adapter.close()
-        clock.advance(1.0)
-        device.ctrl = bytearray(fixture_bytes("aquaero-ctrl-aquabus-before-fan7-write.bin"))
-        adapter.apply(_cmd(qd1=0.6, qd2=0.6, qd3=0.6, qd4=0.6))  # a new open, block 8 again
-    warnings = _messages(caplog, "WARNING")
-    assert not [m for m in warnings if "not PWM" in m]
-    unconfigured = [m for m in warnings if "unconfigured" in m]
-    assert len(unconfigured) == 1 and "pwm8 (qd4)" in unconfigured[0]
-    assert "not verified" in unconfigured[0]
+    assert not [m for m in _messages(caplog, "WARNING") if "not PWM" in m]
+    assert device.sets() == [] and device.saves() == []
+    assert adapter.unconfigured_channels == ("qd4",)
+    assert any("no control source" in p for p in adapter.device_health()["problems"])
     state = channel_state(AQUAERO, device.ctrl, 7)
-    assert (state.duty, state.source, state.on_duty) == (6000, 0x63, True)
-    assert state.mode is not None and state.mode.raw == 0  # the mode is never written
+    assert (state.duty, state.source, state.on_duty) == (10000, SOURCE_UNCONFIGURED, False)
+
+
+def test_a_block_without_a_source_that_is_not_commanded_is_no_problem() -> None:
+    """Only a *commanded* channel is refused: the same controller with its aquabus
+    outputs 5-7 bound and block 8 left out works normally."""
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={f"qd{n}": n + 4 for n in range(1, 4)})
+    adapter, device, _clock = _aquabus(binding)
+    adapter.apply(_cmd(qd1=0.5, qd2=0.5, qd3=0.5))
+    assert len(device.sets()) == 1
+    assert adapter.unconfigured_channels == ()
+    assert adapter.device_health()["problems"] == []
 
 
 def test_an_output_without_a_device_on_aquabus_faults_only_its_own_channel(caplog) -> None:

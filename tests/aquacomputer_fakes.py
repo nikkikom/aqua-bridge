@@ -260,6 +260,19 @@ def aquabus_aquaero(clock: FakeClock, **fields) -> FakeController:
     return FakeController(AQUAERO, clock, **fields)
 
 
+def aquabus_aquaero_all_configured(clock: FakeClock, **fields) -> FakeController:
+    """The same wiring captured 2026-09-17, with every controller block configured:
+    all eight outputs point at preset 1 (source 0x5C) and block 8 is no longer
+    unconfigured, so the adapter commands all eight (PROJECT.md section 8 item 89)."""
+    from aqua_bridge.hw.aquacomputer import AQUAERO
+
+    fields.setdefault("ctrl", bytearray(fixture_bytes("aquaero-ctrl-aquabus-all-on-preset1.bin")))
+    fields.setdefault(
+        "status_template", fixture_bytes("aquaero-status-aquabus-block7-no-power.bin")
+    )
+    return FakeController(AQUAERO, clock, **fields)
+
+
 class FakeBus:
     """The adapter's ``opener``: returns the first present controller of a kind."""
 

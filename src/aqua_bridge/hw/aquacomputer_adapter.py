@@ -165,10 +165,12 @@ Keeping the cache honest
        mismatch again until the device reports its duty (its normal writes on
        a changed command continue);
        the aquaero's output mode is only reported: every commanded output of
-       its own (1-4) not in PWM mode gets one warning per open, an aquabus
-       output (5-8, mode word not interpreted) none, an unconfigured block
-       (source ``0xFFFF``, mode 0) one warning per adapter that writing it is
-       unverified; the mode is never written. Both lists are recomputed from
+       its own (1-4) not in PWM mode gets one warning per open and an aquabus
+       output (5-8, mode word not interpreted) none; the mode is never written.
+       A commanded channel whose controller block has no control source
+       (``0xFFFF``) is *refused*, not written blind: adopting such a report
+       raises ``DeviceUnavailable`` naming the channel (item 89). Both lists
+       are recomputed from
        every control report the adapter adopts (so a mode changed in aquasuite
        mid-run reaches ``device_health`` at the next refresh), only the warnings
        are kept to one;
@@ -205,7 +207,7 @@ from typing import Any, TypeVar
 from aqua_bridge.hw.aquacomputer import (
     DUTY_MAX,
     KINDS,
-    SENSOR_NOT_CONNECTED,
+    SOURCE_UNCONFIGURED,
     TEMP_MAX_C,
     TEMP_MIN_C,
     ChannelSnapshot,
@@ -581,9 +583,9 @@ class AquacomputerAdapter:
         #: daemon's back shows up at the next periodic control read.
         self._not_pwm_channels: tuple[str, ...] = ()
         self._unconfigured_channels: tuple[str, ...] = ()
-        #: Blocks already logged: unconfigured ones once per adapter, non-PWM ones
-        #: once per open (the lists above are state, these two only gate the log).
-        self._unconfigured_reported: set[int] = set()
+        #: Non-PWM blocks already logged, once per open (the lists above are state,
+        #: this one only gates the log). An unconfigured block is not logged and
+        #: kept: it is refused outright, every time it is read.
         self._not_pwm_reported: set[int] = set()
         #: Output numbers that belong to a device on the aquaero's aquabus.
         self._aquabus = frozenset(binding.kind.aquabus_outputs)
@@ -662,8 +664,9 @@ class AquacomputerAdapter:
 
     @property
     def unconfigured_channels(self) -> tuple[str, ...]:
-        """Commanded outputs whose aquaero controller block read unconfigured (source
-        ``0xFFFF``, mode word 0); writing them is not verified on hardware."""
+        """Commanded outputs whose aquaero controller block has no control source
+        (``0xFFFF``). The daemon refuses to command them (module docstring, item 89),
+        so this is the reason ``read()`` and ``apply()`` are failing, not a warning."""
         return self._unconfigured_channels
 
     def fan_readings(self, status: StatusReport | None = None) -> dict[str, dict[str, Any]]:
@@ -679,11 +682,15 @@ class AquacomputerAdapter:
         header -- and which is therefore the only speed the fitted curve of
         ``mpc.fan_models`` describes; without a binding the output's own block is
         used. ``voltage_v`` is the 12 V rail as the *output's* block reports it, and
-        ``current_ma`` / ``power_w`` that block's electrical draw, meaningful only
-        where ``power_reported`` is true (an aquaero reports 0 mA and 0 W for its own
-        outputs in PWM mode). An aquabus slot with no device behind it is left out
-        entirely: its whole block is meaningless; a bound tachometer on such a slot
-        leaves ``rpm`` ``None`` rather than publishing its ``0xFFFF``.
+        ``current_ma`` / ``power_w`` that block's electrical draw -- ``None``, not a
+        number, wherever ``power_reported`` is false, because the figure there is a
+        placeholder and not a measurement: an aquaero reports 0 mA and 0 W for its own
+        outputs in PWM mode, and fills its aquabus blocks 5-8 with the bus device's
+        current in about one report in four and with 0 mA in the rest (PROJECT.md
+        section 2, 2026-09-17, section 8 item 89). An aquabus slot with no device
+        behind it is left out entirely: its whole block is meaningless; a bound
+        tachometer on such a slot leaves ``rpm`` ``None`` rather than publishing its
+        ``0xFFFF``.
         """
         if status is None:
             status = self._status
@@ -695,6 +702,7 @@ class AquacomputerAdapter:
                 continue
             fan = status.fans[number - 1]
             tach = self.binding.fan_map.get(ch, number)
+            reported = self.kind.reports_power(number)
             out[ch] = {
                 "device": self.kind.name,
                 "output": f"pwm{number}",
@@ -702,9 +710,9 @@ class AquacomputerAdapter:
                 "rpm": None if self._empty_slot(status, tach) else float(status.fans[tach - 1].rpm),
                 "duty": fan.duty / DUTY_MAX,
                 "voltage_v": fan.voltage_v,
-                "current_ma": float(fan.current_ma),
-                "power_w": fan.power_w,
-                "power_reported": self.kind.reports_power(number),
+                "current_ma": float(fan.current_ma) if reported else None,
+                "power_w": fan.power_w if reported else None,
+                "power_reported": reported,
                 "aquabus": number in self._aquabus,
             }
         return out
@@ -739,12 +747,7 @@ class AquacomputerAdapter:
             "not_pwm_channels": list(self._not_pwm_channels),
             "unconfigured_channels": list(self._unconfigured_channels),
             "flows": (
-                {}
-                if status is None
-                else {
-                    f"flow{j}": (None if raw == SENSOR_NOT_CONNECTED else raw)
-                    for j, raw in enumerate(status.flows, start=1)
-                }
+                {} if status is None else {f"flow{j}": v for j, v in enumerate(status.flows, 1)}
             ),
         }
         profile = getattr(self, "active_profile", None)  # another change adds it (item 84)
@@ -762,7 +765,7 @@ class AquacomputerAdapter:
         if self._unconfigured_channels:
             problems.append(
                 f"{label}: the controller block of {', '.join(self._unconfigured_channels)} "
-                "is unconfigured"
+                "has no control source; the daemon refuses to command it"
             )
         if self._serial_rejected is not None:
             problems.append(self._serial_rejected)
@@ -1074,7 +1077,12 @@ class AquacomputerAdapter:
 
     def _adopt(self, data: bytes) -> list[int]:
         """Takes a fresh control report as the cache. Returns the channels whose held
-        duty is no longer the one this adapter knew (external changes)."""
+        duty is no longer the one this adapter knew (external changes).
+
+        Raises :class:`~aqua_bridge.hw.hidraw.DeviceUnavailable` when a commanded
+        channel's controller block has no control source: that output is not
+        commandable by any means this project has observed, and the daemon refuses
+        it rather than writing the block blind (PROJECT.md section 8 item 89)."""
         self._check_profile(data)
         now = self._clock()
         drifted: list[int] = []
@@ -1096,6 +1104,17 @@ class AquacomputerAdapter:
                 self._changed_t[k] = now
         self._ctrl, self._ctrl_t = data, now
         self._scan_modes(data)
+        if self._unconfigured_channels:
+            raise DeviceUnavailable(
+                f"{self.binding.label}: the aquaero controller block of "
+                f"{', '.join(self._unconfigured_channels)} has no control source "
+                f"(0x{SOURCE_UNCONFIGURED:04X}): nothing on the device drives that output, and "
+                "writing the block the way a configured one is written has never been seen to "
+                "make the output follow, so this daemon refuses to command it. Give the output "
+                "any control source in the controller's own software (the daemon replaces it "
+                "with its own preset) or drop the channel from the config "
+                "(PROJECT.md section 8 item 89)"
+            )
         return drifted
 
     def _write(self, transport: HidTransport, report: bytes, deadline: float) -> float:
@@ -1270,13 +1289,14 @@ class AquacomputerAdapter:
 
     def _scan_modes(self, ctrl: bytes) -> None:
         """Recomputes ``not_pwm_channels`` / ``unconfigured_channels`` from ``ctrl`` and
-        warns once per open (per adapter for an unconfigured block) about each.
+        warns once per open about each output not in PWM mode.
 
         Called for every control report this adapter adopts, not only the first of an
         open: the owner can switch an output to DC voltage in aquasuite at any time,
         and :meth:`device_health` promises what the controller looks like *now*
         (PROJECT.md section 8 item 83). The mode itself is only reported, never
-        changed (items 81, 85)."""
+        changed (items 81, 85). An unconfigured block is only collected here;
+        :meth:`_adopt` turns it into the refusal (item 89)."""
         not_pwm: list[str] = []
         unconfigured: list[str] = []
         for k in sorted(self._names):
@@ -1286,19 +1306,6 @@ class AquacomputerAdapter:
                 continue
             if state.unconfigured:
                 unconfigured.append(self._names[k])
-                if k not in self._unconfigured_reported:
-                    self._unconfigured_reported.add(k)
-                    _LOG.warning(
-                        "%s: pwm%d (%s): controller block %d is unconfigured (source 0x%04X, "
-                        "mode word 0x%04X); it is written like the others, which is not "
-                        "verified on hardware (PROJECT.md section 8 item 85)",
-                        self.binding.label,
-                        k + 1,
-                        self._names[k],
-                        k + 1,
-                        state.source,
-                        mode.raw,
-                    )
                 continue
             if state.aquabus or mode.is_pwm:
                 self._not_pwm_reported.discard(k)  # back in PWM: say so again if it leaves

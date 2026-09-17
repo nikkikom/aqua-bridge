@@ -5,7 +5,13 @@ zeroed) and the Linux driver's hwmon readings taken about a second later
 (PROJECT.md section 2, "USB spike results", "hidraw check"; section 4.7). The
 ``aquaero-*-aquabus-*`` and ``aquaero-status-no-aquabus`` captures are from
 firmware 2104 with the Quadro on the aquaero's aquabus and without it
-(PROJECT.md section 8 item 85).
+(PROJECT.md section 8 item 85). ``aquaero-status-aquabus-block7-power.bin``,
+``-block7-no-power.bin`` and ``aquaero-ctrl-aquabus-all-on-preset1.bin`` are the
+read-only verification of 2026-09-17 in the final wiring (PROJECT.md section 2,
+"aquabus fields checked against the live devices"; section 8 items 89 and 35):
+two status reports one second apart, so the aquabus blocks' electrical fields
+can be pinned in both of their states, and the control report that goes with
+them.
 """
 
 from __future__ import annotations
@@ -166,7 +172,7 @@ def test_aquaero_without_a_device_on_aquabus() -> None:
     assert [report.fans[k].voltage_cv for k in range(4, 8)] == [0] * 4
     assert [report.rpm(n) for n in range(1, 5)] == [353, 121, 0, 365]
     assert [report.duty(n) for n in range(1, 5)] == [2500, 1412, 10000, 2500]
-    assert report.flows == (0, 0, 0x7FFF)
+    assert report.flows == (0, 0, None)
 
 
 @pytest.mark.parametrize(
@@ -195,6 +201,103 @@ def test_aquaero_with_the_quadro_on_aquabus(name: str, duty: int, rpm: int, bus2
         fan7 = report.fans[6]
         assert (fan7.voltage_cv, fan7.current_ma, fan7.power_cw) == (1210, 27, 32)
         assert fan7.voltage_v == pytest.approx(12.10) and fan7.power_w == pytest.approx(0.32)
+
+
+# --- the aquabus fields against the live devices (items 89, 35; 2026-09-17) -------------
+
+
+def test_the_aquabus_blocks_electrical_fields_are_not_a_per_report_reading() -> None:
+    """Two status reports one second apart, the Quadro on aquabus, every output on
+    preset 1 at 20.00 %, a fan on the Quadro's output 3 (aquaero block 7) turning at
+    255 rpm in both. One report carries the bus device's own measurements -- block 7 at
+    6 mA / 0.07 W, the three outputs with no fan at 0.00 V -- and the next carries
+    substitutes: the rail voltage on all four and 0 mA / 0 W on the turning fan. So a
+    single report says nothing about an aquabus output's draw, and
+    ``reports_power`` is False for the aquaero's aquabus outputs as well as its own.
+    """
+    with_power = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-power.bin"))
+    without = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-no-power.bin"))
+    for report in (with_power, without):
+        assert all(fan.present for fan in report.fans)
+        assert [report.duty(n) for n in range(1, 9)] == [2000] * 8
+        assert report.rpm(7) == 255
+    seven_on, seven_off = with_power.fans[6], without.fans[6]
+    assert (seven_on.current_ma, seven_on.power_cw) == (6, 7)
+    assert (seven_off.current_ma, seven_off.power_cw) == (0, 0)
+    assert seven_on.voltage_cv == 1210 and seven_off.voltage_cv == 1209
+    # The idle aquabus outputs read 0.00 V in the report that carries measurements.
+    assert [with_power.fans[k].voltage_cv for k in (4, 5, 7)] == [0, 0, 0]
+    assert [without.fans[k].voltage_cv for k in (4, 5, 7)] == [1209, 1209, 1209]
+    assert [AQUAERO.reports_power(n) for n in range(1, 9)] == [False] * 8
+    assert not AQUAERO.own_outputs_report_power and not AQUAERO.aquabus_outputs_report_power
+    assert all(QUADRO.reports_power(n) for n in range(1, 5))
+
+
+def test_the_aquabus_blocks_dont_carry_the_aquaeros_own_current() -> None:
+    """The aquaero's own outputs 1-4 in PWM mode report 0 mA and 0 W however fast the
+    fan turns -- three of the four were turning in both captures (item 79)."""
+    for name in (
+        "aquaero-status-aquabus-block7-power.bin",
+        "aquaero-status-aquabus-block7-no-power.bin",
+    ):
+        report = decode_status(AQUAERO, _bin(name))
+        assert [report.rpm(n) for n in range(1, 5)] == [350, 176, 0, 372]
+        assert all(
+            report.fans[k].current_ma == 0 and report.fans[k].power_cw == 0 for k in range(4)
+        )
+
+
+def test_the_live_temperature_groups_and_their_not_connected_sentinel() -> None:
+    """2026-09-17, the final wiring: one thermistor on the aquaero's sensor 6, the
+    Quadro's sensor 2 in aquabus slot 2, all eight software sensors enabled (sensor 1
+    fed by the daemon's heartbeat at 20.00 degC, the others at their 50.00 degC
+    fallback), no virtual sensor configured. Every other slot of every group reads the
+    0x7FFF sentinel and decodes as None."""
+    report = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-no-power.bin"))
+    assert report.firmware == 2104
+    assert report.temp("temp6") == pytest.approx(23.05)
+    assert [report.temp(f"temp{n}") for n in (1, 2, 3, 4, 5, 7, 8)] == [None] * 7
+    assert report.temp("bus2") == pytest.approx(23.68)
+    assert [report.temp(f"bus{n}") for n in (1, 3, 4, 5, 6, 7, 8)] == [None] * 7
+    assert report.temp("soft1") == pytest.approx(20.0)
+    assert [report.temp(f"soft{n}") for n in range(2, 9)] == [pytest.approx(50.0)] * 7
+    assert [report.temp(f"virt{n}") for n in range(1, 5)] == [None] * 4
+    # flow1 and flow2 are the aquaero's own with nothing connected, flow3 the Quadro's
+    # on aquabus: a present-but-empty flow sensor reads 0, an absent slot 0x7FFF.
+    assert report.flows == (0, 0, 0)
+    assert report.flow(3) == 0
+
+
+def test_the_live_control_report_every_block_on_preset_1() -> None:
+    """The owner's profile 1 as the controller holds it (2026-09-17): all eight blocks
+    point at preset 1 (source 0x5C) with limits 0 / 100 %, so only channel 0 -- whose
+    own preset id *is* 0x5C -- reads as following its own preset. Preset 1 holds
+    20.00 %, which every output's status duty shows."""
+    data = _bin("aquaero-ctrl-aquabus-all-on-preset1.bin")
+    check_control_report(AQUAERO, data)
+    assert active_profile(AQUAERO, data) == 1
+    states = [channel_state(AQUAERO, data, k) for k in range(8)]
+    assert [s.source for s in states] == [0x5C] * 8
+    assert [(s.min_power, s.max_power) for s in states] == [(0, 10000)] * 8
+    assert [s.on_duty for s in states] == [True] + [False] * 7
+    assert [s.unconfigured for s in states] == [False] * 8
+    assert control_duty(AQUAERO, data, 0) == 2000
+    assert channel_holds(AQUAERO, data, 0, 2000)
+
+
+def test_the_aquabus_mode_word_is_read_but_never_interpreted() -> None:
+    """One Quadro's four identical PWM outputs, in one report: block 5 reads 0x0000 and
+    blocks 6-8 read 0x0002, and the same blocks read 0x0500 in the 2026-09-15 capture.
+    The word therefore says nothing about an aquabus output, and every aquabus mode is
+    reported uninterpreted whatever its low byte (item 89)."""
+    data = _bin("aquaero-ctrl-aquabus-all-on-preset1.bin")
+    modes = [output_mode(AQUAERO, data, k) for k in range(8)]
+    assert [m.raw for m in modes] == [0x0002] * 4 + [0x0000] + [0x0002] * 3
+    assert [m.interpreted for m in modes] == [True] * 4 + [False] * 4
+    # Block 6's low byte is 0x02, the aquaero's own PWM code, and is still not a mode.
+    assert [m.name for m in modes] == ["pwm"] * 4 + ["unknown"] * 4
+    assert not any(m.is_pwm for m in modes[4:])
+    assert [channel_state(AQUAERO, data, k).mode for k in range(8)] == modes
 
 
 def test_quadro_status_output_duty_and_power_cycles() -> None:
