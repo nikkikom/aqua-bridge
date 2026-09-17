@@ -2015,9 +2015,9 @@ def update(
                 # Each member is predicted where the filter says *it* sits -- its own node
                 # and, on the fused layout, its own placement offset -- and the variance
                 # of the mean is that same prediction's, so a placement the filter is
-                # still unsure of cannot look like a swap either (item 109).
-                # the states each member's prediction is built from: its node, plus its
-                # offset where the fused layout carries one
+                # still unsure of cannot look like a swap either (item 109). ``rows`` are
+                # the states each member's prediction is built from, so the double sum is
+                # the covariance of the mean prediction.
                 rows = [(m[6],) if m[5] is None else (m[6], i_off + m[5]) for m in members]
                 nu_bay = sum(m[3] for m in members) / len(members)
                 var_bay = sum(m[2] for m in members)
