@@ -475,6 +475,12 @@ mpc:
   ident_levels: above    # above: never less cooling than the solver asks for
   ident_replan: true     # re-plan the levels from the live solver demand every tick; false
                          # freezes them at the base of the start (the Zero W behaviour)
+  ident_parallel: false  # false: one group at a time, the siblings held. true: one experiment
+                         # drives every channel of the target's own zones at once, each on its
+                         # own independent code -- the zone-wide excitation the thermal model's
+                         # PE monitor needs to reach converged (section 8 item 102). Under
+                         # ident_levels: above it never commands less cooling; it does raise
+                         # every channel of the zone for the run instead of one at a time.
   ident_hold_s: [60, 120, 180]  # hold times drawn by the seeded sequence (each >= 5 * dt)
   ident_max_duration_s: 1800    # the whole experiment, seconds
   ident_settle_s: 600    # every zone the group serves trusted this long before a start
