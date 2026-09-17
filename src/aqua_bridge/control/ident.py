@@ -19,7 +19,8 @@ The unit is a **fan group** (``fans.<channel>.group``; a channel without a
 group is a group of its own, named like the channel). ``start`` on a group runs
 the group level first (every channel of the group together) and then, for a
 group of several channels, each channel alone, so the thermal model can split
-the group's gain between them; ``start`` on a channel runs that channel alone.
+the group's gain between them; ``start`` on a channel runs that channel alone
+(``ident_parallel`` widens both to the target's whole zones, below).
 ``ident_max_duration_s`` is split evenly over the phases. While one channel of a
 group runs alone the group's other channels are held at the group's base (a
 solver-driven sibling would move against the experiment and make the two
@@ -27,6 +28,42 @@ regressors collinear again; that base follows the solver's demand like every
 other level below, and a held sibling is floored by the solver's own command on
 every tick like every other experiment channel, so holding one never gives less
 cooling than the solver asks for).
+
+Excite a whole zone at once (``ident_parallel``, default false)
+----------------------------------------------------------------
+One group at a time is the wrong unit for the *thermal model*. Its air block per
+zone regresses one airflow regressor per fan group of that zone
+(:mod:`aqua_bridge.control.thermal`, *PE monitor*), and its convergence rule asks
+the smallest eigenvalue of their information matrix to pass ``PE_MIN``: **every**
+group of the zone has to move, independently of the others, inside the monitor's
+~30-window memory. A schedule that telegraphs one group while the solver carries
+the rest gives that matrix one direction, not ``G`` of them, however long it runs
+(section 8 item 102 has the measured eigenvalues).
+
+``ident_parallel: true`` changes the channel set and the schedule, nothing else:
+
+* the target's channel set grows to every channel of the zones that **list** the
+  target's channels (``ZoneLayout.zone_channels``; the coupled zones are not added
+  -- they are served, and still checked and aborted on, but exciting them is not
+  what makes the target's zone identifiable);
+* the experiment is one phase over all of them, and each channel gets its **own**
+  telegraph -- its own start level and its own hold draws, from an LFSR seeded per
+  channel from ``ident_seed`` -- instead of the whole phase sharing one level.
+
+Everything else is untouched: the levels are the same two levels around the same
+anchor, ``above`` still never commands less cooling than the solver, the same
+preconditions are checked (over the larger channel set, so a start is refused when
+any of those channels is saturated or would leave the band), the same envelope and
+the same abort list run on the same served zones, and ``compose`` still floors,
+rate-limits and clamps every override. With ``ident_parallel: false`` the schedule,
+the channel set and the experiment dict are what they were.
+
+What it costs: under ``above`` a channel spends about half an experiment a step
+above the anchor, so ``G`` channels are raised at once instead of one. The
+*integrated* fan-seconds are the same -- one parallel experiment replaces the ``G``
+sequential ones its zone needed -- but they are spent in a ``G``-times shorter
+window, so the enclosure is louder while it runs and quiet again sooner. It never
+costs temperature under ``above``.
 
 Each channel's base ``u_base`` starts as the solver's command for it on the last
 tick before the start. The two levels are ``ident_levels``:
@@ -252,6 +289,7 @@ from aqua_bridge.model import MpcCommand, MpcConfig
 __all__ = [
     "ACTIONS",
     "APPLY_FAILURES_ABORT",
+    "CODE_STRIDE",
     "LEVEL_HIGH",
     "LEVEL_LOW",
     "LFSR_TAPS",
@@ -279,12 +317,15 @@ __all__ = [
     "status",
     "target_channels",
     "track",
+    "zone_channels",
 ]
 
 #: This many consecutive failed writes abort a running experiment.
 APPLY_FAILURES_ABORT = 2
 #: Galois LFSR taps (16 bit, maximal length) of the hold-time sequence.
 LFSR_TAPS = 0xB400
+#: Seed stride between the per-channel code streams of an ``ident_parallel`` phase.
+CODE_STRIDE = 7919
 LEVEL_LOW = 0
 LEVEL_HIGH = 1
 #: ``POST /api/ident`` actions and target kinds.
@@ -320,23 +361,41 @@ def group_channels(cfg: MpcConfig, group: str) -> tuple[str, ...]:
     return groups(cfg)[group]
 
 
+def zone_channels(cfg: MpcConfig, channels: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Every channel of the zones that *list* one of ``channels``, in config order.
+
+    The unit ``ident_parallel`` excites: the zone's own outputs, not those of the zones
+    it is only coupled to. A legacy config (no ``topology``) has no zones, so the input
+    comes back unchanged."""
+    layout = cfg.zone_layout
+    zones = {z for ch in channels for z in layout.channel_zones.get(ch, ())}
+    members = {ch for z in zones for ch in layout.zone_channels.get(z, ())}
+    members.update(channels)
+    return tuple(ch for ch in cfg.channels if ch in members)
+
+
 def target_channels(cfg: MpcConfig, kind: str, name: str) -> tuple[str, ...]:
     """Every channel an experiment on ``kind`` ``name`` commands; ``KeyError`` if unknown.
 
     A channel target commands only that channel; a group target every channel of
-    the group (the group phase, then each channel with its siblings at base)."""
+    the group (the group phase, then each channel with its siblings at base). With
+    ``ident_parallel`` both widen to every channel of the target's own zones
+    (:func:`zone_channels`), which is the unit the thermal model's PE monitor needs."""
     if kind == "channel":
         if name not in cfg.channels:
             raise KeyError(name)
-        return (name,)
-    if kind == "group":
-        return group_channels(cfg, name)
-    raise KeyError(kind)
+        base: tuple[str, ...] = (name,)
+    elif kind == "group":
+        base = group_channels(cfg, name)
+    else:
+        raise KeyError(kind)
+    return zone_channels(cfg, base) if cfg.ident_parallel else base
 
 
 def _phases(cfg: MpcConfig, kind: str, name: str) -> list[tuple[str, ...]]:
     channels = target_channels(cfg, kind, name)
-    if kind == "channel" or len(channels) == 1:
+    if cfg.ident_parallel or kind == "channel" or len(channels) == 1:
+        # parallel: one phase over the whole zone, each channel on its own code
         return [channels]
     return [channels, *((ch,) for ch in channels)]
 
@@ -772,23 +831,55 @@ def hold_sequence(cfg: MpcConfig, total_s: float) -> list[float]:
     return out
 
 
+def _code(cfg: MpcConfig, index: int, start_s: float, end_s: float) -> list[list[float]]:
+    """One channel's own telegraph over ``[start_s, end_s)`` (``ident_parallel``).
+
+    Its own LFSR stream, seeded from ``ident_seed`` and the channel's position in the
+    phase, draws both the start level and every hold, so the codes of a zone's channels
+    are independent of one another -- which is the whole point: the PE monitor reads the
+    smallest eigenvalue over the zone's groups, and channels that switch together leave
+    it at zero."""
+    state = (cfg.ident_seed + CODE_STRIDE * (index + 1)) % 0xFFFF + 1
+    holds = list(cfg.ident_hold_s)
+    segments: list[list[float]] = []
+    for _ in range(16):
+        state = _lfsr_next(state)
+    level = LEVEL_HIGH if state & 1 else LEVEL_LOW
+    t = start_s
+    while t < end_s - _EPS:
+        segments.append([t, level])
+        for _ in range(16):
+            state = _lfsr_next(state)
+        t += holds[state % len(holds)]
+        level = LEVEL_LOW if level == LEVEL_HIGH else LEVEL_HIGH
+    return segments
+
+
 def _schedule(cfg: MpcConfig, phases: list[tuple[str, ...]]) -> list[dict[str, Any]]:
     duration = cfg.ident_max_duration_s
     per_phase = duration / len(phases)
-    holds = iter(hold_sequence(cfg, duration + len(phases) * max(cfg.ident_hold_s)))
+    # the shared stream: a coded phase draws from its own per-channel streams instead
+    holds = (
+        iter(())
+        if cfg.ident_parallel
+        else iter(hold_sequence(cfg, duration + len(phases) * max(cfg.ident_hold_s)))
+    )
     out: list[dict[str, Any]] = []
     for i, channels in enumerate(phases):
         start_s = i * per_phase
         end_s = duration if i == len(phases) - 1 else (i + 1) * per_phase
-        segments: list[list[float]] = []
-        t, level = start_s, LEVEL_HIGH
-        while t < end_s - _EPS:
-            segments.append([t, level])
-            t += next(holds)
-            level = LEVEL_LOW if level == LEVEL_HIGH else LEVEL_HIGH
-        out.append(
-            {"channels": list(channels), "start_s": start_s, "end_s": end_s, "segments": segments}
-        )
+        phase: dict[str, Any] = {"channels": list(channels), "start_s": start_s, "end_s": end_s}
+        if cfg.ident_parallel:
+            phase["codes"] = {ch: _code(cfg, j, start_s, end_s) for j, ch in enumerate(channels)}
+        else:
+            segments: list[list[float]] = []
+            t, level = start_s, LEVEL_HIGH
+            while t < end_s - _EPS:
+                segments.append([t, level])
+                t += next(holds)
+                level = LEVEL_LOW if level == LEVEL_HIGH else LEVEL_HIGH
+            phase["segments"] = segments
+        out.append(phase)
     return out
 
 
@@ -865,37 +956,59 @@ def _replan(
     return {"plan_base": plan_base, "levels": levels}
 
 
+def _level_at(segments: list[Any], offset_s: float) -> int:
+    level = LEVEL_HIGH
+    for seg_t, seg_level in segments:
+        if seg_t <= offset_s + _EPS:
+            level = int(seg_level)
+    return level
+
+
+def _phase_levels(phase: Mapping[str, Any], offset_s: float) -> dict[str, int]:
+    """Level per channel of ``phase`` at ``offset_s``: one shared level, or, for a
+    ``ident_parallel`` phase, each channel's own code."""
+    codes = phase.get("codes")
+    if codes:
+        return {ch: _level_at(codes[ch], offset_s) for ch in phase["channels"]}
+    return dict.fromkeys(phase["channels"], _level_at(phase["segments"], offset_s))
+
+
 def _position(exp: Mapping[str, Any], offset_s: float) -> tuple[int, int]:
     """``(phase index, level)`` of the schedule at ``offset_s`` -- the schedule only,
-    so it says nothing about the levels themselves (they are re-planned around it)."""
+    so it says nothing about the levels themselves (they are re-planned around it).
+    For a coded phase the level is that of its first channel, the phase's reference;
+    :func:`_phase_levels` has the rest."""
     phases = exp["phases"]
     index = len(phases) - 1
     for i, phase in enumerate(phases):
         if offset_s < phase["end_s"] - _EPS:
             index = i
             break
-    level = LEVEL_HIGH
-    for seg_t, seg_level in phases[index]["segments"]:
-        if seg_t <= offset_s + _EPS:
-            level = int(seg_level)
-    return index, level
+    phase = phases[index]
+    codes = phase.get("codes")
+    segments = codes[phase["channels"][0]] if codes else phase["segments"]
+    return index, _level_at(segments, offset_s)
 
 
 def levels_at(exp: Mapping[str, Any], offset_s: float) -> dict[str, Any]:
-    """``{"phase", "level", "overrides"}`` at ``offset_s`` into the experiment.
+    """``{"phase", "level", "overrides"}`` at ``offset_s`` into the experiment, plus
+    ``"code"`` (the level per channel) on a ``ident_parallel`` phase.
 
     Every channel of the target gets an override: the phase's channels their level,
     the other channels of the group their base (``plan_base``: the frozen start base,
     or the re-planned anchor with ``ident_replan``)."""
     index, level = _position(exp, offset_s)
     phase = exp["phases"][index]
-    active = set(phase["channels"])
+    per_channel = _phase_levels(phase, offset_s)
     held = exp.get("plan_base") or exp["base"]
     overrides = {
-        ch: float(exp["levels"][ch][level]) if ch in active else float(held[ch])
+        ch: float(exp["levels"][ch][per_channel[ch]]) if ch in per_channel else float(held[ch])
         for ch in exp["channels"]
     }
-    return {"phase": index, "level": level, "overrides": overrides}
+    out: dict[str, Any] = {"phase": index, "level": level, "overrides": overrides}
+    if phase.get("codes"):
+        out["code"] = [per_channel[ch] for ch in phase["channels"]]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -958,7 +1071,14 @@ def advance(exp: Mapping[str, Any], cfg: MpcConfig, facts: TickFacts) -> Advance
     at = max(offset, 0.0)
     if exp.get("replan"):
         out["prev_overrides"] = dict(exp["overrides"])  # the level this tick ran at
-        switching = _position(out, at) != (int(exp["phase"]), int(exp["level"]))
+        index, level = _position(out, at)
+        switching = (index, level) != (int(exp["phase"]), int(exp["level"]))
+        phase = out["phases"][index]
+        if not switching and phase.get("codes"):
+            # a coded phase switches when *any* of its channels does, not only the
+            # reference channel ``_position`` reads
+            now = [_phase_levels(phase, at)[ch] for ch in phase["channels"]]
+            switching = now != list(exp.get("code") or ())
         out.update(_replan(exp, cfg, facts, switching=switching))
     out.update(levels_at(out, at))
     return Advance(out)
