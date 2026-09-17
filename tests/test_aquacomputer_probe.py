@@ -83,7 +83,8 @@ def test_lists_and_decodes_both_devices_without_writing(rig) -> None:
     assert "pwm2  duty   0.00 %  source 0x0059  min 50.00 %  max 100.00 %  (does not follow" in text
     assert "preset)  mode pwm (0x0502)" in text and "mode dc (0x0501)" in text
     assert "(does not follow its preset)  mode 0x0500 (aquabus, not interpreted)" in text
-    assert "pwm8  duty 100.00 %  source 0xFFFF" in text and "(unconfigured)" in text
+    assert "pwm8  duty 100.00 %  source 0xFFFF" in text
+    assert "(unconfigured: no control source, not commanded)" in text
     # Quadro: power cycles, duty from the control report, software sensors
     assert "power cycles:" in text and "pwm3  duty 100.00 %" in text
     assert "software sensors (soft1..soft16, degC):" in text
@@ -162,7 +163,12 @@ def test_decodes_the_quadro_on_the_aquaeros_aquabus(tmp_path: Path) -> None:
     )
     text = out.getvalue()
     assert "  aquabus temperature slots (bus1..bus8, degC):\n    bus2      24.14\n" in text
-    assert "pwm7/fan7   1105 rpm  duty 100.00 %  12.10 V     27 mA    0.32 W  (aquabus)" in text
+    # The aquaero measures neither its own nor its aquabus outputs dependably (item 89):
+    # the raw figures are shown, marked as not measured.
+    assert (
+        "pwm7/fan7   1105 rpm  duty 100.00 %  12.10 V  not measured (27 mA, 0.32 W)  "
+        "(aquabus)" in text
+    )
     assert "pwm5/fan5      0 rpm" in text and "no device" not in text
     assert "flow3  0" in text
     assert "pwm7  duty 100.00 %  source 0x0059  min 39.96 %" in text

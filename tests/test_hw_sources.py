@@ -699,14 +699,21 @@ def test_read_merges_the_fan_readings_of_every_controller() -> None:
     assert radiator["device"] == "aquaero" and radiator["output"] == "pwm2"
     assert radiator["rpm"] == 120.0 and radiator["duty"] == pytest.approx(0.1412)
     assert radiator["voltage_v"] == pytest.approx(12.09)
-    # the aquaero reports 0 mA / 0 W for its own outputs in PWM mode: not a fault
-    assert radiator["current_ma"] == 0.0 and radiator["power_reported"] is False
-    assert obs.inputs["fans"]["exhaust"]["power_reported"] is True
+    # the aquaero measures no current on its own outputs in PWM mode, so the reading
+    # is None rather than a 0.0 the power rule could read as a dead fan (item 89)
+    assert radiator["current_ma"] is None and radiator["power_w"] is None
+    assert radiator["power_reported"] is False
+    exhaust = obs.inputs["fans"]["exhaust"]  # a Quadro's own output does measure
+    assert exhaust["power_reported"] is True and exhaust["current_ma"] is not None
     # and none of it reached the observation the gate and the solver read
     assert set(obs.temps) == {"air_z0", "air_z1"} and set(obs.rpm) == {"radiator"}
 
 
-def test_an_aquabus_output_reports_its_real_current_and_power() -> None:
+def test_an_aquabus_outputs_current_and_power_are_published_as_unknown() -> None:
+    """The aquaero fills its aquabus blocks with the bus device's current in about one
+    report in four and with 0 mA in the rest (PROJECT.md section 2, 2026-09-17), so a
+    single report's figure is not a measurement: rpm and duty are published, current
+    and power are None, and ``power_reported`` says why (item 89)."""
     clock = FakeClock()
     device = aquabus_aquaero(clock)
     adapter = AquacomputerAdapter(
@@ -716,9 +723,9 @@ def test_an_aquabus_output_reports_its_real_current_and_power() -> None:
         opener=FakeBus(device),
     )
     reading = adapter.read().inputs["fans"]["qd3"]
-    assert reading["aquabus"] is True and reading["power_reported"] is True
-    assert (reading["rpm"], reading["current_ma"]) == (1105.0, 27.0)
-    assert reading["power_w"] == pytest.approx(0.32)
+    assert reading["aquabus"] is True and reading["power_reported"] is False
+    assert reading["rpm"] == 1105.0 and reading["voltage_v"] == pytest.approx(12.10)
+    assert reading["current_ma"] is None and reading["power_w"] is None
 
 
 def test_an_absent_aquabus_slot_contributes_no_fan_reading() -> None:
