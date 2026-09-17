@@ -7800,12 +7800,15 @@ Owner decision (2026-09-16):
     document, not a representative one: `config.example-das.yaml` ships
     `fan_curve_online: false`, so `fan_curves` stays empty, and the DAS
     truth-plant closed loop here never accumulated a SMART calibration
-    a real drive's agent would, so `calibration` and `bays` are empty too
-    -- what's actually in the 1424 bytes is close to the store's floor
-    (`fingerprint`, `ident_settle`, the empty sections), not its steady
-    state on a populated enclosure. The size and the write time both need
-    the Pi run to mean anything for this item: SSD-class dev-machine
-    storage says nothing about a microSD card's write and fsync latency,
+    a real drive's agent would, so `calibration` and `bays` are empty too;
+    the tool passes `ident_settle=None` (no identification experiment
+    runs in this warm-up loop), so that section is unconditionally empty
+    on every run of this tool as well -- what's actually in the 1424
+    bytes is close to the store's floor (`fingerprint`, plus four empty
+    sections: `fan_curves`, `calibration`, `bays`, `ident_settle`), not
+    its steady state on a populated enclosure. The size and the write
+    time both need the Pi run to mean anything for this item: SSD-class
+    dev-machine storage says nothing about a microSD card's write and fsync latency,
     and only a board running against the real topology (drives reporting
     SMART, calibrations accepted, fan curves fit if enabled) reaches the
     store's real size.
