@@ -187,6 +187,13 @@ xt6:
   duty_mismatch_s: 5.0          # a mismatch lasting longer re-reads and rewrites every channel (> 0)
   write_min_interval_s: 0.0     # a falling duty is written at most this often (>= 0; 0 writes every change; rises go out at once)
   write_deadband: 0             # a falling duty is written only this far below the written one, 1/100 % (0..10000; 0 writes every change)
+  bus_absent_s: 10.0            # every aquabus fan block must read "no device" (rpm 0xFFFF) for this long
+                                # before the daemon reports the device on the aquaero's aquabus as lost
+                                # (> 0; at least the measured aquabus refresh window of 4 s, PROJECT.md
+                                # section 8 item 115, so one skipped bus poll is never read as a departure).
+                                # It bounds the report only: an aquabus temperature slot (busN) reads as
+                                # missing from the first such report, because such a slot keeps the last
+                                # value it read instead of reading 0x7FFF (section 8 item 92)
   heartbeat_sensor: 0           # software sensor softN (aquaero 1..8) the daemon writes on every tick
                                 # that commanded the duties, as a hardware watchdog; 0 is off (the
                                 # controller's own timeout, fallback temperature and alarm action are

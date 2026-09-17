@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from aqua_bridge.hw.aquacomputer import AQUAERO, KINDS, QUADRO
+from aqua_bridge.hw.aquacomputer import AQUABUS_REFRESH_S, AQUAERO, KINDS, QUADRO
 from aqua_bridge.hw.aquacomputer_adapter import (
     ENTRY_KEYS,
     KIND_TIMING_DEFAULTS,
@@ -586,6 +586,27 @@ def test_the_unit_watchdog_fits_the_das_example_with_two_controllers_at_their_de
             dt=app.mpc.dt,
             step_bound_s=app.mpc.budget_alarm_ms / 1000.0,
         )
+
+
+# --- the bus-absent window (item 92, bounded by item 115) ----------------------------------
+
+
+def test_bus_absent_s_defaults_and_must_cover_the_measured_refresh_window() -> None:
+    """The key that says how long every aquabus block must read "no device" before the
+    daemon reports the bus device lost (item 92). Its floor is not a taste: below the
+    aquaero's measured aquabus refresh window (item 115) a poll the controller skipped
+    and a device that left the bus are not told apart, so the config is refused. A
+    Quadro has no aquabus outputs and no such window, so nothing bounds it there."""
+    assert _parse(_SECTION).timing.bus_absent_s == 10.0
+    assert "bus_absent_s" in TIMING_KEYS and "bus_absent_s" in ENTRY_KEYS
+    assert _parse(dict(_SECTION, bus_absent_s=AQUABUS_REFRESH_S)).timing.bus_absent_s == 4.0
+    with pytest.raises(ConfigError, match=re.escape("at least the aquaero's aquabus refresh")):
+        _parse(dict(_SECTION, bus_absent_s=AQUABUS_REFRESH_S / 2))
+    with pytest.raises(ConfigError, match="bus_absent_s must be a finite number > 0"):
+        _parse(dict(_SECTION, bus_absent_s=0))
+    assert AquacomputerTiming.for_kind(QUADRO, bus_absent_s=0.5).bus_absent_s == 0.5
+    quadro = _parse(dict(_SECTION, device="quadro", bus_absent_s=0.5))
+    assert quadro.timing.bus_absent_s == 0.5
 
 
 # --- the software-sensor heartbeat (item 84) -----------------------------------------------
