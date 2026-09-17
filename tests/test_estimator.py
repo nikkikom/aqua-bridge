@@ -12,6 +12,7 @@ import copy
 import dataclasses
 import json
 import math
+import random
 from typing import Any
 
 import numpy as np
@@ -586,8 +587,12 @@ def test_a_member_that_returns_after_the_load_moved_is_a_swap_only_on_the_fused_
     assert per_sensor.estimates["a1"]["sigma"] == pytest.approx(
         est.sigma_uncalibrated_c(pair_cfg(SLOPE_SPREAD)), abs=0.05
     )
+    # The map predicts the gap at a rise it has not seen the member at. Not exactly: the
+    # offset half of it is a random walk (``q_offset``, so a placement that *drifts* can
+    # still be followed), which is what keeps the ramps' biased rows nudging it for ever
+    # instead of letting P collapse on them. A few tenths of a degC is what that costs.
     assert per_sensor.bays["a1"]["offsets_c"]["prox_a1b"] == pytest.approx(
-        truth_gap(RISES_C[0]), abs=0.3
+        truth_gap(RISES_C[0]), abs=0.5
     )
 
 
@@ -713,6 +718,80 @@ def test_proximal_slope_spread_is_a_config_key():
     for bad in (-0.1, 0.6):
         with pytest.raises(ConfigError, match="proximal_slope_spread"):
             lcfg(proximal_slope_spread=bad)
+
+
+#: How far the redundant member of bay a1 wanders in :func:`drift_run`, degC. Fouling, a
+#: sensor working loose, a thermistor ageing: a *placement* moving, which is exactly the
+#: quantity ``q_offset`` makes a random walk.
+MEMBER_DRIFT_C = -6.0
+DRIFT_TICKS = 900
+
+
+def drift_run(cfg: MpcConfig, noise: float = 0.0, seed: int = 1):
+    """Both members reporting at a fixed drive while the redundant one slides
+    :data:`MEMBER_DRIFT_C` away from the anchor over :data:`DRIFT_TICKS` ticks."""
+    rnd = random.Random(seed)
+    truth_d = SP + RISES_C[1]
+    mem, up = None, None
+    for i in range(DRIFT_TICKS):
+        gone = MEMBER_DRIFT_C * i / (DRIFT_TICKS - 1)
+        a = member_reading(truth_d, SP) + (rnd.gauss(0.0, noise) if noise else 0.0)
+        b = member_reading(truth_d, SP) + gone + (rnd.gauss(0.0, noise) if noise else 0.0)
+        up = tick(cfg, mem, i * cfg.dt, prox_a1=a, prox_a1b=b)
+        mem = up.memory
+    return up, truth_d
+
+
+@pytest.mark.parametrize("noise", [0.0, 0.15])
+def test_a_drifting_member_is_followed_by_its_map_and_not_by_the_shared_drive(noise):
+    """A placement that drifts must land in the member's own map, as it landed in the
+    random-walk offset state of the fused layout (item 67).
+
+    Without a process-noise term the RLS has no forgetting: ``P`` collapses, the learned
+    map freezes, and the disagreement the member keeps bringing has nowhere to go but the
+    drive both members share -- a silent *under*-estimate of the drive, with ``sigma`` at
+    the uncalibrated floor and so no margin covering it. That is a failure reducing
+    cooling (plan section 2), which is the one thing the estimator may not do.
+    """
+    fused, truth_d = drift_run(pair_cfg(), noise)
+    per_sensor, _ = drift_run(pair_cfg(SLOPE_SPREAD), noise)
+    assert fused.estimates["a1"]["t"] == pytest.approx(truth_d, abs=0.5)
+    assert per_sensor.estimates["a1"]["t"] == pytest.approx(truth_d, abs=0.5)
+    # the drift is carried by the member's learned offset, not by its slope
+    learned = per_sensor.bays["a1"]["proximal_map"]["prox_a1b"]
+    assert learned["offset_delta_c"] < MEMBER_DRIFT_C / 2.0
+    assert learned["slope_delta"] == pytest.approx(0.0, abs=SLOPE_SPREAD)
+
+
+def test_the_learned_map_cannot_run_away_along_the_direction_its_rows_cannot_see():
+    """A row ``z = ds * rise + db`` identifies only the combination, so ``(ds, db)`` is free
+    to walk along ``(1, -rise)`` for ever and still fit every reading. Bounded, it cannot:
+    the slope stays inside the prior spread the operator declared, the offset inside what
+    keeps the member's map usable, and the clip in ``member_map`` never has to bite."""
+    cfg = pair_cfg(SLOPE_SPREAD)
+    for noise in (0.0, 0.15):
+        up, _ = drift_run(cfg, noise)
+        learned = up.bays["a1"]["proximal_map"]["prox_a1b"]
+        assert abs(learned["slope_delta"]) <= SLOPE_SPREAD + 1e-9, learned
+        assert E.CAL_SLOPE_BOUNDS[0] <= learned["slope"] <= E.CAL_SLOPE_BOUNDS[1], learned
+        assert E.CAL_OFFSET_BOUNDS[0] <= learned["offset_c"] <= E.CAL_OFFSET_BOUNDS[1], learned
+        assert learned["clipped"] is False, learned
+
+
+def test_the_diagnostics_publish_the_map_the_filter_predicts_with():
+    """``proximal_map`` carries the effective ``(slope, offset_c)``, not only the learned
+    difference: a reader working out why a bay under-reads must see what the filter is
+    running, and ``clipped`` says when the two have parted company."""
+    cfg = pair_cfg(SLOPE_SPREAD)
+    ups, _ = pair_ticks(cfg, rise_profile(4))
+    learned = ups[-1].bays["a1"]["proximal_map"]["prox_a1b"]
+    s_prior, b_prior = E.CAL_PRIOR
+    assert learned["slope"] == pytest.approx(s_prior + learned["slope_delta"])
+    assert learned["offset_c"] == pytest.approx(b_prior + learned["offset_delta_c"])
+    assert learned["clipped"] is False
+    # the fused layout has no per-member map at all, so it publishes none
+    fused, _ = pair_ticks(pair_cfg(), rise_profile(1))
+    assert fused[-1].bays["a1"]["proximal_map"] == {}
 
 
 # ---------------------------------------------------------------------------
