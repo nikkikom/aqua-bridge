@@ -37,8 +37,14 @@ zone regresses one airflow regressor per fan group of that zone
 the smallest eigenvalue of their information matrix to pass ``PE_MIN``: **every**
 group of the zone has to move, independently of the others, inside the monitor's
 ~30-window memory. A schedule that telegraphs one group while the solver carries
-the rest gives that matrix one direction, not ``G`` of them, however long it runs
-(section 8 item 102 has the measured eigenvalues).
+the rest excites one direction of that matrix at a time, and the others only as
+far as the solver happens to move them: measured over 16 h on the DAS example, a
+round robin over **every** channel does push a zone's ``pe_min`` past ``PE_MIN``
+now and then -- peaks of 0.13 to 0.21 against the 0.05 bound -- but it does not
+hold it there, and over three seeds exactly one zone of twelve latched
+``converged`` that way, its live ``pe_min`` back at 0.008 by the end. A coded
+zone-wide phase peaks at 0.11 to 0.36 and still sits at 0.08 to 0.17 at the end
+of the run (section 8 item 102 has the eigenvalues and the per-seed numbers).
 
 ``ident_parallel: true`` changes the channel set and the schedule, nothing else:
 
@@ -59,11 +65,25 @@ rate-limits and clamps every override. With ``ident_parallel: false`` the schedu
 the channel set and the experiment dict are what they were.
 
 What it costs: under ``above`` a channel spends about half an experiment a step
-above the anchor, so ``G`` channels are raised at once instead of one. The
-*integrated* fan-seconds are the same -- one parallel experiment replaces the ``G``
-sequential ones its zone needed -- but they are spent in a ``G``-times shorter
-window, so the enclosure is louder while it runs and quiet again sooner. It never
-costs temperature under ``above``.
+above the anchor, so ``G`` channels are raised at once instead of one. *Per zone
+identified* that is arithmetic-neutral -- one zone-wide experiment does the work
+of the ``G`` sequential ones its zone needs, in a ``G``-times shorter window --
+but that is arithmetic, not what was measured: in the A/B of
+``tests/test_ident_converge_sim.py`` both arms run the same 16 h of experiment,
+and the zone-wide arm costs **+0.036 to +0.050 mean PWM** over the whole run. It
+never costs temperature under ``above``.
+
+What it costs under ``symmetric``: more than it used to, and this is the one
+accepted worst case the key widens. ``compose`` floors an experiment channel at
+its own solver command minus ``ident_amplitude``; before, at most one group of a
+zone was at its low level at a time (a group's siblings are held at base, above),
+so that is all the cooling a tick could give up. A coded phase has every channel
+of the zone drawing its own level, so all of them can be low on the same tick --
+on the scenario's knobs that is 10 % of the ticks of a three-channel phase and
+20 % of a two-channel one, with the whole zone a step under the solver's command.
+The envelope, the abort list and the per-tick floor are unchanged, and the
+default ``above`` gives up no cooling at all; ``symmetric`` with
+``ident_parallel`` is the combination to weigh against the drives' own margin.
 
 Each channel's base ``u_base`` starts as the solver's command for it on the last
 tick before the start. The two levels are ``ident_levels``:

@@ -785,7 +785,7 @@ long `dt`):
 | `ident_amplitude` | 0.15 | `(0, 0.3]` |
 | `ident_levels` | `above` | `above` \| `symmetric` |
 | `ident_replan` | `true` | the levels follow the live solver demand every tick (§3, §8.4 item 52); `false` freezes them at the base of the start (the Zero W behaviour) |
-| `ident_parallel` | `false` | `true`: one experiment drives every channel of the target's own zones at once, each on its own code — the zone-wide excitation the model's PE monitor needs to reach `converged` (§3, §8.4 item 102) |
+| `ident_parallel` | `false` | `true`: one experiment drives every channel of the target's own zones at once, each on its own code — the zone-wide excitation the model's PE monitor needs to reach `converged`. Louder while it runs (+0.036 to +0.050 mean PWM measured over 16 h), and under `ident_levels: symmetric` the whole zone, not one group of it, may sit `ident_amplitude` under the solver's command on a tick (§3, §8.4 item 102) |
 | `ident_hold_s` | `[60, 120, 180]` | non-empty, positive; each ≥ `5 * dt` when enabled |
 | `ident_max_duration_s` | 1800 | `(0, 7200]` |
 | `ident_settle_s` | 600 | ≥ 0; ≥ `confirm_s` when enabled |
@@ -2430,9 +2430,14 @@ thermal model's air block per zone regresses one airflow regressor per fan group
 of that zone, and `converged` asks the smallest eigenvalue of their information
 matrix to pass `PE_MIN`: every group of the zone has to move, independently of
 the others, inside the PE monitor's ~30-window memory. Telegraphing one group
-while the solver carries the rest fills one direction of that matrix, not `G` of
-them, however long it runs — which is why no closed-loop scenario had ever
-reached `converged` (§8.4 item 102 has the eigenvalues). With
+while the solver carries the rest fills one direction of that matrix at a time,
+and the others only as far as the solver happens to move them: a round robin over
+*every* channel does push `pe_min` past `PE_MIN` now and then — peaks of
+0.13–0.21 against the 0.05 bound — but it does not hold it there, and over three
+seeds exactly one zone of twelve latched `converged` that way, its live `pe_min`
+back at 0.008 by the end of the run. That is why no closed-loop scenario had ever
+been shown to converge (§8.4 item 102 has the eigenvalues and the per-seed
+numbers). With
 `ident_parallel: true` the target's channel set grows to every channel of the
 zones that **list** the target's channels (`ZoneLayout.zone_channels`; the
 coupled zones are served, checked and aborted on as before, but not excited), the
@@ -2444,10 +2449,19 @@ over the larger channel set (so a start is refused when any of those channels is
 saturated or would leave the band), the same envelope and abort list on the same
 served zones, and `compose` still floors, rate-limits and clamps. Under `above`
 the cost is noise, not temperature: `G` channels sit a step above the anchor for
-about half the run instead of one, so the same fan-seconds are spent in a
-`G`-times shorter window — measured on the DAS example, +0.03 to +0.06 mean PWM
-over a 16 h run against one group at a time, and a *larger* worst true margin
-(§8.4 item 102).
+about half the run instead of one — measured on the DAS example against a round
+robin over every channel of the plant, **+0.036 to +0.050 mean PWM** over a 16 h
+run, and a *larger* worst true margin (§8.4 item 102). Per zone identified the
+fan-seconds are arithmetic-neutral (one zone-wide experiment does the work of the
+`G` sequential ones its zone needs, in a `G`-times shorter window), but that is
+arithmetic and not what the A/B measured: both arms there run the same 16 h of
+experiment. Under `symmetric` the accepted worst case widens with the key:
+`compose` floors each experiment channel at its own solver command minus
+`ident_amplitude`, and a coded phase can have *every* channel of the zone at its
+low level on the same tick (10 % of the ticks of a three-channel phase on the
+scenario's knobs, 20 % of a two-channel one), where the old schedule could only
+ever dip one group of it. The envelope, the abort list and the floor itself are
+unchanged; `above`, the default, gives up no cooling at all.
  **Start preconditions**, each refused with a
 named reason: control mode `auto` without human overrides
 (`control_mode`), last command `auto` (`mode:<m>`), no saturation, band
@@ -4226,7 +4240,7 @@ tests carry the `nightly` marker.
 | `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); the re-planned levels of item 52 (the echo of the experiment's own level taken out of the want and no ratchet over a run of high ticks, a fan the solver's own floor lifted still read as demand, the anchor rising at once and falling only at a switch and never below the frozen base, a held sibling with it, the band, `symmetric` dipping at most the amplitude below the live demand, the same aborts on the same tick with and without re-planning, a re-planned level never below the frozen one, the dip and the floor read off the running experiment's own plan, the demand copied only on its ticks, and through the loop a warming zone followed instead of held back, a spent load released instead of pinning the fans, and an experiment ending later than the frozen one and never earlier — against `ident_replan: false`, which still holds it back); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes a run but the settle timers come back from the store and a start between `plan_tick` and `record_tick` keeps its tick (§8 item 20); `k·σ` counted once and the absolute abort from `ident_abort_below_limit_c` (items 53, 54); a lost sensor group blocks a start and aborts a run (item 72); legacy refuses | PR |
 | `tests/test_ident_sim.py` | an experiment on the truth plant never takes a drive over a limit and never leaves the enclosure hotter than the same seed without one, with the excitation visible on the fans; a drawn enclosure that is already saturated refuses the start; and, with the room warming 20 °C/h so the envelope actually binds, the run aborts on `envelope:<bay>` with `T̂_d + k·σ` still below the absolute abort and no drive over its limit from the abort on, on `ident_levels: above` and `symmetric` (§8 item 53) | PR: `basic` seed 1, both `ident_levels`; nightly: `basic` and `rich` seeds 1–5, envelope sweep `basic` seeds 1–5 × both `ident_levels` |
 | `tests/test_ident_replan_sim.py` | re-planned against frozen experiment levels on the truth sim (`rich`, the real loop and supervisor), both solvers and three seeds: no tick below the solver's own command (and the frozen plan does hold one back), no anchor more than `ident_amplitude` above the demand the frozen arm saw (the ratchet guard, which the pre-review `_replan` fails on the MPC arm), and the fit no worse than frozen beyond a loose margin | nightly |
-| `tests/test_ident_converge_sim.py` | the closed-loop convergence evidence item 102 asked for: 16 h on the truth sim (`rich`, the real loop and supervisor), three seeds, `ident_parallel: true` against `false` on the same plant — a zone reaches `converged` with the zone-wide excitation and none does with one group at a time, `pe_min` above `PE_MIN` on the zones that converged, zero limit violations in either arm and the zone-wide arm keeping the larger true margin | nightly |
+| `tests/test_ident_converge_sim.py` | the closed-loop convergence evidence item 102 asked for: 16 h on the truth sim (`rich`, the real loop and supervisor), three seeds, a zone-wide `ident_parallel: true` schedule against a one-channel-at-a-time round robin over *all eight* channels on the same plant — the measured converged zones per seed on both arms (z0+z3 / z1 / z3 against none / z1 / none), `pe_min` and `excited_windows` on the converged zones held to the values the runs reached rather than to the rule's own thresholds, the zones that close no window at all named per seed (the b03 swap-reset defect), zero limit violations in either arm, the larger true margin and the mean-PWM cost bounded | nightly |
 | `tests/test_sim_das.py` | the truth plant: energy balance through transients and hot swap, steady state, more airflow never warms anything, dead band and exponent, quantisation per sensor type, lags, SMART cadence, determinism per seed | PR |
 
 Test cost: the PR selection is about 1,900 tests in under five minutes
@@ -6378,7 +6392,9 @@ Owner decision (2026-09-16):
       on that background: one channel per slot peaks at 0.008–0.030 and never
       clears `PE_MIN`; an independent code per channel peaks at 0.09–0.11 and
       holds above it in 61–68 % of windows. A factor of about twelve, from
-      simultaneity alone.
+      simultaneity alone. (That is the replay, on one fixed background. In the
+      closed loop a sequential round robin does clear `PE_MIN` in bursts — the
+      scenario below has those numbers — but does not hold it.)
     - *why the amplitude also matters.* `pe_min` is a **relative** measure: it
       wants a relative airflow std of √`PE_MIN` = 0.224 in the least-excited
       direction. For a 50/50 telegraph at base `u` with deadband `d`, `above`
@@ -6400,24 +6416,49 @@ Owner decision (2026-09-16):
     `ident_hold_s: [240, 360, 480]` (longer than `model_window_s`, so a window
     sits inside one hold), `ident_max_duration_s: 3600`
     (`PE_WINDOWS × model_window_s`, the monitor's own memory — a shorter
-    experiment can never dominate it), starts on `xt1, xt3, xt2, xt4`, 16 h,
-    `rich` seeds 2/3/4. Zones converged: **z0 and z3 / z1 / z3**, with `pe_min`
-    peaking at 0.12–0.34; the same scenario with `ident_parallel: false`
-    converges **nothing** on any of the three. Zero limit violations in either
-    arm; worst true margin 4.53–4.89 °C with the zone-wide arm against
-    4.22–4.34 °C with one group at a time and 4.07–4.30 °C with no experiment
-    at all — `above` only ever adds cooling. The fit: per-bay `k` rms error
-    0.10–0.18 against 0.22–0.29 with no experiment.
+    experiment can never dominate it), starts on `xt1, xt3, xt2, xt4` (one per
+    zone), 16 h, `rich` seeds 2/3/4. **The control arm is a round robin over all
+    eight channels** (`xt1, qd1, xt3, qd3, xt2, qd2, xt4, qd4`), the schedule a
+    daemon cycling every fan group would actually run: the same 16 starts of the
+    same length and the same amplitude, one channel each instead of a zone. Both
+    arms run on the same plant and the same seed.
+
+    Zones converged, zone-wide: **z0 and z3 / z1 / z3** (seeds 2 / 3 / 4), with
+    `pe_min` peaking at 0.12 / 0.25 / 0.36 and still 0.08–0.17 at the end of the
+    run, 443–478 excited windows and `pred_err_c` 0.05–0.07. One channel at a
+    time: **nothing / z1 / nothing**. That is the honest comparison and it is
+    narrower than "nothing converges sequentially": the round robin does push
+    `pe_min` past `PE_MIN` in bursts (peaks 0.156 on z0 seed 2, 0.214 on z2
+    seed 3, 0.133 on z0 seed 4, all above the 0.05 bound) and on seed 3 that was
+    enough for z1 to latch `converged` — with its live `pe_min` back at 0.0076
+    by the end, i.e. from a transient the monitor no longer holds. What the
+    zone-wide excitation buys is that the bound is *held*, and a zone more per
+    seed on two seeds of three. Restricting the control arm to the four aquaero
+    channels (the four targets the zone-wide arm starts on) converges nothing on
+    any seed, but that measures channel coverage, not simultaneity, and is not
+    the arm the test runs.
+
+    Zero limit violations in either arm; worst true margin 4.59 / 4.89 / 4.53 °C
+    zone-wide against 4.22 / 4.29 / 4.25 °C for the round robin and 4.07–4.30 °C
+    with no experiment at all — `above` only ever adds cooling. The fit: per-bay
+    `k` rms error 0.10–0.18 against 0.22–0.29 with no experiment.
 
     **What it costs.** Noise, and only while it runs: mean PWM over the 16 h
-    +0.03 to +0.06 against one group at a time. Against *no* experiment the
-    cost depends on how hard the enclosure is already working — on a quiet
-    seed +0.045 mean PWM and about +13 dB of mean fan noise, on a warm one
-    −0.6 dB and +0.011 mean PWM, because the extra cooling an `above`
-    telegraph supplies comes back off the solver's own demand. The integrated
-    fan-seconds are the same as the sequential schedule's (one zone-wide
-    experiment replaces the `G` its zone needed); they are spent in a
-    `G`-times shorter window.
+    +0.050 / +0.037 / +0.036 (seeds 2 / 3 / 4) against the eight-channel round
+    robin, on the same starts and the same amplitude. Per *zone identified* the
+    fan-seconds are arithmetic-neutral — one zone-wide experiment does the work
+    of the `G` sequential ones its zone needs, in a `G`-times shorter window —
+    but that is arithmetic, not this A/B: both arms here run the same 16 h of
+    experiment, and the mean-PWM gap above is what that costs. Against *no*
+    experiment the cost depends on how hard the enclosure is already working —
+    on a quiet seed +0.045 mean PWM and about +13 dB of mean fan noise, on a
+    warm one −0.6 dB and +0.011 mean PWM, because the extra cooling an `above`
+    telegraph supplies comes back off the solver's own demand. Under
+    `ident_levels: symmetric` there is a second cost, in cooling rather than
+    noise: a coded phase can have every channel of the zone at its low level on
+    the same tick (10 % of the ticks of a three-channel phase), so the whole
+    zone may sit `ident_amplitude` under the solver's command where the old
+    schedule could only dip one group of it (§3).
 
     **What is not reached, and why.** The *model* status (the least advanced
     zone) is still `learning` in every run: no seed gets all four zones. Two

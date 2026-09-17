@@ -10,6 +10,12 @@ reads as demand, a held sibling follows it too, the levels stay inside the band,
 moves, the dip and the floor come from the running experiment's own plan, and
 ``ident_replan: false`` keeps the frozen plan of the Zero W at its old cost.
 
+A whole zone at once (``ident_parallel``, item 102): the widened target, the single
+coded phase with an independent code per channel, the band check over every channel it
+now drives, the anchor re-planned when *any* channel of the phase switches, and what the
+key costs under ``ident_levels: symmetric`` -- the whole zone, not one group of it, a
+step under the solver's command, still floored by ``compose``.
+
 Through ``Supervisor`` + ``Loop`` on the small DAS fixture: the experiment is a
 composed override (``d_pwm_max``, clamp, fallback beats it), the control mode stays
 ``auto``, a warming zone is followed instead of held back, a spent excursion is released
@@ -314,6 +320,72 @@ def test_a_parallel_start_checks_the_band_on_every_channel_it_drives():
         "fa1",
         human_control=False,
     )
+
+
+def test_a_coded_phase_re_anchors_when_any_of_its_channels_switches():
+    """The anchor may fall only on a tick that ends a hold (item 52), and with one code
+    per channel a hold ends whenever *any* channel switches -- not only the first
+    channel, which is all :func:`ident._position` reads. Without that the other
+    channels' holds would start from an anchor the last rise left where it was."""
+    cfg = ident_cfg(ident_parallel=True, ident_max_duration_s=600.0)
+    exp = ident.start(cfg, good_facts(cfg, pwm=0.5), "channel", "fa1")
+    assert exp["phases"][0]["channels"] == ["fa1", "fa2"]
+    codes = [tuple(ident.levels_at(exp, float(o))["code"]) for o in range(120)]
+    # an offset where only the *second* channel switches (so the schedule position
+    # ``_position`` reads has not moved), and one where neither does
+    only_second = next(
+        o
+        for o in range(2, 120)
+        if codes[o][0] == codes[o - 1][0] and codes[o][1] != codes[o - 1][1]
+    )
+    assert ident._position(exp, float(only_second)) == ident._position(exp, float(only_second - 1))
+    neither = next(o for o in range(2, only_second) if codes[o] == codes[o - 1])
+
+    def anchor_at(offset: int) -> float:
+        """Walk to ``offset`` with the demand at 0.7 (the anchor follows a rise at once),
+        then one tick with it back at 0.5, and report the anchor that tick planned."""
+        run = exp
+        for o in range(1, offset + 1):
+            want = 0.7 if o < offset else 0.5
+            out = _tick(cfg, run, exp["start_ts"] + o - cfg.dt, fa1=want, fa2=want)
+            assert out.experiment is not None
+            run = out.experiment
+        return float(run["plan_base"]["fa1"])
+
+    assert anchor_at(neither) == pytest.approx(0.7)  # mid-hold: the fall waits
+    assert anchor_at(only_second) == pytest.approx(0.6)  # switching: down by d_pwm_max
+
+
+def test_a_symmetric_parallel_phase_can_put_a_whole_zone_under_the_solver_at_once():
+    """What ``ident_parallel`` costs under ``ident_levels: symmetric``, and the floor
+    that still holds. ``compose`` accepts a dip of ``ident_amplitude`` below the solver's
+    command on an experiment channel; before this key at most one *group* of a zone was
+    at its low level at a time (a group's siblings are held at base), so that was all the
+    cooling a tick could give up. A coded phase draws a level per channel, so the whole
+    zone can be under the solver's command on the same tick -- never by more than the
+    dip, and never at all under the default ``above``."""
+    # za's two channels are two groups here, so the old schedule could only drive one
+    fans = {**das_mapping()["fans"], "fa2": {"model": "p12"}}
+    kw: dict[str, Any] = {"ident_levels": "symmetric", "ident_amplitude": 0.2, "fans": fans}
+    dip = 0.2
+
+    def run(parallel: bool, target: Ident) -> tuple[bool, bool]:
+        rig = started_rig(ident_cfg(ident_parallel=parallel, **kw), target)
+        zone_under = fa2_under = False
+        for r in rig.ticks(60):
+            assert rig.status["running"]
+            under = []
+            for ch in ("fa1", "fa2"):
+                assert r.cmd.pwm[ch] >= r.mpc_cmd.pwm[ch] - dip - TOL  # the floor holds
+                # a real dip, not the rate limit lagging a rise: at least half of it
+                under.append(r.cmd.pwm[ch] < r.mpc_cmd.pwm[ch] - dip / 2.0)
+            zone_under |= all(under)
+            fa2_under |= under[1]
+        return zone_under, fa2_under
+
+    assert run(True, Ident("start", channel="fa1")) == (True, True)
+    # one group at a time: fa2 is not the target's group, so it is never taken down
+    assert run(False, Ident("start", group="front")) == (False, False)
 
 
 # ---------------------------------------------------------------------------
