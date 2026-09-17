@@ -1016,16 +1016,86 @@ def test_a_clock_stepped_back_keeps_the_prediction_error_guard_and_the_dwell():
     assert res.diagnostics["model"]["active"] == "mpc"
 
 
+#: A drive temperature that leaves every bay ``occupied`` against this module's 35 degC
+#: zone air, so a later step is a swap and not an occupancy change.
+OCCUPIED_C = 45.0
+#: The same bay after a swap: far enough that the fast-swap rule fires when the sensor
+#: guard finally lets the reading through.
+SWAPPED_C = 55.0
+#: Ticks at :data:`OCCUPIED_C` before the swap: enough for the occupancy exemption of the
+#: bays becoming occupied at the start to expire (``bay_settle_s`` below).
+WARM_OCCUPIED = 30
+#: Ticks the swap is held for: the sensor trust layer rejects a step of this size for a
+#: tick or three before the estimator ever sees it.
+SWAP_TICKS = 6
+
+
+def short_settle_cfg() -> MpcConfig:
+    """:func:`mpc_cfg` with a settling window short enough that the occupancy exemption
+    every bay draws when the run starts has expired before :data:`WARM_OCCUPIED` ticks."""
+    cfg = mpc_cfg()
+    return dataclasses.replace(cfg, estimator=dataclasses.replace(cfg.estimator, bay_settle_s=10.0))
+
+
 def test_the_plant_view_carries_the_estimators_own_exemption():
     """Item 100: ``mpc.step`` hands the solver the estimator's verdict per bay, and the
-    validity gate's exempt set is exactly the bays it marks -- no second rule here."""
+    validity gate *reads* it rather than deriving a second one -- so a bay the estimator
+    does not excuse stays in the checks however wide its sigma is, and one it does excuse
+    stays out however narrow."""
     cfg = mpc_cfg()
     req = recorded_request(cfg, ticks=4)
     flags = {bay: info.get("model_exempt") for bay, info in req.plant["bays"].items()}
     assert flags and all(isinstance(v, bool) for v in flags.values()), flags
-    assert DasMpcSolver._settling_bays(req) == {bay for bay, v in flags.items() if v}
     reasons = {info.get("model_exempt_reason") for info in req.plant["bays"].values()}
     assert reasons <= {None, "occupancy", "uncertain", "calibration"}, reasons
+    wide = exempt(req.plant)  # the estimator excuses nobody
+    wide["bays"]["b06"]["sigma"] = 50.0
+    assert DasMpcSolver._settling_bays(dataclasses.replace(req, plant=wide)) == set()
+    narrow = exempt(req.plant, "b06", reason="uncertain")
+    narrow["bays"]["b06"]["sigma"] = 0.01
+    assert DasMpcSolver._settling_bays(dataclasses.replace(req, plant=narrow)) == {"b06"}
+
+
+def test_a_bay_the_estimator_widens_reaches_the_validity_gate_as_uncertain():
+    """The two halves of item 100 joined: a real fast-swap jump driven through
+    ``mpc.step``, and the bay the *estimator* widened is the bay the solver's validity
+    gate leaves out of its checks, with the reason it was widened for.
+
+    Both halves are pinned on their own -- the estimator's in ``tests/test_estimator.py``,
+    the solver's against a hand-set flag above -- and neither notices if the chain between
+    them breaks: dropping the ``uncertain`` branch of ``_settle_view`` passes every other
+    test in this file and every DAS golden, and shows up only on hardware, as an MPC that
+    keeps scoring its model against a bay it has just widened.
+
+    The exempt set also does not live in the solver's memory any more, so a bumpless
+    transfer -- a zone back from a fault, a solver fault and a retry -- no longer forgets
+    it. The old code cleared ``mem["settle"]`` on every ``initialise()`` and put a bay
+    that was still settling straight back into the model checks; the estimator is the
+    owner now, and a fresh solver memory is not evidence that a bay settled.
+    """
+    cfg = short_settle_cfg()
+    rec = Recorder()
+    warm, state = run(cfg, WARM_OCCUPIED, drive=OCCUPIED_C, solver=rec)
+    assert warm.diagnostics["bays"]["b06"]["occupancy"] == "occupied"
+    assert DasMpcSolver._settling_bays(rec.requests[-1]) == set()  # the bays sit still
+    t = WARM_OCCUPIED * cfg.dt
+    jumped, cmd = None, None
+    for i in range(SWAP_TICKS):  # the sensor guard holds a step back for a tick or three
+        cmd, state = run(
+            cfg, 1, drive={"b06": SWAPPED_C}, state=state, solver=rec, t0=t + i * cfg.dt
+        )
+        if rec.requests[-1].plant["bays"]["b06"]["model_exempt"]:
+            jumped = rec.requests[-1]
+            break
+    assert jumped is not None, "the estimator never widened b06"
+    assert jumped.plant["bays"]["b06"]["model_exempt_reason"] == "uncertain"
+    assert "b06" in DasMpcSolver._settling_bays(jumped)
+    # the same tick in /api/state: the trust rule's own exemption, and why
+    assert cmd.diagnostics["bays"]["b06"]["settling_reason"] == "jump"
+    assert cmd.diagnostics["bays"]["b06"]["model_exempt_until_s"] > 0.0
+    # ...and a solver that starts from nothing sees the same set
+    DasMpcSolver().initialise(cfg, fresh_req(jumped))
+    assert DasMpcSolver._settling_bays(fresh_req(jumped)) == DasMpcSolver._settling_bays(jumped)
 
 
 def test_a_swap_the_estimator_follows_as_a_jump_is_left_out_of_the_drift_check():
@@ -1035,7 +1105,6 @@ def test_a_swap_the_estimator_follows_as_a_jump_is_left_out_of_the_drift_check()
     # the estimator reports the bay ``uncertain``: its fast-swap variance is over
     # ``bay_uncertain_var_c2``, and it is the estimator that says so (item 100)
     plant = exempt(req.plant, "b06", reason="uncertain")
-    plant["bays"]["b06"]["sigma"] = 5.0  # the estimator's fast-swap variance
     plant["bays"]["b06"]["q_w"] = 60.0  # a transient far from equilibrium
     mem = {"v": 1}
     res = solver.solve(cfg, fresh_req(req, plant=plant, memory=mem))

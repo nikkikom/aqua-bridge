@@ -716,11 +716,11 @@ ones get their defaults):
 | `estimator.sigma_fault_c` / `sigma_air_fault_c` | 4.0 / 2.0 | > 0, °C; with `trust_rule: sigma` a zone is untrusted while a constrained bay's drive σ or its air σ is above them; `sigma_fault_c` must then exceed `sigma_uncalibrated_c` |
 | `estimator.sigma_uncalibrated_c` | 1.5 | > 0, °C; the σ floor of a bay without an accepted SMART calibration |
 | `estimator.air_blind_fault_s` | 900 | ≥ 0 s; with `trust_rule: sigma` a zone is untrusted once its air node has had no trusted `zone_air` reading for this long (the air σ barely grows, §3 per-zone trust and §8 item 70) |
-| `estimator.q_t_air` / `q_d_air` / `q_t_drive` / `q_t_sensor` / `q_heat` / `q_offset` | 1e-4 / 4e-7 / 1e-5 / 1e-4 / 4e-7 / 1e-4 | > 0; process noise per tick (the last one a proximal placement offset's) |
+| `estimator.q_t_air` / `q_d_air` / `q_t_drive` / `q_t_sensor` / `q_heat` / `q_offset` | 1e-4 / 4e-7 / 1e-5 / 1e-4 / 4e-7 / 1e-4 | > 0; process noise per tick. `q_offset` is a proximal placement offset's, in both layouts: the offset *state* of a further member with one node per bay, and the offset half of that member's *learned map* with a node per sensor (§3 *A node per proximal sensor*) — a placement drifts either way, and a filter that cannot follow it puts the drift into the shared drive estimate |
 | `estimator.p0_t_air` / `p0_d_air` / `p0_t_drive` / `p0_t_sensor` / `p0_heat` | 0.25 / 2.5e-3 / 0.1 / 0.1 / 2.5e-5 | > 0; the initial variance of those same states |
 | `estimator.sensor_noise_c` | 0.03 | ≥ 0 |
-| `estimator.proximal_offset_c` | 3.0 | ≥ 0, °C; prior σ of the placement offset the filter carries for every proximal sensor of a bay beyond the first (§3 estimator, §8 item 67); 0 fuses them all on one node |
-| `estimator.proximal_slope_spread` | 0.0 | `[0, 0.5]`, dimensionless; prior σ of the *slope* difference between two proximal sensors of one bay. 0 (the default) keeps one sensor node per bay with a constant offset per further member (item 67); above 0 every member gets its own node, its own `tau_s` and its own learned map (§3 *A node per proximal sensor*, §8 item 101) — same state size, same step cost |
+| `estimator.proximal_offset_c` | 3.0 | ≥ 0, °C; prior σ of the offset between two proximal sensors of one bay (§3 estimator, §8 item 67). It means a different thing in each layout `proximal_slope_spread` selects: with one node per bay it is the prior of the offset *state* each further member carries and 0 fuses them all on one node; with a node per sensor it is the prior of the offset half of that member's *learned map*, where 0 would pin the learned difference at 0 for ever — so `proximal_offset_c: 0` together with `proximal_slope_spread > 0` is a config error, not a third layout |
+| `estimator.proximal_slope_spread` | 0.0 | `[0, 0.5]`, dimensionless; prior σ of the *slope* difference between two proximal sensors of one bay. 0 (the default) keeps one sensor node per bay with a constant offset per further member (item 67); above 0 every member gets its own node, its own `tau_s` and its own learned map (§3 *A node per proximal sensor*, §8 item 101) — same state size, same step cost. The learned map is held inside this spread and inside the bounds an accepted calibration has, projected along the combination `Δs·rise + Δb` its rows identify, and its offset half is a random walk with `q_offset` |
 | `estimator.smart_max_age_s` / `smart_reject_c` | 300 / 8.0 | ≥ `dt` / > 0 |
 | `estimator.occupied_dT_c` / `empty_dT_c` / `empty_confirm_s` | 2.0 / 0.7 / 300 | `occupied_dT_c > empty_dT_c > 0`; `empty_confirm_s ≥ 2 * dt` |
 | `estimator.occupancy_hold_s` | 30 | `0 ≤ occupancy_hold_s ≤ smart_max_age_s`, s; a blind bay keeps its occupancy this long (0: no debounce). It is also the window in which a blind `empty` bay is unconstrained, so it is bounded by the estimator's other tolerance for absent per-bay evidence |
@@ -1661,7 +1661,7 @@ disagreement is `Δs·(T̂_d − T̂_a) + Δb` and moves with the drive-to-air r
 measurement is a plain scalar update on that node. The offset block of item 67
 becomes the extra sensor nodes, so **the state is exactly the same size** and the
 measurement is cheaper (a scalar update instead of the rank-two one). `(Δs_i,
-Δb_i)` is a two-parameter RLS without forgetting, prior `(0, 0)` at
+Δb_i)` is a two-parameter RLS, prior `(0, 0)` at
 `diag(proximal_slope_spread², proximal_offset_c²)`, row `z_i − z_anchor` against
 the filter's own rise with variance `R_i + R_anchor + CAL_ROW_VAR`, skipped on a
 jump tick. **No SMART is needed**: both members see the same drive and the same
@@ -1671,6 +1671,29 @@ map, so an unconverged placement still cannot look like a swap. The bay's own
 node stays the anchor's: `t_sensor`, the occupancy ΔT, the association series and
 the SMART calibration all read it, so the model store's `cal` schema is unchanged.
 
+Two things keep that RLS honest, and without either it is *worse* than the offset
+state it replaces. **`Δb` is a random walk** (`estimator.q_offset`, the same key
+and the same per-tick variance the fused layout gives its offset state): a
+placement drifts — fouling, a sensor working loose, a thermistor ageing — and a
+plain RLS has no forgetting, so `P` collapses, the learned map freezes and the
+disagreement the member keeps bringing has nowhere left to go but the drive both
+members share. Measured on the two-plateau fixture with the redundant member
+sliding 6 °C away over 900 ticks: with the random walk the drive estimate lands
+within 0.4 °C of truth on both layouts; without it the per-sensor layout is
+1.4–2.4 °C **under** truth with σ still at the uncalibrated floor 1.50 °C, i.e. a
+failure that reduces cooling. `Δs` gets none: a placement's geometry does not
+drift. **`(Δs, Δb)` is bounded**, because a row identifies only the *combination*
+`Δs·rise + Δb` — the pair may walk along `(1, −rise)` for ever and still fit every
+reading it has ever taken, and under regulation the rise barely moves, so that is
+what it does (measured unbounded on the same fixture: `Δs` +2.5 against a prior
+spread of 0.25, `Δb` −51 °C). The bound is `proximal_slope_spread` on `Δs` and,
+on both, whatever keeps `s_i`, `b_i` inside the bounds an accepted calibration has;
+a pair that leaves the box is slid back **along that same null direction**, so the
+member keeps predicting what the evidence says it reads and only the *split*
+between slope and offset moves. Truncating the two coordinates one at a time
+instead throws the combination away with them, and the clipped map then bears no
+relation to either the prior or the evidence.
+
 What it buys, measured. While both members report, the fused offset is *measured*
 every tick and follows a slope nearly as well as a map does (after a change of
 rise: 0.08 °C out against 0.02 for the per-sensor layout on `tests/test_estimator.py`'s
@@ -1679,17 +1702,28 @@ goes quiet leaves its offset at the rise it last saw, so when the load moves und
 and it comes back, the reading is a jump — σ 4.67 °C, `settling: jump`, against σ at
 the uncalibrated floor 1.50 °C and no jump with a node of its own. That is item 67's
 leftover, and the reason the pairs still cost the `sigma` trust rule an exemption.
-On the closed loop the difference is not visible: over `rich` seeds 0, 2 and 5
-(`config.example-das.yaml`, declared serials, 75 minutes) the per-bay drive-estimate
-rms is unchanged to 0.01 °C (b03 1.05/1.05, b10 1.11/1.12, 2.60/2.60, 3.16/3.17).
-The reason is identifiability, not the representation: the drive-to-air rise barely
-moves under regulation, so `Δs` and `Δb` are collinear and the RLS recovers about
-half the true slope on one seed and the wrong sign on another — the *combination*
-`Δs·rise + Δb` is right either way, which is why the estimate does not move. Step
+On the closed loop the difference is not visible. Measured over the whole 4500 s
+`rich` run (`config.example-das.yaml`, declared serials, calibrated MPC, the first
+300 s discarded), seeds 0, 1, 2, 3, 5 and 7: every bay's drive-estimate rms agrees
+between the two layouts to 0.01 °C on five of the six seeds, and the exception is
+seed 0, where b10 (a redundant pair) goes 3.40 → 3.56 °C and b09 (a single-sensor
+bay in the same zone, reached through the shared air) 3.62 → 3.90 °C. The worst
+under-estimate over those seeds is unchanged to 0.02 °C. **The horizon matters**:
+over 900 ticks the two layouts look identical to 0.01 °C everywhere, and an
+unbounded `(Δs, Δb)` needs longer than that to leave its box — the 47 % rms
+regression the unbounded version showed on seed 7 is what the bound above removes.
+The reason accuracy does not move either way is identifiability, not the
+representation: the drive-to-air rise barely moves under regulation, so `Δs` and
+`Δb` are collinear and the RLS recovers about half the true slope on one seed and
+the wrong sign on another — the *combination* `Δs·rise + Δb` is right either way,
+which is why the estimate does not move, and why the bound projects along it. Step
 cost, development machine, 400 ticks, `tools/bench_step.py --sim-plant das`, two
-repeats: DAS MPC step p99 3.32/3.48 ms fused against 3.26/3.40 per sensor, solve
-p99 3.36/3.58 against 3.30/3.47, PI-like DAS p99 1.43/1.42 against 1.34/1.47 — the
-same within run-to-run noise, as the equal state size predicts. **The default is 0**
+repeats, with the bound and the random walk above in: DAS MPC step p99 3.08/3.26 ms
+fused against 3.45/3.10 per sensor, solve p99 3.19/3.31 against 3.48/3.13 — the same
+within run-to-run noise, as the equal state size predicts; PI-like DAS p99 1.12/1.10
+against 1.60/1.51, a real but small cost (the extra nodes and the RLS row, ~0.4 ms)
+in the path that has nothing else to do. Both are two orders of magnitude inside the
+250 ms budget. **The default is 0**
 because turning it on for the example's two redundant pairs moves the four DAS
 goldens, which is item 99's decision.
 
@@ -1711,12 +1745,19 @@ is the honest cost of not touching the drives: without SMART the absolute
 sensor-to-drive offset is a prior, and it decides how loud the fans run.
 Per bay the block also carries `observed` (a trusted proximal member this tick),
 `seeded`, `offsets_c` (the disagreement the filter carries per further proximal
-member), `proximal_map` (its learned `Δs, Δb`, item 101) and the **settling
+member), `proximal_map` and the **settling
 block**; per zone `air_blind_s`, the wall-clock time since a
 trusted `zone_air` reading was fused (a tick gap counts in full, capped at the
 filter's 3600 s prediction horizon). `trust_rule: sigma` reads `observed`,
 `settling` and `air_blind_s` (§3 per-zone trust); `seeded`, `offsets_c` and
-`proximal_map` are diagnostics.
+`proximal_map` are diagnostics. `proximal_map` carries, per further proximal
+member (item 101): `slope_delta` / `offset_delta_c`, the learned difference from
+the bay's own map; `slope` / `offset_c`, **the map the filter actually predicts
+that member with** — the difference added to the bay's map and clipped to the
+bounds an accepted calibration has; `clipped`, whether that clip bit; and
+`samples`. The effective pair is published beside the learned one because they can
+part company, and a reader working out why a bay under-reads must see the numbers
+the estimator is running rather than the ones it wishes it were.
 
 **One owner, two exemptions** (item 100). "This bay is settling" used to mean two
 different things in two places: the estimator's `settling` flag and the DAS MPC
@@ -1737,6 +1778,15 @@ has just been swapped, and which the trust rule must **not** excuse (that is the
 observability loss it exists to catch). A jump reaches the model gate through
 `uncertain`, because the jump is what put the variance there.
 `control/solver_das.py::_settling_bays` is now one read of `model_exempt`.
+
+One behaviour changed with the ownership, and it is the intended direction. The
+marks used to live in the *solver's* memory (`mem["settle"]`, `mem["cal"]`), which
+`_fresh_memory()` cleared on every `initialise()` — so a bumpless transfer (a zone
+back from a fault, a solver fault and its retry) put a bay that was still settling
+straight back into the prediction-error, drift and air-disturbance checks. They now
+live with the estimator and survive that restart: a fresh solver memory is evidence
+about the solver, not about whether the bay settled. Everything else reproduces the
+old set tick for tick, which is why the four DAS goldens do not move.
 
 **Occupancy** (`topology.bays.<b>.occupied`, runtime `POST /api/bay`):
 `true` is always `occupied`, `false` always `empty`; `auto` runs a machine
@@ -4012,14 +4062,14 @@ tests carry the `nightly` marker.
 | `tests/test_sigma_trust.py` | `trust_rule: sigma` (§3, §8 item 8): thresholds inclusive, empty and undeclared bays, an uninitialised zone, a sigma that is not a number, time faults, unknown keys and setpoint groups still fault, `strict` ignores the estimator; the `sigma_fault_c` floor; switching rules by config only; the verdict reads this tick's σ across a crossing; an estimator fault applies `strict`; a zone in fault returns without its lost sensor only under `sigma`; on the truth sim 2 % DS18B20 dropouts fault far fewer zones than `strict` with no violation (both DAS solvers), a replay without a bay's only proximal sensor never lowers its zone's airflow beyond 2 % and raises it within ten minutes (PI-like DAS), losing either member of a redundant pair changes almost nothing, a bay's or a zone's sensors lost for good fault the zone (on the drive σ, or on the blind air clock of item 70) and it holds, then ramps high; the example's redundant pairs fault no zone on `rich` with their σ at the floor (item 67); a hot swap no longer faults its zone but a swapped bay that goes blind faults at once, and a flapping proximal sensor spends `bay_settle_max_s` and then faults its zone on every jump again (item 69); a zone that loses only its air sensor faults on `air_blind_fault_s`, and never at all with that key set wide (item 70); the soft sigma floor (§8 item 68): it holds the command before the loss, ends on the σ growth or the hold time, falls at its rate, reopens on a further lost group, keeps its episode on an estimator fault, starts over from malformed memory, its config keys; on the DAS MPC without a bay's only sensor the no-floor run reproduces the drop (−0.04, about 21 % less airflow) and the soft floor holds, then releases | PR: `basic`; nightly: dropout sweep on `basic` and `rich`, the redundant pairs on `rich` seeds 0–5 and both solvers, a sensor lost for good on both presets and solvers, the soft floor's margin, noise and no-ratchet bounds on `basic` seeds 1–5 and `rich` 0–2, both solvers, two sensors, and its margin bounds on the DAS MPC until the floor has released (`basic` b02 and b13, `rich` b02) |
 | `tests/test_das_core.py` | the core invariants, closed loops and DAS goldens for `pi_das` and `mpc_das` (§4.2) | PR |
 | `tests/test_pi_das.py`, `tests/test_estimates.py`, `tests/test_das_config.py` | the margin-deficit PI (served zones, unconstrained channels, fixed channels, occupancy), the estimates block and prior map, `noise` / `limit_c` / served-zone config | PR |
-| `tests/test_estimator.py` | exact discretisation and Joseph form (random sequences keep P symmetric PSD); first tick and constant readings; σ grows while a bay is unobserved and shrinks back; redundant members; placement offsets (a constant disagreement is an offset and not a swap, `proximal_offset_c: 0` reproduces item 67, one sensor carries no offset state, a swap still widens a bay with two, either member keeps the bay observed); a node per proximal sensor (item 101: the slope between two placements learned from the two readings alone, the same state size, a config with one sensor per bay bit-identical either way, a member that returns after the load moved a swap only on the fused node, both members / one absent / one lying the other way / a hot swap on both layouts); the two notions of settling (item 100: the reason and the seconds left of each exemption, an occupancy change and a calibration step named, and a bay nobody reads out of the model checks but still faulting its zone); the fast-swap rule needs a bay's proximal members to agree, so a standing disagreement between a redundant pair never locks the bay's SMART out while a step both members see together still fires it (§8 item 17); per-bay seeding (a bay missing on the first tick is seeded by its first reading, a sensor returning after a later loss still widens its bay), `settling` expiring and its wall-clock budget (repeated jumps at four cadences spend `bay_settle_max_s` and stop exempting, a clean run earns it back, an empty bay spends nothing, 0 grants none), `air_blind_s` and a tick gap counted in full; the occupancy machine incl. "never empty while zone air is unobserved"; SMART calibration acceptance, rejection, serial change and expiry after `calibration_max_age_days`; a guessed serial never relaxes a class; determinism, JSON round trip, malformed memory | PR |
+| `tests/test_estimator.py` | exact discretisation and Joseph form (random sequences keep P symmetric PSD); first tick and constant readings; σ grows while a bay is unobserved and shrinks back; redundant members; placement offsets (a constant disagreement is an offset and not a swap, `proximal_offset_c: 0` reproduces item 67, one sensor carries no offset state, a swap still widens a bay with two, either member keeps the bay observed); a node per proximal sensor (item 101: the slope between two placements learned from the two readings alone, the same state size, a config with one sensor per bay bit-identical either way, a member that returns after the load moved a swap only on the fused node, both members / one absent / one lying the other way / a hot swap on both layouts, a member that *drifts* followed by its own map on both layouts instead of biasing the shared drive, the learned map bounded so it cannot run along the combination its rows identify, and the diagnostics publishing the map the filter predicts with); the two notions of settling (item 100: the reason and the seconds left of each exemption, an occupancy change and a calibration step named, and a bay nobody reads out of the model checks but still faulting its zone); the fast-swap rule needs a bay's proximal members to agree, so a standing disagreement between a redundant pair never locks the bay's SMART out while a step both members see together still fires it (§8 item 17); per-bay seeding (a bay missing on the first tick is seeded by its first reading, a sensor returning after a later loss still widens its bay), `settling` expiring and its wall-clock budget (repeated jumps at four cadences spend `bay_settle_max_s` and stop exempting, a clean run earns it back, an empty bay spends nothing, 0 grants none), `air_blind_s` and a tick gap counted in full; the occupancy machine incl. "never empty while zone air is unobserved"; SMART calibration acceptance, rejection, serial change and expiry after `calibration_max_age_days`; a guessed serial never relaxes a class; determinism, JSON round trip, malformed memory | PR |
 | `tests/test_associate.py` | detrended correlation, greedy assignment with margins, confirmation, full-window history, drops on silence / jump / empty, a declared serial wins; on the truth sim the right bays are found and indistinguishable bays refused | PR |
 | `tests/test_stuck_sim.py` | Stuck evidence on the truth sim (§3 Stuck sizing, §8 items 3 and 58): healthy `rich` runs flag no sensor and fault no zone; a frozen DS18B20 or thermistor proximal reading is flagged once its zone's airflow moves, or, with the fans held by the rate limit, once its zone air has risen past `stuck_zone_air_dT_c` and another bay has followed it; a zone-air sensor drifting on a healthy enclosure flags no proximal reading; only a bay's last proximal sensor faults its zone | PR: 2 seeds, 3 frozen runs, 1 drifting-air run; nightly: 48 seeds, 2.5-hour runs of both DAS solvers, and the per-seed coverage sweep (each proximal reading frozen in turn) |
 | `tests/test_hotswap.py` | slow swap, quick swap (never through `empty`, margin widens, class follows the new drive) and empty-at-boot on the truth sim: no limit violation, no zone fault, fans rise, constraints removed on empty | PR |
 | `tests/test_thermal_model.py` | structure, fan groups, parameter table, Jacobians vs finite differences, `eig` vs matrix exponential and the Euler fallback, windows, lag correction, RLS safeguards, status machine, never raising in `step`, shadow never changes the command | PR |
 | `tests/test_thermal_split.py` | the per-channel split (item 13): only a multi-channel group gets keys, the prior split reproduces the shared-`E` prediction and Jacobians bit for bit, a split redistributes without changing the group total, the Jacobian of a split group against finite differences, a whole-group experiment leaves the split at 0 while single-channel phases find a 60 % difference, a store file written with the switch the other way is converted (and a corrupt coefficient on that path drops the thermal section alone, not the seed), and a split that would make a channel cool less than nothing is projected back so the zone's airflow and its Jacobian stay usable | PR |
 | `tests/test_thermal_ident.py` | identifiability with group experiments on the truth sim: in-zone `E` within 15 % (PR seed), per-bay `k` within 25 %, `leak` / `κ` at prior, convergence; regulation only never converges; the seed sweep (bound 25 %), sensor offsets, the rich preset | PR: 4 cases; nightly: sweeps |
-| `tests/test_solver_das.py` | active-piece SQP vs a projected-gradient reference, monotone objective, iteration cap, forbidden-band snap and hysteresis, zero-order hold, prediction vs thermal Jacobians, noise index and surrogate, bumpless offset, fixed channels, validity gate and model fallback with dwell (the entry dwell, the model rate through the drives' filter, the air-disturbance check, the prediction guard on eligible rows only), a clock stepped back, horizon and block extremes | PR |
+| `tests/test_solver_das.py` | active-piece SQP vs a projected-gradient reference, monotone objective, iteration cap, forbidden-band snap and hysteresis, zero-order hold, prediction vs thermal Jacobians, noise index and surrogate, bumpless offset, fixed channels, validity gate and model fallback with dwell (the entry dwell, the model rate through the drives' filter, the air-disturbance check, the prediction guard on eligible rows only), a clock stepped back, horizon and block extremes, the estimator's own exemption read rather than re-derived (a real fast-swap jump driven through `mpc.step` reaching the gate as `uncertain`, and the set surviving a solver restart, §8 item 100) | PR |
 | `tests/test_model_fallback_sim.py` | the validity gate against the truth plant: the observed drive rate (ramp, restarts, memory), a sound model returns within `model_return_dwell_s + 2 · mpc_every_ticks · dt` and does not re-enter (§8 items 10, 64), a model with wrong bay gains is caught and held, a healthy enclosure never reaches the fallback (§8 item 65), a fouling jump to 0.15× airflow does (§8 item 66) and the same run without it does not, every drive within its limit and bumpless switches; the plain drift holds the same step | PR: 1 return, 1 broken model, 3 healthy seeds and the fouling pair per preset; nightly: zones × seeds on `basic` and `rich`, more broken gains, 8 healthy seeds and 4 fouling seeds per preset |
 | `tests/test_noise_regression.py` | calibrated DAS MPC noise ≤ 0.8× the quietest uniform curve at equal or better worst true margin (measured 0.31–0.48×); uncalibrated bound 2.0 (0.30–0.69×); rich preset bound 1.25 (up to 1.18×); on `rich` every bay calibrates and the estimate follows the drive-*reported* temperature to 2.5 °C rms and never reads more than 1.0 °C *below* it (§8 item 17); MPC vs PI-DAS reported, not asserted (PI-DAS has not settled within the window on several seeds) | PR: 2 seeds; nightly: 8-seed sweeps |
 | `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× (named constant) the legacy MPC p99, the 75th percentile of several interleaved, warm-up-discarded repeats (§8 item 6); `bench_step.py` runs both DAS solvers; absolute p99 ≤ `mpc.budget_ms` only on `armv6l`; the Zero W fallback of §8 item 73 (`budget_ms` 1000 with `budget_alarm_ms` 1250 loads, `budget_ms` 1000 alone is rejected, `mpc_every_ticks: 3` solves a third of the ticks and a solve tick is the expensive one) | PR / Pi |
@@ -5968,7 +6018,11 @@ Owner decision (2026-09-16):
     **the four DAS goldens do not move** — the part item 99 was blocking (the
     model gate honouring the `jump` *event* instead of the `uncertain` *level*)
     is the part that is not needed: the level is the better question for that
-    gate, and the event is the better question for the trust rule.
+    gate, and the event is the better question for the trust rule. One behaviour
+    does change, in the intended direction: the marks lived in the solver's memory,
+    which `initialise()` cleared, so a bumpless transfer used to drop up to
+    `bay_settle_s` of them and put a still-settling bay back into the checks. They
+    live with the estimator now and survive a solver restart.
 
 107. The online fan-curve fit (item 14) feeds the thermal model and the DAS
     MPC's prediction, but two other users of `fan_models` still read the
@@ -5991,20 +6045,36 @@ Owner decision (2026-09-16):
     term. Each member now gets its own node with its own `tau_s` and its own map
     `s + Δs_i`, `b + Δb_i`, learned by a two-parameter RLS from the two readings
     alone — no SMART, since both members see the same drive and the same air.
+    That RLS needs two things to be no worse than the offset state it replaces,
+    and both are in it: `Δb` is a **random walk** with the same `estimator.q_offset`
+    the fused offset state uses, so a placement that drifts (fouling, a loosening
+    sensor, a thermistor ageing) is followed by the member's own map instead of
+    biasing the drive both members share; and `(Δs, Δb)` is **bounded**, because a
+    row identifies only the combination `Δs·rise + Δb` and the pair would otherwise
+    walk along that null direction for ever (measured unbounded on the two-plateau
+    fixture: `Δs` +2.5 against a prior spread of 0.25, `Δb` −51 °C, and a drive
+    estimate 2.4 °C *under* truth with σ still at the uncalibrated floor). A pair
+    that leaves its box is slid back along that same null direction, so the member
+    keeps predicting what the evidence says it reads.
     The offset block becomes the extra nodes, so the **state size and the step
-    cost are unchanged** (measured: step p99 3.26–3.40 ms against 3.32–3.48 ms
-    fused, two repeats of `tools/bench_step.py --sim-plant das --ticks 400`); the
+    cost are unchanged** (measured: DAS MPC step p99 3.10–3.45 ms against
+    3.08–3.26 ms fused, two repeats of `tools/bench_step.py --sim-plant das
+    --ticks 400`; the PI-like DAS path pays about 0.4 ms for the extra nodes and
+    the RLS row, which is still two orders of magnitude inside the budget); the
     bay's own node stays the anchor's, so `cal`, the occupancy machine and the
     association are untouched and the model store needs no migration.
     Three things it does **not** do, which is the reason for the default:
     (a) turning it on for the example's two redundant pairs moves the four DAS
     goldens — item 99's decision;
-    (b) on the closed loop it changes nothing measurable. Over `rich` seeds 0, 2
-    and 5 the per-bay drive-estimate rms is the same to 0.01 °C (b10 1.11/1.12,
-    2.60/2.60, 3.16/3.17). The premise about the accuracy is also stale: measured
-    today, b03 and b10 are not the worst bays on any seed tried — the worst
-    per-tick error belongs to single-sensor bays (b05 +6.54, b06 +6.83 °C during
-    the warm-up), and the windowed rms of the pairs is 0.04–0.15 °C;
+    (b) on the closed loop it changes almost nothing. Measured over the whole
+    4500 s `rich` run, seeds 0, 1, 2, 3, 5 and 7, first 300 s discarded: every
+    bay's drive-estimate rms agrees between the two layouts to 0.01 °C on five of
+    the six seeds, and on seed 0 b10 goes 3.40 → 3.56 °C and b09 3.62 → 3.90 °C.
+    The horizon matters — over 900 ticks the two look identical everywhere, which
+    is not long enough for the bound above to have anything to do. The premise
+    about the accuracy is also stale: measured today, b03 and b10 are not the
+    worst bays on any seed tried — the worst per-tick error belongs to
+    single-sensor bays (b05 +6.54, b06 +6.83 °C during the warm-up);
     (c) the slope is **not identifiable from regulation alone**: the drive-to-air
     rise barely moves, so `Δs` and `Δb` are collinear and the RLS recovers about
     half the true slope on `rich` seed 2 and the wrong sign on seed 0. The
