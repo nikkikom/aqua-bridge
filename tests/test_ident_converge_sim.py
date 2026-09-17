@@ -285,6 +285,9 @@ def test_a_zone_wide_experiment_converges_a_zone_that_one_channel_at_a_time_does
     # for good on the two-group z0 of seed 4: which of its converged zones still stand
     # above the bound at the end of the run is per-seed data, not a rule.
     assert max(sequential["pe_max"].values()) > thermal.PE_MIN
+    # a held zone is a converged zone by construction, so this pins the record itself:
+    # without it the loop below goes quiet the day a recorded zone stops converging.
+    assert set(sequential["converged"]) >= set(want["held"]), sequential["converged"]
     for z in sequential["converged"]:
         held = float(sequential["zones"][z]["pe_min"]) >= thermal.PE_MIN
         assert held == (z in want["held"]), (z, sequential["zones"][z]["pe_min"])

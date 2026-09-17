@@ -1840,26 +1840,45 @@ def test_a_redundant_proximal_pair_is_never_reported_swapped(seed):
     assert counts == {}
 
 
-@pytest.mark.parametrize("bay", ["b03", "b10", "b02"])
-def test_a_hot_swap_is_caught_as_fast_with_a_redundant_pair_as_without(bay):
-    """The cost side of item 109, on the same plant: a drive replaced in place by one
-    12 degC hotter is reported on the first tick the step reaches the sensors, whether the
-    bay has one proximal sensor (b02) or a redundant pair at different placements (b03,
-    b10). The pair is not the slower of the two -- it is the quieter one."""
+def _hot_swap(bay: str, *, seed: int = 3, swap_at: int = 600, step_c: float = 12.0):
+    """Replace the drive in ``bay`` in place at ``swap_at`` by one ``step_c`` hotter, on
+    the same plant the false-positive test uses, and report every tick the bay called
+    ``swapped``: those before the step, which are false, and those after, the first of
+    which is the detection latency."""
     cfg = example_cfg()
-    plant = truth_plant(cfg, preset="rich", seed=3)
-    swap_at = 600
-    seen: list[int] = []
+    plant = truth_plant(cfg, preset="rich", seed=seed)
+    before: list[int] = []
+    after: list[int] = []
 
-    def on_tick(i, plant, up, seen=seen):
-        if i > swap_at and up.bays[bay]["swapped"]:
-            seen.append(i - swap_at)
+    def on_tick(i, plant, up):
+        if up.bays[bay]["swapped"]:
+            (after if i > swap_at else before).append(i - swap_at)
         if i == swap_at:
             drive = plant.drives[plant._bi[bay]]
-            plant.insert(bay, drive, temp_c=plant.t_drive()[bay] + 12.0)
+            plant.insert(bay, drive, temp_c=plant.t_drive()[bay] + step_c)
 
     run_truth(cfg, plant, swap_at + 30, smart=True, on_tick=on_tick)
-    assert seen and seen[0] <= 2, seen
+    return before, after
+
+
+def test_a_hot_swap_is_caught_as_fast_with_a_redundant_pair_as_without():
+    """The cost side of item 109, measured as a comparison and not against a constant: a
+    drive replaced in place by one 12 degC hotter is caught no later on a bay with a
+    redundant pair at different placements (b03, b10) than on the single-sensor b02 of
+    the same run. Each bay is swapped in its own run of the same plant, and each must be
+    *silent until the swap* -- a bay standing in alarm would otherwise "detect" it on the
+    first tick without detecting anything, which is exactly what the defect did and what
+    the latency of a pre-fix b03 was.
+    """
+    latency: dict[str, int] = {}
+    for bay in ("b02", "b03", "b10"):
+        before, after = _hot_swap(bay)
+        assert not before, (bay, len(before), before[:8])  # nothing but the swap is one
+        assert after, bay
+        latency[bay] = after[0]
+    assert latency["b02"] <= 2, latency  # the reference is itself prompt
+    assert latency["b03"] <= latency["b02"], latency
+    assert latency["b10"] <= latency["b02"], latency
 
 
 def test_swapped_on_the_edge_of_empty(as_empty):
