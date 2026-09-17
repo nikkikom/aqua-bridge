@@ -2575,14 +2575,34 @@ rather than as PWM: a fan near `pwm_max` really does move proportionally less
 extra air per unit of PWM, and dividing by something else would relabel an
 uninformative channel, not inform it. What changed is that the arithmetic is no
 longer invisible. `ident.excitation` publishes it per channel — `rel_swing`, the
-`pe_reach` it implies and whether that clears `PE_MIN` — in
+`pe_reach` it implies, whether that clears `PE_MIN` at the configured
+`ident_amplitude` (`excitable`) and whether any amplitude up to the `0.3` cap
+would (`excitable_at_cap`, so the owner is told which remedy applies: a larger
+amplitude, or waiting for the solver to park the channel lower) — in
 `snapshot().extra["experiment"]` (`excitation`, `unexcitable`) and in a warning
 on the start log line, and the thermal model publishes the measured half:
 `pe_diag`, the **diagonal** of the very matrix whose smallest eigenvalue is
 `pe_min`, one entry per strong group. The eigenvalue can never exceed the
 smallest diagonal, so a group whose own entry sits at or under `PE_MIN` shuts its
 zone's gate by itself and `pe_diag` names it. `ident_require_excitable` (default
-`false`) turns the prediction into a refusal, `not_excitable:<ch>`. The reach is
+`false`) turns the prediction into a refusal, `not_excitable:<ch>`.
+
+**The published reach is an upper bound**, not a prediction. The monitor never
+sees the telegraph's two levels: it accumulates one sin²-weighted mean of the
+airflow regressor per `model_window_s` block, so a regression window reads a
+level only while it sits inside one hold, and a window that spans a switch
+averages the two — which can only move it toward their mean. `rel_swing` is
+therefore what the monitor reads exactly when every hold of `ident_hold_s` is at
+least `model_window_s` long, and more than it reads otherwise;
+`holds_cover_window` in the same status says which case the schedule is in. So
+`excitable` is a **necessary** condition: `false` is a proof that the channel
+cannot inform its zone from this base, `true` is permission for the schedule to
+try. `ident_require_excitable` refuses on that bound, so it never blocks a start
+that could have worked — with holds shorter than a window it can let one through
+that still falls short, and `pe_diag` is what says so afterwards. The shipped
+`config.example-das.yaml` is in that case (`ident_hold_s: [60, 120, 180]` against
+`model_window_s: 120`); `tests/test_ident_converge_sim.py` lengthens the holds
+past the window for exactly this reason. The reach is
 computed from the commissioned `fan_models` curve, not from a fitted one
 (`fancurve.READERS["ident_excitation"] = "config"`): `check_start` runs on the
 supervisor's side, where a fit is not in hand, and the number is a plan for a
@@ -2593,18 +2613,25 @@ measured answer is `pe_diag`, which follows whatever the model used.
 summary carries `blocked`: the parts of the `converged` rule it still fails, in
 the rule's own words — `windows:<zone|bay>`, `pe:<zone|bay>`,
 `rel_se:<coefficient>` and `pred_err`. It comes from the same function the status
-machine decides with, so the published list and the decision cannot drift apart,
-and it is empty exactly for a `converged` or `frozen` zone. Each bay also
-publishes `se`, the absolute standard error beside `rel_se`: `rel_se(k)` is
-`se / |k|`, so a bay whose airflow sensitivity is genuinely small fails the
-relative gate on a fit no worse than its neighbours' (§8 item 111 has the
-numbers).
+machine decides with — and, since the review of items 110–112, from the same
+occupancy rule (`thermal._bay_occupied`), so the published list and the decision
+cannot drift apart on their input either — and it is empty exactly for a
+`converged` or `frozen` zone. Each bay also publishes `se`, the absolute standard
+error beside `rel_se`: `rel_se(k)` is `se / |k|`, so a bay whose airflow
+sensitivity is genuinely small fails the relative gate on a fit no worse than its
+neighbours' (§8 item 111 has the numbers). `se` is `null` per coefficient
+wherever `rel_se` is — a block that has closed no window carries the prior's own
+initial variance in `P`, and publishing its square root would hand the owner a
+prior dressed as a measurement, on exactly the bays (b03, b10) item 111 asks them
+to read `se` for.
 
 **Start preconditions**, each refused with a
 named reason: control mode `auto` without human overrides
 (`control_mode`), last command `auto` (`mode:<m>`), no saturation, band
 or stall on the target (`saturated:`, `band:`, `no_command:`,
-`fan_stall:`), every served zone (listing a target channel, plus
+`fan_stall:`), with `ident_require_excitable` a target channel whose telegraph
+can reach the thermal model's PE bound from where the solver parked it
+(`not_excitable:`, above), every served zone (listing a target channel, plus
 `coupled_to`) trusted and fault-free for `ident_settle_s` (`settle:`),
 no served zone with a sensor group that has no trusted, confirmed
 member (`sensor_lost:`, from `diagnostics["sigma_floor"]`: under
@@ -4312,7 +4339,8 @@ runners allow it.
   and DAS presets in `tests/test_das_intents.py`.
 - `tests/test_loop.py` — §4.3 loop cases, READY/WATCHDOG/STOPPING, the
   applied-command mirror after an emergency ramp (the next healthy tick
-  rate-limits from the fans, not from the command they no longer carry),
+  rate-limits from the fans, not from the command they no longer carry,
+  while the window sample of the last good tick is left exactly as it was),
   overrides and bumpless release through the loop, an override on frozen
   temperatures tripping Stuck, run scheduling, the `on_tick` hook, the
   step budget alarm (injected clock: tracking, warn/error thresholds,
@@ -4440,7 +4468,7 @@ tests carry the `nightly` marker.
 | `tests/test_associate.py` | detrended correlation, greedy assignment with margins, confirmation, full-window history, drops on silence / jump / empty, a declared serial wins; on the truth sim the right bays are found and indistinguishable bays refused | PR |
 | `tests/test_stuck_sim.py` | Stuck evidence on the truth sim (§3 Stuck sizing, §8 items 3 and 58): healthy `rich` runs flag no sensor and fault no zone; a frozen DS18B20 or thermistor proximal reading is flagged once its zone's airflow moves, or, with the fans held by the rate limit, once its zone air has risen past `stuck_zone_air_dT_c` and another bay has followed it; a zone-air sensor drifting on a healthy enclosure flags no proximal reading; only a bay's last proximal sensor faults its zone | PR: 2 seeds, 3 frozen runs, 1 drifting-air run; nightly: 48 seeds, 2.5-hour runs of both DAS solvers, and the per-seed coverage sweep (each proximal reading frozen in turn) |
 | `tests/test_hotswap.py` | slow swap, quick swap (never through `empty`, margin widens, class follows the new drive) and empty-at-boot on the truth sim: no limit violation, no zone fault, fans rise, constraints removed on empty | PR |
-| `tests/test_thermal_model.py` | structure, fan groups, parameter table, Jacobians vs finite differences, `eig` vs matrix exponential and the Euler fallback, windows, lag correction, RLS safeguards, status machine, never raising in `step`, shadow never changes the command; the diagnostics that say why a zone is still learning (items 110, 111): `pe_diag` is the diagonal of the matrix `pe_min` is the smallest eigenvalue of (so `pe_min ≤ min(pe_diag)`) and reads 0 on a block with no windows, `blocked` names exactly the gates the `converged` rule fails and is empty exactly for a `converged` or `frozen` zone, and a bay's `se` is its `rel_se` times the coefficient | PR |
+| `tests/test_thermal_model.py` | structure, fan groups, parameter table, Jacobians vs finite differences, `eig` vs matrix exponential and the Euler fallback, windows, lag correction, RLS safeguards, status machine, never raising in `step`, shadow never changes the command; the diagnostics that say why a zone is still learning (items 110, 111): `pe_diag` is the diagonal of the matrix `pe_min` is the smallest eigenvalue of (so `pe_min ≤ min(pe_diag)`) and reads 0 on a block with no windows, `blocked` names exactly the gates the `converged` rule fails and is empty exactly for a `converged` or `frozen` zone, and a bay's `se` is its `rel_se` times the coefficient and `null` wherever `rel_se` is, including on a block that has closed no window | PR |
 | `tests/test_thermal_split.py` | the per-channel split (item 13): only a multi-channel group gets keys, the prior split reproduces the shared-`E` prediction and Jacobians bit for bit, a split redistributes without changing the group total, the Jacobian of a split group against finite differences, a whole-group experiment leaves the split at 0 while single-channel phases find a 60 % difference, a store file written with the switch the other way is converted (and a corrupt coefficient on that path drops the thermal section alone, not the seed), and a split that would make a channel cool less than nothing is projected back so the zone's airflow and its Jacobian stay usable | PR |
 | `tests/test_thermal_ident.py` | identifiability with group experiments on the truth sim: in-zone `E` within 15 % (PR seed), per-bay `k` within 25 %, `leak` / `κ` at prior, convergence; regulation only never converges; the seed sweep (bound 25 %), sensor offsets, the rich preset | PR: 4 cases; nightly: sweeps |
 | `tests/test_solver_das.py` | active-piece SQP vs a projected-gradient reference, monotone objective, iteration cap, forbidden-band snap and hysteresis, zero-order hold, prediction vs thermal Jacobians, noise index and surrogate, bumpless offset, fixed channels, validity gate and model fallback with dwell (the entry dwell, the model rate through the drives' filter, the air-disturbance check, the prediction guard on eligible rows only), a clock stepped back, horizon and block extremes, the estimator's own exemption read rather than re-derived (a real fast-swap jump driven through `mpc.step` reaching the gate as `uncertain`, and the set surviving a solver restart, §8 item 100) | PR |
@@ -4449,10 +4477,10 @@ tests carry the `nightly` marker.
 | `tests/test_bench_budget.py` | DAS MPC step p99 ≤ 12× (named constant) the legacy MPC p99, the 75th percentile of several interleaved, warm-up-discarded repeats (§8 item 6); `bench_step.py` runs both DAS solvers; absolute p99 ≤ `mpc.budget_ms` only on a recognised Pi board (`platform.machine()` in `PI_MACHINES` -- armv6l Zero W, aarch64 Zero 2 W; a skip on any other board names what it saw, §8 item 108); the Zero W fallback of §8 item 73 (`budget_ms` 1000 with `budget_alarm_ms` 1250 loads, `budget_ms` 1000 alone is rejected, `mpc_every_ticks: 3` solves a third of the ticks and a solve tick is the expensive one) | PR / Pi |
 | `tests/test_modelstore.py` | config keys, store path (CLI, env, legacy), fingerprint covers structure not policy, corrupt / truncated / wrong-schema / wrong-fingerprint files → prior, fresh vs stale by age (a clock behind the file is stale), fresh loads `frozen` and the MPC acts at once, stale holds until `model_reconfirm_s` with the prediction error in bounds, calibration keyed by serial and inflated when stale, a save does not reset a stale hold, atomic writes, malformed seeds never raise; a `tools/fit_model.py` report in the store's place loads as a model, ages like a store file, drops a model of another structure and is refused outright when its `store_fingerprint` is another config's or missing (item 15); the settle timers round-trip through the file as seconds already settled minus the daemon's outage, drop on a long outage, a stale file or an unknown age, a malformed section is dropped with a warning, and the persister asks the supervisor for them before a save (item 20); the handheld calibrations round-trip per bay, are always restored provisional, are kept at the staleness window's boundary and dropped one second past it, dropped for an unknown or negative age with the warning naming which of the two causes it was (no saved sample time against a wall clock behind the file), dropped when the bay's declared `occupied` / `class` / `serial` has changed, and land in the same estimator memory as the SMART ones (item 104) | PR |
 | `tests/test_fancurve.py` | the online PWM → RPM fit (item 14): a swept fan is identified per fan model, one duty or a ramping command is never enough, a noisy tachometer is refused by the residual, the bins stay bounded and follow a fan that changes, a malformed memory or a changed channel → fan-model map starts over, `curve_pair` falls back to the config for anything unusable, `step` publishes the fit into the store's `fan_curves` and reports it, the curve round-trips through `model.json`, and `model_use_rpm` keeps the configured `rpm_max` as its reference so a worn fan still reads as less air. Item 107, the readers: every reader has a decision in `READERS`, the estimator's airflow and the noise objective's `u0` follow a fitted curve and fall back without one, the noise diagnostics name the curve behind the index, fan health judges a fan at half speed a deviation whatever is fitted, the Stuck airflow evidence and the identification's excitation reach stay on the configured curve, a fit nothing re-confirms goes stale and every reader falls back, one that keeps being re-confirmed does not, and a curve from the store stays in force until a fit replaces it | PR |
-| `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); the re-planned levels of item 52 (the echo of the experiment's own level taken out of the want and no ratchet over a run of high ticks, a fan the solver's own floor lifted still read as demand, the anchor rising at once and falling only at a switch and never below the frozen base, a held sibling with it, the band, `symmetric` dipping at most the amplitude below the live demand, the same aborts on the same tick with and without re-planning, a re-planned level never below the frozen one, the dip and the floor read off the running experiment's own plan, the demand copied only on its ticks, and through the loop a warming zone followed instead of held back, a spent load released instead of pinning the fans, and an experiment ending later than the frozen one and never earlier — against `ident_replan: false`, which still holds it back); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes a run but the settle timers come back from the store and a start between `plan_tick` and `record_tick` keeps its tick (§8 item 20); `k·σ` counted once and the absolute abort from `ident_abort_below_limit_c` (items 53, 54); a lost sensor group blocks a start and aborts a run (item 72); the excitation reach of item 110 (`rel_swing` matches the plan's closed form and the fan's own curve, falls with the base, rises with the amplitude and is read off the clamped pair; `excitation` / `unexcitable` in the status; `ident_require_excitable` refusing with `not_excitable:<ch>` and a channel the band already refuses getting one reason, not two); the release of item 112 (the experiment's channels are never put into `released`, the solver keeps its integrator through a completion and through every human intent, and a run stopped on its high level hands back the solver's own level while the fan walks down at `d_pwm_max`); legacy refuses | PR |
+| `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); the re-planned levels of item 52 (the echo of the experiment's own level taken out of the want and no ratchet over a run of high ticks, a fan the solver's own floor lifted still read as demand, the anchor rising at once and falling only at a switch and never below the frozen base, a held sibling with it, the band, `symmetric` dipping at most the amplitude below the live demand, the same aborts on the same tick with and without re-planning, a re-planned level never below the frozen one, the dip and the floor read off the running experiment's own plan, the demand copied only on its ticks, and through the loop a warming zone followed instead of held back, a spent load released instead of pinning the fans, and an experiment ending later than the frozen one and never earlier — against `ident_replan: false`, which still holds it back); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes a run but the settle timers come back from the store and a start between `plan_tick` and `record_tick` keeps its tick (§8 item 20); `k·σ` counted once and the absolute abort from `ident_abort_below_limit_c` (items 53, 54); a lost sensor group blocks a start and aborts a run (item 72); the excitation reach of item 110 (`rel_swing` matches the plan's closed form and the fan's own curve, falls with the base, rises with the amplitude and is read off the clamped pair; `excitation` / `unexcitable` / `holds_cover_window` in the status; `pe_bound` is the constant and not `pe_min`; `excitable` at the configured amplitude against `excitable_at_cap` at the `0.3` cap, which separates "raise the amplitude" from "only a lower park reaches it"; the published reach met by the monitor's own `pe_diag` when a window sits inside a hold and missed when it straddles a switch; `ident_require_excitable` refusing with `not_excitable:<ch>` and a channel the band already refuses getting one reason, not two); the release of item 112 (the experiment's channels are never put into `released`, the solver keeps its integrator through a completion and through every human intent, and a run stopped on its high level hands back the solver's own level while the fan walks down at `d_pwm_max`); legacy refuses | PR |
 | `tests/test_ident_sim.py` | an experiment on the truth plant never takes a drive over a limit and never leaves the enclosure hotter than the same seed without one, with the excitation visible on the fans; a drawn enclosure that is already saturated refuses the start; and, with the room warming 20 °C/h so the envelope actually binds, the run aborts on `envelope:<bay>` with `T̂_d + k·σ` still below the absolute abort and no drive over its limit from the abort on, on `ident_levels: above` and `symmetric` (§8 item 53) | PR: `basic` seed 1, both `ident_levels`; nightly: `basic` and `rich` seeds 1–5, envelope sweep `basic` seeds 1–5 × both `ident_levels` |
 | `tests/test_ident_replan_sim.py` | re-planned against frozen experiment levels on the truth sim (`rich`, the real loop and supervisor), both solvers and three seeds: no tick below the solver's own command (and the frozen plan does hold one back), no anchor more than `ident_amplitude` above the demand the frozen arm saw (the ratchet guard, which the pre-review `_replan` fails on the MPC arm), and the fit no worse than frozen beyond a loose margin | nightly |
-| `tests/test_ident_converge_sim.py` | closed-loop identification on the daemon's own path, 16 h on the truth sim (`rich`, the real loop and supervisor), three seeds. Item 102: a zone-wide `ident_parallel: true` schedule against a one-channel-at-a-time round robin over *all eight* channels on the same plant — the measured converged zones per seed on both arms (z0+z3 / none / z3 against none on every seed), `pe_min` and `excited_windows` on the converged zones held to the values the runs reached rather than to the rule's own thresholds, the zones that close no window at all named per seed (the b03 swap-reset defect), zero limit violations in either arm, both arms' true margin above a floor and the mean-PWM gap bounded both ways. Item 112: no channel is left with a floor above `pwm_min` after an experiment ends and the mean PWM stays under what the old release spent. Item 111: the same schedule at 36 h — the zones that converge with more windows, no zone blocked by an `E`'s relative standard error, the bays that still block one named per seed, and `se(k)` under 0.12 on every bay that closes windows | nightly |
+| `tests/test_ident_converge_sim.py` | closed-loop identification on the daemon's own path, 16 h on the truth sim (`rich`, the real loop and supervisor), three seeds. Item 102: a zone-wide `ident_parallel: true` schedule against a one-channel-at-a-time round robin over *all eight* channels on the same plant — the measured converged zones per seed on both arms (z0+z3 / none / z3 against none on every seed), `pe_min` and `excited_windows` on the converged zones held to the values the runs reached rather than to the rule's own thresholds, the zones that close no window at all named per seed (the b03 swap-reset defect, and a seed whose zone-wide arm converges *nothing* pinned exactly rather than as a lower bound, so that case stays a test), zero limit violations in either arm, both arms' true margin above a floor and the mean-PWM gap bounded both ways. Item 112: no channel is left with a floor above `pwm_min` after an experiment ends, and both the enclosure's mean PWM and qd1's own stay under what the old release spent (the channel mean is what separates the two releases on the seeds where qd1 already reached `pwm_min`). Item 111: the same schedule at 36 h — the zones that converge with more windows, no zone blocked by an `E`'s relative standard error, the bays that still block one named per seed, and `se(k)` under 0.12 on every bay that closes windows | nightly |
 | `tests/test_sim_das.py` | the truth plant: energy balance through transients and hot swap, steady state, more airflow never warms anything, dead band and exponent, quantisation per sensor type, lags, SMART cadence, determinism per seed | PR |
 
 Test cost: the PR selection is about 1,900 tests in under five minutes
@@ -4724,7 +4752,8 @@ estimate, SMART counters). `/api/model`: `thermal` is
 coefficients with relative standard errors, plus per zone `pe_diag` — the
 per-group diagonal beside `pe_min` — and `blocked`, the parts of the
 `converged` rule the zone still fails, and per bay `se`, the absolute standard
-error beside `rel_se` (§3, §8 items 110, 111); `{"status": "off"}` without
+error beside `rel_se` and `null` wherever `rel_se` is (§3, §8 items 110, 111);
+`{"status": "off"}` without
 `model_shadow`), `parameters` the static table of §3 (unit, bounds,
 prior, identified from), `calibration` per bay (serial, calibrated,
 `sigma_cal_c`, `calibration_source` — `smart` | `manual` | `null` — and the
@@ -4735,8 +4764,13 @@ model store loaded
 experiment's status (running, target, phase, level, the base at the start,
 the anchor the levels are drawn around now (`plan_base`) with `levels` and
 `replan`, `excitation` per channel and `unexcitable` — how far each channel's
-telegraph can move the model's PE monitor from where it sits, and the channels
-that cannot clear its bound at all (§3, §8 item 110) — elapsed and remaining
+telegraph can move the model's PE monitor from where it sits (`rel_swing`,
+`pe_reach`, `pe_bound`, `excitable`, `pe_reach_at_cap`, `excitable_at_cap`; the
+constant bound is `pe_bound`, never `pe_min`, which is the thermal summary's own
+*measured* eigenvalue) and the channels that cannot clear that bound at the
+configured `ident_amplitude` — `holds_cover_window`, whether the schedule can
+deliver that reach at all or a regression window averages two levels and the
+monitor reads less (§3, §8 item 110), elapsed and remaining
 seconds, the last result and abort reason).
 
 `/api/health` keys:
@@ -6915,11 +6949,24 @@ Owner decision (2026-09-16):
 
     - `ident.excitation(cfg, levels)` gives per channel `rel_swing`, the
       `pe_reach` it implies and whether that clears `PE_MIN`, computed on the
-      channel's commissioned curve with the monitor's own scale floor, so its
-      square is exactly the `pe_diag` entry a group of that one channel would
-      report. It rides in `snapshot().extra["experiment"]` as `excitation` /
-      `unexcitable` and in a `WARNING` on the start log line naming the channels
-      that cannot get there.
+      channel's commissioned curve with the monitor's own scale floor. `pe_reach`
+      is the **most** a group of that one channel could report on `pe_diag`: the
+      monitor accumulates one sin²-weighted mean of the regressor per
+      `model_window_s` block, so it reads the telegraph's own levels only while a
+      regression window sits inside one hold, and a window that spans a switch
+      averages the two. `holds_cover_window` (`min(ident_hold_s) ≥
+      model_window_s`) rides beside it and says whether the bound is tight; the
+      shipped DAS example is not in that case, `tests/test_ident_converge_sim.py`
+      is. `excitable` is read at the **configured** `ident_amplitude` and
+      `excitable_at_cap` at the `0.3` cap, so the owner is told which remedy
+      applies — a larger amplitude, or a lower park — instead of only that the
+      channel is blind. The constant bound is published as `pe_bound`, not
+      `pe_min`: that name is already the thermal summary's *measured* smallest
+      eigenvalue, and both structures reach `/api/model` and MQTT. It rides in
+      `snapshot().extra["experiment"]` as `excitation` / `unexcitable` and in a
+      `WARNING` on the start log line naming the channels that cannot get there —
+      logged when that answer *changes*, not on every start, since on a busy
+      enclosure most starts have one (the item 108 precedent).
     - The thermal summary gains `pe_diag` per zone: the **diagonal** of the very
       matrix whose smallest eigenvalue is `pe_min`, one entry per strong group.
       `pe_min ≤ min(pe_diag)` always, so a group whose own entry sits at or under
@@ -6931,7 +6978,10 @@ Owner decision (2026-09-16):
 
     `mpc.ident_require_excitable` (bool, default `false`) turns the prediction
     into a refusal, `not_excitable:<ch>`, the way `band:` and `saturated:`
-    refuse. **Off by default deliberately, and measured:** on this example a
+    refuse (§3's start-precondition list has it). It refuses on the upper bound
+    above, so it never blocks a start that could have worked; with holds shorter
+    than `model_window_s` it can let one through that still falls short, and
+    `pe_diag` is what says so afterwards. **Off by default deliberately, and measured:** on this example a
     zone-wide start is widened to channels the solver parks high, so with the key
     on almost no start is allowed and the zones that do converge today would not.
     An experiment that cannot finish the air block's PE gate still informs the
@@ -7013,8 +7063,17 @@ Owner decision (2026-09-16):
 
     The fix is to stop releasing them. The experiment's levels are an override
     applied *after* `mpc.step`, so the solver ran on every one of its ticks and
-    its integrator already holds the command it would have given without one;
-    keeping it returns control exactly there. Nothing steps: `step` still
+    the integrator kept at the release is its own state, advanced throughout and
+    never re-seeded from the fan; keeping it returns control at the solver's own
+    demand rather than at the experiment's level. *Near* it, not bit-exact, under
+    the DAS MPC: its first block is solved with `weight_dpwm·‖u₀ − prev‖²` and
+    `prev` is the PWM in force, which during the experiment is the experiment's
+    own level, so the stored core keeps a small residual pull toward it — in the
+    safe direction, more cooling than the counterfactual — and `_replay_core`
+    hands the same plan back for up to `mpc_every_ticks` ticks after the release.
+    Raising either knob makes that residue larger; at the shipped values the
+    measurements below show the ratchet gone. On the PI-DAS branch there is no
+    such term and the integrator is exact. Nothing steps: `step` still
     rate-limits against the PWM on the fan, so the walk back is `d_pwm_max` per
     tick like any other move. Under `ident_levels: symmetric` — where the old
     release could hand the solver the *low* level, below what it wanted — the
@@ -7057,9 +7116,14 @@ Owner decision (2026-09-16):
     move the fans. The next healthy tick then measured `d_pwm_max` from a command
     the fans no longer carried, so it could move them by up to two steps at once
     (and after a long emergency run, by however far the ramp had walked toward
-    `fallback_pwm`). The applied-command mirror now follows the emergency ramp;
-    nothing the broken tick *computed* is committed, which is what "state
-    untouched" is for. The old experiment release happened to mask this on the
+    `fallback_pwm`). `state.last_cmd` now follows the emergency ramp; nothing the
+    broken tick *computed* is committed, which is what "state untouched" is for.
+    **Only** `last_cmd`: a broken tick pushes no window sample, so the newest one
+    belongs to the last *good* tick, and writing a later command into it (as the
+    first version of this fix did, through `_with_applied`) would back-date the
+    whole airflow excursion into the command history `gate._stuck` reads — where
+    `stuck_pwm_lag_fraction` exists precisely to require that the drives have had
+    time to answer a move before a flat proximal sensor is called stuck. The old experiment release happened to mask this on the
     experiment path (it pinned the solver at the same stale value), which is how
     it surfaced.
 

@@ -59,7 +59,14 @@ from aqua_bridge.control.intents import (
 )
 from aqua_bridge.control.loop import Loop
 from aqua_bridge.control.supervisor import Supervisor
-from aqua_bridge.model import ConfigError, Mode, MpcCommand, MpcConfig, PlantObservation
+from aqua_bridge.model import (
+    IDENT_AMPLITUDE_MAX,
+    ConfigError,
+    Mode,
+    MpcCommand,
+    MpcConfig,
+    PlantObservation,
+)
 from das_fixtures import das_cfg, das_mapping, das_obs
 from invariants import TOL
 
@@ -1364,8 +1371,8 @@ def test_the_demand_is_read_out_of_the_diagnostics_only_for_a_running_experiment
 def test_the_relative_airflow_swing_a_telegraph_reaches_is_the_pe_arithmetic():
     """``pe_min`` is relative, so what a telegraph can reach depends on where the channel
     sits. ``rel_swing`` is that number, on the fan's own curve and with the PE monitor's
-    own scale floor, so its square is exactly the ``pe_diag`` entry the monitor would
-    report for a group of this one channel (section 8 item 110)."""
+    own scale floor, so its square is the most a group of this one channel could report
+    on ``pe_diag`` (section 8 item 110)."""
     cfg = ident_cfg()  # fa1: p12, deadband 0.1, exponent 1.0
     deadband, exponent = 0.1, 1.0
 
@@ -1400,11 +1407,85 @@ def test_excitation_names_the_channels_that_cannot_reach_the_pe_bound():
     assert out["fa1"]["excitable"] is True and out["fa2"]["excitable"] is False
     for ch, entry in out.items():
         assert entry["pe_reach"] == pytest.approx(entry["rel_swing"] ** 2)
-        assert entry["pe_min"] == thermal.PE_MIN
+        # the *bound*, not the thermal summary's measured ``pe_min``: two published
+        # structures, one name each (section 8 item 110)
+        assert entry["pe_bound"] == thermal.PE_MIN and "pe_min" not in entry
         assert entry["excitable"] is (entry["pe_reach"] > thermal.PE_MIN)
         assert entry["rel_swing"] == pytest.approx(ident.rel_swing(cfg, ch, *levels[ch]))
     assert ident.unexcitable(cfg, levels) == ["fa2"]
     assert ident.excitation(cfg, {"fa1": "nonsense", "fa2": [0.5]}) == {}
+
+
+def test_excitation_says_which_remedy_a_blind_channel_needs():
+    """``excitable`` is read at the configured amplitude, so "cannot be excited" on its
+    own does not say whether a larger ``ident_amplitude`` would do it. ``*_at_cap`` is the
+    same arithmetic at the largest amplitude the config allows, which separates "raise the
+    amplitude" from "only a lower park reaches this channel" (section 8 item 110)."""
+    cfg = ident_cfg()  # ident_amplitude 0.15, fa1 deadband 0.1 exponent 1.0
+    assert cfg.ident_amplitude < IDENT_AMPLITUDE_MAX and cfg.ident_levels == "above"
+
+    def entry(base: float, amplitude: float | None = None) -> dict[str, Any]:
+        c = cfg if amplitude is None else dataclasses.replace(cfg, ident_amplitude=amplitude)
+        return ident.excitation(c, {"fa1": (base, base + c.ident_amplitude)})["fa1"]
+
+    # parked at 0.45 the shipped amplitude falls short and the cap clears it: the honest
+    # answer is "raise mpc.ident_amplitude", not "wait for a lower park"
+    mid = entry(0.45)
+    assert mid["excitable"] is False and mid["excitable_at_cap"] is True
+    assert mid["pe_reach_at_cap"] == pytest.approx(entry(0.45, IDENT_AMPLITUDE_MAX)["pe_reach"])
+    assert entry(0.45, IDENT_AMPLITUDE_MAX)["excitable"] is True
+    # past about 0.62 PWM no allowed amplitude reaches the bound (the module's own closed
+    # form: A >= 0.576 (u - deadband), against the 0.3 cap)
+    high = entry(0.8)
+    assert high["excitable"] is False and high["excitable_at_cap"] is False
+    # the cap is never below the configured amplitude's reach
+    for base in (0.2, 0.35, 0.5, 0.8):
+        e = entry(base)
+        assert e["pe_reach_at_cap"] >= e["pe_reach"] - 1e-12
+    # under ``symmetric`` the pair is read around its midpoint, not its low level
+    sym = dataclasses.replace(cfg, ident_levels="symmetric")
+    got = ident.excitation(sym, {"fa1": (0.45 - sym.ident_amplitude, 0.45 + sym.ident_amplitude)})
+    assert got["fa1"]["pe_reach_at_cap"] == pytest.approx(
+        ident.rel_swing(sym, "fa1", 0.45 - IDENT_AMPLITUDE_MAX, 0.45 + IDENT_AMPLITUDE_MAX) ** 2
+    )
+
+
+def test_the_published_reach_is_an_upper_bound_the_schedule_may_not_deliver():
+    """The PE monitor never sees the telegraph's two levels: it accumulates one weighted
+    mean of the airflow regressor per ``model_window_s`` block. A window that sits inside
+    one hold reads a level, so ``pe_diag`` meets ``pe_reach``; a window that spans a
+    switch reads a mixture of the two, which can only move it toward their mean. So
+    ``pe_reach`` is a bound, tight exactly when ``holds_cover_window`` (section 8 item
+    110)."""
+    cfg = ident_cfg()
+    lo, hi = 0.2, 0.2 + cfg.ident_amplitude
+    reach = ident.excitation(cfg, {"fa1": (lo, hi)})["fa1"]["pe_reach"]
+    deadband, exponent = 0.1, 1.0
+    phi_lo = thermal.phi(lo, deadband, exponent)
+    phi_hi = thermal.phi(hi, deadband, exponent)
+
+    def diagonal(window_means: list[float]) -> float:
+        """The monitor's own ``pe_diag`` after these window means, through its own
+        exponential recursion -- no arithmetic re-derived here."""
+        block = {"m": [0.0], "S": [[0.0]], "w": 0}
+        beta = 1.0 / thermal.PE_WINDOWS
+        for value in window_means:
+            block["m"] = [(1.0 - beta) * block["m"][0] + beta * value]
+            block["S"] = [[(1.0 - beta) * block["S"][0][0] + beta * value * value]]
+            block["w"] += 1
+        return thermal.pe_diagonal(block)[0]
+
+    n = 4 * thermal.PE_WINDOWS
+    # windows inside the holds: the monitor reads the levels themselves
+    aligned = [phi_hi if i % 2 else phi_lo for i in range(n)]
+    assert diagonal(aligned) == pytest.approx(reach, rel=0.02)
+    # every other window straddles a switch and reads the mean of the two
+    mixed = [(phi_lo + phi_hi) / 2 if i % 2 else (phi_lo if i % 4 else phi_hi) for i in range(n)]
+    assert diagonal(mixed) < 0.8 * reach
+
+    assert ident.holds_cover_window(dataclasses.replace(cfg, ident_hold_s=(60.0, 90.0))) is False
+    assert ident.holds_cover_window(dataclasses.replace(cfg, ident_hold_s=(240.0, 360.0))) is True
+    assert ident.holds_cover_window(cfg) is (min(cfg.ident_hold_s) >= cfg.model_window_s)
 
 
 def test_a_running_experiment_publishes_what_its_channels_can_reach():
@@ -1419,9 +1500,13 @@ def test_a_running_experiment_publishes_what_its_channels_can_reach():
         assert entry["excitable"] is False
         assert entry["rel_swing"] == pytest.approx(0.1579, abs=1e-3)
     assert rig.sup.snapshot().extra["experiment"]["unexcitable"] == st_["unexcitable"]
+    # whether the schedule can deliver that reach at all rides beside it: the fixture's
+    # holds are shorter than a regression window, so the reach above is a bound
+    assert st_["holds_cover_window"] is ident.holds_cover_window(rig.cfg)
     # and it is gone with the experiment
     rig.sup.submit(Ident("stop"))
     assert rig.status["excitation"] == {} and rig.status["unexcitable"] == []
+    assert rig.status["holds_cover_window"] is ident.holds_cover_window(rig.cfg)
 
 
 def test_ident_require_excitable_refuses_a_start_that_cannot_inform_the_pe_gate():

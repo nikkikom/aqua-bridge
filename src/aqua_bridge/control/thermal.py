@@ -225,13 +225,20 @@ section 8 item 110: the relative normalisation is deliberate -- a fan already ne
 ``pwm_max`` really does have less airflow information to give per unit of PWM than one
 near ``pwm_min``, and normalising by something else would relabel it rather than inform
 it -- so the headroom a channel has is published (``pe_diag`` here after the fact,
-:func:`aqua_bridge.control.ident.excitation` before a start) instead of hidden.
+:func:`aqua_bridge.control.ident.excitation` before a start) instead of hidden. The two
+are not the same number: ``excitation`` reads the telegraph's own two levels, while a
+window here accumulates one weighted mean of the regressor over ``model_window_s``, so a
+window that spans a level switch reads a mixture. The reach published before a start is
+an upper bound on this diagonal, tight when every hold outlasts a window.
 
 **Why a zone is still learning** ``blocked``: the parts of the ``converged`` rule the
 zone still fails, in the rule's own words -- ``windows:<zone|bay>``, ``pe:<zone|bay>``,
 ``rel_se:<coefficient>`` and ``pred_err``. It comes from the same function the status
-machine decides with, so the published list and the decision cannot drift apart. A bay
-block also publishes ``se``, the absolute standard error beside ``rel_se``: ``rel_se(k)``
+machine decides with, and from the same occupancy rule (:func:`_bay_occupied`), so the
+published list and the decision cannot drift apart on the rule or on its input. A bay
+block also publishes ``se``, the absolute standard error beside ``rel_se`` and ``None``
+wherever ``rel_se`` is (a block that has closed no window carries only the prior's own
+initial variance in ``P``, and its square root is not a measurement): ``rel_se(k)``
 is ``se / |k|``, so a bay whose airflow sensitivity is genuinely small fails the relative
 gate on a fit no worse than its neighbours' (section 8 item 111).
 
@@ -307,7 +314,13 @@ Memory (plain JSON)::
      "bays": {bay: block}}
     block = {"theta": [...], "P": [[...]], "s2": float, "n": excited windows,
              "w": windows, "m": [...], "S": [[...]], "fm": [...] | None, "pe": float,
+             "pd": [...], "se": [...] | None,
              "rel": [...] | None, "acc": {"x", "y", "h", "fan", "t0", "c"} | None}
+
+``pd`` (the ``pe`` diagonal) and ``se`` (the absolute standard errors behind ``rel``) are
+*derived*: refreshed with ``pe`` / ``rel`` at every closing window and rebuilt from ``m``,
+``S`` and ``P`` when a memory is loaded, never read from the file. They live in the block
+so the per-tick summary reads them instead of rebuilding two matrices per zone and bay.
 
 A memory that does not match the config's structure, or is malformed in any way,
 starts over (never an exception).
@@ -818,6 +831,20 @@ class ThermalParams:
     fan: dict[str, tuple[float, float]]  # channel -> (deadband, exponent)
 
 
+def _bay_occupied(declared: Mapping[str, Any], bay: str, occ: str | None) -> bool:
+    """Whether ``bay`` counts as occupied: the estimator's own reading when it has one,
+    else the declared ``constrained`` flag (a bay the topology does not declare at all --
+    only a caller's own structure has one -- counts as occupied).
+
+    One rule, called by :func:`model_params` for the decision and by :func:`summary` for
+    the ``blocked`` list it publishes, so the two cannot drift apart on their *input* any
+    more than they can on the rule itself (section 8 item 111)."""
+    if occ is not None:
+        return occ != EMPTY
+    spec = declared.get(bay)
+    return True if spec is None else bool(spec.constrained)
+
+
 def model_params(
     cfg: MpcConfig,
     theta: Mapping[str, float] | None = None,
@@ -852,7 +879,7 @@ def model_params(
     b: dict[str, float] = {}
     for bay in st.bays:
         occ = None if occupancy is None else occupancy.get(bay)
-        occupied[bay] = (occ != EMPTY) if occ is not None else topo.bays[bay].constrained
+        occupied[bay] = _bay_occupied(topo.bays, bay, occ)
         cls = (classes or {}).get(bay) or cfg.bay_class(bay)
         c_drive[bay] = drive_capacity(cfg, cls)
         s[bay], b[bay] = _sensor_map((maps or {}).get(bay))
@@ -1327,6 +1354,8 @@ def _fresh_block(spec: _BlockSpec, n_fan: int) -> dict[str, Any]:
         "S": np.zeros((n_fan, n_fan)).tolist(),
         "fm": None,
         "pe": 0.0,
+        "pd": [0.0] * n_fan,
+        "se": None,
         "rel": None,
         "acc": None,
     }
@@ -1415,6 +1444,8 @@ def _rls_window(
     block["m"] = m_arr.tolist()
     block["S"] = s_arr.tolist()
     block["pe"] = _pe_min(m_arr, s_arr, int(block["w"]))
+    block["pd"] = _pe_diag(m_arr, s_arr, int(block["w"]))
+    block["se"] = _standard_errors(block, spec)
     block["rel"] = _rel_se(block, spec)
     return residual, excited
 
@@ -1473,6 +1504,13 @@ def _pe_min(mean: np.ndarray, second: np.ndarray, windows: int) -> float:
     return float(min(1.0, max(0.0, vals[0])))
 
 
+def _pe_diag(mean: np.ndarray, second: np.ndarray, windows: int) -> list[float]:
+    norm = _pe_normalised(mean, second, windows)
+    if norm is None:
+        return [0.0] * int(mean.size)
+    return [float(min(1.0, max(0.0, v))) for v in np.diag(norm)]
+
+
 def pe_diagonal(block: Mapping[str, Any]) -> list[float]:
     """Each fan regressor's own squared relative variation over the PE monitor's memory.
 
@@ -1482,13 +1520,17 @@ def pe_diagonal(block: Mapping[str, Any]) -> list[float]:
     *which* group is not moving where ``pe_min`` only says that some direction is not:
     a group whose own entry is at or under :data:`PE_MIN` holds its zone's gate shut on
     its own, whatever the others do, because the eigenvalue is bounded by it (section 8
-    item 110)."""
-    norm = _pe_normalised(
+    item 110).
+
+    Kept in the block as ``pd`` beside ``pe``, refreshed at each closing window, so the
+    per-tick :func:`summary` reads it instead of rebuilding the matrix; recomputed here
+    for a block that does not carry it (a caller's own dict)."""
+    stored = block.get("pd")
+    if isinstance(stored, list) and len(stored) == len(block["m"]):
+        return [float(v) for v in stored]
+    return _pe_diag(
         np.array(block["m"], dtype=float), np.array(block["S"], dtype=float), int(block["w"])
     )
-    if norm is None:
-        return [0.0] * len(block["m"])
-    return [float(min(1.0, max(0.0, v))) for v in np.diag(norm)]
 
 
 def _standard_errors(block: Mapping[str, Any], spec: _BlockSpec) -> list[float]:
@@ -1625,7 +1667,7 @@ def _parse_block(raw: object, spec: _BlockSpec, n_fan: int) -> dict[str, Any]:
             raise ValueError("rel")
         rel = [_opt_num(v) for v in rel]
     acc = raw.get("acc")
-    return {
+    out = {
         "theta": theta,
         "P": _checked(raw["P"], (n, n)),
         "s2": _num(raw["s2"]),
@@ -1638,6 +1680,12 @@ def _parse_block(raw: object, spec: _BlockSpec, n_fan: int) -> dict[str, Any]:
         "rel": rel,
         "acc": None if acc is None else _parse_acc(acc, n, n_fan),
     }
+    # ``pd`` / ``se`` are derived from what was just parsed, not read from the file: the
+    # two are a view of ``m``/``S`` and of ``P``, and deriving them here keeps every
+    # block in memory carrying them so :func:`summary` never recomputes per tick.
+    out["pd"] = _pe_diag(np.array(out["m"], dtype=float), np.array(out["S"], dtype=float), out["w"])
+    out["se"] = None if rel is None else _standard_errors(out, spec)
+    return out
 
 
 def _parse_acc(raw: object, n: int, n_fan: int) -> dict[str, Any]:
@@ -2327,6 +2375,7 @@ def _convert_air_block(
     out["theta"] = theta
     out["P"] = p.tolist()
     out["rel"] = None
+    out["se"] = None
     out["acc"] = None
     return out
 
@@ -2504,9 +2553,7 @@ def summary(
     topo = cfg.topology
     declared = {} if topo is None else topo.bays
     occupied = {
-        b: (occupancy[b] != EMPTY)
-        if occupancy is not None and b in occupancy
-        else (b not in declared or declared[b].constrained)
+        b: _bay_occupied(declared, b, None if occupancy is None else occupancy.get(b))
         for b in st.bays
     }
     zones_out: dict[str, Any] = {}
@@ -2547,8 +2594,16 @@ def summary(
     bays_out: dict[str, Any] = {}
     for b, bay in st.bays.items():
         block = memory["bays"][b]
+        has_fit = block.get("rel") is not None
         rel = block.get("rel") or [None] * len(bay.keys)
-        se = _standard_errors(block, bay_specs[b])
+        # ``None`` exactly where ``rel_se`` is ``None``: a block that has closed no
+        # window still carries the prior's own initial variance in ``P``, and publishing
+        # its square root as a standard error would hand the owner -- or a later tool
+        # ranking bays by it -- a prior dressed as a measurement (section 8 item 111).
+        se: list[float | None] = [None] * len(bay.keys)
+        if has_fit:
+            stored = block.get("se")
+            se = list(stored) if stored is not None else _standard_errors(block, bay_specs[b])
         bays_out[b] = {
             "zone": bay.zone,
             "windows": block["w"],
@@ -2558,7 +2613,8 @@ def summary(
             "rel_se": dict(zip(bay.keys, rel, strict=True)),
             # the absolute standard error beside the relative one: ``rel_se(k)`` is
             # ``se / |k|``, so a bay whose airflow sensitivity is genuinely small fails
-            # the relative gate on a fit no worse than its neighbours' (section 8 item 111)
+            # the relative gate on a fit no worse than its neighbours' (section 8 item
+            # 111). ``None`` per coefficient while the block has closed no window.
             "se": dict(zip(bay.keys, se, strict=True)),
         }
         if occupancy is not None and b in occupancy:

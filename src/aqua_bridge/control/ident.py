@@ -111,10 +111,22 @@ That normalisation stays as it is. It is what makes the monitor read as *informa
 rather than as PWM: a fan already near ``pwm_max`` really does move proportionally less
 extra air per unit of PWM, and dividing by something else would relabel an uninformative
 channel, not inform it. What changes is that the arithmetic is no longer invisible.
-:func:`excitation` publishes it per channel -- ``rel_swing``, the ``pe_reach`` it implies
-and whether that clears :data:`~aqua_bridge.control.thermal.PE_MIN` -- in
-``snapshot().extra["experiment"]`` and in the start log line, so a channel that cannot be
-excited is **visible** instead of leaving its zone silently pending; the measured half is
+:func:`excitation` publishes it per channel -- ``rel_swing``, the ``pe_reach`` it implies,
+whether that clears :data:`~aqua_bridge.control.thermal.PE_MIN` at the configured
+``ident_amplitude`` (``excitable``) and whether any allowed amplitude would
+(``excitable_at_cap``) -- in ``snapshot().extra["experiment"]`` and in the start log line,
+so a channel that cannot be excited is **visible** instead of leaving its zone silently
+pending, and the owner is told which of the two remedies applies: a larger amplitude, or
+waiting for the solver to park the channel lower.
+
+``pe_reach`` is an **upper bound**, not a prediction. The monitor accumulates one
+sin^2-weighted mean of the airflow regressor per ``model_window_s`` block, so it sees the
+telegraph's own two levels only while a regression window fits inside one hold; a window
+that spans a switch averages them and reads less. :func:`holds_cover_window` says whether
+``min(ident_hold_s) >= model_window_s`` holds, and the status publishes it beside the
+reach, so a schedule that cannot deliver what it promises says so. ``excitable`` is
+therefore a necessary condition: ``false`` is a proof that the channel cannot inform its
+zone from this base, ``true`` is permission for the schedule to try. The measured half is
 the thermal model's own ``pe_diag``, the diagonal beside ``pe_min``, which names the group
 that is short after the fact, and its ``blocked`` list, which names the gate.
 
@@ -231,6 +243,9 @@ refuses a second start while one runs. Here:
 * ``no_tick`` / ``mode:<mode>`` -- the last command exists and its mode is ``auto``
   (not ``saturated``, ``degraded`` or ``fallback``);
 * ``saturated:<ch>``, ``no_command:<ch>``, ``band:<ch>`` -- per channel of the target;
+  ``not_excitable:<ch>`` -- only with ``ident_require_excitable``: the channel's
+  telegraph cannot reach the thermal model's PE bound from where the solver parked it
+  (:func:`excitation`), so the run could not inform that zone's air block;
   ``fan_stall:<ch>`` -- on any channel;
 * ``settle:<zone>`` -- every zone the target serves (``ZoneLayout.served``: the zones
   listing one of its channels plus their declared ``coupled_to``) has been trusted
@@ -323,9 +338,9 @@ survive one, through the model store (above).
 Release: the solver keeps its own integrator (section 8 item 112)
 -----------------------------------------------------------------
 An experiment is an override *after* ``mpc.step``, so the solver ran normally on every
-one of its ticks and its integrator is its own: at the release it already holds the
-command the solver would have given had no experiment run. The supervisor therefore
-**does not** put the experiment's channels into ``TickPlan.released``. It used to, and
+one of its ticks and the integrator at the release is its own state, advanced throughout
+and never re-seeded from the fan. The supervisor therefore **does not** put the
+experiment's channels into ``TickPlan.released``. It used to, and
 that dropped their integrator entries, which made ``step`` re-initialise the solver
 bumplessly -- its first output equal to *the PWM on the fan*, i.e. the experiment's own
 level. A channel released on its high level was handed that level as the solver's
@@ -333,6 +348,16 @@ starting point and stayed there until the integral wound it back down, and a lat
 that took the inflated command as its base stepped up by another ``ident_amplitude``
 (measured on the zone-wide schedule: qd1 ran 0.44-0.99 PWM where the sequential schedule
 kept it at 0.2-0.69).
+
+It returns control *near* the solver's own demand rather than exactly at it. On the
+PI-DAS branch the integrator is exact -- the solver advances it from its stored entry and
+never reads the PWM on the fan while that entry exists. Under the DAS MPC the first block
+is solved with ``weight_dpwm`` against the PWM in force, which during the experiment is
+the experiment's own level, so the stored core keeps a small pull toward it (in the safe
+direction: more cooling than the counterfactual) and ``_replay_core`` hands the same plan
+back for up to ``mpc_every_ticks`` ticks after the release. A larger ``weight_dpwm`` or
+``mpc_every_ticks`` makes that residue larger; measured at the shipped values it does not
+reintroduce the ratchet (section 8 item 112 has the numbers).
 
 Nothing steps: ``step`` still rate-limits the command against the PWM on the fan, so the
 return to the solver's own demand takes ``d_pwm_max`` per tick like every other move, and
@@ -351,7 +376,7 @@ from typing import Any
 
 from aqua_bridge.control import thermal
 from aqua_bridge.control.estimator import CAL_MIN_SAMPLES, EMPTY, UNKNOWN
-from aqua_bridge.model import MpcCommand, MpcConfig
+from aqua_bridge.model import IDENT_AMPLITUDE_MAX, MpcCommand, MpcConfig
 
 __all__ = [
     "ACTIONS",
@@ -374,6 +399,7 @@ __all__ = [
     "group_channels",
     "groups",
     "hold_sequence",
+    "holds_cover_window",
     "levels_at",
     "lost_sensor_zones",
     "new_tracker",
@@ -753,8 +779,15 @@ def rel_swing(cfg: MpcConfig, ch: str, lo: float, hi: float) -> float:
     The two levels are clamped into ``[pwm_min, pwm_max]`` first (a level the rail eats
     moves no air), turned into airflow with :func:`aqua_bridge.control.thermal.phi` on
     the channel's commissioned curve, and divided by their mean with the PE monitor's
-    own floor under it -- so this is exactly the quantity whose square the monitor
-    reports as that group's ``pe_diag`` entry, on the telegraph alone."""
+    own floor under it.
+
+    This is the swing of the telegraph *itself*, at its two levels. The PE monitor does
+    not see those levels: it accumulates one sin^2-weighted mean of the airflow
+    regressor per ``model_window_s`` block, so its own swing equals this one only while
+    a regression window sits inside a single hold. A window that spans a switch averages
+    the two levels, which can only move it toward their mean -- so this is an **upper
+    bound** on what the monitor reads, tight exactly when every hold of ``ident_hold_s``
+    is at least ``model_window_s`` long (:func:`holds_cover_window`)."""
     deadband, exponent = _curve(cfg, ch)
     p_lo = thermal.phi(_clamp(lo, cfg.pwm_min, cfg.pwm_max), deadband, exponent)
     p_hi = thermal.phi(_clamp(hi, cfg.pwm_min, cfg.pwm_max), deadband, exponent)
@@ -762,42 +795,82 @@ def rel_swing(cfg: MpcConfig, ch: str, lo: float, hi: float) -> float:
     return 0.5 * abs(p_hi - p_lo) / max(mean, thermal.PE_SCALE_FLOOR)
 
 
+def _levels_at(cfg: MpcConfig, base: float, amplitude: float) -> tuple[float, float]:
+    """The two levels ``amplitude`` around ``base``, unclamped."""
+    if cfg.ident_levels == "symmetric":
+        return base - amplitude, base + amplitude
+    return base, base + amplitude
+
+
 def _levels(cfg: MpcConfig, base: float) -> tuple[float, float]:
     """The two levels around ``base``, unclamped (the start refuses a base whose levels
     would leave the band; a re-planned base clamps them, :func:`_replan`)."""
-    a = cfg.ident_amplitude
-    if cfg.ident_levels == "symmetric":
-        return base - a, base + a
-    return base, base + a
+    return _levels_at(cfg, base, cfg.ident_amplitude)
+
+
+def _anchor(cfg: MpcConfig, lo: float, hi: float) -> float:
+    """The base a pair of levels was drawn around: the low level under ``above``, their
+    midpoint under ``symmetric``."""
+    return 0.5 * (lo + hi) if cfg.ident_levels == "symmetric" else lo
+
+
+def holds_cover_window(cfg: MpcConfig) -> bool:
+    """Whether every hold of ``ident_hold_s`` lasts at least ``model_window_s``.
+
+    True: a regression window can sit inside one hold, so the monitor sees the
+    telegraph's own levels and :func:`rel_swing` is what it reads. False: some hold is
+    shorter than a window, so windows that span a switch average the two levels and the
+    monitor reads *less* than :func:`rel_swing` says -- ``pe_reach`` stays an upper
+    bound and ``excitable`` a necessary condition, not a sufficient one."""
+    return bool(cfg.ident_hold_s) and min(cfg.ident_hold_s) >= cfg.model_window_s
 
 
 def excitation(cfg: MpcConfig, levels: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     """Per channel of ``levels`` (``{channel: [low, high]}``), how much airflow variation
     that telegraph can put into the thermal model's PE monitor.
 
-    ``rel_swing`` is :func:`rel_swing` of the two levels, ``pe_reach`` its square -- the
-    entry the monitor would report on ``pe_diag`` for a group of this one channel, from
-    the telegraph alone -- and ``excitable`` whether that clears
+    ``rel_swing`` is :func:`rel_swing` of the two levels and ``pe_reach`` its square: the
+    most a group of this one channel could report on ``pe_diag`` from the telegraph
+    alone, reached when a regression window sits inside one hold and short of it
+    otherwise (:func:`holds_cover_window`). ``pe_bound`` is
     :data:`aqua_bridge.control.thermal.PE_MIN`, the bound the ``converged`` rule asks the
-    zone's smallest eigenvalue to pass. A channel whose ``excitable`` is false cannot
-    carry its zone over that bound at any allowed amplitude from where it sits, and the
-    zone will wait for ever unless the solver parks it lower (section 8 item 110)."""
+    zone's smallest eigenvalue to pass -- named apart from the thermal summary's own
+    ``pe_min``, which is the *measured* eigenvalue and not this constant.
+
+    ``excitable`` is whether ``pe_reach`` clears that bound **at the configured
+    ``ident_amplitude``**, from where the channel sits. Because ``pe_reach`` is an upper
+    bound it is a necessary condition, not a sufficient one: ``false`` means the channel
+    provably cannot carry its zone over the bound from this base, ``true`` that it can
+    only if the schedule delivers the swing. ``pe_reach_at_cap`` / ``excitable_at_cap``
+    are the same numbers at :data:`~aqua_bridge.model.IDENT_AMPLITUDE_MAX`, the largest
+    amplitude the config allows, so a channel that is ``excitable_at_cap`` but not
+    ``excitable`` wants a larger ``ident_amplitude`` while one that is neither is out of
+    reach at any allowed amplitude and waits for the solver to park it lower (section 8
+    item 110)."""
     out: dict[str, dict[str, Any]] = {}
     for ch, pair in levels.items():
         if not (isinstance(pair, list | tuple) and len(pair) == 2):
             continue
-        swing = rel_swing(cfg, ch, float(pair[0]), float(pair[1]))
+        lo, hi = float(pair[0]), float(pair[1])
+        swing = rel_swing(cfg, ch, lo, hi)
+        cap_lo, cap_hi = _levels_at(cfg, _anchor(cfg, lo, hi), IDENT_AMPLITUDE_MAX)
+        cap = rel_swing(cfg, ch, cap_lo, cap_hi)
         out[ch] = {
             "rel_swing": swing,
             "pe_reach": swing * swing,
-            "pe_min": thermal.PE_MIN,
+            "pe_reach_at_cap": cap * cap,
+            "pe_bound": thermal.PE_MIN,
             "excitable": swing * swing > thermal.PE_MIN,
+            "excitable_at_cap": cap * cap > thermal.PE_MIN,
         }
     return out
 
 
 def unexcitable(cfg: MpcConfig, levels: Mapping[str, Any]) -> list[str]:
-    """The channels of ``levels`` whose telegraph cannot reach ``PE_MIN`` (in order)."""
+    """The channels of ``levels`` whose telegraph cannot reach ``PE_MIN`` at the
+    configured ``ident_amplitude`` (in order). See :func:`excitation`: a channel is
+    listed here whatever ``excitable_at_cap`` says, so the list answers "which channel
+    cannot inform the model on this run", not "which one never could"."""
     return [ch for ch, e in excitation(cfg, levels).items() if not e["excitable"]]
 
 
@@ -1221,7 +1294,10 @@ def status(
     (``{channel: [low, high]}``) with ``replan`` (whether this experiment follows the
     live demand), ``excitation`` / ``unexcitable`` (:func:`excitation`: how far each
     channel's telegraph can move the PE monitor from where it sits, and the channels
-    that cannot clear its bound at all -- section 8 item 110), ``elapsed_s``,
+    that cannot clear its bound at the configured ``ident_amplitude`` -- section 8 item
+    110), ``holds_cover_window`` (:func:`holds_cover_window`: whether the schedule can
+    deliver that reach at all, or whether a regression window averages two levels and
+    the monitor reads less), ``elapsed_s``,
     ``remaining_s``, and from the last experiment that ended: ``last_result``
     (``completed`` | ``aborted``), ``last_abort_reason`` and ``last_target``.
     """
@@ -1243,6 +1319,7 @@ def status(
         "levels": {},
         "excitation": {},
         "unexcitable": [],
+        "holds_cover_window": holds_cover_window(cfg),
         "elapsed_s": None,
         "remaining_s": None,
         "last_result": last.get("result"),

@@ -213,6 +213,7 @@ from aqua_bridge.control.intents import (
     SetSetpoint,
 )
 from aqua_bridge.model import (
+    IDENT_AMPLITUDE_MAX,
     ConfigError,
     Mode,
     MpcCommand,
@@ -468,6 +469,12 @@ class Supervisor:
         self._ident_facts: ident.TickFacts | None = None
         self._experiment: dict[str, Any] | None = None
         self._ident_last: dict[str, Any] = {}
+        #: The last ``(target, blind channels)`` the unexcitable-channel WARNING named
+        #: (section 8 item 110). Most starts on a busy enclosure have one, so the line
+        #: is logged when the answer *changes*, not on every start -- the item 108
+        #: precedent: a warning repeated on a normal, permitted condition is a warning
+        #: the owner learns to skip.
+        self._ident_blind: tuple[tuple[str, str], tuple[str, ...]] | None = None
         self._ident_resume_pending = True
         #: A plan has been handed to the loop and its tick is not recorded yet.
         self._plan_pending = False
@@ -895,7 +902,8 @@ class Supervisor:
         self._experiment = ident.start(
             cfg, facts, kind, name, skip_ticks=1 if self._plan_pending else 0
         )
-        blind = ident.unexcitable(cfg, self._experiment["levels"])
+        reach = ident.excitation(cfg, self._experiment["levels"])
+        blind = [ch for ch, e in reach.items() if not e["excitable"]]
         _LOG.info(
             "experiment started on %s %r: channels %s, base %s",
             kind,
@@ -903,18 +911,38 @@ class Supervisor:
             self._experiment["channels"],
             self._experiment["base"],
         )
-        if blind:
+        seen = ((kind, name), tuple(blind))
+        if blind and seen != self._ident_blind:
             # section 8 item 110: pe_min is relative, so a channel parked high cannot
-            # reach it at any allowed amplitude. Say so instead of leaving the zone
-            # pending for ever with nothing in the log.
+            # reach it at this amplitude. Say so instead of leaving the zone pending for
+            # ever with nothing in the log, and say which remedy applies -- a larger
+            # amplitude, or waiting for the solver to park the channel lower.
+            capped = [ch for ch in blind if not reach[ch]["excitable_at_cap"]]
             _LOG.warning(
                 "experiment on %s %r: %s cannot reach the model's PE bound from this "
-                "base (mpc.ident_amplitude %.3f); the air block of any zone they serve "
-                "cannot converge while they sit there",
+                "base at mpc.ident_amplitude %.3f; the air block of any zone they serve "
+                "cannot converge while they sit there. %s",
                 kind,
                 name,
                 ", ".join(blind),
                 cfg.ident_amplitude,
+                (
+                    f"{', '.join(capped)}: no amplitude up to the {IDENT_AMPLITUDE_MAX} "
+                    "cap reaches it either, only a lower park does"
+                    if capped
+                    else "A larger mpc.ident_amplitude would reach it"
+                ),
+            )
+        self._ident_blind = seen if blind else None
+        if blind and not ident.holds_cover_window(cfg):
+            _LOG.info(
+                "experiment on %s %r: mpc.ident_hold_s %s has a hold shorter than "
+                "mpc.model_window_s %.0f s, so a regression window averages two levels "
+                "and the monitor reads less than the reach above (an upper bound)",
+                kind,
+                name,
+                list(cfg.ident_hold_s),
+                cfg.model_window_s,
             )
 
     def _end_experiment(self, result: str, reason: str | None) -> None:
@@ -924,11 +952,22 @@ class Supervisor:
         integrator entry, which makes ``step`` re-initialise the solver bumplessly at the
         PWM on the fan -- the experiment's own level -- and a channel released high was
         then handed that level as the solver's starting point. The solver ran on every
-        tick of the experiment (the levels are an override applied after it), so its
-        integrator already holds the command it would have given without one; keeping it
-        returns control there, and ``step``'s rate limit still moves the fan at most
-        ``d_pwm_max`` per tick. A human override of the same channel is unaffected: it is
-        released by :meth:`_clear_override` as before."""
+        tick of the experiment (the levels are an override applied after it), so the
+        integrator kept here is the solver's own state, advanced normally throughout and
+        never re-seeded from the fan; the release returns control near the solver's own
+        demand instead of at the experiment's level, and ``step``'s rate limit still
+        moves the fan at most ``d_pwm_max`` per tick.
+
+        *Near*, not bit-exact, under the DAS MPC: its first block is solved with
+        ``weight_dpwm`` against the PWM in force, which during the experiment is the
+        experiment's own level, so the stored core carries a small residual pull toward
+        it -- in the safe direction, more cooling than the counterfactual -- and
+        ``_replay_core`` hands the same plan back for up to ``mpc_every_ticks`` ticks
+        after the release. Raising either knob makes that residue larger. On the PI-DAS
+        branch there is no such term and the integrator is exact.
+
+        A human override of the same channel is unaffected: it is released by
+        :meth:`_clear_override` as before."""
         exp = self._experiment
         if exp is None:
             return

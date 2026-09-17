@@ -356,12 +356,16 @@ def test_controller_exception_applies_emergency_ramp_and_skips_watchdog(fast_cfg
     for ch in fast_cfg.channels:
         want = fast_cfg.fallback_pwm[ch]
         assert abs(r2.cmd.pwm[ch] - want) <= abs(r1.cmd.pwm[ch] - want)  # toward fallback
-    # Not half-updated: nothing the broken tick computed is committed. The applied-command
-    # mirror does follow the fans, because the emergency ramp moved them -- the next tick
-    # rate-limits from what is on them, not from the command they no longer carry.
-    assert dataclasses.replace(loop.state, last_cmd=None, window=()) == dataclasses.replace(
-        state_before, last_cmd=None, window=()
+    # Not half-updated: nothing the broken tick computed is committed. ``last_cmd`` does
+    # follow the fans, because the emergency ramp moved them -- the next tick rate-limits
+    # from what is on them, not from the command they no longer carry. The window is left
+    # alone: a broken tick pushes no sample, so its newest one is the last *good* tick's,
+    # and writing a later command into it would back-date the ramp into the command
+    # history the stuck detector reads.
+    assert dataclasses.replace(loop.state, last_cmd=None) == dataclasses.replace(
+        state_before, last_cmd=None
     )
+    assert loop.state.window == state_before.window
     assert loop.state.last_cmd is r2.cmd
     assert notifier.watchdog_n == 1  # only the healthy tick kicked it
 

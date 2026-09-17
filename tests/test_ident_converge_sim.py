@@ -46,8 +46,9 @@ z1 loses the race on one bay's ``rel_se(k)`` instead of winning it.
 
 * seed 2 -- z0 and z3 against nothing; 0.282 and 0.238 peak, 0.216 and 0.205 at the
   end; 467 and 471 excited windows; mean PWM 0.3587 against 0.3660;
-* seed 3 -- nothing against nothing (z0 closes no window at all, item 109); mean PWM
-  0.2636 / 0.2387;
+* seed 3 -- nothing against nothing (z0 closes no window at all, item 109), pinned
+  exactly rather than as a lower bound, so that case stays a no-regression test instead
+  of a tautology; mean PWM 0.2636 / 0.2387;
 * seed 4 -- z3 against nothing; 0.316 peak, 0.201 at the end; 468 windows;
   0.2969 / 0.2794.
 
@@ -112,6 +113,17 @@ LONG_HOURS = 36.0
 #: ``status == "converged"`` already implies.
 PE_PEAK_FLOOR = 0.10
 WINDOWS_FLOOR = 300
+#: What the **old** release (the experiment's channels put into ``TickPlan.released``,
+#: so the solver re-initialised bumplessly at the PWM on the fan) spent on the same
+#: plant and seed, measured by reinstating it beside the new one: the enclosure mean and
+#: qd1's own mean, the channel the ratchet hit hardest. Both are asserted, because the
+#: enclosure mean alone leaves margins of 0.012 and 0.017 on seeds 3 and 4 while qd1's
+#: separates the two releases by 0.06 to 0.30 (section 8 item 112).
+OLD_RELEASE: dict[int, dict[str, float]] = {
+    2: {"mean_pwm": 0.4064, "qd1": 0.790},
+    3: {"mean_pwm": 0.2758, "qd1": 0.362},
+    4: {"mean_pwm": 0.3142, "qd1": 0.374},
+}
 #: How far the two arms' mean PWM may sit apart. Since section 8 item 112 the zone-wide
 #: arm is no longer always the louder of the two: a released experiment hands the solver
 #: its own level instead of the level on the fan, so nothing is left elevated between
@@ -239,10 +251,16 @@ def test_a_zone_wide_experiment_converges_a_zone_that_one_channel_at_a_time_does
 
     # 1. the answer, per seed and per zone: the zone-wide arm converges the zones it
     #    converged, one channel at a time converges no more than it did, and never more
-    #    than the zone-wide arm.
-    assert set(parallel["converged"]) >= set(want["parallel"]), {
-        z: v["status"] for z, v in parallel["zones"].items()
-    }
+    #    than the zone-wide arm. A seed whose zone-wide arm converged *nothing* (seed 3
+    #    since item 112) is pinned exactly, both ways: ``>= set()`` is a tautology, so
+    #    without this the case would assert nothing at all about the behaviour its name
+    #    claims and only seeds 2 and 4 would separate the arms.
+    if want["parallel"]:
+        assert set(parallel["converged"]) >= set(want["parallel"]), {
+            z: v["status"] for z, v in parallel["zones"].items()
+        }
+    else:
+        assert parallel["converged"] == [], {z: v["status"] for z, v in parallel["zones"].items()}
     assert set(sequential["converged"]) <= set(want["sequential"]), sequential["converged"]
     assert set(parallel["converged"]) >= set(sequential["converged"])
 
@@ -304,17 +322,22 @@ def test_a_released_experiment_hands_the_solver_its_own_level_not_the_fans(das_e
     with no experiment at all (item 102). That is the point -- the fans were elevated
     after the experiments, not during them.
 
-    Asserted here without the old code: no channel is left with a floor above
-    ``pwm_min``, which is exactly the ratchet (qd1's 0.326 above), and the mean PWM stays
-    under what the old release spent.
+    Asserted here without the old code, against :data:`OLD_RELEASE`: no channel is left
+    with a floor above ``pwm_min``, which is exactly the ratchet (qd1's 0.326 above), and
+    both the enclosure mean and qd1's own mean stay under what the old release spent. The
+    floor clause only discriminates on seed 2 -- on seeds 3 and 4 qd1 reached ``pwm_min``
+    under the old release too -- and the enclosure mean leaves margins of 0.012 and 0.017
+    there, so qd1's mean is what carries those two seeds.
     """
     run = _run(_config(das_example_cfg, parallel=True), seed, ORDER)
+    old = OLD_RELEASE[seed]
     assert run["starts"] > 0 and run["violations"] == 0
     # every channel comes all the way back down between experiments: no ratcheted floor
     assert run["ch_min"] == pytest.approx(
         dict.fromkeys(run["ch_min"], das_example_cfg.pwm_min), abs=TOL
     )
-    assert run["mean_pwm"] <= {2: 0.4064, 3: 0.2758, 4: 0.3142}[seed]
+    assert run["mean_pwm"] <= old["mean_pwm"]
+    assert run["ch_mean"]["qd1"] <= old["qd1"]
     assert run["worst_margin_c"] >= MARGIN_FLOOR_C
 
 

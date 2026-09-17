@@ -41,13 +41,16 @@ The solver rate-limits against ``state.last_cmd``. The command the sink
 receives can differ from the solver's (manual overrides, failed apply), so
 after every tick the loop rewrites ``state.last_cmd`` -- and the newest
 ``WindowSample.cmd_pwm`` (stuck detection compares net *commanded* PWM) --
-to the applied command. That happens on an emergency tick too: the
-controller's own state is left exactly as it was (nothing a broken tick
-computed is committed), but the emergency ramp did move the fans, so the
-mirror follows them -- otherwise the next tick's rate limit would be
-measured against a command the fans no longer carry and a fan the
-emergency walked up toward ``fallback_pwm`` would come back down in one
-step. Channels the supervisor released from a manual
+to the applied command. On an emergency tick ``last_cmd`` alone follows
+the fans: the controller's own state is left exactly as it was (nothing a
+broken tick computed is committed), but the emergency ramp did move the
+fans, so without it the next tick's rate limit would be measured against a
+command the fans no longer carry and a fan the emergency walked up toward
+``fallback_pwm`` would come back down in one step. The window is *not*
+touched there -- a broken tick pushes no sample, so its newest sample is
+the last good tick's, and dating a later command into it would hand the
+stuck detector an airflow move that happened ticks after the temperatures
+beside it. Channels the supervisor released from a manual
 override have their integrator entry dropped for one tick; ``step`` then
 re-initialises the solver bumplessly (its first output equals what is on
 the fan). An identification experiment's channels are *not* released
@@ -317,11 +320,14 @@ class Loop:
             self.state = self._with_applied(new_state, self.applied_cmd)
         elif applied:
             # The controller's own state stays exactly as it was -- nothing a broken tick
-            # computed is committed -- but the applied-command mirror follows the fans,
-            # because the emergency ramp *did* move them. Without this the next tick's
-            # rate limit is measured from a command the fans no longer carry, and a fan
-            # the emergency walked up to ``fallback_pwm`` comes back down in one step.
-            self.state = self._with_applied(self.state, self.applied_cmd)
+            # computed is committed -- but ``last_cmd`` follows the fans, because the
+            # emergency ramp *did* move them. Without this the next tick's rate limit is
+            # measured from a command the fans no longer carry, and a fan the emergency
+            # walked up to ``fallback_pwm`` comes back down in one step. Only the
+            # command: the newest ``WindowSample`` belongs to the last *good* tick (a
+            # broken tick pushes none), and writing a later command into it would
+            # back-date the ramp into the history the stuck detector reads.
+            self.state = dataclasses.replace(self.state, last_cmd=self.applied_cmd)
 
         watchdog_sent = False
         if controller_error is None:
