@@ -1326,7 +1326,12 @@ class EstimatorSpec:
       cannot decide; ``aqua_bridge.control.zones``)
     * ``q_t_air`` / ``q_d_air`` / ``q_t_drive`` / ``q_t_sensor`` / ``q_heat`` /
       ``q_offset`` -- process noise per tick of the filter states ``T_a``, ``d_a``,
-      ``T_d``, ``T_s``, ``q`` and a proximal sensor's placement offset (> 0)
+      ``T_d``, ``T_s``, ``q`` and a proximal sensor's placement offset (> 0).
+      ``q_offset`` keeps its meaning in both layouts ``proximal_slope_spread`` selects:
+      the offset *state* of a further member is a random walk with it, and so is the
+      offset half of that member's learned map when it has one -- a placement drifts
+      (fouling, a loosening sensor, a thermistor ageing) and the filter has to be able to
+      follow it, or the drift ends up in the drive estimate both members share
     * ``p0_t_air`` / ``p0_d_air`` / ``p0_t_drive`` / ``p0_t_sensor`` / ``p0_heat`` -- the
       initial variance of those same states when a zone's filter starts (> 0)
     * ``reset_drive_var``          -- drive variance a bay's filter restarts from when a
@@ -1337,7 +1342,12 @@ class EstimatorSpec:
     * ``sensor_noise_c``           -- white noise of a temperature sensor, degC (>= 0);
       the measurement variance is ``sensor_noise_c ** 2 + quant_c ** 2 / 12``
     * ``proximal_offset_c``        -- prior standard deviation of the *offset* between two
-      proximal sensors of one bay, degC (``>= 0``; 0 puts them at the same offset)
+      proximal sensors of one bay, degC (``>= 0``). It means a different thing in each of
+      the two layouts ``proximal_slope_spread`` selects: with one node per bay it is the
+      prior of the offset *state* each further member carries, and 0 removes those states
+      so every member reads the bay's node directly; with a node per sensor it is the
+      prior of the offset half of that member's *learned map*, where 0 would pin the
+      learned difference at exactly 0 for ever, so it is a config error there
     * ``proximal_slope_spread``    -- prior standard deviation of the *slope* difference
       between two proximal sensors of one bay (``0 <= x <= 0.5``, dimensionless): how far
       apart two placements on one bay may sit in the fraction ``1 - beta`` of the drive
@@ -1518,6 +1528,16 @@ class EstimatorSpec:
             raise ConfigError(
                 f"{where}.proximal_slope_spread must be in [0, 0.5], got "
                 f"{self.proximal_slope_spread}"
+            )
+        if self.proximal_slope_spread > 0 and self.proximal_offset_c <= 0:
+            # In the fused layout 0 means "no offset state, every member reads the bay's
+            # node". In the per-sensor layout it is the *prior* on a member's learned
+            # offset difference, so 0 asks the filter to hold that difference at exactly
+            # 0 -- neither of the two documented layouts, and silently worse than both.
+            raise ConfigError(
+                f"{where}.proximal_offset_c must be > 0 when proximal_slope_spread > 0 "
+                f"(it is the prior on each member's learned offset difference), got "
+                f"{self.proximal_offset_c}"
             )
         if self.bay_settle_s < 0:
             raise ConfigError(f"{where}.bay_settle_s must be >= 0, got {self.bay_settle_s}")

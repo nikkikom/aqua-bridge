@@ -265,7 +265,9 @@ mpc:
                          # trusted zone_air reading for this long (the air sigma barely grows,
                          # so it cannot decide on its own); 0 faults on the first blind tick
     q_t_air: 1.0e-4      # process noise per tick: air, air disturbance, drive, sensor node,
-    q_d_air: 4.0e-7      # heat, and a proximal sensor's placement offset
+    q_d_air: 4.0e-7      # heat, and a proximal sensor's placement offset (q_offset drives the
+                         # offset state of the fused layout and the offset half of a member's
+                         # learned map in the per-sensor one -- a placement drifts either way)
     q_t_drive: 1.0e-5
     q_t_sensor: 1.0e-4
     q_heat: 4.0e-7
@@ -274,8 +276,14 @@ mpc:
     proximal_offset_c: 3.0  # prior sigma of the placement offset the filter carries for every
                          # proximal sensor of a bay beyond the first (degC): two sensors on one
                          # bay sit differently and disagree by degrees, which is an offset to
-                         # estimate, not a drive swap. 0: one node for all of them (the per-bay
-                         # seeding of item 69 still applies, so 0 is not the pre-item-67 filter)
+                         # estimate, not a drive swap. It means a different thing in each of
+                         # the two layouts proximal_slope_spread selects. At 0 (one node per
+                         # bay): no offset states, every member reads the bay's node directly
+                         # (the per-bay seeding of item 69 still applies, so 0 is not the
+                         # pre-item-67 filter). With a node per sensor it is instead the prior
+                         # of the offset half of that member's learned map, and 0 there would
+                         # pin the learned difference at exactly 0 for ever -- neither layout,
+                         # so the config is refused rather than run silently worse than both
     proximal_slope_spread: 0.0  # prior sigma of the *slope* difference between two proximal
                          # sensors of one bay, dimensionless [0, 0.5]. 0 (the default): one
                          # sensor node per bay, every further member reading it plus the
@@ -285,7 +293,12 @@ mpc:
                          # difference in how much of the drive each sensor sees, which moves
                          # with the drive-to-air rise (item 101). Same state size and the same
                          # step cost either way; turning it on with the two redundant pairs
-                         # below moves the four DAS goldens, which is item 99's decision
+                         # below moves the four DAS goldens, which is item 99's decision. The
+                         # learned map is held inside this spread and inside what keeps the
+                         # member's own (slope, offset) usable, because a row identifies only
+                         # the combination slope * rise + offset and the pair would otherwise
+                         # walk along that combination for ever; its offset half is a random
+                         # walk with q_offset above, so a placement that drifts is followed
     smart_max_age_s: 300 # older SMART samples are ignored; a silent serial loses its bay
     smart_reject_c: 8.0  # a SMART value this far from the estimate is dropped
     occupied_dT_c: 2.0   # proximal minus zone air above this: a drive is there
