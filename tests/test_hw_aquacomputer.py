@@ -247,11 +247,17 @@ def test_the_aquabus_blocks_electrical_fields_are_not_a_per_report_reading() -> 
 
 def test_the_unidentified_u16_of_a_fan_block_is_read_but_named_nothing() -> None:
     """Item 114. The ``u16`` at ``+0x0A`` is decoded raw and carries no unit: it is not
-    the current (26 against that block's 6 mA) and not the power (7 cW), it is 0 on
+    the current (26 against that block's 6 mA) and not the power (7 cW), and it is 0 on
     every one of the aquaero's own blocks and 0 on an aquabus block in a report that
-    refreshed nothing, and the only regularity in the captures is that it times the
-    block's output duty into the current field -- 26 at 20 % against 6 mA, 27 at 100 %
-    against 27 mA. Two duties do not name a field, and a third needs a write."""
+    refreshed nothing.
+
+    The suspicion -- a current over the output's on-time, of which the current field is
+    the duty average -- is pinned here as the arithmetic it really is, so nobody reads
+    more into it than the captures hold. One capture is informative: at duty 20 %,
+    ``raw x duty`` is 5.2 against a measured 6 mA, 0.8 mA (13 %) low. The other is at
+    duty 100 %, where ``raw x duty`` is the raw value itself and therefore says nothing
+    about duty at all. The bound below is that observed miss, not an instrument
+    tolerance."""
     with_power = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-power.bin"))
     without = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-no-power.bin"))
     full = decode_status(AQUAERO, _bin("aquaero-status-aquabus-fan7-100.bin"))
@@ -260,12 +266,13 @@ def test_the_unidentified_u16_of_a_fan_block_is_read_but_named_nothing() -> None
     assert (seven.duty, seven.current_ma, seven.power_cw) == (2000, 6, 7)
     assert full.fans[6].unidentified_raw == 27
     assert (full.fans[6].duty, full.fans[6].current_ma) == (10000, 27)
-    # Duty-weighted, the field lands on the current field in both captures (+-0.8 mA).
-    for report in (with_power, full):
-        fan = report.fans[6]
-        assert fan.unidentified_raw is not None
-        scaled = fan.unidentified_raw * fan.duty / DUTY_MAX
-        assert abs(scaled - fan.current_ma) <= 0.8
+    scaled = seven.unidentified_raw * seven.duty / DUTY_MAX
+    assert scaled == pytest.approx(5.2)
+    assert seven.current_ma - scaled == pytest.approx(0.8)  # the miss, in the one direction
+    hundred = full.fans[6]
+    assert hundred.unidentified_raw is not None and hundred.duty == DUTY_MAX
+    # Vacuous by construction: at full duty the product IS the raw value.
+    assert hundred.unidentified_raw * hundred.duty / DUTY_MAX == hundred.unidentified_raw
     # 0 on the aquaero's own blocks, and on an aquabus block that refreshed nothing.
     assert [with_power.fans[k].unidentified_raw for k in range(4)] == [0] * 4
     assert [without.fans[k].unidentified_raw for k in range(4, 8)] == [0] * 4

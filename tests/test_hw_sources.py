@@ -710,7 +710,10 @@ def test_an_empty_aquabus_slot_does_not_blind_the_rest_of_the_controller(fast_cf
     assert "the device on its aquabus stopped answering" in errors[1]
     assert [m for m in _messages(caplog, "INFO") if "again" in m] == [
         "aquaero: a device is behind pwm5 (intake), fan5 (intake) again",
-        "aquaero: a device answers on aquabus again; its temperature slots are readings once more",
+        # Nothing of this controller reads an aquabus temperature slot, so the
+        # recovery line says so instead of claiming slots are readings again.
+        "aquaero: a device answers on aquabus again "
+        "(nothing of this controller reads its aquabus temperature slots)",
     ]
     assert loop.shutdown() is True
 

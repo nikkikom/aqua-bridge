@@ -610,7 +610,7 @@ What every decoder assumption now stands at:
 | rpm `0xFFFF` = no device behind the block | confirmed, and narrower than it reads | it means *no device on aquabus at all*: with the Quadro present, its outputs with no fan read 0 rpm, not `0xFFFF` |
 | fan block current +6 and power +8 | **contradicted as a per-report reading** | see below |
 | fan block voltage +4 = *that output's* 12 V rail | confirmed on blocks 1-4, **contradicted on the aquabus blocks 5-8** | block 7 read 12.10 V (the Quadro's rail) in a measuring report and 12.09 V (the aquaero's own) one second later at an unchanged duty, and the outputs with no fan read 0.00 V then 12.09 V; nothing in a single report tells the two apart, so `DeviceKind.reports_rail` is False for 5-8 and the adapter publishes no rail for them |
-| the `u16` at `+0x0A` of a fan block = current in mA (item 89's guess) | **contradicted, and still unidentified** | it read 26 while the same block's current field read 6 mA; over the run it tracked current and power but matched neither (26↔6 mA/7 cW, 22↔5/6, 15↔4/4, 11↔3/3, 3↔1/1). The one regularity across the captures is that the *duty-weighted* field lands on the current field — 26 at 20 % against 6 mA, 27 at 100 % against 27 mA — but two duties do not name a field (item 114 below). It is decoded raw as `FanStatus.unidentified_raw`, for `tools/aquabus_watch.py` only, and published nowhere |
+| the `u16` at `+0x0A` of a fan block = current in mA (item 89's guess) | **contradicted, and still unidentified** | it read 26 while the same block's current field read 6 mA; over the run it tracked current and power but matched neither (26↔6 mA/7 cW, 22↔5/6, 15↔4/4, 11↔3/3, 3↔1/1). The captures suggest a *duty-weighted* reading, but they hold one point that can test it: 26 × 20 % = 5.2 against 6 mA, 13 % low (at 100 % duty the product is the raw value itself and tests nothing — item 114 below). It is decoded raw as `FanStatus.unidentified_raw`, for `tools/aquabus_watch.py` only, and published nowhere |
 | flow `flow1..3` at `0xF9`, `flow3` from aquabus | confirmed | all three read 0 with the Quadro present; `flow3` read `0x7FFF` without it (2026-09-15), so `0x7FFF` is the absent-slot sentinel and 0 is "present, nothing connected" |
 | control report: feature id `0x0B`, 2707 bytes, no checksum | confirmed | one GET, 2707 bytes |
 | active profile = control report byte `0x06`, 0-based | confirmed | byte 0 = profile 1, matching the profile the heartbeat holds |
@@ -636,10 +636,14 @@ give a current a health rule may judge, and `DeviceKind.reports_power` is False
 for all eight.
 
 **That interval is now a number the code carries**: 23 measuring reports in 90
-over 88.6 s is one in 3.9 reports, 3.85 s, which
+over 88.6 s is a *mean* of one in 3.9 reports, 3.85 s, which
 `aquacomputer.AQUABUS_REFRESH_REPORTS` (4) and `AQUABUS_REFRESH_S` (4.0) round to
 and `DeviceKind` carries next to `aquabus_outputs_report_power`, as a hardware
-fact and not a tunable (§8 item 115). Only the electrical fields follow it: the
+fact and not a tunable (§8 item 115). It is a mean and not the longest gap: the
+refresh is per block and not atomic, and the maximum gap and the per-block spread
+are still unmeasured, so no key and no rule is bounded by this number — it is
+reported (`tools/aquabus_watch.py`, `device_health.aquabus.refresh_reports`) and
+that is all. Only the electrical fields follow it: the
 speed and the output duty of an aquabus block are in **every** report — block 7
 read 255 rpm and duty 2000 in all 90 — which is what makes the absence of a bus
 device judgeable at all (§8 item 92) and why no rule may key on a voltage or a
@@ -735,11 +739,14 @@ carried the bus device's own electrical values, 67 carried substitutes, over 88.
 s — one refresh in 3.9 reports, 3.85 s, at a report cadence of 0.98 s. The
 refresh is *not* atomic (one report had blocks 5 and 6 refreshed and block 8 not,
 another had a current with a zero power), so it is a per-block interval, not a
-report-level one. The interval is recorded where a caller can act on it:
-`DeviceKind.aquabus_refresh_reports` / `aquabus_refresh_s`, and
-`AquacomputerTiming.check_kind` refuses a `bus_absent_s` shorter than it, so the
-one rule that judges the bus over time can never be set faster than the bus
-itself. What the run cannot say — and what the next hardware session must
+report-level one. The 3.85 s is therefore a mean over 23 refreshes, not the
+longest gap between two of them, which this run cannot give. The interval is
+recorded where a caller can act on it — `DeviceKind.aquabus_refresh_reports` /
+`aquabus_refresh_s`, `device_health.aquabus.refresh_reports`, and the watch tool's
+own report — but it bounds **nothing**: item 92's `bus_absent_s` is deliberately
+not floored by it, because presence is read from the speed field, which every
+report carries, so no skipped poll can look like a departure at any window. What
+the run cannot say — and what the next hardware session must
 measure with `tools/aquabus_watch.py --reports 600 --raw` — is whether the
 interval is *fixed or drifts*, whether it differs per block, and whether it moves
 with the report rate. Whether it is a **device setting** cannot be answered
@@ -754,13 +761,19 @@ current (26 against 6 mA in the same block of the same report), not the power (7
 cW there), not a constant, and nothing at all on the aquaero's own blocks 1–4,
 where it reads 0 in every capture. It is refreshed with the electrical group — 0
 in a report that refreshed nothing — so it is part of what the bus device sends.
-The only regularity in the captures: the field times the block's own output duty
-lands on the current field, at both duties ever captured — 26 × 20 % = 5.2
-against 6 mA, 27 × 100 % = 27 against 27 mA, and the 20 % run's other pairs
-(22↔5, 15↔4, 11↔3, 3↔1) fit the same line to ±0.4 mA. That reads like a current
-measured over the output's on-time, of which the current field is the duty
-average, but **two duties are not evidence enough to name a field**, and a third
-duty is a duty change, which is a write. So it stays unidentified: decoded raw as
+What the captures suggest, and how little they support it: the field times the
+block's own output duty lands *near* the current field. The captures hold exactly
+one point that can test that, since at 100 % duty the product is the raw value
+itself (27 against 27 mA) and says nothing about duty — and at that one point it
+misses: 26 × 20 % = 5.2 against a measured 6 mA, 13 % low. The 20 % run's further
+pairs (22↔5, 15↔4, 11↔3, 3↔1) are all at that same duty, so they constrain a
+slope and not a duty relation; under `raw × duty` each of them sits high, by 0.4
+to 1.0 mA, every one in the same direction. A straight line fitted to the five
+pairs does fit them to ±0.3 mA, but it has a slope of 0.211 and an intercept of
+0.55 mA — it is not `field × duty`. So the reading "a current measured over the
+output's on-time, of which the current field is the duty average" stays a
+**suspicion**: it has one informative point, and that one misses. A second duty
+is a duty change, which is a write. So it stays unidentified: decoded raw as
 `FanStatus.unidentified_raw` so `tools/aquabus_watch.py` can show it, published
 by nothing, judged by nothing. Item 89's other suggestion — look at the aquaero's
 own outputs in DC mode, where they do report current — needs a mode change, which
@@ -782,18 +795,27 @@ split by how much they cost:
   would reach the solver as a measurement. A missing one makes its zone untrusted,
   which holds and then raises: a lost bus device is less evidence, not less heat,
   and nothing about this rule ever lowers a duty.
-- **after `bus_absent_s`** (10 s by default, never below the measured refresh
-  window above): the *report* — one error line, an entry in `device_health`'s
-  `problems`, and the `aquabus` block of the device health carrying `present`,
-  `seen`, `absent_s`, `lost` and the temperature names gone missing. `seen` is
-  what separates "the Quadro left" from "nothing has ever answered on this bus",
-  and the window is what separates both from a re-enumeration blip or a skipped
-  aquabus poll.
+- **after `bus_absent_s`** (10 s by default; > 0 and floored by nothing else, see
+  the refresh interval above): the *report* — one error line, an entry in
+  `device_health`'s `problems`, and the `aquabus` block of the device health
+  carrying `state`, `present`, `seen`, `absent_s`, `lost` and the temperature
+  names gone missing. `state` is the single field a page line or a binary sensor
+  can show: `present`, `empty`, `lost`, `never_seen` or `unknown` — and `lost` is
+  True only for a device that answered and then stopped, never for the empty bus
+  of a plain aquaero, which is `never_seen`. What the window keeps out is a device
+  re-enumerating (item 90's transient `0xFFFF`); a skipped aquabus poll never
+  could reach it, since presence is read from the speed field.
 
 What the rule cannot see: a bus device with **no fan outputs** (a sensor-only
 slave) is indistinguishable from an empty bus, because presence is judged from
-the fan blocks. In the supported topology the slave is a Quadro with four
-outputs. What still needs the board: run `tools/aquabus_watch.py --seconds 900`
+the fan blocks — its `busN` slots would read as missing for ever, which is a zone
+with no temperature on a healthy system. That is not left to a warning: the
+config model refuses a `busN` binding unless the same entry also binds one of
+that device's aquabus outputs (`aquabus_binding_problem`), which is how a config
+says the device on the bus is one whose presence can be seen. In the supported
+topology the slave is a Quadro with four outputs, commanded through `pwm5..8`.
+
+What still needs the board: run `tools/aquabus_watch.py --seconds 900`
 against the healthy bus and confirm it reports no empty stretch at all (the rule
 quiet on a healthy system), and repeat the departure with the daemon running once
 the owner is willing to unplug the Quadro again.
@@ -3024,7 +3046,9 @@ a model converges only with them.
     error line, `device_health.aquabus`, a `problems` entry). Nothing here lowers
     a duty: the missing reading makes its zone untrusted, which holds and then
     raises. A bus device with no fan outputs cannot be told from an empty bus,
-    since presence is judged from the fan blocks. `ts` comes from the
+    since presence is judged from the fan blocks — which is why binding a `busN`
+    without one of that device's aquabus outputs is a config error (Track B
+    below). `ts` comes from the
     injected monotonic clock. `last_status` keeps the newest decoded
     report for tools and diagnostics; voltage, current and power are not in
     the observation (§8 item 79).
@@ -3262,7 +3286,8 @@ a model converges only with them.
     write_min_interval_s: 0.0
     write_deadband: 0
     bus_absent_s: 10.0            # how long every aquabus block must read "no device"
-                                  # before the bus device is reported lost
+                                  # before the bus device is reported lost (the report
+                                  # only: a bound busN reads as missing at once)
     heartbeat_sensor: 0           # softN written on every tick that commanded the duties;
                                   # 0 = off, and right only while no softN is enabled there
     heartbeat_value_c: 20.0
@@ -3279,7 +3304,7 @@ a model converges only with them.
   | `duty_mismatch_s` | 5.0 | finite, > 0 | a mismatch lasting longer re-reads the report and rewrites every channel |
   | `write_min_interval_s` | 0.0 | finite, ≥ 0 | a falling duty is written at most this long after the device's last write (rises at once); 0 writes every fall; only limits USB traffic since writes are not saved (§8 item 86) |
   | `write_deadband` | 0 | integer 0..10000 | 1/100 %: a falling duty is written only this far below the written one; 0 writes every fall (§8 item 86) |
-  | `bus_absent_s` | 10.0 | finite, > 0, and ≥ the kind's `aquabus_refresh_s` (4 s on the aquaero) | how long every aquabus fan block must read "no device" (rpm `0xFFFF`), over received reports, before the controller reports the device on its aquabus as lost. It bounds the *report* only — a bound `busN` reads as missing from the first such report — and its floor keeps one skipped aquabus poll (§8 item 115) from being read as a departure (§8 item 92) |
+  | `bus_absent_s` | 10.0 | finite, > 0 | how long every aquabus fan block must read "no device" (rpm `0xFFFF`), over received reports, before the controller reports the device on its aquabus as lost (§8 item 92). It bounds the *report* only — a bound `busN` reads as missing from the first such report — and what it buys is the blip: a device re-enumerating shows one or two reports of `0xFFFF` (§8 item 90). It is deliberately **not** floored by the aquabus refresh interval (§8 item 115): that interval moves an aquabus block's electrical fields, while presence is read from the speed field every report carries, so a skipped poll cannot look like a departure at any window |
   | `heartbeat_sensor` | 0 (off) | integer 0..8, aquaero only | the software sensor `softN` every `apply()` writes, after its duty work and only when that succeeded, as the heartbeat of the controller's own watchdog; 0 only while no software sensor is enabled on the device (§8 item 84) |
   | `heartbeat_value_c` | 20.0 | finite, −327.68..327.66 °C | the temperature the heartbeat writes; it must stay below the alarm the controller has on that sensor |
 
@@ -3304,13 +3329,18 @@ a model converges only with them.
   tells apart from a measurement, so both `parse_device_section` and
   `DeviceBinding.__post_init__` refuse it — see "Fan and device health"
   below and §8 item 113 for what is published instead. A `busN` **may** be
-  bound since §8 item 92: while no device answers on that aquabus the slot
-  reads as missing instead of as the value the controller keeps serving for
-  it, so a frozen temperature can no longer reach the solver as an ordinary
-  reading. The exception is a bus device with **no fan outputs**, which is
-  indistinguishable from an empty bus (presence is judged from the aquabus
-  fan blocks), so its slots would read as missing for ever; do not bind
-  one of those. A
+  bound since §8 item 92, on one condition the config model enforces: the
+  same entry must also bind one of that device's aquabus outputs
+  (`pwm5..8`, or a `fanN` of one of them), or the entry is rejected. While
+  no device answers on that aquabus the slot reads as missing instead of
+  as the value the controller keeps serving for it, so a frozen
+  temperature can no longer reach the solver as an ordinary reading — but
+  presence is judged from the aquabus *fan* blocks, so a bus device with
+  **no fan outputs** is indistinguishable from an empty bus and its slots
+  would read as missing for ever. Binding one of its outputs is how a
+  config says the device on the bus is one whose presence can be seen; a
+  sensor-only slave is out of scope until the presence evidence for one
+  is found. A
   name of the hwmon driver's numbering that means another input now is
   rejected with the new name: aquaero `temp17..20` (`virt1..4`) and the
   Quadro's flow sensor `fan5`, which is not a tachometer. The hwmon names
@@ -3429,8 +3459,10 @@ a model converges only with them.
     controller `stuck_channels`, `absent_channels`, `not_pwm_channels`
     (commanded own outputs in DC or an unknown mode),
     `unconfigured_channels`, the flow sensors `flowN`, `aquabus` (§8 item 92:
-    `present`, `seen`, `absent_s`, `lost`, `temps_missing`,
-    `refresh_reports`), serial, firmware,
+    `state` — `unknown`, `present`, `empty`, `lost` or `never_seen`, the one
+    field a single line can show — plus `present`, `seen`, `absent_s`, `lost`
+    (a device that answered and then stopped, never an empty bus nothing was
+    ever on), `temps_missing` and `refresh_reports`), serial, firmware,
     power cycles, status age, and `active_profile` when a later change
     publishes one (read defensively; absent until then). `problems` is the
     human-readable list, empty exactly when nothing is wrong. Two more
@@ -7867,22 +7899,31 @@ Owner decision (2026-09-16):
     the observation, so its zone goes untrusted and holds and then raises —
     nothing in this rule ever lowers a duty, because a lost bus device is less
     evidence, not less heat. The **report** waits for the new `bus_absent_s`
-    (10.0 s, > 0 and never below the kind's measured aquabus refresh window of
-    4 s, §8 item 115): one error line naming what went missing, an entry in
-    `device_health`'s `problems`, and `device_health.aquabus` with `present`,
-    `seen`, `absent_s`, `lost`, `temps_missing` and `refresh_reports`. `seen`
-    separates "the Quadro left" from "nothing has ever answered here", and the
-    window separates both from a re-enumeration blip (item 90) and from a
-    skipped aquabus poll (item 115). Tests cover the departure on one adapter
+    (10.0 s, > 0, floored by nothing else): one error line naming what went
+    missing, an entry in `device_health`'s `problems`, and
+    `device_health.aquabus` with `state`, `present`, `seen`, `absent_s`, `lost`,
+    `temps_missing` and `refresh_reports`. `state` (`unknown`, `present`,
+    `empty`, `lost`, `never_seen`) is the field a one-line consumer shows, and
+    `lost` is True only for a device that answered and then stopped — the empty
+    bus of a plain aquaero is `never_seen`, not a fault. `seen` separates "the
+    Quadro left" from "nothing has ever answered here", and the window keeps a
+    re-enumeration blip (item 90) out of the report. It is deliberately **not**
+    floored by item 115's refresh interval: that interval moves the electrical
+    fields, never the speed field presence is read from, so no skipped poll can
+    look like a departure at any window. Tests cover the departure on one adapter
     and through the loop (a bound `bus2`, where no tick after the loss commands
     any channel below what it commanded before it, ending at `fallback_pwm`),
     the refresh gap never being read as an absence, a single transient
-    `0xFFFF`, a controller with nothing bound on the bus, and a bus that was
-    never there. §3 Track B and the README no longer forbid binding a `busN`,
-    with one exception: a bus device with **no fan outputs** is
-    indistinguishable from an empty bus here, so its slots would read as
-    missing for ever. Not done on the hardware: the board was unreachable all
-    session, so the rule has not been shown quiet on the real bus over a long
+    `0xFFFF`, a controller with nothing bound on the bus, a bus that was never
+    there, and a reopen of the node (which does not restart the clock on an
+    empty bus, so `lost` and `absent_s` stay one pair). §3 Track B and the
+    README no longer forbid binding a `busN` — they require, and the config
+    model now checks, that the same entry binds one of that device's aquabus
+    outputs: a bus device with **no fan outputs** is indistinguishable from an
+    empty bus here, so its slots would read as missing for ever, and that shape
+    is refused rather than warned about. Not done on the hardware: the board
+    was unreachable all session, so the rule has not been shown quiet on the
+    real bus over a long
     run (`tools/aquabus_watch.py --seconds 900`), and the departure has not
     been repeated with the daemon running. Still open besides, unchanged:
     why the menu misbehaves with the Quadro on aquabus, what control-report
@@ -8048,15 +8089,21 @@ Owner decision (2026-09-16):
     report), not the power (7 cW there), not a constant, and nothing at all on
     the aquaero's own blocks 1–4, where every capture reads 0. It is refreshed
     with the electrical group (0 in a report that refreshed nothing), so it
-    comes from the bus device. The only regularity in the captures is that the
-    field times that block's own output duty lands on the current field, at
-    both duties ever captured: 26 × 20 % = 5.2 against 6 mA, 27 × 100 % = 27
-    against 27 mA, with the 20 % run's other pairs (22↔5, 15↔4, 11↔3, 3↔1) on
-    the same line to ±0.4 mA. That reads like a current measured over the
-    output's on-time, of which the current field is the duty average — but two
-    duties do not name a field, and a third duty is a duty change, i.e. a
-    write. The same goes for item 89's suggestion of looking at the aquaero's
-    own outputs in DC mode (a mode change is a write). So it is decoded raw as
+    comes from the bus device. What the captures suggest is that the field times
+    that block's own output duty lands near the current field — and how thin
+    that is, stated plainly: of the two captured duties only one can test it,
+    since at 100 % duty `raw × duty` is the raw value itself (27 against 27 mA)
+    and tests nothing, and at the one informative point it misses — 26 × 20 % =
+    5.2 against a measured 6 mA, 13 % low. The 20 % run's further pairs (22↔5,
+    15↔4, 11↔3, 3↔1) are all at that same duty: they constrain a slope, not a
+    duty relation, and under `raw × duty` each sits 0.4 to 1.0 mA high, every
+    one in the same direction. A line fitted to the five pairs does fit them to
+    ±0.3 mA, but with a slope of 0.211 and an intercept of 0.55 mA — that line
+    is not `field × duty`. So "a current measured over the output's on-time, of
+    which the current field is the duty average" is a suspicion with one
+    informative point that misses, not a finding; a second duty is a duty
+    change, i.e. a write. The same goes for item 89's suggestion of looking at
+    the aquaero's own outputs in DC mode (a mode change is a write). So it is decoded raw as
     `FanStatus.unidentified_raw` for `tools/aquabus_watch.py`, published by
     nothing and judged by nothing, and the field stays unidentified until the
     owner decides between one bench experiment (three duties on an aquabus
@@ -8068,17 +8115,21 @@ Owner decision (2026-09-16):
     values and 67 carried substitutes over 88.6 s — one refresh in 3.9 reports,
     3.85 s, at a report cadence of 0.98 s — and the refresh is per block, not
     per report (one report refreshed blocks 5 and 6 but not 8, another carried
-    a current with a zero power). That is now
+    a current with a zero power). The 3.85 s is a **mean** over 23 refreshes and
+    not the longest gap, which this run cannot give. That is now
     `aquacomputer.AQUABUS_REFRESH_REPORTS` (4) and `AQUABUS_REFRESH_S` (4.0) on
-    `DeviceKind`, where a caller can act on it: `AquacomputerTiming.check_kind`
-    refuses a `bus_absent_s` shorter than the window, so the rule that judges
-    the bus over time (item 92) can never be set faster than the bus itself.
+    `DeviceKind`, where a caller reads it: `tools/aquabus_watch.py` reports it
+    and `device_health.aquabus.refresh_reports` publishes it. It bounds no key:
+    item 92's `bus_absent_s` is deliberately not floored by it, because presence
+    is read from the speed field every report carries, so a skipped poll cannot
+    look like a departure at any window.
     Only the electrical fields follow the interval — speed and output duty are
     in every report, which is what makes item 92 judgeable and item 116's
     warning about keying on a voltage concrete. What is **not** answered: the
     board was unreachable all session, so nothing new was measured on the
     hardware. Whether the interval is fixed or drifts, whether it differs per
-    block and whether it moves with the report rate is one run of the new
+    block, what the longest gap actually is and whether any of it moves with the
+    report rate is one run of the new
     `tools/aquabus_watch.py --reports 600 --raw` away (read-only, no feature
     report at all). Whether it is a **device setting** the owner could raise
     cannot be answered read-only: no field of the 2707-byte control report is

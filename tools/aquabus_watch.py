@@ -26,9 +26,12 @@ with no device, so a healthy bus can be shown to stay quiet under the daemon's
 ``bus_absent_s``.
 
 *What is the ``u16`` at ``+0x0A`` of a fan block?* Unidentified (item 114). It is
-printed raw next to that block's duty, current and power, with the ratio the
-captures show (field x duty vs the current field) -- the way to collect the
-evidence at a duty the captures do not cover. Nothing in the daemon reads it.
+printed raw next to that block's duty, current and power, together with
+``field x duty`` against the current field -- the relation the captures suggest at
+the one duty that can test it (20 %, where it lands 13 % low) and cannot test at
+the other (100 %, where the product is the raw value itself). This is how to
+collect that evidence at a duty the captures do not cover. Nothing in the daemon
+reads the field.
 
 Classifying a report as one that refreshed a block is a judgement from what the
 fields hold: a block that reads 0.00 V (an output with no fan, which reads the
