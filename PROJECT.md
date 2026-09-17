@@ -785,6 +785,7 @@ long `dt`):
 | `ident_amplitude` | 0.15 | `(0, 0.3]` |
 | `ident_levels` | `above` | `above` \| `symmetric` |
 | `ident_replan` | `true` | the levels follow the live solver demand every tick (§3, §8.4 item 52); `false` freezes them at the base of the start (the Zero W behaviour) |
+| `ident_parallel` | `false` | `true`: one experiment drives every channel of the target's own zones at once, each on its own code — the zone-wide excitation the model's PE monitor needs to reach `converged` (§3, §8.4 item 102) |
 | `ident_hold_s` | `[60, 120, 180]` | non-empty, positive; each ≥ `5 * dt` when enabled |
 | `ident_max_duration_s` | 1800 | `(0, 7200]` |
 | `ident_settle_s` | 600 | ≥ 0; ≥ `confirm_s` when enabled |
@@ -2421,7 +2422,33 @@ excitation stops until the demand falls back). The base drift is slow next
 to the 60–180 s holds, so the regressors keep the content the fit lives on
 (§8.4 item 52 has the sim numbers and the measured per-tick cost).
 `ident_replan: false` keeps the levels frozen at the base of the start,
-which is what ran on the Zero W, and costs exactly what it cost then. **Start preconditions**, each refused with a
+which is what ran on the Zero W, and costs exactly what it cost then.
+
+**A whole zone at once, on independent codes** (`ident_parallel`, default
+`false`; item 102). One group at a time is the wrong unit for the *model*. The
+thermal model's air block per zone regresses one airflow regressor per fan group
+of that zone, and `converged` asks the smallest eigenvalue of their information
+matrix to pass `PE_MIN`: every group of the zone has to move, independently of
+the others, inside the PE monitor's ~30-window memory. Telegraphing one group
+while the solver carries the rest fills one direction of that matrix, not `G` of
+them, however long it runs — which is why no closed-loop scenario had ever
+reached `converged` (§8.4 item 102 has the eigenvalues). With
+`ident_parallel: true` the target's channel set grows to every channel of the
+zones that **list** the target's channels (`ZoneLayout.zone_channels`; the
+coupled zones are served, checked and aborted on as before, but not excited), the
+experiment is one phase over all of them, and each channel gets its own telegraph
+— its own start level and its own hold draws, from an LFSR seeded per channel
+from `ident_seed`. Nothing else moves: the same two levels around the same
+anchor, `above` still never below the solver's command, the same preconditions
+over the larger channel set (so a start is refused when any of those channels is
+saturated or would leave the band), the same envelope and abort list on the same
+served zones, and `compose` still floors, rate-limits and clamps. Under `above`
+the cost is noise, not temperature: `G` channels sit a step above the anchor for
+about half the run instead of one, so the same fan-seconds are spent in a
+`G`-times shorter window — measured on the DAS example, +0.03 to +0.06 mean PWM
+over a 16 h run against one group at a time, and a *larger* worst true margin
+(§8.4 item 102).
+ **Start preconditions**, each refused with a
 named reason: control mode `auto` without human overrides
 (`control_mode`), last command `auto` (`mode:<m>`), no saturation, band
 or stall on the target (`saturated:`, `band:`, `no_command:`,
@@ -3445,6 +3472,7 @@ aqua-bridge/
     test_ident_experiment.py
     test_ident_sim.py        # experiments against the DAS truth plant
     test_ident_replan_sim.py  # re-planned vs frozen levels on sim/das (nightly)
+    test_ident_converge_sim.py  # closed-loop convergence, zone-wide vs one group (nightly)
     test_recorder.py
     test_tools_fit_replay.py
     test_sim_das.py
@@ -4198,6 +4226,7 @@ tests carry the `nightly` marker.
 | `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); the re-planned levels of item 52 (the echo of the experiment's own level taken out of the want and no ratchet over a run of high ticks, a fan the solver's own floor lifted still read as demand, the anchor rising at once and falling only at a switch and never below the frozen base, a held sibling with it, the band, `symmetric` dipping at most the amplitude below the live demand, the same aborts on the same tick with and without re-planning, a re-planned level never below the frozen one, the dip and the floor read off the running experiment's own plan, the demand copied only on its ticks, and through the loop a warming zone followed instead of held back, a spent load released instead of pinning the fans, and an experiment ending later than the frozen one and never earlier — against `ident_replan: false`, which still holds it back); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes a run but the settle timers come back from the store and a start between `plan_tick` and `record_tick` keeps its tick (§8 item 20); `k·σ` counted once and the absolute abort from `ident_abort_below_limit_c` (items 53, 54); a lost sensor group blocks a start and aborts a run (item 72); legacy refuses | PR |
 | `tests/test_ident_sim.py` | an experiment on the truth plant never takes a drive over a limit and never leaves the enclosure hotter than the same seed without one, with the excitation visible on the fans; a drawn enclosure that is already saturated refuses the start; and, with the room warming 20 °C/h so the envelope actually binds, the run aborts on `envelope:<bay>` with `T̂_d + k·σ` still below the absolute abort and no drive over its limit from the abort on, on `ident_levels: above` and `symmetric` (§8 item 53) | PR: `basic` seed 1, both `ident_levels`; nightly: `basic` and `rich` seeds 1–5, envelope sweep `basic` seeds 1–5 × both `ident_levels` |
 | `tests/test_ident_replan_sim.py` | re-planned against frozen experiment levels on the truth sim (`rich`, the real loop and supervisor), both solvers and three seeds: no tick below the solver's own command (and the frozen plan does hold one back), no anchor more than `ident_amplitude` above the demand the frozen arm saw (the ratchet guard, which the pre-review `_replan` fails on the MPC arm), and the fit no worse than frozen beyond a loose margin | nightly |
+| `tests/test_ident_converge_sim.py` | the closed-loop convergence evidence item 102 asked for: 16 h on the truth sim (`rich`, the real loop and supervisor), three seeds, `ident_parallel: true` against `false` on the same plant — a zone reaches `converged` with the zone-wide excitation and none does with one group at a time, `pe_min` above `PE_MIN` on the zones that converged, zero limit violations in either arm and the zone-wide arm keeping the larger true margin | nightly |
 | `tests/test_sim_das.py` | the truth plant: energy balance through transients and hot swap, steady state, more airflow never warms anything, dead band and exponent, quantisation per sensor type, lags, SMART cadence, determinism per seed | PR |
 
 Test cost: the PR selection is about 1,900 tests in under five minutes
@@ -6317,20 +6346,91 @@ Owner decision (2026-09-16):
     sees and σ stays at the uncalibrated floor 1.50 °C
     (`tests/test_estimator.py::test_a_member_that_returns_after_the_load_moved_is_a_swap_only_on_the_fused_node`).
     That is what keeps the pairs costing the `sigma` trust rule an exemption.
-102. No closed-loop scenario in which the identification converges. Every
-    convergence result there is comes from `tests/test_thermal_ident.py`,
-    which drives the outputs open loop (fixed levels 0.35/0.8, independent
-    sequences on every channel at once) and never runs `control/ident.py`.
-    In the closed loop the supervisor runs one experiment at a time while the
-    solver moves the rest of the zone, and neither `ident_replan: true` nor
-    `false` reaches `converged` — `pe_min` stays near zero on every seed of
-    `tests/test_ident_replan_sim.py` (item 52's A/B, §8.4). So the two
-    experiment machines are tested for different things: the fit is measured
-    where `ident.py` is absent, and `ident.py` is measured where the fit does
-    not converge. Worth deciding whether the closed-loop scenario should be
-    made to converge — several channels of a group excited at once, longer
-    runs, or `ident_max_duration_s` and the phase split reconsidered — or
-    whether the open-loop evidence is enough and this is only a note.
+102. **Done** (2026-09-17): a closed-loop scenario in which the fit converges,
+    and the reason none did before. *What it was:* every convergence result
+    came from `tests/test_thermal_ident.py`, which drives the outputs open
+    loop (fixed levels 0.35/0.8, independent sequences on every channel at
+    once) and never runs `control/ident.py`, while `ident.py` was measured
+    only where the fit does not converge.
+
+    **Diagnosis** (DAS example, `rich` preset, real `Loop` + `Supervisor` +
+    `control/ident.py`, PI-DAS, 4–24 h per run). Of the four conditions in the
+    `converged` rule only two ever fail: `excited_windows` reaches 110 of 119
+    within 4 h, the air block's `rel_se(E)` is 0.03–0.15 against the 0.25
+    bound and `pred_err_c` 0.05–0.10 against 1.0 — the air block's `pe_min`
+    and the bays' `rel_se(k)` are the whole of it. Per hypothesis:
+
+    - *conditioning, not aborts, not the window, not the siblings.* In a
+      three-group zone the group regressors correlate 0.91–0.98 and the
+      smallest eigenvalue of the normalised covariance is 0.002–0.05 against
+      diagonals of 0.06–0.17: one direction is excited, not three. Aborts are
+      not the cause (0–1 per 12–24 h run, and the baseline 4 h run aborts
+      nothing at all, completing 7 of 8 starts with the experiment running
+      96 % of ticks). The measure is not computed on the wrong signal: the
+      per-window and per-tick eigenvalues agree to under 10 %. Holding a
+      zone's siblings, the fix the module docstring applies within a group,
+      does not do it either — replayed on the measured regressors it moves z1
+      from 0.0165 to 0.0379 and makes z3 *worse*.
+    - *regulation alone is exactly zero.* The rank-1 common-mode fit of the
+      measured regressors — what the solver's own motion contributes — scores
+      `pe_min` 0.0000 on every zone.
+    - *sequential vs simultaneous, same amplitude, same background.* Replayed
+      on that background: one channel per slot peaks at 0.008–0.030 and never
+      clears `PE_MIN`; an independent code per channel peaks at 0.09–0.11 and
+      holds above it in 61–68 % of windows. A factor of about twelve, from
+      simultaneity alone.
+    - *why the amplitude also matters.* `pe_min` is a **relative** measure: it
+      wants a relative airflow std of √`PE_MIN` = 0.224 in the least-excited
+      direction. For a 50/50 telegraph at base `u` with deadband `d`, `above`
+      gives `A / (2 (u − d + A/2))` and `symmetric` `A / (u − d)`, so `above`
+      needs `A ≥ 0.576 (u − d)` — above the `ident_amplitude` cap of 0.3 for
+      any channel parked past ≈ 0.62 PWM. Measured on the example with
+      regulation only, the channels park between 0.21 and 0.94 PWM, which asks
+      0.06–0.49; the one channel that asks more than the cap is also the one
+      the `saturated:` precondition already refuses to excite.
+
+    **What changed:** one config key, `ident_parallel` (default `false`, so
+    the old schedule is byte-identical). With it an experiment drives every
+    channel of the target's own zones at once, each on its own code (§3). No
+    change to the levels, the preconditions, the envelope, the abort list or
+    `compose`.
+
+    **The scenario and what it reached** (`tests/test_ident_converge_sim.py`,
+    nightly): `ident_parallel: true`, `ident_amplitude: 0.25`,
+    `ident_hold_s: [240, 360, 480]` (longer than `model_window_s`, so a window
+    sits inside one hold), `ident_max_duration_s: 3600`
+    (`PE_WINDOWS × model_window_s`, the monitor's own memory — a shorter
+    experiment can never dominate it), starts on `xt1, xt3, xt2, xt4`, 16 h,
+    `rich` seeds 2/3/4. Zones converged: **z0 and z3 / z1 / z3**, with `pe_min`
+    peaking at 0.12–0.34; the same scenario with `ident_parallel: false`
+    converges **nothing** on any of the three. Zero limit violations in either
+    arm; worst true margin 4.53–4.89 °C with the zone-wide arm against
+    4.22–4.34 °C with one group at a time and 4.07–4.30 °C with no experiment
+    at all — `above` only ever adds cooling. The fit: per-bay `k` rms error
+    0.10–0.18 against 0.22–0.29 with no experiment.
+
+    **What it costs.** Noise, and only while it runs: mean PWM over the 16 h
+    +0.03 to +0.06 against one group at a time. Against *no* experiment the
+    cost depends on how hard the enclosure is already working — on a quiet
+    seed +0.045 mean PWM and about +13 dB of mean fan noise, on a warm one
+    −0.6 dB and +0.011 mean PWM, because the extra cooling an `above`
+    telegraph supplies comes back off the solver's own demand. The integrated
+    fan-seconds are the same as the sequential schedule's (one zone-wide
+    experiment replaces the `G` its zone needed); they are spent in a
+    `G`-times shorter window.
+
+    **What is not reached, and why.** The *model* status (the least advanced
+    zone) is still `learning` in every run: no seed gets all four zones. Two
+    reasons, both measured and neither an excitation problem. (a) A channel
+    parked past ≈ 0.62 PWM cannot clear `PE_MIN` under `above` at any allowed
+    amplitude (the arithmetic above); `symmetric` can, at the owner-accepted
+    dip, but the band check refuses it once the base is within
+    `ident_amplitude` of either rail. (b) On `rich` seeds 3 and 4 bay b03 — one
+    of the two bays with a redundant second proximal sensor — is reported
+    `swapped` on 2788 and 2391 of 2880 ticks, so `model_reset_on_swap` resets
+    its block and its zone's air accumulator on nearly every tick: b03 closes
+    **zero** regression windows in 24 h and z0 closes 0 and 16, which no
+    excitation can fix. That is a separate defect, in the proposed items.
 
 103. **Done** (2026-09-16): the Pi's own temperature and throttling as a
     health signal (owner decision above, §8.1). `hostinfo.read_throttled()`
@@ -6918,9 +7018,10 @@ Owner decision (2026-09-16):
     Neither arm reaches `converged` in this closed-loop scenario (`pe_min`
     stays near zero: with the solver moving the other channels of a zone, one
     experiment at a time does not excite the zoned regressors) — that is the
-    scenario, not this item, and it is item 102; the convergence evidence stays
-    `tests/test_thermal_ident.py`, whose open-loop excitation this item does
-    not touch and which still passes.
+    scenario, not this item. Item 102 has since measured why and given the
+    closed loop a scenario that does converge (`ident_parallel`,
+    `tests/test_ident_converge_sim.py`); this A/B is unchanged, still runs one
+    group at a time, and still passes.
 
     *Main session, on the Zero 2 W:* run one experiment on the real
     enclosure with `ident_replan: true` and confirm (a) an experiment on a
@@ -7057,7 +7158,7 @@ Owner decision (2026-09-16):
 - [x] Tick recorder and offline tools: `--record`, `tools/fit_model.py --topology`, `tools/fit_fans.py`, `tools/replay.py`
 - [x] DAS MPC: noise surrogate, soft / hard and terminal rows, move blocks, active-piece SQP, forbidden bands, validity gate with PI-DAS model fallback, bumpless, `mpc_every_ticks`, `noise_db` (`control/solver_das.py`, `control/noise.py`)
 - [x] Model store with calibration and bays sections, fresh → `frozen`, stale → shadow hold re-confirmed for `model_reconfirm_s`, `StateDirectory=` (`modelstore.py`, `control/persist.py`)
-- [x] Active identification experiments per fan group with the +3 °C envelope on estimates, `POST /api/ident`, MQTT `cmd/ident`, HA `ident_running` (`control/ident.py`); levels re-planned from the live solver demand every tick, a rise in demand always winning over the plan (`ident_replan`, §8.4 item 52)
+- [x] Active identification experiments per fan group with the +3 °C envelope on estimates, `POST /api/ident`, MQTT `cmd/ident`, HA `ident_running` (`control/ident.py`); levels re-planned from the live solver demand every tick, a rise in demand always winning over the plan (`ident_replan`, §8.4 item 52); optionally a whole zone at once on independent codes, which is what the fit needs to converge in the closed loop (`ident_parallel`, §8.4 item 102)
 - [x] Runtime drive limits: `POST /api/limit`, MQTT `cmd/limit/...`, HA `limit_<class>`; DAS presets (comfort band, noise weight)
 
 #### Track B — hardware (Pi USB; fake sysfs anywhere)
