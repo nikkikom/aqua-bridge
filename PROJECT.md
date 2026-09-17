@@ -7235,6 +7235,15 @@ Owner decision (2026-09-16):
     USB in a topology the project supports — or whether it is accepted and
     simply documented.
 
+118. The `http` / `mqtt` optional extras (`aiohttp`, `paho-mqtt`) are not
+    installed into the shared dev `.venv` by default: a full-suite run from
+    a clean checkout of that venv fails 6 unrelated tests purely because
+    those extras are missing (found running item 108's own full-suite
+    check). Either install them into the shared venv by default, or
+    document that `pip install -e .[http,mqtt]` is required before running
+    the full suite documented in this file, so a clean checkout does not
+    surprise the next person running it.
+
 ### 8.4 Open — Zero 2 W upgrade
 
 50. **Done** (2026-09-16): the owner moved the controller itself from the
