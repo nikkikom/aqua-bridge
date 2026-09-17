@@ -1,8 +1,13 @@
 """Tests for tools/aquabus_watch.py: the read-only aquabus measurement (items 114, 115, 92).
 
-The reports are the captured ones, played back in the pattern the 90-report run of
-2026-09-17 showed -- one report in four carries the bus device's own measurements --
-so what the tool prints is checked against what the hardware actually did.
+What is checked here is the tool's own arithmetic and its presence/refresh
+classification, over the captured reports, played back at a cadence taken from the
+90-report run of 2026-09-17 (one report in four carried the bus device's own
+measurements). The cadence is written out literally below, so that
+``AQUABUS_REFRESH_REPORTS`` is an expectation of these tests and not their input. What
+the hardware does over a long run is not tested here and cannot be: the captured
+sequence of that run is not in the repository, and §8 item 115 keeps the
+``--reports 600 --raw`` run as the measurement that answers it.
 
 ``tools/`` is not on ``pythonpath``, so this file adds it to ``sys.path`` itself (the
 same way tests/test_aquacomputer_probe.py does).
@@ -89,15 +94,23 @@ def _run(rig, reports: list[bytes], **kwargs) -> tuple[int, str, ScriptedControl
     return code, out.getvalue(), controller
 
 
+#: The cadence of the 2026-09-17 run, written out rather than derived from the constant:
+#: one report that carried the bus device's measurements, then three that did not.
+_CADENCE = ("m", "s", "s", "s")
+
+
 def _refresh_pattern(count: int) -> list[bytes]:
-    """The measured cadence: every fourth report carries the bus device's measurements."""
+    """The reports in that cadence, `count` of them."""
     measuring, substituted = fixture_bytes(MEASURING), fixture_bytes(SUBSTITUTED)
-    return [measuring if i % AQUABUS_REFRESH_REPORTS == 0 else substituted for i in range(count)]
+    return [measuring if _CADENCE[i % len(_CADENCE)] == "m" else substituted for i in range(count)]
 
 
 def test_it_measures_the_refresh_interval_and_closes_the_device(rig) -> None:
     """Item 115: how many reports carry a measurement, how far apart they are in reports
-    and in seconds, and whether the four blocks refresh together."""
+    and in seconds, and whether the four blocks refresh together. The numbers below are
+    the tool's arithmetic over the played-back cadence; the constant the daemon carries
+    is checked against that cadence rather than used to derive it."""
+    assert len(_CADENCE) == AQUABUS_REFRESH_REPORTS
     code, text, controller = _run(rig, _refresh_pattern(40))
     assert code == 0 and controller.closed
     assert "40 status reports in 39.0 s" in text

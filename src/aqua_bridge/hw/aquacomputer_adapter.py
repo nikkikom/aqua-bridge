@@ -68,17 +68,24 @@ The device on aquabus
     raises. A lost bus device is less evidence, not less heat.
 
     The *diagnosis* is slower than the safety on purpose. ``bus_absent_s`` (10 s
-    by default, never below the kind's measured aquabus refresh window of
-    :data:`~aqua_bridge.hw.aquacomputer.AQUABUS_REFRESH_S`, item 115) is how long
-    every aquabus block must read ``0xFFFF``, over received reports, before the
-    controller reports the loss: one error line naming what went missing, an entry
-    in ``device_health``'s ``problems``, and ``bus_device`` carrying the state --
-    including whether a device ever answered since this adapter started reading,
-    which is what separates "the Quadro left" from "nothing has ever been on this
-    bus". A blip while a device re-enumerates, or an aquabus poll the controller
-    skipped, never reaches that report. What this cannot see is a bus device with
-    no fan outputs at all: presence is judged from the fan blocks, so such a
-    device reads as an empty bus and its temperature slots would stay missing.
+    by default) is how long every aquabus block must read ``0xFFFF``, over
+    received reports, before the controller reports the loss: one error line
+    naming what went missing, an entry in ``device_health``'s ``problems``, and
+    ``bus_device`` carrying the state -- including whether a device ever answered
+    since this adapter started reading, which is what separates "the Quadro left"
+    from "nothing has ever been on this bus". What the window keeps out is a
+    device re-enumerating: one transient ``0xFFFF`` (item 90) is a blip, not a
+    departure. It is *not* bounded by the aquabus refresh interval of item 115:
+    that interval moves the electrical fields only, while presence is read from
+    the speed field, which every report carries, so a poll the controller skipped
+    cannot look like a departure however short this window is.
+
+    What this cannot see is a bus device with **no fan outputs** at all: presence
+    is judged from the fan blocks, so such a device reads as an empty bus and its
+    temperature slots would stay missing for ever. That is why binding a ``busN``
+    needs an aquabus output of the same device bound in the same entry, which the
+    config model enforces (:class:`DeviceBinding`) rather than leaving to a line
+    in the documentation.
 
 Writing
     ``apply()`` opens the node without waiting for a status report, so the
@@ -370,11 +377,13 @@ class AquacomputerTiming:
     #: status reports, before the controller reports the device on its aquabus as
     #: lost, seconds (> 0). It bounds only the *diagnosis*: the aquabus
     #: temperatures of an absent device read as missing from the first such
-    #: report, without waiting (module docstring, Reading). It may not be shorter
-    #: than the kind's measured aquabus refresh window
-    #: (:attr:`~aqua_bridge.hw.aquacomputer.DeviceKind.aquabus_refresh_s`, 4 s on
-    #: the aquaero: :meth:`check_kind`), so that no single aquabus poll the
-    #: controller skipped can be reported as a device that left the bus.
+    #: report, without waiting (module docstring, Reading). What it buys is the
+    #: blip: a device re-enumerating shows one or two reports of ``0xFFFF``
+    #: (item 90), and a window of a few report periods keeps those out of the
+    #: health payload. It is *not* bounded by the aquabus refresh interval
+    #: (:attr:`~aqua_bridge.hw.aquacomputer.DeviceKind.aquabus_refresh_s`, item
+    #: 115): that interval moves the electrical fields, never the speed field
+    #: presence is read from.
     bus_absent_s: float = 10.0
     #: Software sensor (``softN``) that gets the heartbeat every ``apply()``;
     #: 0 is off. Only the aquaero has a known software-sensor report.
@@ -403,16 +412,15 @@ class AquacomputerTiming:
 
     def check_kind(self, kind: DeviceKind) -> None:
         """Validates what only the device kind can bound: which software sensors
-        exist, whether the kind has a software-sensor report at all, and that
-        ``bus_absent_s`` covers the kind's aquabus refresh window."""
-        window = kind.aquabus_refresh_s
-        if window is not None and self.bus_absent_s < window:
-            raise ConfigError(
-                f"bus_absent_s must be at least the {kind.name}'s aquabus refresh window of "
-                f"{window:g} s ({kind.aquabus_refresh_reports} status reports, measured: "
-                f"PROJECT.md section 8 item 115), got {self.bus_absent_s:g}; below it a poll "
-                "the controller skipped and a device that left the bus are not told apart"
-            )
+        exist, and whether the kind has a software-sensor report at all.
+
+        ``bus_absent_s`` is deliberately *not* bounded here by the kind's aquabus
+        refresh interval: that interval moves the electrical fields of an aquabus
+        block, while presence is read from the speed field, which every report
+        carries (PROJECT.md section 8 items 115 and 92), so no skipped poll can be
+        read as a departure at any window. A very short window only risks
+        reporting a re-enumeration blip, which costs a log line, never cooling.
+        """
         if not self.heartbeat_on:
             return
         count = kind.soft_sensor_count if kind.soft_sensor_report_id is not None else None
@@ -525,6 +533,44 @@ def check_watchdog(
         )
 
 
+def aquabus_binding_problem(
+    kind: DeviceKind,
+    pwm_map: Mapping[str, int],
+    fan_map: Mapping[str, int],
+    temp_map: Mapping[str, str],
+) -> str | None:
+    """Why this binding may not read the kind's aquabus temperature slots, or ``None``.
+
+    A ``busN`` slot keeps the last value it read when the device on aquabus leaves
+    (PROJECT.md section 8 item 92), so it is a reading only while a device answers
+    there -- and that is judged from the aquabus *fan* blocks
+    (:func:`~aqua_bridge.hw.aquacomputer.aquabus_present`). A bus device with no fan
+    outputs is therefore indistinguishable from an empty bus, and its slots would read
+    as missing for ever: a zone that never gets a temperature on a healthy system. The
+    config model refuses that shape instead of warning about it -- binding one of the
+    device's aquabus outputs in the same entry is how a config says the device on the
+    bus is one whose presence can be seen.
+    """
+    bus_inputs = frozenset(kind.aquabus_temp_names)
+    bound = sorted(name for name, value in temp_map.items() if value in bus_inputs)
+    if not bound:
+        return None
+    aquabus = frozenset(kind.aquabus_outputs)
+    if any(number in aquabus for mapping in (pwm_map, fan_map) for number in mapping.values()):
+        return None
+    outputs = ", ".join(f"pwm{n}" for n in sorted(aquabus))
+    return (
+        f"{bound} are bound to {kind.name} aquabus temperature slots while no aquabus output "
+        f"({outputs}) is bound in the same entry. Such a slot keeps the last value it read when "
+        f"the device leaves the bus, so it is a reading only while a device answers on aquabus "
+        f"-- which is judged from the aquabus fan blocks, so a bus device with no fan outputs "
+        f"cannot be told from an empty bus and those names would read as missing for ever. Bind "
+        f"one of the device's aquabus outputs here (the supported topology commands the Quadro "
+        f"through {outputs}), or drop the aquabus temperature binding (PROJECT.md section 8 "
+        f"item 92)"
+    )
+
+
 @dataclass(frozen=True)
 class DeviceBinding:
     """Which device, and where the logical names live on it.
@@ -584,6 +630,9 @@ class DeviceBinding:
         stray = sorted(set(self.fan_map) - set(self.pwm_map))
         if stray:
             raise ValueError(f"fan_map keys {stray} are not pwm_map channels")
+        problem = aquabus_binding_problem(kind, self.pwm_map, self.fan_map, self.temp_map)
+        if problem is not None:
+            raise ValueError(problem)
 
     @property
     def label(self) -> str:
@@ -764,27 +813,45 @@ class AquacomputerAdapter:
         """What the newest status report says about a device on this controller's
         aquabus (PROJECT.md section 8 item 92), for ``device_health``.
 
+        ``state`` is the one field a line of a page or a binary sensor can show:
+        ``"unknown"`` (not judged yet, or a kind with no aquabus outputs),
+        ``"present"``, ``"empty"`` (reading empty, not for long enough to report),
+        ``"lost"`` (a device answered and then stopped) or ``"never_seen"`` (a bus
+        that has read empty since this adapter started reading -- the normal state
+        of an aquaero with nothing on its bus, and not a fault).
         ``present`` is what :func:`~aqua_bridge.hw.aquacomputer.aquabus_present`
         judged (``None`` before the first read, and on a kind with no aquabus
         outputs); ``seen`` whether one ever answered since this adapter started
         reading, which is what separates a device that *left* the bus from one that
-        was never there;
-        ``absent_s`` how long the bus has read empty, counted over received reports;
-        ``lost`` whether that has held for ``bus_absent_s`` and is reported;
+        was never there; ``absent_s`` how long the bus has read empty, measured from
+        the receipt of the first report that showed it so (``None`` until a report
+        arrives; the span survives a reopen of the node, because the bus state does);
+        ``lost`` whether a device that *had* answered has now been absent for
+        ``bus_absent_s`` and is reported -- it stays False on a bus nothing was ever
+        on, which is why a consumer with room for one field should show ``state``;
         ``temps_missing`` the logical names whose aquabus slot is reported as
         missing this tick instead of as the frozen value the controller keeps
-        there; and ``refresh_reports`` the measured aquabus refresh window of the
-        kind (item 115), which is why this is judged from the speed field and not
+        there; and ``refresh_reports`` the kind's mean aquabus refresh interval
+        (item 115), which is why this is judged from the speed field and not
         from a voltage or a current.
         """
         absent_s: float | None = None
         if self._bus_absent_since is not None and self._status_t is not None:
             absent_s = max(0.0, self._status_t - self._bus_absent_since)
+        if self._bus_present is None:
+            state = "unknown"
+        elif self._bus_present:
+            state = "present"
+        elif not self._bus_lost:
+            state = "empty"
+        else:
+            state = "lost" if self._bus_seen else "never_seen"
         return {
+            "state": state,
             "present": self._bus_present,
             "seen": self._bus_seen,
             "absent_s": absent_s,
-            "lost": self._bus_lost,
+            "lost": state == "lost",
             "temps_missing": sorted(self._bus_temps) if self._bus_present is False else [],
             "refresh_reports": self.kind.aquabus_refresh_reports,
         }
@@ -1176,10 +1243,12 @@ class AquacomputerAdapter:
         self._not_pwm_channels = ()
         self._unconfigured_channels = ()
         self._unconfigured_ks = frozenset()
-        # The run of "no device on aquabus" reports starts again: wall time passing
-        # while nothing was read is evidence of nothing (item 92). What was judged
-        # stays until a report replaces it, the way the status report itself does.
-        self._bus_absent_since = None
+        # The aquabus state is deliberately *not* reset here (item 92): the bus does
+        # not change because this daemon reopened the node, and _bus_lost survives an
+        # open already. Clearing only the start of the empty run would leave the pair
+        # inconsistent -- "lost" with an absent_s counting up from zero -- exactly
+        # when someone reads it. So absent_s keeps measuring from the first report
+        # that showed the bus empty, across the reopen.
         _LOG.info("%s: opened %s", self.binding.label, transport.info.node)
         return transport
 
@@ -1295,24 +1364,28 @@ class AquacomputerAdapter:
         missing, and holding a frozen temperature back one report too early costs
         nothing while passing one on costs the solver its evidence. The *report* --
         the error line and ``device_health``'s ``problems`` -- waits until the bus
-        has read that way for ``bus_absent_s`` of live reports, which is what tells
-        a device that left the bus from a poll the controller skipped (item 115) and
-        from a transient ``0xFFFF`` while it re-enumerates (item 90).
+        has read that way for ``bus_absent_s``, which is what tells a device that
+        left the bus from one re-enumerating for a report or two (item 90). A poll
+        the controller skipped (item 115) never enters into it: that moves the
+        block's electrical fields, not the speed field read here.
 
-        Time counts in received reports, not in wall time: a controller that sends
-        nothing proves nothing about its bus, and the run is measured from the
-        receipt of the first report that showed the bus empty.
+        The run is measured between report receipts -- from the first report that
+        showed the bus empty to the newest one -- and survives a reopen of the node,
+        because the bus does not change when this daemon reopens a device. Only a
+        report showing a device ends it.
         """
         present = aquabus_present(self.kind, status)
         self._bus_present = present
         if present is None:  # a kind with no aquabus outputs cannot say
             return False
         if present:
-            if self._bus_lost:
+            if self._bus_lost and self._bus_bound:
                 _LOG.info(
-                    "%s: a device answers on aquabus again; its temperature slots are "
-                    "readings once more",
+                    "%s: a device answers on aquabus again%s",
                     self.binding.label,
+                    "; its temperature slots are readings once more"
+                    if self._bus_temps
+                    else " (nothing of this controller reads its aquabus temperature slots)",
                 )
             self._bus_seen = True
             self._bus_absent_since = None
@@ -1345,7 +1418,8 @@ class AquacomputerAdapter:
         )
         _LOG.error(
             "%s: %s -- every aquabus fan block has read rpm 0xFFFF for %.1f s (longer than "
-            "bus_absent_s = %g, so it is not one aquabus poll the controller skipped). %s. "
+            "bus_absent_s = %g, so it is not a device re-enumerating for a report or two). "
+            "%s. "
             "Nothing is commanded lower for it: a lost bus device is less evidence, not "
             "less heat, so what it fed reads as missing and the zones it served hold or "
             "raise (PROJECT.md section 8 item 92)",
@@ -2226,6 +2300,9 @@ def parse_device_section(
     for name, value in dict(temp_section or {}).items():
         temp_map[name] = _temperature_input(f"{label}.temp_map.{name}", value, kind)
         _claim_input(temp_seen, temp_map[name], name, f"{label}.temp_map")
+    problem = aquabus_binding_problem(kind, pwm_map, fan_map, temp_map)
+    if problem is not None:
+        raise ConfigError(f"{label}.temp_map: {problem}")
     if channels is not None:
         _check_keys(f"{label}.fans", pwm_map, channels, "mpc.channels")
     if temps is not None:

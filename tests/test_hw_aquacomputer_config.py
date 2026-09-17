@@ -588,25 +588,46 @@ def test_the_unit_watchdog_fits_the_das_example_with_two_controllers_at_their_de
         )
 
 
-# --- the bus-absent window (item 92, bounded by item 115) ----------------------------------
+# --- the bus-absent window (item 92) and the aquabus temperature slots ---------------------
 
 
-def test_bus_absent_s_defaults_and_must_cover_the_measured_refresh_window() -> None:
+def test_bus_absent_s_defaults_and_is_bounded_only_by_being_a_positive_time() -> None:
     """The key that says how long every aquabus block must read "no device" before the
-    daemon reports the bus device lost (item 92). Its floor is not a taste: below the
-    aquaero's measured aquabus refresh window (item 115) a poll the controller skipped
-    and a device that left the bus are not told apart, so the config is refused. A
-    Quadro has no aquabus outputs and no such window, so nothing bounds it there."""
+    daemon reports the bus device lost (item 92). It has no floor from the aquabus
+    refresh interval (item 115): that interval moves an aquabus block's electrical
+    fields, while presence is read from the speed field every report carries, so no
+    skipped poll can look like a departure however short the window is. A short window
+    only risks reporting a re-enumeration blip, which costs a log line and never
+    cooling -- the temperatures go missing from the first empty report either way."""
     assert _parse(_SECTION).timing.bus_absent_s == 10.0
     assert "bus_absent_s" in TIMING_KEYS and "bus_absent_s" in ENTRY_KEYS
     assert _parse(dict(_SECTION, bus_absent_s=AQUABUS_REFRESH_S)).timing.bus_absent_s == 4.0
-    with pytest.raises(ConfigError, match=re.escape("at least the aquaero's aquabus refresh")):
-        _parse(dict(_SECTION, bus_absent_s=AQUABUS_REFRESH_S / 2))
+    assert _parse(dict(_SECTION, bus_absent_s=1.0)).timing.bus_absent_s == 1.0
     with pytest.raises(ConfigError, match="bus_absent_s must be a finite number > 0"):
         _parse(dict(_SECTION, bus_absent_s=0))
     assert AquacomputerTiming.for_kind(QUADRO, bus_absent_s=0.5).bus_absent_s == 0.5
     quadro = _parse(dict(_SECTION, device="quadro", bus_absent_s=0.5))
     assert quadro.timing.bus_absent_s == 0.5
+
+
+def test_a_busn_needs_an_aquabus_output_bound_in_the_same_entry() -> None:
+    """Item 92's teeth, where PROJECT.md section 3 used to have only a warning. A
+    ``busN`` slot keeps the last value it read when the device on aquabus leaves, so it
+    is a reading only while a device answers there -- and that is judged from the
+    aquabus fan blocks. A bus device with no fan outputs is therefore indistinguishable
+    from an empty bus, and such a binding would read as missing for ever: a zone with no
+    temperature on a healthy system. The config model refuses it, naming the entry."""
+    fans = {"radiator": {"pwm": "pwm1", "rpm": "fan1"}, "intake": {"pwm": "pwm2"}}
+    sensor_only = dict(_SECTION, fans=fans, temp_map={"coolant": "temp1", "air": "bus2"})
+    with pytest.raises(ConfigError, match=re.escape("xt6.temp_map: ['air'] are bound to aquaero")):
+        _parse(sensor_only)
+    with pytest.raises(ConfigError, match="no aquabus output .pwm5, pwm6, pwm7, pwm8."):
+        _parse(sensor_only)
+    # One of the bus device's own outputs commanded (the supported topology) is accepted,
+    with_output = dict(sensor_only, fans=dict(fans, quadro1={"pwm": "pwm7", "rpm": "fan7"}))
+    assert _parse(with_output).temp_map == {"coolant": "temp1", "air": "bus2"}
+    # ... and so is the same entry with no aquabus temperature bound at all.
+    assert _parse(dict(_SECTION, fans=fans)).temp_map == {"coolant": "temp1", "air": "temp2"}
 
 
 # --- the software-sensor heartbeat (item 84) -----------------------------------------------

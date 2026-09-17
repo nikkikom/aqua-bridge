@@ -1484,7 +1484,8 @@ def test_an_output_without_a_device_on_aquabus_faults_only_its_own_channel(caplo
     assert bus_error.startswith("aquaero: no device has answered on its aquabus")
     assert [m for m in _messages(caplog, "INFO") if "again" in m] == [
         "aquaero: a device is behind pwm5 (qd1), fan5 (qd1) again",
-        "aquaero: a device answers on aquabus again; its temperature slots are readings once more",
+        "aquaero: a device answers on aquabus again "
+        "(nothing of this controller reads its aquabus temperature slots)",
     ]
 
 
@@ -1603,7 +1604,7 @@ def test_a_bus_device_that_leaves_makes_its_temperature_slots_missing_not_frozen
             device.emit()
             assert adapter.read().temps["quadro_air"] is None
         health = adapter.device_health()
-        assert health["aquabus"]["lost"] is True
+        assert health["aquabus"]["lost"] is True and health["aquabus"]["state"] == "lost"
         assert health["aquabus"]["absent_s"] >= AQUAERO_T.bus_absent_s
         assert health["aquabus"]["refresh_reports"] == AQUABUS_REFRESH_REPORTS
         (problem,) = [p for p in health["problems"] if "item 92" in p]
@@ -1646,6 +1647,7 @@ def test_the_aquabus_refresh_gap_is_never_read_as_a_missing_bus_device() -> None
         assert obs.temps["quadro_air"] is not None
         assert adapter.bus_device["present"] is True
     assert adapter.bus_device == {
+        "state": "present",
         "present": True,
         "seen": True,
         "absent_s": None,
@@ -1678,13 +1680,43 @@ def test_one_transient_report_without_the_bus_device_reports_no_loss(caplog) -> 
     assert [m for m in _messages(caplog, "ERROR") if "item 92" in m] == []
 
 
+def test_reopening_the_node_does_not_restart_the_clock_on_an_empty_bus(caplog) -> None:
+    """A transport reopen is the daemon's business, not the bus's. The bus state and
+    ``absent_s`` are one pair: reporting ``lost`` next to an ``absent_s`` counting up
+    from zero would read as a device that had just gone, or as a flapping rule, in
+    exactly the case an operator consults it. So the empty run keeps being measured
+    from the first report that showed the bus empty, across the reopen, and the loss is
+    not announced a second time for the same absence."""
+    adapter, device, clock = _aquabus_all_configured(_bus_binding())
+    adapter.read()
+    device.status_template = _bus_device_gone(device.status_template)
+    with caplog.at_level("INFO", logger=LOGGER):
+        for _ in range(int(AQUAERO_T.bus_absent_s) + 2):
+            clock.advance(1.0)
+            device.emit()
+            adapter.read()
+        assert adapter.bus_device["state"] == "lost"
+        before = adapter.bus_device["absent_s"]
+        adapter.close()
+        clock.advance(30.0)
+        device.emit()
+        obs = adapter.read()  # a new open, with the bus still empty
+    assert obs.temps["quadro_air"] is None
+    health = adapter.device_health()["aquabus"]
+    assert health["state"] == "lost" and health["lost"] is True
+    assert health["absent_s"] == pytest.approx(before + 30.0 + 1.0, abs=1.0)
+    assert len([m for m in _messages(caplog, "ERROR") if "item 92" in m]) == 1
+
+
 def test_a_controller_with_nothing_bound_on_aquabus_reports_the_state_but_no_problem(
     caplog,
 ) -> None:
     """The aquaero's own outputs and thermistors, with nothing of this daemon's on the
     bus: an empty aquabus is that controller's normal state and no problem of the
     daemon's. The state is still published, so an owner can see what the bus looks
-    like."""
+    like -- as ``never_seen``, never as ``lost``: a bus no device was ever on has
+    lost nothing, and ``lost`` is the field a one-line consumer would show.
+    """
     binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1}, temp_map={"inlet": "temp6"})
     adapter, device, _bus, clock, _ = _setup(binding)  # the plain aquaero: empty aquabus
     with caplog.at_level("INFO", logger=LOGGER):
@@ -1694,7 +1726,8 @@ def test_a_controller_with_nothing_bound_on_aquabus_reports_the_state_but_no_pro
             adapter.read()
     health = adapter.device_health()
     assert health["aquabus"]["present"] is False and health["aquabus"]["seen"] is False
-    assert health["aquabus"]["lost"] is True and health["aquabus"]["temps_missing"] == []
+    assert health["aquabus"]["state"] == "never_seen"
+    assert health["aquabus"]["lost"] is False and health["aquabus"]["temps_missing"] == []
     assert health["problems"] == []
     assert [m for m in _messages(caplog, "ERROR") if "item 92" in m] == []
 
@@ -1712,7 +1745,8 @@ def test_a_bus_that_was_never_there_is_reported_as_that_and_not_as_a_departure(c
             device.emit()
             adapter.read()
     health = adapter.device_health()
-    assert health["aquabus"]["seen"] is False and health["aquabus"]["lost"] is True
+    assert health["aquabus"]["seen"] is False and health["aquabus"]["lost"] is False
+    assert health["aquabus"]["state"] == "never_seen"  # nothing was lost here
     assert [p for p in health["problems"] if "item 92" in p] == [
         "aquaero: no device answers on its aquabus, and none has since this daemon "
         "started reading it (PROJECT.md section 8 item 92)"
@@ -1728,6 +1762,7 @@ def test_the_quadro_itself_never_judges_an_aquabus() -> None:
     adapter, _device, _bus, _clock, _ = _setup(_quadro_binding())
     adapter.read()
     assert adapter.bus_device == {
+        "state": "unknown",
         "present": None,
         "seen": False,
         "absent_s": None,
@@ -1772,7 +1807,19 @@ def test_binding_rejects_numbers_outside_the_kind() -> None:
         DeviceBinding(kind=QUADRO, pwm_map={}, temp_map={"t": "bus1"})
     with pytest.raises(ValueError, match="share one"):
         DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"t": "bus1", "u": "bus1"})
-    DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"t": "bus1", "u": "virt4"})
+    # A busN is a reading only while a device answers on aquabus, which is judged from
+    # the aquabus fan blocks: without one of them bound the binding is refused (item 92).
+    with pytest.raises(ValueError, match="no aquabus output"):
+        DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"t": "bus1", "u": "virt4"})
+    DeviceBinding(
+        kind=AQUAERO,
+        pwm_map={"qd1": 5},
+        temp_map={"t": "bus1", "u": "virt4"},
+    )
+    DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"u": "virt4"})
+    # A softN software sensor is never a bindable input (item 113), busN aside.
+    with pytest.raises(ValueError, match="software sensor"):
+        DeviceBinding(kind=AQUAERO, pwm_map={"qd1": 5}, temp_map={"v": "soft8"})
     with pytest.raises(ValueError, match="share one"):
         DeviceBinding(kind=AQUAERO, pwm_map={"a": 1, "b": 1})
     with pytest.raises(ValueError, match="not pwm_map channels"):

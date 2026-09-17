@@ -166,12 +166,18 @@ one second apart (``tests/test_hw_aquacomputer.py``).
 The ``u16`` at ``+0x0A`` of a fan block stays unidentified (item 114). What is
 known: it is 0 on every block of the aquaero's own outputs 1-4 and on an aquabus
 block in a report that refreshed nothing, it is not the current (it read 26 with
-the same block's current field at 6 mA) and not the power (7 cW there), and over
-the captures its ratio to the current field is the block's output duty -- 26 at
-duty 20 % against 6 mA, 27 at duty 100 % against 27 mA, the same in the 90-report
-run (22/5, 15/4, 11/3, 3/1 at 20 %). Two duties are not enough to name a field,
-and a third needs a duty change, which is a write. It is therefore decoded raw,
-named ``unidentified``, and no caller may treat it as a measurement.
+the same block's current field at 6 mA) and not the power (7 cW there). What is
+*suspected and not established*: that it is a current over the output's on-time,
+of which the current field is the duty average. The captures hold exactly one
+informative point for that -- 26 at duty 20 % against 6 mA, where ``raw x duty``
+comes to 5.2, 13 % below the measured current. The other capture is at duty
+100 %, where ``raw x duty`` is the raw value itself (27 against 27 mA) and so
+says nothing about duty, and the 90-report run's further pairs (22/5, 15/4, 11/3,
+3/1) are all at that same 20 %: they constrain a slope, not a duty relation, and
+under ``raw x duty`` every one of them sits high, by 0.4 to 1.0 mA. It is
+therefore decoded raw, named ``unidentified``, and no caller may treat it as a
+measurement; naming it needs duties nobody has captured, and a duty change is a
+write.
 """
 
 from __future__ import annotations
@@ -260,10 +266,15 @@ TEMP_MAX_C = 327.66
 #: How often the aquaero refreshes one of its aquabus fan blocks with the bus
 #: device's own measurements: once in this many status reports, which at the
 #: report's own ~1 s cadence is :data:`AQUABUS_REFRESH_S` seconds. Measured, not
-#: chosen: 23 of 90 consecutive reports carried measurements over 88.6 s
-#: (2026-09-17), i.e. one in 3.9 reports, 3.85 s (PROJECT.md section 2, "The
-#: aquabus blocks' electrical fields are not a per-report reading", section 8
-#: item 115). A hardware fact of the aquaero, like
+#: chosen, and a **mean**: 23 of 90 consecutive reports carried measurements over
+#: 88.6 s (2026-09-17), i.e. one in 3.9 reports, 3.85 s, rounded up here
+#: (PROJECT.md section 2, "The aquabus blocks' electrical fields are not a
+#: per-report reading", section 8 item 115). The *longest* such gap, whether the
+#: interval drifts and whether it differs per block are **not** measured -- the
+#: refresh is per block and not atomic -- and need the long run of
+#: ``tools/aquabus_watch.py --reports 600 --raw``. Nothing is bounded by this
+#: number: it is a fact reported by that tool and published in ``device_health``,
+#: not a limit on any key. A hardware fact of the aquaero, like
 #: :attr:`DeviceKind.aquabus_outputs_report_power`, and not a tunable: no key
 #: changes it and nothing the daemon writes moves it. Only the electrical fields
 #: (voltage, current, power and the unidentified ``u16``) follow this cadence --
@@ -405,14 +416,15 @@ class DeviceKind:
     #: device's rail in a single report (PROJECT.md section 2, 2026-09-17), so the
     #: field may not be published as that output's rail. A hardware fact.
     aquabus_outputs_report_rail: bool = True
-    #: How many status reports pass between two refreshes of one aquabus fan
-    #: block, and how long that is in seconds. Measured on the aquaero, not a
+    #: The mean number of status reports between two refreshes of one aquabus
+    #: fan block, and what that is in seconds. Measured on the aquaero, not a
     #: tunable and nothing the daemon can change: PROJECT.md section 8 item 115.
-    #: ``None`` on a kind with no aquabus outputs. Callers use it as the length
-    #: of the longest gap in which an aquabus block carries no fresh measurement
-    #: -- :meth:`AquacomputerTiming.check_kind
-    #: <aqua_bridge.hw.aquacomputer_adapter.AquacomputerTiming.check_kind>`
-    #: refuses a ``bus_absent_s`` shorter than it.
+    #: ``None`` on a kind with no aquabus outputs. It is a mean over 23 refreshes
+    #: in 88.6 s and **not** the longest gap: the refresh is per block and not
+    #: atomic, and the maximum gap and the per-block spread are still unmeasured.
+    #: So no rule is bounded by it -- a caller reports it (``tools/aquabus_watch``,
+    #: ``device_health``'s ``aquabus``) and reads it as the cadence to expect of
+    #: the electrical fields, nothing more.
     aquabus_refresh_reports: int | None = None
     aquabus_refresh_s: float | None = None
 
