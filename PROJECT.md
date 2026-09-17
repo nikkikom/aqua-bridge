@@ -6639,6 +6639,47 @@ Owner decision (2026-09-16):
     so the gate runs again — `tests/test_mpc_nominal.py` has a tolerance
     comment with the same `armv6l` assumption to check while at it.
 
+109. A bay with a redundant proximal sensor can be reported `swapped` on
+    almost every tick, and then its zone can never converge. On `sim/das.py`
+    `rich` seeds 3 and 4 (item 102's scenario), bay b03 (two proximal
+    sensors, a DS18B20 and a thermistor with different placement offsets)
+    trips the estimator's fast-swap rule on 2788 and 2391 of 2880 ticks.
+    `model_reset_on_swap` then resets its block and its zone's air
+    accumulator every tick, so b03 closes zero regression windows in 24 h
+    and z0 closes 0 or 16. Neither the estimator nor the model reports
+    anything wrong: the zone simply stays `learning` forever. Worth
+    deciding whether the fast-swap rule should be quieter on a two-sensor
+    bay, whether a repeated swap should be rate-limited before it resets
+    the model, or whether a bay resetting this often should be reported.
+
+110. `pe_min` is a relative measure and a fan near `pwm_max` cannot satisfy
+    it (item 102). `above` needs `A ≥ 0.576 (u − deadband)`; at `u = 0.7`
+    that is 0.346, past the `ident_amplitude` cap of 0.3, and `symmetric`
+    is refused by the band check once the base is within `ident_amplitude`
+    of a rail. A zone whose hardest-working channel sits high is therefore
+    not identifiable at all, quietly. Worth deciding whether `check_start`
+    should say so with its own reason (the way `band:` and `saturated:` do)
+    rather than letting an experiment run that cannot inform the fit, and
+    whether the PE monitor should normalise by something other than the
+    running mean.
+
+111. The bays' `rel_se(k)` is the second gate item 102's `ident_parallel`
+    does not aim at. Even with the air block's PE cleared, 3 to 5 of 15
+    bays sit above `model_converged_rel_se` after 16 h (0.10–0.52
+    observed). It falls roughly as 1/√windows and with the square of the
+    airflow swing. Worth deciding whether a zone should be allowed to
+    converge on its air block plus the bays that have informed themselves,
+    with the rest carrying the prior, rather than all-or-nothing.
+
+112. An experiment released on its high level hands the solver that level
+    (item 102). The bumpless release re-initialises the solver's
+    integrator at the PWM on the fan, so a channel released high stays
+    high until the solver unwinds, and a start that takes it as its base
+    steps up by another `ident_amplitude`. Measured on the zone-wide
+    schedule: qd1 ran 0.44–0.99 PWM where the sequential schedule kept it
+    at 0.2–0.69. Ending every phase on its low level would cost nothing
+    and would take the step away.
+
 ### 8.3 Open — needs the DAS hardware
 
 31. USB host: `dtoverlay=dwc2,dr_mode=host` (`deploy/host-usb.sh`), powered
