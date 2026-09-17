@@ -145,7 +145,9 @@ mpc:
   ident_levels: above    # above: base and base + amplitude | symmetric: base +- amplitude
   ident_replan: true     # levels follow the live solver demand every tick (false: frozen at the start)
   ident_parallel: false  # true: one experiment excites every channel of the target's own zones at
-                         # once, each on its own code -- what the thermal model needs to converge
+                         # once, each on its own code -- what the thermal model needs to converge.
+                         # Louder while it runs; with ident_levels: symmetric the whole zone, not
+                         # one group of it, may sit ident_amplitude under the solver's command
   ident_hold_s: [60, 120, 180]  # hold times the seeded sequence draws from (each >= 5 * dt when enabled)
   ident_max_duration_s: 1800    # whole experiment, seconds, (0, 7200]
   ident_settle_s: 600    # every zone served trusted this long before a start (>= confirm_s when enabled)

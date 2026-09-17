@@ -12,16 +12,36 @@ and never runs ``control/ident.py``, while ``tests/test_ident_replan_sim.py`` ru
 ``ident.py`` in a scenario whose ``pe_min`` never leaves the floor. The two machines were
 tested for different things.
 
-Why one group at a time cannot do it. The thermal model's air block per zone regresses
-one airflow regressor per fan group of that zone, and ``converged`` asks the smallest
-eigenvalue of their information matrix to pass ``thermal.PE_MIN``
+**The two arms.** Both run 16 starts of the same length at the same amplitude on the same
+plant. The zone-wide arm starts on one channel per zone (``ORDER``) and ``ident_parallel``
+widens each start to that zone's channels, each on its own code. The control arm is a
+round robin over **all eight** channels (``SEQUENTIAL_ORDER``) -- the schedule a daemon
+cycling every fan group would actually run -- one channel per start. Restricting the
+control arm to the four aquaero channels instead would compare channel *coverage* rather
+than simultaneity, and would flatter the zone-wide arm: it converges nothing on any seed.
+
+**What one channel at a time does and does not do.** The thermal model's air block per
+zone regresses one airflow regressor per fan group of that zone, and ``converged`` asks
+the smallest eigenvalue of their information matrix to pass ``thermal.PE_MIN``
 (:mod:`aqua_bridge.control.thermal`, *PE monitor*): every group of the zone has to move
 independently of the others inside the monitor's ~30-window memory. Telegraphing one
-group while the solver carries the rest fills one direction of that matrix, not ``G`` of
-them -- measured on the example config, the channels of a three-group zone correlate 0.91
-to 0.98 and the smallest eigenvalue sits at 0.002 to 0.05 against diagonals of 0.06 to
-0.17. ``ident_parallel`` excites every channel of the target's own zones at once, each on
-its own code, which is the same excitation the open-loop test uses.
+group while the solver carries the rest excites one direction at a time -- measured on
+the example config, the channels of a three-group zone correlate 0.91 to 0.98 and the
+smallest eigenvalue sits at 0.002 to 0.05 against diagonals of 0.06 to 0.17. It is *not*
+true that it never clears the bound: the round robin peaks at 0.13 to 0.21 on some zone
+of every seed (asserted below), and on seed 3 that was enough for z1 to latch
+``converged`` from a transient, its live ``pe_min`` back at 0.0076 by the end of the run.
+What the zone-wide excitation buys is that the bound is *held* -- 0.08 to 0.17 still
+standing at the end -- and a zone more per seed on two seeds of three.
+
+Observed over 16 h, zone-wide against the round robin (converged zones; the zone-wide
+arm's ``pe_min`` peak and its value at the end of the run; mean PWM of each arm):
+
+* seed 2 -- z0 and z3 against nothing; 0.117 and 0.336 peak, 0.083 and 0.125 at the
+  end; 443 and 472 excited windows; mean PWM 0.406 against 0.357;
+* seed 3 -- z1 against z1; 0.253 peak, 0.100 at the end; 478 windows; 0.276 / 0.239;
+* seed 4 -- z3 against nothing; 0.359 peak, 0.172 at the end; 472 windows;
+  0.314 / 0.279.
 
 The scenario, and why each knob is where it is:
 
@@ -54,9 +74,29 @@ from aqua_bridge.sim.das import build_das_plant
 from test_thermal_ident import truth_topology
 
 HOURS = 16.0
-#: One start per zone; consecutive starts share as few channels as the chain allows.
+#: Zone-wide arm: one start per zone; consecutive starts share as few channels as the
+#: chain allows. ``ident_parallel`` widens each to that zone's own channels.
 ORDER = ("xt1", "xt3", "xt2", "xt4")
+#: Control arm: one channel per start, round robin over every channel of the plant.
+SEQUENTIAL_ORDER = ("xt1", "qd1", "xt3", "qd3", "xt2", "qd2", "xt4", "qd4")
 TOL = 1e-9
+#: What each arm reached per seed (module docstring). ``dead`` are the zones that close
+#: **no** regression window in 16 h: on seed 3 bay b03's redundant proximal pair is read
+#: as ``swapped`` on nearly every tick and ``model_reset_on_swap`` resets z0's air
+#: accumulator with it, so that zone can never converge for reasons no excitation
+#: reaches. It is pinned here so a zone going dead is visible instead of silent.
+MEASURED: dict[int, dict[str, tuple[str, ...]]] = {
+    2: {"parallel": ("z0", "z3"), "sequential": (), "dead": ()},
+    3: {"parallel": ("z1",), "sequential": ("z1",), "dead": ("z0",)},
+    4: {"parallel": ("z3",), "sequential": (), "dead": ()},
+}
+#: Floors on the converged zones, from the runs above (peak 0.12-0.36, end 0.08-0.17,
+#: 443-478 windows) rather than from the ``converged`` rule's own 0.05 / 30, which
+#: ``status == "converged"`` already implies.
+PE_PEAK_FLOOR = 0.10
+WINDOWS_FLOOR = 300
+#: Mean PWM the zone-wide arm may add over the round robin (observed +0.036 to +0.050).
+MEAN_PWM_BUDGET = 0.10
 
 
 class _Rig:
@@ -100,8 +140,8 @@ def _config(example: MpcConfig, *, parallel: bool) -> MpcConfig:
     )
 
 
-def _run(cfg: MpcConfig, seed: int) -> dict[str, Any]:
-    """One closed-loop run; a start on each zone's own aquaero channel, round robin."""
+def _run(cfg: MpcConfig, seed: int, order: tuple[str, ...]) -> dict[str, Any]:
+    """One closed-loop run, starting an experiment on ``order`` round robin."""
     plant = build_das_plant(
         truth_topology(cfg, seed), preset="rich", seed=seed, dt=cfg.dt, initial_pwm=0.6
     )
@@ -130,7 +170,7 @@ def _run(cfg: MpcConfig, seed: int) -> dict[str, Any]:
         if rig.sup.snapshot().extra["experiment"]["running"]:
             continue
         try:
-            rig.sup.submit(Ident("start", channel=ORDER[nxt % len(ORDER)]))
+            rig.sup.submit(Ident("start", channel=order[nxt % len(order)]))
             starts += 1
         except (IntentConflict, IntentInvalid):
             pass
@@ -139,6 +179,7 @@ def _run(cfg: MpcConfig, seed: int) -> dict[str, Any]:
     return {
         "starts": starts,
         "converged": sorted(z for z, v in zones.items() if v["status"] in ("converged", "frozen")),
+        "dead": sorted(z for z, v in zones.items() if not v["excited_windows"]),
         "pe_max": pe_max,
         "zones": zones,
         "worst_margin_c": worst_margin,
@@ -148,39 +189,55 @@ def _run(cfg: MpcConfig, seed: int) -> dict[str, Any]:
 
 
 @pytest.mark.nightly
-@pytest.mark.parametrize("seed", [2, 3, 4])
-def test_a_zone_wide_experiment_converges_a_zone_and_one_group_at_a_time_does_not(
+@pytest.mark.parametrize("seed", sorted(MEASURED))
+def test_a_zone_wide_experiment_converges_a_zone_that_one_channel_at_a_time_does_not(
     das_example_cfg, seed
 ):
-    """The item's question, answered on the daemon's own path.
+    """The item's question, answered on the daemon's own path, against the honest control
+    arm: the same 16 starts, one channel each, over every channel of the plant.
 
-    Observed over 16 h (seeds 2 / 3 / 4): ``ident_parallel: true`` converges z0 and z3 /
-    z1 / z3 with ``pe_min`` peaking at 0.12-0.34, and ``false`` converges nothing on any
-    of the three, its air ``pe_min`` peaking at 0.05-0.25 and holding above
-    ``PE_MIN`` in at most a tenth of the windows of the zones that matter. Neither arm
-    ever violates a drive limit, and the zone-wide arm keeps the *larger* true margin --
-    ``ident_levels: above`` only ever adds cooling.
+    The numbers the runs reached are in :data:`MEASURED` and the module docstring, and
+    are asserted here rather than the thresholds of the ``converged`` rule, which
+    ``status == "converged"`` implies on its own. Neither arm ever violates a drive
+    limit, and the zone-wide arm keeps the *larger* true margin -- ``ident_levels:
+    above`` only ever adds cooling.
     """
-    parallel = _run(_config(das_example_cfg, parallel=True), seed)
-    sequential = _run(_config(das_example_cfg, parallel=False), seed)
-    assert parallel["starts"] > 0 and sequential["starts"] > 0
+    want = MEASURED[seed]
+    parallel = _run(_config(das_example_cfg, parallel=True), seed, ORDER)
+    sequential = _run(_config(das_example_cfg, parallel=False), seed, SEQUENTIAL_ORDER)
+    assert parallel["starts"] == sequential["starts"] > 0  # the same experiment time
 
-    # 1. the answer: a zone reaches converged, and one group at a time does not
-    assert parallel["converged"], {z: v["status"] for z, v in parallel["zones"].items()}
-    assert not sequential["converged"], sequential["converged"]
+    # 1. the answer, per seed and per zone: the zone-wide arm converges the zones it
+    #    converged, one channel at a time converges no more than it did, and never more
+    #    than the zone-wide arm.
+    assert set(parallel["converged"]) >= set(want["parallel"]), {
+        z: v["status"] for z, v in parallel["zones"].items()
+    }
+    assert set(sequential["converged"]) <= set(want["sequential"]), sequential["converged"]
+    assert set(parallel["converged"]) >= set(sequential["converged"])
 
-    # 2. it is the PE monitor that moved, and it is above the threshold where it counts
+    # 2. it is the PE monitor that moved, and it is held, not touched once
     for z in parallel["converged"]:
-        assert parallel["pe_max"][z] > thermal.PE_MIN
-        assert parallel["zones"][z]["excited_windows"] >= thermal.MIN_WINDOWS
+        assert parallel["pe_max"][z] >= PE_PEAK_FLOOR
+        assert parallel["zones"][z]["pe_min"] >= thermal.PE_MIN  # still standing at the end
+        assert parallel["zones"][z]["excited_windows"] >= WINDOWS_FLOOR
         assert parallel["zones"][z]["pred_err_c"] < das_example_cfg.model_max_pred_err_c
+    # one channel at a time does clear the bound in bursts -- what it cannot do is hold
+    # it, so a zone it converges ends below what the zone-wide arm holds there.
+    assert max(sequential["pe_max"].values()) > thermal.PE_MIN
+    for z in sequential["converged"]:
+        assert sequential["zones"][z]["pe_min"] < parallel["zones"][z]["pe_min"]
 
-    # 3. the safety price: none. `above` never commands less cooling than the solver,
+    # 3. a zone that closes no regression window at all is a defect, not a result: it is
+    #    named per seed, so a new one fails here instead of quietly shrinking the test.
+    assert parallel["dead"] == sequential["dead"] == list(want["dead"])
+
+    # 4. the safety price: none. `above` never commands less cooling than the solver,
     #    so the true margin cannot be the worse of the two, and no limit is crossed.
     assert parallel["violations"] == 0 and sequential["violations"] == 0
     assert parallel["worst_margin_c"] >= sequential["worst_margin_c"] - TOL
 
-    # 4. the noise price is real and bounded: more fan than one group at a time, and
-    #    well inside the band (observed +0.03 to +0.06 mean PWM over the whole run)
+    # 5. the noise price is real and bounded: more fan than one channel at a time
+    #    (observed +0.036 to +0.050 mean PWM over the whole run)
     assert parallel["mean_pwm"] >= sequential["mean_pwm"] - TOL
-    assert parallel["mean_pwm"] <= sequential["mean_pwm"] + 0.15
+    assert parallel["mean_pwm"] <= sequential["mean_pwm"] + MEAN_PWM_BUDGET
