@@ -24,6 +24,8 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from aqua_bridge.hw.aquacomputer import (
+    AQUABUS_REFRESH_REPORTS,
+    AQUABUS_REFRESH_S,
     AQUAERO,
     DUTY_MAX,
     FAN_ABSENT_RPM,
@@ -37,6 +39,7 @@ from aqua_bridge.hw.aquacomputer import (
     DeviceKind,
     ReportError,
     active_profile,
+    aquabus_present,
     capture_channel,
     channel_holds,
     channel_state,
@@ -240,6 +243,78 @@ def test_the_aquabus_blocks_electrical_fields_are_not_a_per_report_reading() -> 
     assert not AQUAERO.aquabus_outputs_report_rail
     assert all(QUADRO.reports_rail(n) for n in range(1, 5))
     assert [with_power.fans[k].voltage_cv for k in range(4)] == [1205, 1206, 1207, 1205]
+
+
+def test_the_unidentified_u16_of_a_fan_block_is_read_but_named_nothing() -> None:
+    """Item 114. The ``u16`` at ``+0x0A`` is decoded raw and carries no unit: it is not
+    the current (26 against that block's 6 mA) and not the power (7 cW), it is 0 on
+    every one of the aquaero's own blocks and 0 on an aquabus block in a report that
+    refreshed nothing, and the only regularity in the captures is that it times the
+    block's output duty into the current field -- 26 at 20 % against 6 mA, 27 at 100 %
+    against 27 mA. Two duties do not name a field, and a third needs a write."""
+    with_power = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-power.bin"))
+    without = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-no-power.bin"))
+    full = decode_status(AQUAERO, _bin("aquaero-status-aquabus-fan7-100.bin"))
+    seven = with_power.fans[6]
+    assert seven.unidentified_raw == 26
+    assert (seven.duty, seven.current_ma, seven.power_cw) == (2000, 6, 7)
+    assert full.fans[6].unidentified_raw == 27
+    assert (full.fans[6].duty, full.fans[6].current_ma) == (10000, 27)
+    # Duty-weighted, the field lands on the current field in both captures (+-0.8 mA).
+    for report in (with_power, full):
+        fan = report.fans[6]
+        assert fan.unidentified_raw is not None
+        scaled = fan.unidentified_raw * fan.duty / DUTY_MAX
+        assert abs(scaled - fan.current_ma) <= 0.8
+    # 0 on the aquaero's own blocks, and on an aquabus block that refreshed nothing.
+    assert [with_power.fans[k].unidentified_raw for k in range(4)] == [0] * 4
+    assert [without.fans[k].unidentified_raw for k in range(4, 8)] == [0] * 4
+    # The Quadro's own blocks have no such field at all.
+    assert all(
+        fan.unidentified_raw is None
+        for fan in decode_status(QUADRO, _bin("quadro-status.bin")).fans
+    )
+    assert QUADRO.fan_layout.unidentified is None and AQUAERO.fan_layout.unidentified == 0x0A
+
+
+def test_the_measured_aquabus_refresh_window_is_carried_on_the_kind() -> None:
+    """Item 115: the interval the captures measured (one report in about four, 3.85 s
+    over 90 reports) is on the kind, where a caller can act on it, and the Quadro --
+    which has no aquabus outputs -- carries none."""
+    assert (AQUAERO.aquabus_refresh_reports, AQUAERO.aquabus_refresh_s) == (
+        AQUABUS_REFRESH_REPORTS,
+        AQUABUS_REFRESH_S,
+    )
+    assert (AQUABUS_REFRESH_REPORTS, AQUABUS_REFRESH_S) == (4, 4.0)
+    assert QUADRO.aquabus_refresh_reports is None and QUADRO.aquabus_refresh_s is None
+    assert AQUAERO.aquabus_temp_names == tuple(f"bus{i}" for i in range(1, 9))
+    assert QUADRO.aquabus_temp_names == ()
+
+
+def test_aquabus_presence_is_judged_from_the_speed_field_alone() -> None:
+    """Item 92, and the line between it and items 115 and 116. A device answers on
+    aquabus while any of blocks 5-8 has one behind it; every block reading speed
+    ``0xFFFF`` is the empty bus. The refresh gap must not look like an absence: in the
+    report that refreshed nothing every aquabus block reads 0 mA and three of them the
+    aquaero's own rail where the measuring report had 0.00 V, and presence is unchanged
+    in both."""
+    with_power = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-power.bin"))
+    without = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-no-power.bin"))
+    empty = decode_status(AQUAERO, _bin("aquaero-status-no-aquabus.bin"))
+    assert aquabus_present(AQUAERO, with_power) is True
+    assert aquabus_present(AQUAERO, without) is True  # a refresh gap is not an absence
+    assert [with_power.fans[k].voltage_cv for k in (4, 5, 7)] == [0, 0, 0]  # item 116
+    assert aquabus_present(AQUAERO, empty) is False
+    assert all(report.fans[k].rpm == FAN_ABSENT_RPM for k in range(4, 8) for report in (empty,))
+    # One slot answering is a device on the bus: its other outputs simply have no fan.
+    one_left = bytearray(_bin("aquaero-status-no-aquabus.bin"))
+    speed = AQUAERO.fan_blocks[5] + AQUAERO.fan_layout.speed
+    one_left[speed : speed + 2] = (0).to_bytes(2, "big")
+    assert aquabus_present(AQUAERO, decode_status(AQUAERO, bytes(one_left))) is True
+    # A kind with no aquabus outputs cannot say, and a report of another kind is refused.
+    assert aquabus_present(QUADRO, decode_status(QUADRO, _bin("quadro-status.bin"))) is None
+    with pytest.raises(ValueError, match="status report of a quadro, not a aquaero"):
+        aquabus_present(AQUAERO, decode_status(QUADRO, _bin("quadro-status.bin")))
 
 
 def test_the_aquaeros_own_blocks_report_no_current() -> None:
