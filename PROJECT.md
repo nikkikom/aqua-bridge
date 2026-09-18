@@ -278,6 +278,152 @@ back to their firmware controllers, and the Quadro's duty) exists but is
 (3) shows the firmware controller is the better state after exit, calling
 it is a one-line change in `__main__.py` (§8 items 33, 76).
 
+### Watchdog layering, and the network outside the cooling path
+
+Four watchdogs, innermost first. Each one catches what the one inside it
+cannot, and each fires later than the one inside it — that ordering is the
+whole design, because the cheap recovery has to get its chance before the
+expensive one.
+
+| # | Watchdog | Catches | Cannot catch | Fires after | Set in |
+|---|----------|---------|--------------|-------------|--------|
+| 1 | the daemon's own sensor gate (§3) | a sensor path that went quiet or implausible | anything that stops the process | `fallback_hold_s`, then the ramp | `config.yaml` |
+| 2 | systemd service watchdog | a tick that stops sending `WATCHDOG=1` — a blocked read, a wedged control endpoint, a publisher hook that hangs | a kernel or systemd hang; the daemon being killed outright | `WatchdogSec=45` | `deploy/aqua-bridge.service` |
+| 3 | SoC hardware watchdog (BCM2835) | a kernel or systemd hang: PID 1 stops pinging `/dev/watchdog` and the board resets | anything userspace can still act on — it only ever resets the board | `RuntimeWatchdogSec=60 s` | `deploy/install-board-watchdogs.sh` |
+| 4 | the aquaero's software-sensor alarm | **nothing writing the heartbeat at all** — daemon dead, board dead, USB gone, power gone | nothing above it; it is the last line | 30 s of silence on `softN` (set on the device, §8 items 33, 84) | the controller itself |
+
+Layer 4 is the last line and is **independent of this board**: it lives in
+the aquaero's own firmware, runs off its own clock, and takes every output
+to 100 % when the heartbeat stops. Everything above it is an attempt to
+never get there. That is why 3 sits above 2, and it is the difference between
+them: layer 2's restart is `RestartSec=5` plus about 3 s of interpreter start
+and first tick (measured below), inside the aquaero's 30 s — layer 4 usually
+does not fire. Layer 3 *spends* layer 4 every time: this board takes 28 s from
+power to its first controller write (measured below), which is already the
+whole window, and a shutdown comes before that. A reset means the alarm.
+
+**A slow tick degrades to a restart, not to silence.** `WATCHDOG=1` goes out
+at the end of every tick whose controller work did not raise; two pings
+further apart than `WatchdogSec` and systemd kills the daemon.
+`WatchdogSignal` is left at its `SIGABRT` default on purpose: `SIGTERM` would
+run the stop path, which writes `fallback_pwm` through the very sink whose
+slowness tripped the watchdog, block until `TimeoutStopSec` and be `SIGKILL`ed
+anyway — later, and no cleaner. So **what happens to the fans during that
+restart**: the process dies at once and nothing is written, so the fans hold
+the last PWM they were commanded (a watchdog kill never turns them down);
+`Restart=always` brings the daemon back after `RestartSec=5`; its first tick
+has no `last_cmd`, so `resolve_prev` takes `prev` from the duty it reads off
+the device and the ramp continues from where the fans actually are — no jump
+to `fallback_pwm`, which only the *clean* stop path writes (§9). If that gap
+outlasts the aquaero's 30 s, layer 4 fires and every fan goes to 100 % until
+the daemon's heartbeat resumes, which takes about 2 s.
+
+`StartLimitIntervalSec=0` closes the one hole that would be real silence:
+systemd's default rate limit (5 starts in 10 s) parks a unit in `failed`, and
+a parked unit never writes the controllers or the heartbeat again.
+
+**Sizes, argued from this board** (Zero 2 W, kernel 6.18, 2026-09-18):
+
+- `step()` for the DAS MPC against the DAS plant: p50 50 ms, p99 82 ms, max
+  87 ms over 60 ticks (`tools/bench_step.py`) — the `mpc.budget_ms` 250 /
+  `budget_alarm_ms` 350 in `config.example-das.yaml` are 2.9× the p99, as that
+  file says.
+- A cold start of the daemon: 1.4 s to import numpy, PyYAML and `aqua_bridge`,
+  2.9 s from the command line to the first applied command with
+  `--source sim --sim-plant das`. That plus `RestartSec=5` is what layer 2's
+  restart costs.
+- The bound `check_watchdog` computes from `config.example-das.yaml` —
+  `mpc.dt` + `budget_alarm_ms` + the controllers' worst-case I/O — is **18.5 s**
+  as the example ships (the Quadro on aquabus) and **31.5 s** with the Quadro
+  on its own USB port. `WatchdogSec=45` leaves 26.5 s and 13.6 s of margin for
+  what that bound explicitly does not count, the publishers and the recorder;
+  their largest single item on the loop thread is one `vcgencmd get_throttled`
+  at `host_health.vcgencmd_timeout_s` = 2 s, at most once a minute
+  (`tests/test_deploy.py` checks the margin against both).
+- A healthy boot: kernel at monotonic 10.4 s (firmware before that), the
+  heartbeat service started at 27.0 s and its first write to the aquaero at
+  **27.7 s**. `RuntimeWatchdogSec=60 s` is one service-watchdog period plus
+  margin above `WatchdogSec=45`, and systemd then pings every 30 s — far above
+  anything a tick does, and short enough that a hung board does not stay hung.
+  `RebootWatchdogSec=120 s` bounds a hung shutdown.
+- The journal is persistent on this board (`Storage=persistent`). Left at
+  systemd's defaults `SystemMaxUse` is 10 % of the filesystem — about 1.5 GB of
+  the owner's 15 GB card — so `install-board-watchdogs.sh` caps it at 200 MB,
+  16 MB per file, 30 days, `SyncIntervalSec=5m`.
+
+**The network is outside the cooling path.** The owner's rule: switching off
+the home router must never degrade cooling. Traced, path by path, on
+2026-09-18:
+
+- **The unit no longer waits for the network.** `Wants=`/`After=network-online.target`
+  used to be in `deploy/aqua-bridge.service`. With nothing to associate with,
+  `NetworkManager-wait-online` spends its full 30 s default (`nm-online`'s
+  documented timeout; 1.0 s on a healthy boot here) and the daemon's first
+  write to the controllers is that much later — one whole aquaero window, spent
+  on a router. Removed; `tests/test_deploy.py` now fails if any directive in
+  that unit names the network.
+- **MQTT.** `MqttService.start` calls `connect_async` + `loop_start`, never
+  `connect`: paho's network thread owns DNS, the TCP connect and the
+  reconnects (`reconnect_delay_set(1, 60)`), so a broker that is down at boot
+  or dies mid-run costs nothing on the loop thread. `on_tick` returns
+  immediately while `client.connected` is false, and paho's `publish()` under
+  `loop_start()` only appends to a deque and pokes a non-blocking socketpair —
+  it never writes the broker socket from the caller's thread. Every exception
+  is caught and counted in `publish_errors`.
+- **Home Assistant discovery** is `client.publish(qos=1)` per entity on the
+  same path, sent from `on_tick` after a (re)connect or a `manual` crossing.
+  Same deque, same non-blocking enqueue.
+- **The HTTPS API** runs on its own asyncio loop in a daemon thread.
+  `HttpService.start` blocks the main thread for at most 10 s *once*, before
+  the loop starts, and it is network-independent: the default `http.bind` is
+  `0.0.0.0`, so nothing is resolved and nothing is dialled. A bind failure is
+  logged and the daemon runs on without the API. (Keep `http.bind` an address
+  and not a hostname: aiohttp would resolve a name there, and with no DNS that
+  would spend the 10 s.)
+- **Nothing in the daemon does a DNS lookup or a blocking network call on the
+  loop thread.** The only `socket` use outside the publishers is
+  `sdnotify.py`'s `AF_UNIX` datagram to `$NOTIFY_SOCKET`; the only subprocess
+  is `vcgencmd`, bounded by a documented key.
+- **The order inside `Loop.tick` is what makes this hold.** `on_tick` — where
+  every publisher hangs its hook — runs *after* `sink.apply()` and *after*
+  `notifier.watchdog()`. A publisher that hangs therefore cannot hold back the
+  command this tick already put on the fans, and cannot swallow this tick's
+  ping. It does delay the next tick, and that is exactly what layer 2 is for:
+  the daemon goes quiet, systemd restarts it, and the fans hold meanwhile.
+  `tests/test_loop.py::test_the_publishers_only_ever_see_a_tick_that_has_already_reached_the_fans`
+  pins the order.
+- **SMART arrives over the network and its absence cannot lower a fan.** A
+  reading older than `bays.smart_max_age_s` (300 s) is simply not there — never
+  substituted, never carried forward. The bay is then estimated from its
+  proximal 1-Wire sensor, which is wired to this board, with a wider variance;
+  the DAS solvers work to `limit - k·sigma`, so a wider sigma can only raise
+  duty. A sigma past `sigma_fault_c` is a zone fault: hold, then ramp high.
+  Losing the network makes the fans work harder, never less.
+- **Recovery never escalates.** `deploy/aqua-net-recover.sh` (a `oneshot` unit
+  behind a 5 min timer) probes the gateway its own interface was handed — no
+  hardcoded address — and, after two failed checks, re-associates the Wi-Fi
+  interface with `nmcli device disconnect`/`connect`. That is all it may do:
+  no reboot in any form, no `systemctl`, nothing that touches
+  `aqua-bridge.service`, `aqua-heartbeat.service` or a controller. After three
+  fruitless re-associations it logs one line and stops, so a router that is
+  simply switched off costs one journal line, not a bounce loop. It exists
+  because of the outage below; it is not part of cooling and cannot become part
+  of it. A gateway watchdog that *reboots* is forbidden outright: with the
+  router off it is a reboot loop, and every reboot is a heartbeat gap and a jolt
+  on the fans.
+
+**The outage that shaped this (2026-09-17).** The board dropped off the
+network for hours. It kept running and kept feeding the aquaero's software
+sensor the whole time, so the fans never left the quiet profile — the layering
+worked, and the network's absence was invisible to the drives. The cause was
+Wi-Fi power save on the BCM43430 (`brcmf_cfg80211_set_power_mgmt: power save
+enabled` in the kernel log at boot, `power save disabled` when it was turned
+off by hand 19 minutes later). Power save is now off through a NetworkManager
+drop-in rather than a connection profile — the profile carries the SSID, which
+stays out of this repository, and a profile written later by the imager
+inherits the drop-in. The journal was made persistent at the same time, which
+is what the size cap above is for.
+
 ### USB spike results (2026-09-14)
 
 Since 2026-09-15 the daemon no longer uses the hwmon driver described
@@ -8677,8 +8823,9 @@ Owner decision (2026-09-16):
 - [x] `xt6.fans`: one entry per fan with `pwm` and optional `rpm`; legacy `map` / `fan_map` rejected
 - [x] `test_hw_map.py` / fake hwmon in CI (replaced by the fake controller, 2026-09-15)
 - [x] `hw/sources.py`: several hwmon devices + 1-Wire, every name bound exactly once (`--source hwmon`; since 2026-09-15 controllers over hidraw, `--source composite`)
-- [x] systemd unit: `Type=notify`, `Wants=`+`After=network-online.target`,
-      `Restart=always`, `WatchdogSec`, `TimeoutStartSec`,
+- [x] systemd unit: `Type=notify`, no ordering on `network-online.target`
+      (removed 2026-09-18, §2: the network is outside the cooling path),
+      `Restart=always`, `RestartSec`, `StartLimitIntervalSec=0`, `WatchdogSec`, `TimeoutStartSec`,
       `ExecStart=/opt/aqua-bridge/.venv/bin/python -m aqua_bridge --config /etc/aqua-bridge/config.yaml`,
       SIGTERM stop path writes `fallback_pwm` (no `ExecStop=`), `StateDirectory=aqua-bridge`
 - [x] udev rule for hwmon `pwm*` group write (`plugdev`; kept for the optional driver)
@@ -8922,8 +9069,9 @@ does it, substituting `User=`, then `daemon-reload` and
 ```text
 [Unit]
 Description=aqua-bridge MPC fan controller (aquaero 6 XT + Quadro)
-Wants=network-online.target
-After=network-online.target
+Documentation=file:///opt/aqua-bridge/PROJECT.md
+# No Wants=/After=network-online.target: §2, the network is outside the cooling path
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
@@ -8934,6 +9082,7 @@ SupplementaryGroups=dialout plugdev
 ExecStart=/opt/aqua-bridge/.venv/bin/python -m aqua_bridge --config /etc/aqua-bridge/config.yaml
 StateDirectory=aqua-bridge
 Restart=always
+RestartSec=5
 WatchdogSec=45
 TimeoutStartSec=120
 
@@ -8960,8 +9109,21 @@ before the real one is set — repeated-directive semantics,
 `tests/test_deploy.py` checks that the drop-in's `ExecStart=` is the
 base unit's plus exactly `--source composite`, nothing else.
 
-(The file itself carries the reasoning as comments.) `After=` does not
-pull in the target; `Wants=network-online.target` must sit next to it.
+(The file itself carries the reasoning as comments.) **Nothing here waits
+for the network**, on purpose: `Wants=`/`After=network-online.target` were
+removed on 2026-09-18 (§2, "the network is outside the cooling path") —
+with nothing to associate with, `NetworkManager-wait-online` spends its
+full 30 s default and the daemon's first write to the controllers is that
+much later, which is the aquaero's whole software-sensor window spent on a
+router. Do not put them back; `tests/test_deploy.py` fails if any directive
+in the unit names the network.
+`StartLimitIntervalSec=0` (in `[Unit]`, where it has lived since systemd
+229) turns off systemd's default start rate limit. That default — 5 starts
+in 10 s, then the unit is parked in `failed` — is the one way this unit can
+go silent: parked means nothing writes the controllers and nothing writes
+the heartbeat again. `RestartSec=5` is what makes "never park" affordable:
+a daemon that exits immediately restarts once every five seconds instead of
+ten times a second, and 5 s is far inside the aquaero's 30 s.
 `Type=notify` is required or `READY=1` is ignored. `NotifyAccess=main`
 means the **main** process is Python: `ExecStart=` is the venv
 interpreter and `-m aqua_bridge` directly — no `sh -c`, no wrapper
@@ -8989,8 +9151,19 @@ Quadro on the aquaero's aquabus, as the example now has it, one controller:
 below it; raise `WatchdogSec=` or lower those keys, and keep a margin for
 the publishers and the recorder, which the bound does not count.
 `tests/test_hw_aquacomputer_config.py` checks the unit against the DAS
-example and the two-controller alternative. `TimeoutStartSec=120` stays
-above `WatchdogSec`.
+example and the two-controller alternative, and `tests/test_deploy.py`
+checks the *margin*: the bound is 18.5 s as the example ships and 31.5 s
+with the Quadro on its own port, so 45 s leaves 26.5 s and 13.6 s for the
+publishers and the recorder, whose largest single item on the loop thread
+is one `vcgencmd get_throttled` at `host_health.vcgencmd_timeout_s` (2 s,
+at most once a minute). `TimeoutStartSec=120` stays above `WatchdogSec`.
+
+`WatchdogSignal` stays at its `SIGABRT` default, and what that means for
+the fans is in §2 ("A slow tick degrades to a restart, not to silence"):
+nothing is written, the fans hold their last commanded PWM, the daemon is
+back after `RestartSec=5` and resumes the ramp from the duty it reads off
+the device. This is the one path that does *not* jump the fans to
+`fallback_pwm` — that is the clean stop below.
 
 `READY=1` waits for the first applied command, so a device that is
 absent at boot (USB not enumerated, hidraw permissions wrong) shows up as
@@ -9030,6 +9203,64 @@ there the ramp target is `max(prev, fallback_pwm)`, §3.)
 Pi **power loss** is still uncovered: last PWM stays on the fans until
 XT6 firmware reverts (spike §2.3) or the board comes back. Accepted if
 (3) fails.
+
+### Board hardening: SoC watchdog, journald, Wi-Fi
+
+`deploy/install-board-watchdogs.sh` — idempotent, run by the owner with
+`sudo`, `--check` reports without writing anything, `--no-net-recover`
+leaves the Wi-Fi timer out. It installs layer 3 of §2 and the two board
+settings the 2026-09-17 outage produced, and it touches
+`aqua-bridge.service`, the controllers and `config.yaml` **not at all**
+(`install-pi.sh` owns the unit; the script only *reads* it, to print the
+layering). Every number is a variable at the top, overridable from the
+environment (`sudo SOC_WATCHDOG_SEC=90 deploy/install-board-watchdogs.sh`):
+
+| Variable | Default | What it writes |
+|----------|---------|----------------|
+| `SOC_WATCHDOG_SEC` | `60` | `RuntimeWatchdogSec=` in `/etc/systemd/system.conf.d/10-aqua-watchdog.conf` |
+| `REBOOT_WATCHDOG_SEC` | `120` | `RebootWatchdogSec=` in the same file |
+| `JOURNAL_MAX_USE` | `200M` | `SystemMaxUse=` in `/etc/systemd/journald.conf.d/20-aqua-journal-limits.conf` |
+| `JOURNAL_MAX_FILE_SIZE` | `16M` | `SystemMaxFileSize=` in the same file |
+| `JOURNAL_MAX_RETENTION` | `30day` | `MaxRetentionSec=` in the same file |
+| `JOURNAL_SYNC_INTERVAL` | `5m` | `SyncIntervalSec=` in the same file |
+| `WIFI_POWERSAVE` | `off` | `wifi.powersave = 2` in `/etc/NetworkManager/conf.d/10-aqua-wifi-powersave.conf` (`keep`: install nothing) |
+| `NET_RECOVER_INTERVAL` | `5min` | `OnBootSec=`/`OnUnitActiveSec=` in `aqua-net-recover.timer` |
+
+Notes that only show up on a real board:
+
+- **No overlay is needed for the watchdog.** `bcm2835_wdt` is in the base
+  Raspberry Pi device tree: `/dev/watchdog` (`Broadcom BCM2835 Watchdog
+  timer`) is there on a stock trixie image with nothing added to
+  `config.txt`. The script refuses to install if it is absent rather than
+  writing an overlay it cannot verify.
+- **Raspberry Pi OS already enables it**, in
+  `/usr/lib/systemd/system.conf.d/40-rpi-enable-watchdog.conf`
+  (`RuntimeWatchdogSec=1m`, `RebootWatchdogSec=2m`). The drop-in above is in
+  `/etc`, which wins, so the board runs the value §2 argues for and it does
+  not move when `raspberrypi-sys-mods` is upgraded. The numbers happen to
+  agree today; the point is that they are now ours.
+- **`RuntimeWatchdogSec` is only read when PID 1 re-executes**, so the script
+  runs `systemctl daemon-reexec`. That restarts no service and does not
+  interrupt the control loop.
+- **NetworkManager is reloaded, never restarted** (a restart drops the active
+  connection, and the script has to be safe over ssh). `wifi.powersave` applies
+  from the next activation of the interface — a reconnect or a reboot.
+- `install-pi.sh` does not call this script and this script does not call
+  `install-pi.sh`; run both, in either order.
+
+`deploy/aqua-net-recover.{sh,service,timer}` are the network-recovery unit
+described in §2. The script is installed to
+`/usr/local/lib/aqua-bridge/aqua-net-recover.sh`; its own knobs
+(`AQUA_NET_IFACE`, `AQUA_NET_FAIL_CHECKS`, `AQUA_NET_MAX_BOUNCES`,
+`AQUA_NET_PING_COUNT`, `AQUA_NET_PING_DEADLINE_S`, `AQUA_NET_STATE_DIR`) are
+at the top of the file with their reasoning; the unit passes none of them, so
+an override is `systemctl edit aqua-net-recover.service`. Counters live under
+`RuntimeDirectory=` (tmpfs: they are meaningless across a reboot and must not
+wear the card). `--dry-run` reports what one check would do and changes
+nothing. `tests/test_deploy.py` runs the script against `nmcli`/`ip`/`ping`
+stubs and fails if it ever re-associates more than `AQUA_NET_MAX_BOUNCES`
+times, pings without a gateway, or touches a disconnected interface that
+NetworkManager is already retrying.
 
 ### udev
 
@@ -9130,6 +9361,12 @@ on a Zero W; the hardware steps are waiting for the aquaero.
    `root:USER`; rerun it to change a password or add a user (no restart).
    Without a certificate, key or user the API stays off and the journal
    says why; the fans are controlled regardless.
+6b. Board hardening, once per card and independent of the hardware steps:
+   `sudo deploy/install-board-watchdogs.sh` (`--check` first to see what it
+   would change). SoC watchdog, journald caps, Wi-Fi power save off, and the
+   Wi-Fi re-association timer — §9 *Board hardening*, §2 *Watchdog layering*.
+   It enables `aqua-net-recover.timer` and nothing else; it never enables or
+   starts `aqua-bridge`.
 7. USB: dwc2 host, powered hub, XT6 on USB; the Quadro on aquabus (its PWM
    is writable through the aquaero, §2), or on its own USB port.
 8. `lsusb`, then `.venv/bin/python tools/aquacomputer_probe.py` as the

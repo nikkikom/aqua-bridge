@@ -1,0 +1,35 @@
+[Unit]
+Description=aqua-bridge board: re-associate Wi-Fi when the link is up but dead
+Documentation=file:///opt/aqua-bridge/PROJECT.md
+# NetworkManager only. Deliberately NOT ordered against network-online.target:
+# this unit's whole job is the case where the network is not online, and
+# waiting for that target would mean never running then.
+After=NetworkManager.service
+# Deliberately no relation of any kind to aqua-bridge.service or to
+# aqua-heartbeat.service -- no Requires=, no Wants=, no After=, no Conflicts=.
+# The network is outside the cooling path (PROJECT.md §2): nothing here may
+# order, delay, start or stop the daemon that drives the fans.
+
+[Service]
+Type=oneshot
+# Root because "nmcli device disconnect/connect" needs it. The script does
+# nothing else that would: it reads nmcli and ip, pings one gateway, and keeps
+# two counters under RuntimeDirectory.
+ExecStart=/usr/local/lib/aqua-bridge/aqua-net-recover.sh
+# Behind the control loop on a single-core-bound board: a Wi-Fi check must never
+# take CPU from a tick.
+Nice=10
+# /run/aqua-net-recover, kept between the timer's runs (the counters are
+# meaningless across a reboot, which is why they live on tmpfs).
+RuntimeDirectory=aqua-net-recover
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=yes
+# strict is safe next to a D-Bus client: nm-priv-helper.service (NetworkManager's
+# own), polkit.service and systemd-logind.service all ship with it on this image.
+# If nmcli ever does fail under it, ProtectSystem=full is the fix -- a failed
+# check is a journal line and the timer's next run, never anything more.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# No Restart=: a failed check is a journal line and the timer's next run, never
+# a loop. No WatchdogSec= either -- a oneshot has nothing to notify with.

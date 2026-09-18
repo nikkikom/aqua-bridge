@@ -505,6 +505,28 @@ def test_on_tick_hook_sees_every_result_and_its_errors_do_not_break_the_tick(fas
     assert sup.snapshot().last_cmd == results[-1].cmd  # hook runs after the supervisor update
 
 
+def test_the_publishers_only_ever_see_a_tick_that_has_already_reached_the_fans(fast_cfg):
+    """Section 2, "the network is outside the cooling path". The publishers (MQTT
+    state, Home Assistant discovery) run on this thread, in ``on_tick``. What keeps a
+    broker or an HTTP client out of the cooling path is the order inside ``tick``: the
+    command is on the fans and ``WATCHDOG=1`` is already sent before any publisher is
+    called, so a publisher that hangs cannot hold back this tick's command and cannot
+    swallow its ping. It does delay the *next* tick -- which is exactly what
+    ``WatchdogSec`` is for: the daemon goes silent, systemd restarts it, and the fans
+    keep their last commanded PWM meanwhile (section 9). Move ``on_tick`` earlier in
+    ``Loop.tick`` and this fails."""
+    seen: list[tuple[int, int]] = []
+
+    def hook(_result: TickResult) -> None:
+        seen.append((len(sink.applied), notifier.watchdog_n))
+
+    loop, sink, notifier, _ = make_loop(fast_cfg, good_source(fast_cfg))
+    loop.on_tick = hook
+    loop.tick()
+    loop.tick()
+    assert seen == [(1, 1), (2, 2)]
+
+
 # --- shutdown (section 9) -------------------------------------------------------------
 
 

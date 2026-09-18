@@ -1,0 +1,21 @@
+[Unit]
+Description=aqua-bridge board: periodic Wi-Fi link check
+Documentation=file:///opt/aqua-bridge/PROJECT.md
+
+[Timer]
+# OnBootSec= and OnUnitActiveSec= are both written by
+# deploy/install-board-watchdogs.sh from its NET_RECOVER_INTERVAL variable; the
+# values here are that script's default and tests/test_deploy.py checks the two
+# agree. Five minutes: two failed checks (the script's AQUA_NET_FAIL_CHECKS)
+# are ten minutes of a dead link before anything is re-associated, and one
+# check costs a handful of pings.
+OnBootSec=5min
+OnUnitActiveSec=5min
+# The check is not urgent and the board has one job; let systemd coalesce it.
+AccuracySec=30s
+# False on purpose: a check missed while the board was off is worthless, and
+# Persistent=true would write a timestamp to the card on every run.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

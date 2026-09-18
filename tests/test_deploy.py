@@ -53,10 +53,29 @@ def test_unit_notify_watchdog_restart_and_no_execstop(unit):
     assert unit["Type"] == ["notify"]
     assert unit["NotifyAccess"] == ["main"]
     assert unit["Restart"] == ["always"]
-    assert "Wants" in unit and "network-online.target" in unit["Wants"][0]
-    assert "After" in unit and "network-online.target" in unit["After"][0]
     assert float(unit["WatchdogSec"][0]) > 0
     assert "ExecStop" not in unit, "section 9: the SIGTERM handler is the only stop path"
+
+
+def test_the_unit_never_waits_for_the_network(unit):
+    """Section 2, "the network is outside the cooling path": the daemon drives the fans
+    over USB and needs no network, so nothing in this unit may order it behind one.
+    `Wants=`/`After=network-online.target` used to be here; with the router off,
+    NetworkManager-wait-online spends its full 30 s default and the daemon's first
+    write to the controllers is that much later, inside the aquaero's own 30 s
+    software-sensor window."""
+    for key, values in unit.items():  # every directive, not only the ordering ones
+        for value in values:
+            assert "network" not in value, f"{key}={value} orders cooling behind the network"
+
+
+def test_the_unit_keeps_restarting_instead_of_being_parked(unit):
+    """Section 2: a failure never reduces cooling. systemd's default start rate limit
+    (5 starts in 10 s) parks the unit in "failed", which is the one state in which
+    nothing writes the controllers and nothing writes the aquaero's software sensor
+    again. RestartSec keeps "never park" from spinning the board."""
+    assert unit["StartLimitIntervalSec"] == ["0"]
+    assert 0 < float(unit["RestartSec"][0]) < 30.0  # well inside the aquaero's timeout
 
 
 def test_unit_execstart_is_the_venv_interpreter_running_the_module_directly(unit):
@@ -70,6 +89,28 @@ def test_unit_has_an_explicit_start_timeout(unit):
     surface as a bounded start timeout, not systemd's implicit default."""
     (timeout,) = unit["TimeoutStartSec"]
     assert float(timeout) >= float(unit["WatchdogSec"][0])
+
+
+def test_the_unit_watchdog_leaves_the_margin_the_daemons_own_bound_does_not_count(unit):
+    """Section 2, watchdog layering. `check_watchdog` bounds mpc.dt + the step bound +
+    the controllers' worst-case I/O and says in so many words that the publishers and
+    the recorder are not counted -- so the rest of WatchdogSec is their margin, and it
+    has to be more than the largest single thing they can do on the loop thread. That
+    is one `vcgencmd get_throttled` at host_health.vcgencmd_timeout_s (the MQTT
+    publisher refreshes the host metrics from `on_tick`). Checked for the DAS example
+    as it ships and for the two-controller alternative it describes."""
+    from aqua_bridge.config import load_config
+    from aqua_bridge.health import HostHealthConfig
+    from aqua_bridge.hw.aquacomputer_adapter import AquacomputerTiming
+
+    app = load_config(DEPLOY.parent / "config.example-das.yaml")
+    watchdog = float(unit["WatchdogSec"][0])
+    publisher_worst = HostHealthConfig.from_section(app.section("host_health")).vcgencmd_timeout_s
+    shipped = [entry["device"] for entry in app.aquacomputer]
+    for devices in (shipped, ["aquaero", "quadro"]):
+        controllers = sum(AquacomputerTiming.for_kind(name).worst_case_tick_s() for name in devices)
+        bound = app.mpc.dt + app.mpc.budget_alarm_ms / 1000.0 + controllers
+        assert watchdog - bound >= publisher_worst, devices
 
 
 def test_unit_gives_the_model_store_a_state_directory(unit):
@@ -221,7 +262,16 @@ def test_install_script_das_flag_installs_das_config_and_dropin_never_enabling()
     assert "systemctl start" not in before_summary
 
 
-@pytest.mark.parametrize("script", ["install-pi.sh", "host-usb.sh", "install-aquacomputer-dkms.sh"])
+@pytest.mark.parametrize(
+    "script",
+    [
+        "install-pi.sh",
+        "host-usb.sh",
+        "install-aquacomputer-dkms.sh",
+        "install-board-watchdogs.sh",
+        "aqua-net-recover.sh",
+    ],
+)
 def test_shell_scripts_parse(script):
     bash = shutil.which("bash")
     if bash is None:
@@ -362,3 +412,205 @@ def test_driver_patch_is_well_formed_and_applies_to_its_own_context(patch_file, 
 
 def test_at_least_one_driver_patch_exists():
     assert sorted(DKMS_PKG.glob("*.patch"))
+
+
+# --- board watchdogs and the network-recovery timer (section 2, "Watchdog layering") ---
+
+BOARD_SCRIPT = DEPLOY / "install-board-watchdogs.sh"
+NET_SCRIPT = DEPLOY / "aqua-net-recover.sh"
+NET_UNIT = DEPLOY / "aqua-net-recover.service"
+NET_TIMER = DEPLOY / "aqua-net-recover.timer"
+
+
+def _shell_default(script: Path, name: str) -> str:
+    """The default of a ``NAME="${NAME:-v}"`` / ``: "${NAME:=v}"`` knob."""
+    text = script.read_text()
+    for pattern in (
+        rf'^{name}="\$\{{{name}:-([^}}]*)\}}"$',
+        rf'^: "\$\{{{name}:=([^}}]*)\}}"$',
+    ):
+        match = re.search(pattern, text, re.MULTILINE)
+        if match is not None:
+            return match.group(1)
+    raise AssertionError(f"{name} is not a documented variable at the top of {script.name}")
+
+
+def test_board_script_takes_every_value_from_a_variable_with_a_default():
+    """Every threshold the board script writes comes from a knob at the top, so the
+    numbers in the drop-ins are the ones its header argues for, in one place."""
+    knobs = {
+        "SOC_WATCHDOG_SEC": "60",
+        "REBOOT_WATCHDOG_SEC": "120",
+        "JOURNAL_MAX_USE": "200M",
+        "JOURNAL_MAX_FILE_SIZE": "16M",
+        "JOURNAL_MAX_RETENTION": "30day",
+        "JOURNAL_SYNC_INTERVAL": "5m",
+        "WIFI_POWERSAVE": "off",
+        "NET_RECOVER_INTERVAL": "5min",
+    }
+    for name, default in knobs.items():
+        assert _shell_default(BOARD_SCRIPT, name) == default
+    text = BOARD_SCRIPT.read_text()
+    for directive, name in (
+        ("RuntimeWatchdogSec", "SOC_WATCHDOG_SEC"),
+        ("RebootWatchdogSec", "REBOOT_WATCHDOG_SEC"),
+        ("SystemMaxUse", "JOURNAL_MAX_USE"),
+        ("SystemMaxFileSize", "JOURNAL_MAX_FILE_SIZE"),
+        ("MaxRetentionSec", "JOURNAL_MAX_RETENTION"),
+        ("SyncIntervalSec", "JOURNAL_SYNC_INTERVAL"),
+    ):
+        assert f"{directive}=${{{name}}}" in text, directive
+
+
+def test_the_soc_watchdog_sits_above_the_service_watchdog(unit):
+    """The order is the point (section 2): a slow tick must get a daemon restart, which
+    is cheap, before the board gets a reset, which costs a whole boot and spends the
+    aquaero's own timeout on the way."""
+    soc = float(_shell_default(BOARD_SCRIPT, "SOC_WATCHDOG_SEC"))
+    assert soc > float(unit["WatchdogSec"][0])
+    assert float(_shell_default(BOARD_SCRIPT, "REBOOT_WATCHDOG_SEC")) >= soc
+
+
+def test_the_timer_ships_the_interval_the_board_script_installs():
+    """install-board-watchdogs.sh rewrites OnBootSec=/OnUnitActiveSec= from
+    NET_RECOVER_INTERVAL; the file in the repository has to already say that, so
+    reading deploy/ tells the truth about the board."""
+    interval = _shell_default(BOARD_SCRIPT, "NET_RECOVER_INTERVAL")
+    values = _unit_values(NET_TIMER.read_text())
+    assert values["OnBootSec"] == [interval]
+    assert values["OnUnitActiveSec"] == [interval]
+
+
+def _code_lines(path: Path) -> list[str]:
+    return [
+        line.strip()
+        for line in path.read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+#: A word in command position: start of line, or after ;, &, |, or a shell keyword.
+def _runs_command(lines: list[str], word: str) -> bool:
+    pattern = re.compile(rf"(?:^|[;&|]\s*|\b(?:then|else|do)\s+){word}\b")
+    return any(pattern.search(line) for line in lines)
+
+
+def test_the_board_script_leaves_the_controllers_and_the_daemon_alone():
+    """It installs watchdogs and journald limits. The service watchdog belongs to
+    deploy/aqua-bridge.service, which this script only *reads* (to print the layering),
+    and the controllers belong to the daemon."""
+    lines = _code_lines(BOARD_SCRIPT)
+    assert not _runs_command(lines, "reboot") and not _runs_command(lines, "shutdown")
+    for line in lines:
+        assert "aqua-heartbeat" not in line and "hidraw" not in line, line
+        if "aqua-bridge.service" in line:
+            assert line.startswith('UNIT_SRC="'), line
+        if "systemctl" in line:
+            assert "aqua-bridge" not in line, line
+
+
+def test_network_recovery_never_escalates_beyond_re_associating():
+    """The owner's constraint: switching off the router must not degrade cooling. So no
+    reboot in any form, nothing touching aqua-bridge or the heartbeat, no controller."""
+    lines = _code_lines(NET_SCRIPT)
+    for word in ("reboot", "shutdown", "systemctl", "poweroff", "halt"):
+        assert not _runs_command(lines, word), f"aqua-net-recover.sh runs {word}"
+    for line in lines:
+        assert "aqua-bridge" not in line and "aqua-heartbeat" not in line, line
+        assert "hidraw" not in line, line
+    for path in (NET_UNIT, NET_TIMER):
+        for key, values in _unit_values(path.read_text()).items():
+            if not key.startswith("Exec"):
+                continue  # ordering is checked by test_the_recovery_unit_is_wired_...
+            for value in values:
+                for forbidden in ("reboot", "systemctl", "aqua-bridge.service", "hidraw"):
+                    assert forbidden not in value, f"{path.name}: {key}={value}"
+    script = NET_SCRIPT.read_text()
+    assert "nmcli device disconnect" in script and "nmcli device connect" in script
+
+
+def test_the_recovery_unit_is_wired_to_nothing_that_cools():
+    values = _unit_values(NET_UNIT.read_text())
+    assert values["Type"] == ["oneshot"]
+    assert "Restart" not in values  # a failed check waits for the timer, never loops
+    assert values["RuntimeDirectory"] == ["aqua-net-recover"]  # counters on tmpfs
+    assert values["RuntimeDirectoryPreserve"] == ["yes"]
+    for key in ("Wants", "Requires", "After", "Before", "Conflicts", "PartOf"):
+        for value in values.get(key, []):
+            assert "aqua-bridge" not in value and "aqua-heartbeat" not in value
+            assert "network-online" not in value  # it exists for the offline case
+
+
+def _stub_bin(root: Path, *, connected: bool, gateway: str, ping_ok: bool) -> Path:
+    """nmcli / ip / ping stubs under ``root`` that log every call to ``root/calls.log``."""
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True)
+    state = "100 (connected)" if connected else "30 (disconnected)"
+    (bin_dir / "nmcli").write_text(
+        "#!/bin/sh\n"
+        f'echo "nmcli $*" >> "{root}/calls.log"\n'
+        'case "$*" in\n'
+        f'  *"device show"*) echo "GENERAL.STATE:{state}" ;;\n'
+        "esac\n"
+        "exit 0\n"
+    )
+    route = f"default via {gateway} proto dhcp metric 600" if gateway else ""
+    (bin_dir / "ip").write_text(f'#!/bin/sh\necho "{route}"\nexit 0\n')
+    (bin_dir / "ping").write_text(
+        f'#!/bin/sh\necho "ping $*" >> "{root}/calls.log"\nexit {0 if ping_ok else 1}\n'
+    )
+    for name in ("nmcli", "ip", "ping"):
+        (bin_dir / name).chmod(0o755)
+    (root / "calls.log").write_text("")
+    return bin_dir
+
+
+def _run_recovery(root: Path, bin_dir: Path, runs: int) -> list[str]:
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - bash is in packages-rpi.txt and in CI
+        pytest.skip("bash not available")
+    env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "AQUA_NET_STATE_DIR": str(root / "state"),
+        "AQUA_NET_PING_DEADLINE_S": "1",
+    }
+    return [
+        subprocess.run(
+            [bash, str(NET_SCRIPT)], env=env, capture_output=True, text=True, check=True
+        ).stdout
+        for _ in range(runs)
+    ]
+
+
+def test_a_reachable_gateway_re_associates_nothing(tmp_path):
+    bin_dir = _stub_bin(tmp_path, connected=True, gateway="192.0.2.1", ping_ok=True)
+    _run_recovery(tmp_path, bin_dir, runs=5)
+    calls = (tmp_path / "calls.log").read_text()
+    assert "ping" in calls
+    assert "device disconnect" not in calls and "device connect" not in calls
+
+
+def test_a_router_that_is_simply_off_stops_bouncing_instead_of_looping(tmp_path):
+    """The failure the owner forbade, seen from the other side: with nothing answering,
+    the script re-associates AQUA_NET_MAX_BOUNCES times and then goes quiet, rather
+    than bouncing the interface for as long as the router stays off."""
+    bin_dir = _stub_bin(tmp_path, connected=True, gateway="192.0.2.1", ping_ok=False)
+    bounces = int(_shell_default(NET_SCRIPT, "AQUA_NET_MAX_BOUNCES"))
+    checks = int(_shell_default(NET_SCRIPT, "AQUA_NET_FAIL_CHECKS"))
+    outputs = _run_recovery(tmp_path, bin_dir, runs=checks * (bounces + 4))
+    calls = (tmp_path / "calls.log").read_text().splitlines()
+    assert sum(1 for line in calls if "device disconnect" in line) == bounces
+    assert sum(1 for line in calls if "device connect" in line) == bounces
+    assert sum(1 for out in outputs if "stopping here" in out) == 1  # said once, not per run
+
+
+def test_no_gateway_and_no_carrier_are_both_no_ops(tmp_path):
+    """With the router off long enough the lease is gone, and a disconnected interface
+    is NetworkManager's own retry to make: neither is this script's business."""
+    no_gateway = _stub_bin(tmp_path / "a", connected=True, gateway="", ping_ok=False)
+    _run_recovery(tmp_path / "a", no_gateway, runs=3)
+    assert "ping" not in (tmp_path / "a" / "calls.log").read_text()
+    disconnected = _stub_bin(tmp_path / "b", connected=False, gateway="192.0.2.1", ping_ok=False)
+    _run_recovery(tmp_path / "b", disconnected, runs=3)
+    calls = (tmp_path / "b" / "calls.log").read_text()
+    assert "ping" not in calls and "device disconnect" not in calls

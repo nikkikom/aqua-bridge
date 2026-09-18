@@ -112,6 +112,20 @@ is not yet confirmed on real hardware, on either board.
    runs); rerun the same command once the code is in place to pick up
    the pip install.
 
+   Then, once per card and independent of the hardware steps:
+
+   ```bash
+   deploy/install-board-watchdogs.sh --check     # then again with sudo, without --check
+   ```
+
+   That one installs the SoC hardware watchdog, journald size and
+   retention caps for the persistent journal, Wi-Fi power save off, and a
+   timer that re-associates the Wi-Fi interface if the link goes deaf —
+   and nothing else: it never reboots, never restarts `aqua-bridge` and
+   never touches a controller, because the network is outside the cooling
+   path (PROJECT.md §2 *Watchdog layering*, §9 *Board hardening*). Every
+   value is a variable at the top of the script.
+
 6. **Config.** Edit `/etc/aqua-bridge/config.yaml`: `mpc.channels` /
    `mpc.temps` / `mpc.sensors` / `mpc.topology` for the enclosure, the
    `aquacomputer:` list (one entry per controller — the supported topology
