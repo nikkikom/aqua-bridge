@@ -295,12 +295,42 @@ expensive one.
 Layer 4 is the last line and is **independent of this board**: it lives in
 the aquaero's own firmware, runs off its own clock, and takes every output
 to 100 % when the heartbeat stops. Everything above it is an attempt to
-never get there. That is why 3 sits above 2, and it is the difference between
-them: layer 2's restart is `RestartSec=5` plus about 3 s of interpreter start
-and first tick (measured below), inside the aquaero's 30 s — layer 4 usually
-does not fire. Layer 3 *spends* layer 4 every time: this board takes 28 s from
-power to its first controller write (measured below), which is already the
-whole window, and a shutdown comes before that. A reset means the alarm.
+never get there. That is why 3 sits above 2: a daemon restart is the cheap
+recovery and has to get its chance before a board reset.
+
+**Both of them spend layer 4, and the arithmetic says so.** Layer 4 fires
+after 30 s of silence on `soft1`. Layers 2 and 3 fire after 45 s and 60 s.
+Neither can therefore beat the controller, and neither is meant to:
+
+- Layer 3 spends it on the boot alone. This board takes 28 s from power to
+  its first controller write (measured below), which is already the whole
+  window, and a shutdown comes before that. A reset means the alarm.
+- Layer 2 spends it *before* it even fires, whenever the daemon is the one
+  writing the heartbeat. `WATCHDOG=1` goes out at the end of a tick, and the
+  heartbeat goes out inside `apply()` on the same tick, after the duty work and
+  only when that succeeded (Track B in §3). So "no `WATCHDOG=1` for 45 s" is
+  also "no heartbeat for at least 45 s": at 30 s `soft1` has already fallen
+  back to its 90.00 °C, the alarm has already selected profile 2, and every
+  output is already at 100 % — fifteen seconds before systemd sends the signal.
+  The restart ends the alarm; it does not avoid it.
+
+`WatchdogSec` cannot be lowered under the 30 s to change that. It has to stay
+above the bound `check_watchdog` computes, and that bound is 18.5 s for
+`config.example-das.yaml` as it ships but **31.5 s** with the Quadro on its own
+USB port — already past the controller's 30 s, with no room for the publishers
+on top. A watchdog that fires inside the controller's window would have to fire
+inside a legitimate slow tick, which is worse: it would kill a daemon that is
+still doing its job. 45 s is the right value and the alarm is its accepted cost.
+
+The one configuration in which a watchdog kill is invisible to the fans is the
+one the board runs **today**: `heartbeat_sensor: 0` in both example configs,
+with a separate `aqua-heartbeat.service` writing `soft1` every 2 s. That
+service is not this daemon and a stalled tick does not stop it, so the alarm
+never fires and the fans hold their last commanded duty until the daemon is
+back. That changes the moment `heartbeat_sensor: 1` is set, which is what the
+DAS example says to do once the daemon's heartbeat has run against the
+hardware (§8 item 93) — so the paragraph above, not this one, is the case to
+design for.
 
 **A slow tick degrades to a restart, not to silence.** `WATCHDOG=1` goes out
 at the end of every tick whose controller work did not raise; two pings
@@ -308,15 +338,26 @@ further apart than `WatchdogSec` and systemd kills the daemon.
 `WatchdogSignal` is left at its `SIGABRT` default on purpose: `SIGTERM` would
 run the stop path, which writes `fallback_pwm` through the very sink whose
 slowness tripped the watchdog, block until `TimeoutStopSec` and be `SIGKILL`ed
-anyway — later, and no cleaner. So **what happens to the fans during that
-restart**: the process dies at once and nothing is written, so the fans hold
-the last PWM they were commanded (a watchdog kill never turns them down);
-`Restart=always` brings the daemon back after `RestartSec=5`; its first tick
-has no `last_cmd`, so `resolve_prev` takes `prev` from the duty it reads off
-the device and the ramp continues from where the fans actually are — no jump
-to `fallback_pwm`, which only the *clean* stop path writes (§9). If that gap
-outlasts the aquaero's 30 s, layer 4 fires and every fan goes to 100 % until
-the daemon's heartbeat resumes, which takes about 2 s.
+anyway — later, no cleaner, and jolting the fans to `fallback_pwm` on every
+timeout as well.
+
+**What happens to the fans during that restart**, with the daemon writing the
+heartbeat, in order:
+
+| t | what |
+|---|------|
+| 0 s | the last tick that finished: duties written, heartbeat written |
+| 30 s | `soft1` falls back to 90.00 °C, the alarm selects profile 2, **every output 100 %** |
+| 45 s | systemd sends `SIGABRT`; the process dies at once and writes nothing (no `fallback_pwm` jump — only the *clean* stop path writes that, §9) |
+| ~53 s | `RestartSec=5` plus about 3 s of start: the first tick has no `last_cmd`, so `resolve_prev` takes `prev` from the duty it reads off the device — the alarm's 100 % — and rate-limits down from there. That tick's `apply()` writes the duties and then the heartbeat |
+| ~55 s | the resumed heartbeat clears the alarm (~2 s, measured) and profile 1 is reloaded |
+| +`duty_mismatch_s` | the profile switch reloaded the **saved** profile, so every duty written live is gone and the outputs sit at that profile's preset (20 % on the owner's controller). The duty verification sees the mismatch, re-reads the control report, notices the profile change and writes every channel again ("The active profile" above bounds this edge) |
+
+So a watchdog restart is not invisible to the fans: it is about 25 s at 100 %,
+then a few seconds at the saved preset, then the daemon's own command again.
+Loud first and quiet second, which is the right order — but not "the fans never
+moved", and nothing here reduces cooling below what a working daemon would ask
+for except that last bounded dip, which the duty verification is there to end.
 
 `StartLimitIntervalSec=0` closes the one hole that would be real silence:
 systemd's default rate limit (5 starts in 10 s) parks a unit in `failed`, and
@@ -330,8 +371,9 @@ a parked unit never writes the controllers or the heartbeat again.
   file says.
 - A cold start of the daemon: 1.4 s to import numpy, PyYAML and `aqua_bridge`,
   2.9 s from the command line to the first applied command with
-  `--source sim --sim-plant das`. That plus `RestartSec=5` is what layer 2's
-  restart costs.
+  `--source sim --sim-plant das`. That plus `RestartSec=5` is layer 2's
+  *recovery*, the ~8 s after the kill — not its cost, which starts with the
+  45 s of silence that tripped it.
 - The bound `check_watchdog` computes from `config.example-das.yaml` —
   `mpc.dt` + `budget_alarm_ms` + the controllers' worst-case I/O — is **18.5 s**
   as the example ships (the Quadro on aquabus) and **31.5 s** with the Quadro
@@ -405,8 +447,18 @@ the home router must never degrade cooling. Traced, path by path, on
   interface with `nmcli device disconnect`/`connect`. That is all it may do:
   no reboot in any form, no `systemctl`, nothing that touches
   `aqua-bridge.service`, `aqua-heartbeat.service` or a controller. After three
-  fruitless re-associations it logs one line and stops, so a router that is
-  simply switched off costs one journal line, not a bounce loop. It exists
+  fruitless re-associations it logs one line and then says nothing at all until
+  a probe succeeds, so a router that is simply switched off costs one journal
+  line — not a bounce loop, and not a line every timer period either. Three
+  details make that true rather than merely intended: the counter moves
+  *before* the `nmcli` pair, so a re-association that hangs until systemd kills
+  the unit still counts as the attempt it was; each `nmcli` carries an explicit
+  `--wait` (`AQUA_NET_NMCLI_WAIT_S`, 20 s) because `device connect`'s own
+  default is 90 s, longer than any sane start timeout; and `device disconnect`
+  blocks autoconnect until a manual activation (`nmcli(1)`), so autoconnect is
+  restored *between* the disconnect and the connect — a run killed in the
+  middle then leaves NetworkManager retrying on its own instead of leaving the
+  board off the network until somebody logs in locally. It exists
   because of the outage below; it is not part of cooling and cannot become part
   of it. A gateway watchdog that *reboots* is forbidden outright: with the
   router off it is a reboot loop, and every reboot is a heartbeat gap and a jolt
@@ -9159,11 +9211,18 @@ is one `vcgencmd get_throttled` at `host_health.vcgencmd_timeout_s` (2 s,
 at most once a minute). `TimeoutStartSec=120` stays above `WatchdogSec`.
 
 `WatchdogSignal` stays at its `SIGABRT` default, and what that means for
-the fans is in §2 ("A slow tick degrades to a restart, not to silence"):
-nothing is written, the fans hold their last commanded PWM, the daemon is
-back after `RestartSec=5` and resumes the ramp from the duty it reads off
-the device. This is the one path that does *not* jump the fans to
-`fallback_pwm` — that is the clean stop below.
+the fans is the timeline in §2 ("A slow tick degrades to a restart, not to
+silence"): nothing is written, so this is the one path that does *not* jump
+the fans to `fallback_pwm` (that is the clean stop below) — but it is not a
+free restart either. `WatchdogSec=45` is above the aquaero's own 30 s, and it
+has to be, because the bound it must clear is already 31.5 s in the
+two-controller layout. So whenever the daemon is the one writing the heartbeat
+(`heartbeat_sensor`), a watchdog kill means the alarm fired fifteen seconds
+before the kill: every fan at 100 %, then, after the restart, a few seconds at
+the saved profile's preset while the duty verification catches up, then the
+daemon's command again. With `heartbeat_sensor: 0` and a separate service
+feeding `soft1`, as the board runs today, the stall never reaches the
+controller and the fans simply hold.
 
 `READY=1` waits for the first applied command, so a device that is
 absent at boot (USB not enumerated, hidraw permissions wrong) shows up as
@@ -9226,6 +9285,12 @@ environment (`sudo SOC_WATCHDOG_SEC=90 deploy/install-board-watchdogs.sh`):
 | `WIFI_POWERSAVE` | `off` | `wifi.powersave = 2` in `/etc/NetworkManager/conf.d/10-aqua-wifi-powersave.conf` (`keep`: install nothing) |
 | `NET_RECOVER_INTERVAL` | `5min` | `OnBootSec=`/`OnUnitActiveSec=` in `aqua-net-recover.timer` |
 
+`--no-net-recover` is an off switch, not a skipped step: it stops and disables
+`aqua-net-recover.timer` and deletes the three installed files. Skipping alone
+would leave a previously enabled timer running the copy of the script installed
+back then, with the thresholds it had back then — and a re-run with the flag
+would look like it had turned the recovery off while it had not.
+
 Notes that only show up on a real board:
 
 - **No overlay is needed for the watchdog.** `bcm2835_wdt` is in the base
@@ -9252,15 +9317,22 @@ Notes that only show up on a real board:
 described in §2. The script is installed to
 `/usr/local/lib/aqua-bridge/aqua-net-recover.sh`; its own knobs
 (`AQUA_NET_IFACE`, `AQUA_NET_FAIL_CHECKS`, `AQUA_NET_MAX_BOUNCES`,
-`AQUA_NET_PING_COUNT`, `AQUA_NET_PING_DEADLINE_S`, `AQUA_NET_STATE_DIR`) are
+`AQUA_NET_PING_COUNT`, `AQUA_NET_PING_DEADLINE_S`, `AQUA_NET_NMCLI_WAIT_S`,
+`AQUA_NET_STATE_DIR`) are
 at the top of the file with their reasoning; the unit passes none of them, so
-an override is `systemctl edit aqua-net-recover.service`. Counters live under
+an override is `systemctl edit aqua-net-recover.service`. The unit's
+`TimeoutStartSec=90` is twice the worst case those defaults allow
+(`2·AQUA_NET_NMCLI_WAIT_S + AQUA_NET_PING_DEADLINE_S` = 45 s) and is set
+explicitly because systemd's default (1 min 30 s here) is *below* `nmcli`'s own
+default wait for `device connect` alone. Counters live under
 `RuntimeDirectory=` (tmpfs: they are meaningless across a reboot and must not
 wear the card). `--dry-run` reports what one check would do and changes
 nothing. `tests/test_deploy.py` runs the script against `nmcli`/`ip`/`ping`
 stubs and fails if it ever re-associates more than `AQUA_NET_MAX_BOUNCES`
 times, pings without a gateway, or touches a disconnected interface that
-NetworkManager is already retrying.
+NetworkManager is already retrying. The stubs cover the failing branches too,
+which are the ones the guards exist for: an `nmcli` that exits non-zero, one
+slow enough to be killed mid-run, and the silence after the give-up.
 
 ### udev
 

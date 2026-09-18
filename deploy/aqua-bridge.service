@@ -47,8 +47,9 @@ StateDirectory=aqua-bridge
 Restart=always
 # 5 s, not systemd's 100 ms default: it keeps a daemon that exits immediately
 # (a config error) from spinning the CPU and the journal, and it is far inside
-# the aquaero's 30 s software-sensor timeout, so a restart never costs a fan
-# alarm on its own.
+# the aquaero's 30 s software-sensor timeout, so a crash or a clean restart
+# never costs a fan alarm by itself. A watchdog kill is the one case where the
+# alarm has already fired before the restart begins -- see WatchdogSec below.
 RestartSec=5
 # Two WATCHDOG=1 pings further apart than this and systemd kills the daemon.
 # The bound the daemon checks itself at startup against $WATCHDOG_USEC
@@ -58,15 +59,31 @@ RestartSec=5
 # margin for what that bound does not count -- the publishers and the recorder,
 # whose largest single item is one vcgencmd at host_health.vcgencmd_timeout_s
 # (2 s, at most once a minute).
+# 45 s is ABOVE the aquaero's own 30 s software-sensor timeout, and it has to
+# be: the bound above is already 32 s in the two-controller layout, so there is
+# no value that both stays clear of a legitimate slow tick and beats the
+# controller. What follows from that, and is the honest answer to "what happens
+# to the fans during a watchdog restart" (PROJECT.md §2 has the timeline):
+# systemd firing this watchdog *means* no tick finished for 45 s, and with
+# heartbeat_sensor set the heartbeat goes out inside apply() on a tick that
+# succeeded -- so at 30 s the software sensor has already fallen back, the alarm
+# has already selected the 100 % profile, and every fan is already at 100 %
+# fifteen seconds before the kill. The restart is what ends that, not what
+# causes it. (With heartbeat_sensor: 0 and a separate service feeding the
+# sensor, as the board runs today, the stall is invisible to the controller and
+# the fans simply hold.)
 # WatchdogSignal is left at SIGABRT on purpose. SIGTERM would run the daemon's
 # stop path, which writes fallback_pwm through the very sink whose slowness
 # tripped the watchdog: it would block until TimeoutStopSec and be SIGKILLed
-# anyway, only later. So: the process dies at once, the fans hold their last
-# commanded PWM (they are never turned down by a watchdog kill), Restart=always
-# brings the daemon back within RestartSec, and its first tick resumes the ramp
-# from the duty it reads off the device. Nothing writes the aquaero's software
-# sensor during that gap; if the gap outlasts the sensor's own timeout the
-# aquaero drives every output to 100 % -- loud, and the safe direction.
+# anyway, only later -- and it would jolt the fans to fallback_pwm on every
+# timeout. So: the process dies at once and writes nothing, Restart=always
+# brings the daemon back after RestartSec, and its first tick has no last_cmd,
+# so it takes prev from the duty it reads off the device -- the alarm's 100 %
+# if the alarm is up -- and rate-limits from there. Its first successful apply
+# resumes the heartbeat, the alarm clears within ~2 s, and the profile switch
+# back reloads the SAVED profile, so the duties just written live are gone and
+# the outputs drop to that profile's preset until the duty verification sees
+# the mismatch and rewrites every channel (duty_mismatch_s plus a tick).
 WatchdogSec=45
 # READY=1 is sent after the first tick whose command reached the device, so
 # a device that is absent at boot (USB not yet enumerated, hidraw permissions

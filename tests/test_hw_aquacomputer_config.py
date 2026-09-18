@@ -562,10 +562,15 @@ def test_a_retry_after_a_timeout_blocks_no_longer_than_the_bound() -> None:
     assert blocked <= timing.worst_case_tick_s() - timing.status_max_age_s + 1e-9
 
 
-def test_the_unit_watchdog_fits_the_das_example_with_two_controllers_at_their_defaults() -> None:
+def test_the_unit_watchdog_fits_the_das_example_as_it_ships_and_with_two_controllers() -> None:
     """deploy/aqua-bridge.service's WatchdogSec against config.example-das.yaml's dt and
-    step bound plus its controllers at their defaults, and plus the aquaero and a Quadro
-    on its own USB port."""
+    step bound plus the controllers *the example declares*, and plus the aquaero and a
+    Quadro on its own USB port.
+
+    The timings are built from the example's own entries, the way config.py builds them
+    (``from_section``), not from the per-kind defaults: the example spells its timing
+    keys out, so defaults that equal them today would make this test blind to the day
+    someone raises one of them."""
     from aqua_bridge.config import load_config
 
     root = Path(__file__).resolve().parent.parent
@@ -574,12 +579,15 @@ def test_the_unit_watchdog_fits_the_das_example_with_two_controllers_at_their_de
     assert match is not None
     app = load_config(root / "config.example-das.yaml")
     example = [
-        (entry["device"], AquacomputerTiming.for_kind(entry["device"]))
-        for entry in app.aquacomputer
+        (
+            entry["device"],
+            AquacomputerTiming.from_section(entry, f"aquacomputer[{i}]", KINDS[entry["device"]]),
+        )
+        for i, entry in enumerate(app.aquacomputer)
     ]
     assert [name for name, _ in example] == ["aquaero"]  # the Quadro on its aquabus
     # The alternative the example describes, the Quadro on its own USB port, fits too.
-    both = [(name, AquacomputerTiming.for_kind(name)) for name in ("aquaero", "quadro")]
+    both = [*example, ("quadro", AquacomputerTiming.for_kind("quadro"))]
     for pair in (example, both):
         check_watchdog(
             pair,
