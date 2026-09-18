@@ -92,6 +92,7 @@ _DEVICE_HEALTH: dict[str, Any] = {
                 "seen": True,
                 "absent_s": 42.0,
                 "lost": True,
+                "bound": True,
                 "temps_missing": [],
             },
             # the software-sensor heartbeat and the controller's softN slots
@@ -118,7 +119,36 @@ _DEVICE_HEALTH: dict[str, Any] = {
                 },
             ],
             "problems": ["aquaero: no device on aquabus behind qd1"],
-        }
+        },
+        {
+            # A quadro has no aquabus at all: "aquabus.state" stays "unknown"
+            # forever, which the page must not print as a bare "unknown" row
+            # (§8 item 117's rule; PROJECT.md item 129's review).
+            "label": "quadro",
+            "device": "quadro",
+            "serial": "99999-11111",
+            "firmware": 1042,
+            "power_cycles": None,
+            "open": True,
+            "status_age_s": 0.4,
+            "stuck_channels": [],
+            "absent_channels": [],
+            "not_pwm_channels": [],
+            "unconfigured_channels": [],
+            "flows": {},
+            "aquabus": {
+                "state": "unknown",
+                "present": None,
+                "seen": False,
+                "absent_s": None,
+                "lost": False,
+                "bound": False,
+                "temps_missing": [],
+            },
+            "heartbeat": {"on": False, "ok": None, "sensor": None, "value_c": None},
+            "software_sensors": [],
+            "problems": [],
+        },
     ],
     "fans": {
         "xt1": {

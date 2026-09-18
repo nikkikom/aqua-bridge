@@ -148,15 +148,36 @@ function renderModel(model, diag) {
     const zi = zones[zone];
     const blocked = zi.blocked || [];
     const peDiag = zi.pe_diag || {};
-    const peParts = Object.keys(peDiag).sort().map(g => g + "=" + fmt(peDiag[g], 3));
+    // pe_diag reads 0 for every group until the PE monitor has closed two windows
+    // (control/thermal's _pe_normalised) -- and 0 is not a neutral placeholder,
+    // it is the reading a group at PE_MIN gets. Show it only once it is a
+    // measurement; before that, say so instead of printing a number that looks
+    // like the worst possible one (§8 item 117's rule, applied here).
+    const windows = zi.windows;
+    const peMeasured = windows !== null && windows !== undefined && windows >= 2;
+    const peParts = peMeasured
+      ? Object.keys(peDiag).sort().map(g => g + "=" + fmt(peDiag[g], 3))
+      : [];
+    const peText = peMeasured
+      ? (peParts.length ? " (pe " + peParts.join(", ") + ")" : "")
+      : " (pe not yet measured, " + fmt(windows, 0) + " window" + (windows === 1 ? "" : "s") + ")";
     rows.push(row(zone + " model", fmt(zi.status)
       + (blocked.length ? " -- blocked: " + blocked.join(", ") : "")
-      + (peParts.length ? " (pe " + peParts.join(", ") + ")" : "")));
+      + peText));
   }
   // Item 121: which channels the running (or last) experiment could not excite past
   // the model's PE bound at the configured amplitude (control/ident's excitation).
+  // experiment.excitation is empty until an identification experiment has actually
+  // run (control/ident's status() returns it empty while exp is None, the normal
+  // state of a daemon with no experiment under way) -- so an empty "excitation" must
+  // read as "not evaluated", never as "none unexcitable", or a channel nothing ever
+  // checked reads the same as one that was checked and cleared (§8 item 117's rule).
+  const excitation = experiment.excitation || {};
   const unexcitable = experiment.unexcitable || [];
-  rows.push(row("Unexcitable channels", unexcitable.length ? unexcitable.join(", ") : "none"));
+  const unexcitableText = Object.keys(excitation).length
+    ? (unexcitable.length ? unexcitable.join(", ") : "none")
+    : "not evaluated (no experiment)";
+  rows.push(row("Unexcitable channels", unexcitableText));
   table("model", rows);
 }
 
@@ -188,15 +209,24 @@ function renderDevices(health) {
     rows.push(row(d.label || d.device, age + (flags.length ? " | " + flags.join(" | ") : " | ok")));
     // Item 129: the aquabus itself, keyed on "state" (not on "lost" alone) so a
     // healthy aquaero with nothing on its bus ("never_seen") reads apart from a
-    // device that answered and then stopped ("lost").
+    // device that answered and then stopped ("lost"). Only "aquaero" kinds have
+    // an aquabus at all (hw/aquacomputer module) -- on any other kind (a "quadro")
+    // "state" is permanently "unknown" because there is no bus to judge, not
+    // because a reading is pending, so that row is skipped rather than shown as
+    // an unresolved state a person would go looking to explain (§8 item 117's
+    // rule: a rule that cannot run for this controller is named as not running,
+    // not left reading like one that has not run yet).
     const bus = d.aquabus || {};
-    const busText = {
-      present: "a device answers",
-      lost: "lost " + fmt(bus.absent_s, 0) + " s ago",
-      empty: "empty",
-      never_seen: "never connected",
-    }[bus.state] || "unknown";
-    rows.push(row((d.label || d.device) + " aquabus", busText));
+    if (!(bus.state === "unknown" && d.device !== "aquaero")) {
+      const busText = {
+        present: "a device answers",
+        lost: "lost " + fmt(bus.absent_s, 0) + " s ago",
+        empty: "empty",
+        never_seen: "never connected",
+        unknown: "not read yet",
+      }[bus.state] || "not read yet";
+      rows.push(row((d.label || d.device) + " aquabus", busText));
+    }
   }
   const fans = h.fans || {};
   for (const ch of Object.keys(fans).sort()) {

@@ -1605,6 +1605,7 @@ def test_a_bus_device_that_leaves_makes_its_temperature_slots_missing_not_frozen
         health = adapter.device_health()
         assert health["aquabus"]["lost"] is True and health["aquabus"]["state"] == "lost"
         assert health["aquabus"]["absent_s"] >= AQUAERO_T.bus_absent_s
+        assert health["aquabus"]["bound"] is True  # quadro_air reads the bus (item 129)
         assert "refresh_reports" not in health["aquabus"]  # withdrawn, item 115
         (problem,) = [p for p in health["problems"] if "item 92" in p]
         assert problem == (
@@ -1627,6 +1628,30 @@ def test_a_bus_device_that_leaves_makes_its_temperature_slots_missing_not_frozen
     assert [m for m in _messages(caplog, "INFO") if "answers on aquabus again" in m] == [
         "aquaero: a device answers on aquabus again; its temperature slots are readings once more"
     ]
+
+
+def test_a_lost_bus_reads_unbound_when_nothing_of_this_controller_reads_it() -> None:
+    """Item 129: aquabus presence is judged from the status report's speed field
+    alone, not from the binding, so a bus can read ``lost`` on a controller with
+    nothing of its own config behind it -- an aquaero whose Quadro this daemon
+    happens to read over the Quadro's own USB instead. ``bound`` says so, which is
+    what a consumer (a Home Assistant binary sensor) must gate a fault on to agree
+    with ``device_health``'s own ``problems`` list, which already does."""
+    binding = DeviceBinding(kind=AQUAERO, pwm_map={"xt1": 1}, temp_map={"inlet": "temp6"})
+    adapter, device, clock = _aquabus(binding)
+    obs = adapter.read()
+    assert obs.temps == {"inlet": pytest.approx(23.07)}
+    assert adapter.bus_device["present"] is True and adapter.bus_device["bound"] is False
+    device.status_template = _bus_device_gone(device.status_template)
+    for _ in range(int(AQUAERO_T.bus_absent_s) + 2):
+        clock.advance(1.0)
+        device.emit()
+        adapter.read()
+    health = adapter.device_health()
+    assert health["aquabus"]["lost"] is True and health["aquabus"]["state"] == "lost"
+    assert health["aquabus"]["bound"] is False
+    # Not this daemon's problem: nothing of its own config reads the bus.
+    assert [p for p in health["problems"] if "item 92" in p] == []
 
 
 def test_a_report_whose_electrical_sample_missed_is_never_read_as_a_missing_device() -> None:
@@ -1652,6 +1677,7 @@ def test_a_report_whose_electrical_sample_missed_is_never_read_as_a_missing_devi
         "seen": True,
         "absent_s": None,
         "lost": False,
+        "bound": True,
         "temps_missing": [],
     }
     assert adapter.device_health()["problems"] == []
@@ -1766,6 +1792,7 @@ def test_the_quadro_itself_never_judges_an_aquabus() -> None:
         "seen": False,
         "absent_s": None,
         "lost": False,
+        "bound": False,
         "temps_missing": [],
     }
     assert adapter.device_health()["problems"] == []

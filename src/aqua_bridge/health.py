@@ -878,6 +878,26 @@ class HostHealth:
             _LOG.warning("host health: %s (PROJECT.md section 8 item 103)", text)
 
 
+def _aquabus_lost(devices: list[Mapping[str, Any]]) -> bool:
+    """Whether any controller's aquabus is ``lost`` *and* ``bound`` (PROJECT.md
+    section 8 item 129) -- the same gate ``device_health``'s own ``problems`` list
+    already applies before it reports a lost bus
+    (:meth:`~aqua_bridge.hw.aquacomputer_adapter.AquacomputerAdapter.device_health`):
+    ``lost`` alone is read straight off the status report and says nothing about
+    whether this controller's own config reads the bus at all, so a controller with
+    an aquabus device that only some *other* controller uses is not this daemon's
+    problem. Given as one scalar, computed once here rather than by each consumer,
+    so a Home Assistant binary sensor keyed on it can never disagree with the
+    daemon about what counts as a fault, and never has to resolve the per-controller
+    ``devices`` list -- which carries each controller's serial number -- just to
+    read one boolean."""
+    return any(
+        bool((d.get("aquabus") or {}).get("lost")) and bool((d.get("aquabus") or {}).get("bound"))
+        for d in devices
+        if isinstance(d, Mapping)
+    )
+
+
 def _spin_problems(verdicts: Mapping[str, Any]) -> list[str]:
     """One line per fan the spin-up rule has declared failed, channel order.
 
@@ -1290,6 +1310,9 @@ class HealthMonitor:
                 *_spin_problems(spin),
                 *board["faults"],
             ],
+            # One scalar a Home Assistant binary sensor can key on without walking
+            # the per-controller list (item 129); see _aquabus_lost.
+            "aquabus_lost": _aquabus_lost(devices["devices"]),
         }
         payload["ok"] = not payload["problems"]
         self.last = payload

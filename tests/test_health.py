@@ -26,6 +26,7 @@ from aqua_bridge.health import (
     HealthMonitor,
     HostHealth,
     HostHealthConfig,
+    _aquabus_lost,
     default_air_temps,
     expected_rpm,
     host_metrics_reader,
@@ -407,6 +408,7 @@ def test_on_tick_without_a_device_health_source_still_publishes_the_fan_verdicts
         "fans": published[-1]["fans"],
         "host": _EMPTY_BOARD,
         "problems": [],
+        "aquabus_lost": False,
         "ok": True,
     }
     assert published[-1]["fans"]["qd3"]["power_w"] == pytest.approx(0.32)
@@ -440,6 +442,51 @@ def test_a_single_controller_source_is_published_as_one_device() -> None:
     assert payload["ok"] is False
 
 
+def test_aquabus_lost_is_gated_on_bound_not_on_lost_alone() -> None:
+    """Item 129: a bus reading ``lost`` from the status report is only this
+    daemon's problem when something of that controller's own config reads the
+    bus (``bound``) -- the same gate ``device_health``'s own ``problems`` list
+    applies (:meth:`AquacomputerAdapter.device_health`), so a Home Assistant
+    binary sensor keyed on the aggregate never disagrees with the daemon about
+    what counts as a fault."""
+    lost_and_bound = [{"label": "aquaero", "aquabus": {"lost": True, "bound": True}}]
+    lost_not_bound = [{"label": "aquaero", "aquabus": {"lost": True, "bound": False}}]
+    bound_not_lost = [{"label": "aquaero", "aquabus": {"lost": False, "bound": True}}]
+    never_seen = [{"label": "aquaero", "aquabus": {"state": "never_seen", "lost": False}}]
+    assert _aquabus_lost(lost_and_bound) is True
+    assert _aquabus_lost(lost_not_bound) is False
+    assert _aquabus_lost(bound_not_lost) is False
+    assert _aquabus_lost(never_seen) is False
+    assert _aquabus_lost([]) is False
+    # A second controller whose bus is fine never masks the first one's problem.
+    assert _aquabus_lost(lost_and_bound + bound_not_lost) is True
+    # A device entry without an "aquabus" key at all (an old recording, or a
+    # source that never populates one) reads as no problem, not as a crash.
+    assert _aquabus_lost([{"label": "aquaero"}]) is False
+
+
+def test_on_tick_publishes_aquabus_lost_gated_on_bound() -> None:
+    """The scalar ``update()`` actually publishes is gated the same way, end to
+    end through the real :class:`AquacomputerAdapter`, not just in the helper."""
+    source = _FakeSource(
+        {
+            "devices": [
+                {"label": "aquaero", "aquabus": {"lost": True, "bound": True}},
+                {"label": "quadro", "aquabus": {"lost": False, "bound": False}},
+            ],
+            "problems": [],
+            "ok": True,
+        }
+    )
+    mon = HealthMonitor(_cfg(), FanHealthConfig(), source=source)
+    payload = mon.update({}, 0.0)
+    assert payload["aquabus_lost"] is True
+
+    source.health["devices"][0]["aquabus"]["bound"] = False
+    payload = mon.update({}, 0.0)
+    assert payload["aquabus_lost"] is False
+
+
 def test_a_source_answering_with_neither_shape_contributes_nothing() -> None:
     mon = HealthMonitor(_cfg(), FanHealthConfig(), source=_FakeSource({}))
     payload = mon.update({}, 0.0)
@@ -448,6 +495,7 @@ def test_a_source_answering_with_neither_shape_contributes_nothing() -> None:
         "fans": {},
         "host": _EMPTY_BOARD,
         "problems": [],
+        "aquabus_lost": False,
         "ok": True,
     }
 

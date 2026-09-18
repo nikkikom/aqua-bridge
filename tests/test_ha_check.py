@@ -220,6 +220,43 @@ def test_a_template_default_is_read_instead_of_a_missing_path(das_example_cfg: M
     assert shown == "unknown" and missing and defaulted == []
 
 
+def test_aquabus_problem_state_is_a_scalar_never_a_serial_number(
+    das_example_cfg: MpcConfig,
+) -> None:
+    """Item 129's review: ``entity_state`` renders whatever a template's path
+    resolves to with ``json.dumps`` -- and this daemon's hard constraints treat a
+    device serial number as private data that ends up in issues and commit
+    messages (module docstring). The template must resolve to the daemon's own
+    ``aquabus_lost`` scalar, never to the per-controller ``devices`` list (which
+    carries ``serial``), so a rendered checklist line can never contain one."""
+    entities = ha.expected_entities(
+        das_example_cfg,
+        node_id=NODE_ID,
+        discovery_prefix=PREFIX,
+        control_mode=ControlMode.AUTO,
+    )
+    aquabus_problem = next(e for e in entities.values() if e.object_id == "aquabus_problem")
+    blob = {
+        "device_health": {
+            "aquabus_lost": True,
+            "devices": [
+                {
+                    "label": "aquaero",
+                    "serial": "12345-54321",
+                    "aquabus": {"state": "lost", "lost": True, "bound": True},
+                }
+            ],
+        }
+    }
+    shown, missing, defaulted = ha.entity_state(aquabus_problem, blob)
+    assert missing == [] and defaulted == []
+    # ha_check does not evaluate the Jinja if/else -- it shows the raw resolved
+    # value of the one path the template reads (json.dumps'd), which is the point:
+    # that value must be the scalar "aquabus_lost", not the "devices" list.
+    assert shown == "true"
+    assert "12345-54321" not in shown and "serial" not in shown
+
+
 def test_the_das_entity_set_is_complete(das_example_cfg: MpcConfig) -> None:
     sup = Supervisor(das_example_cfg)
     messages = _daemon_messages(das_example_cfg, sup)

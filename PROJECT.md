@@ -8608,19 +8608,27 @@ Owner decision (2026-09-16):
     cooling *given up*, and that is the path the key is for.
 121. **Done** (2026-09-18): the page's Model panel gets one line per zone
     (`<zone> model`: status, `-- blocked: <reasons>` when the zone is not
-    `converged`/`frozen`, `(pe <group>=<value>, …)` from `pe_diag`) and one
-    "Unexcitable channels" line from `experiment.unexcitable`
-    (`publishers/static/index.html`, `renderModel`). Home Assistant gets a
-    `sensor` per zone, `model_block_<zone>` (state: `blocked` joined, or
-    `none`; `json_attributes` the whole per-zone `diagnostics["thermal"]
+    `converged`/`frozen`, `(pe <group>=<value>, …)` from `pe_diag` once the
+    PE monitor has closed two windows, `(pe not yet measured, <n> windows)`
+    before that — `pe_diag` reads 0 for every group until then, and 0 is the
+    reading a group at `PE_MIN` gets, so it must not print like a measurement)
+    and one "Unexcitable channels" line from `experiment.unexcitable`,
+    or `not evaluated (no experiment)` while `experiment.excitation` is
+    still empty — the normal state of a daemon with no identification
+    experiment under way, which must not read the same as a channel an
+    experiment actually cleared (`publishers/static/index.html`,
+    `renderModel`). Home Assistant gets a `sensor` per zone,
+    `model_block_<zone>` (state: `blocked` joined, or `none`;
+    `json_attributes` the whole per-zone `diagnostics["thermal"]
     ["zones"][<zone>]` block, `pe_diag` included), and one `sensor`
-    `unexcitable_channels` (state: `unexcitable` joined, or `none`;
-    attributes the per-channel `excitation` mapping) — values, not a
-    `device_class: problem` binary sensor: a zone still `learning` is not a
-    fault, only a reading about the model (`publishers/mqtt_ha.py`,
-    `_sensor_with_attributes`). Nothing here reaches `PlantObservation` or
-    the solver's `diagnostics`; both keys were already published, this
-    only puts them where a person looks.
+    `unexcitable_channels` (state: `unexcitable` joined, `none` once
+    `excitation` is non-empty and nothing is unexcitable, or `not evaluated`
+    while `excitation` is still empty; attributes the per-channel
+    `excitation` mapping) — values, not a `device_class: problem` binary
+    sensor: a zone still `learning` is not a fault, only a reading about the
+    model (`publishers/mqtt_ha.py`, `_sensor_with_attributes`). Nothing here
+    reaches `PlantObservation` or the solver's `diagnostics`; both keys were
+    already published, this only puts them where a person looks.
 122. The nightly cost and the third seed. `test_ident_converge_sim.py` is
     now **18 cases at 16:47 measured alone on a quiet 32-core host** (it was
     9 at ~12.5 min): the 36 h item-111 case is ~60 s per
@@ -8816,16 +8824,29 @@ Owner decision (2026-09-16):
     recordings meant something; it plays no part in the curve fit itself
     (only `pwm`/`rpm` do).
 129. **Done** (2026-09-18): the page's Controllers section gets one line
-    per controller, `<label> aquabus`, from `device_health.devices[].
-    aquabus.state` ("a device answers" / "lost `<absent_s>` s ago" /
-    "empty" / "never connected" / "unknown"; `publishers/static/
-    index.html`, `renderDevices`). Home Assistant gets `aquabus_problem`
-    (`device_class: problem`, diagnostic, both modes), keyed on `state`
-    through `lost` — a bus with `state: "never_seen"` (a healthy aquaero
-    with an empty bus) or `"empty"` never turns it on, only a device that
-    answered and then has been missing for `bus_absent_s` does; its
-    attributes are the `aquabus` block of every controller in
-    `device_health.devices` (`publishers/mqtt_ha.py`).
+    per controller that actually has an aquabus, `<label> aquabus`, from
+    `device_health.devices[].aquabus.state` ("a device answers" / "lost
+    `<absent_s>` s ago" / "empty" / "never connected" / "not read yet"); a
+    controller kind with no aquabus at all (a `quadro`) has no such row —
+    its `state` reads `"unknown"` forever, which is not the same thing as
+    an aquaero that has simply not been read yet, and must not print like
+    it (`publishers/static/index.html`, `renderDevices`). Home Assistant
+    gets `aquabus_problem` (`device_class: problem`, diagnostic, both
+    modes), keyed on the daemon's own `device_health.aquabus_lost` scalar
+    (`aqua_bridge.health._aquabus_lost`): true only where some controller's
+    aquabus is both `lost` (a device that answered has now been missing for
+    `bus_absent_s`) *and* `bound` (something of that controller's own
+    config — an aquabus output, tachometer or temperature slot — actually
+    reads the bus) — the same gate `device_health`'s own `problems` list
+    already applies before it reports a lost bus, since aquabus presence is
+    read from the status report alone and can go `lost` on a controller
+    with nothing of its own bound behind it. A bus with `state:
+    "never_seen"` (a healthy aquaero with an empty bus) or `"empty"` never
+    turns it on either. Its attributes are `{"devices": [...], "aquabus":
+    [...]}` — each controller's `label` and `aquabus` block (now including
+    `bound`), index for index — a JSON object, because Home Assistant's
+    MQTT attributes mixin discards anything else (`publishers/mqtt_ha.py`,
+    `health.py`).
 133. `tools/bench_model_store.py`'s warm-up loop never gets `calibration`
     or `fan_curves` populated against the shipped
     `config.example-das.yaml` (`fan_curve_online: false`, and the DAS

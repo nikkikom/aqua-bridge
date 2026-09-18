@@ -208,9 +208,9 @@ def test_the_host_problem_template_and_the_host_key_read_the_published_state_blo
 def test_discovery_has_one_aquabus_problem_sensor_in_both_modes(
     cfg: MpcConfig, das_example_cfg: MpcConfig
 ) -> None:
-    """Item 129: the aquabus gets its own problem entity, keyed on ``lost`` (not on
-    the mere absence of a device), with the per-controller detail as its
-    attributes."""
+    """Item 129: the aquabus gets its own problem entity, keyed on the daemon's own
+    ``aquabus_lost`` verdict (``lost`` *and* ``bound``, not ``lost`` alone), with the
+    per-controller detail as its attributes."""
     for config in (cfg, das_example_cfg):
         entities = build_discovery_entities(
             config, node_id=NODE_ID, discovery_prefix=PREFIX, control_mode=ControlMode.AUTO
@@ -222,16 +222,21 @@ def test_discovery_has_one_aquabus_problem_sensor_in_both_modes(
         assert entity.config_topic == f"{PREFIX}/binary_sensor/{NODE_ID}/aquabus_problem/config"
         assert entity.payload["device_class"] == "problem"
         assert entity.payload["entity_category"] == "diagnostic"
-        assert "value_json.device_health.devices" in entity.payload["value_template"]
-        assert "aquabus.lost" in entity.payload["value_template"]
+        assert "value_json.device_health.aquabus_lost" in entity.payload["value_template"]
         assert entity.payload["json_attributes_topic"] == f"{NODE_ID}/state"
         assert "aquabus" in entity.payload["json_attributes_template"]
+        # The attributes template must render a JSON object (Home Assistant's MQTT
+        # attributes mixin discards a top-level array), keyed so a per-controller
+        # aquabus block still carries its label (not just an anonymous list).
+        assert entity.payload["json_attributes_template"].strip().startswith("{{ {")
+        assert "map(attribute='label')" in entity.payload["json_attributes_template"]
 
 
 def test_the_aquabus_problem_template_reads_the_published_state_blob(cfg: MpcConfig) -> None:
-    """The device list the template reads exists in ``ControlSnapshot.to_dict()``,
-    each device carrying the ``aquabus`` block :meth:`AquacomputerAdapter.bus_device`
-    publishes (``state``, ``present``, ``seen``, ``absent_s``, ``lost``,
+    """The device list the attributes template reads, and the ``aquabus_lost``
+    scalar the value template reads, exist in ``ControlSnapshot.to_dict()``, each
+    device carrying the ``aquabus`` block :meth:`AquacomputerAdapter.bus_device`
+    publishes (``state``, ``present``, ``seen``, ``absent_s``, ``lost``, ``bound``,
     ``temps_missing``)."""
     from aqua_bridge.control.intents import ControlSnapshot, Preset, SolverStatus
 
@@ -244,6 +249,7 @@ def test_the_aquabus_problem_template_reads_the_published_state_blob(cfg: MpcCon
                 "seen": True,
                 "absent_s": 42.0,
                 "lost": True,
+                "bound": True,
                 "temps_missing": [],
             },
         }
@@ -265,11 +271,19 @@ def test_the_aquabus_problem_template_reads_the_published_state_blob(cfg: MpcCon
         usb_present=False,
         mqtt_connected=None,
         uptime_s=0.0,
-        device_health={"devices": devices, "fans": {}, "problems": [], "ok": True},
+        device_health={
+            "devices": devices,
+            "fans": {},
+            "problems": [],
+            "ok": True,
+            "aquabus_lost": True,
+        },
     )
     blob = state_payload(snapshot.to_dict(), {})
     assert blob["device_health"]["devices"][0]["aquabus"]["lost"] is True
+    assert blob["device_health"]["devices"][0]["aquabus"]["bound"] is True
     assert blob["device_health"]["devices"][0]["aquabus"]["state"] == "lost"
+    assert blob["device_health"]["aquabus_lost"] is True
 
 
 def test_discovery_has_a_model_block_sensor_per_zone_and_an_unexcitable_sensor(
@@ -299,6 +313,12 @@ def test_discovery_has_a_model_block_sensor_per_zone_and_an_unexcitable_sensor(
     assert unexcitable.component == "sensor"
     assert unexcitable.payload.get("device_class") is None
     assert "extra.experiment.unexcitable" in unexcitable.payload["value_template"]
+    # An empty "excitation" (no experiment has ever run) must read as "not
+    # evaluated", never as "none" -- "none" is what a channel reads once an
+    # experiment has actually cleared it (item 121, on the same principle as
+    # item 117's "not monitored").
+    assert "extra.experiment.excitation" in unexcitable.payload["value_template"]
+    assert "not evaluated" in unexcitable.payload["value_template"]
     assert "extra.experiment.excitation" in unexcitable.payload["json_attributes_template"]
 
 
