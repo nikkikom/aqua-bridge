@@ -278,6 +278,17 @@ def test_das_mpc_step_p99_within_the_relative_budget():
     9.6x-11.7x, in the same range item 126's own prior measurements report (10.4x-10.6x,
     10.57x-10.62x). The absolute Pi gate below keeps wall clock: there, real elapsed time
     against ``dt`` is exactly the question, and the Pi runs this suite alone.
+
+    ``process_time`` sums CPU time across every thread of the process, so it would stop
+    being machine-independent if the linear algebra here (``np.linalg.solve``,
+    ``eigvalsh``, ``pinv``, ``lstsq``) ever ran multi-threaded BLAS -- CPU time would then
+    scale with however many worker threads OpenBLAS spun up, which can itself vary with
+    the machine. Checked directly, not assumed: forcing ``OMP_NUM_THREADS`` /
+    ``OPENBLAS_NUM_THREADS`` to 1, 16 and unset (this machine has 32 cores) all gave the
+    same ~8x-10x ratio on this branch's code -- the matrices this solver ever forms
+    (``mpc.channels`` up to a handful, at most a few dozen decision variables) sit well
+    under OpenBLAS's own threshold for switching a solve to multiple threads, so thread
+    count is not, in practice, a second source of scheduler-dependent noise here.
     """
     cfg = das_mpc_config()
     ratios: list[float] = []
