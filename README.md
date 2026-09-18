@@ -321,6 +321,23 @@ is not yet confirmed on real hardware, on either board.
     curve fitted to the very tachometer readings being judged would follow
     a fan that slows down, and the deviation would never show.
 
+    A fan that is **commanded but does not turn** is a different problem and
+    has its own answer (`spin_up:`, §8 item 75): a fan's starting duty is
+    above its running duty, so after a restart a channel can read a healthy
+    duty on a healthy rail while the rotor stands still. The daemon confirms
+    that on the tachometer, raises that one channel to its own `kick_duty`
+    for `kick_s`, checks the tachometer again, and after `max_attempts` calls
+    it a failed fan — a `problems` line, and a floor under the other channels
+    of the zones it served so the enclosure cannot lose cooling because of
+    it. The kick is a floor and never a level: it goes through the same
+    `mpc.d_pwm_max` and `[pwm_min, pwm_max]` as any command and is a no-op
+    whenever the solver already wants more. **The kick duty is per output**,
+    because the duty-to-rpm mapping is the output's, not the fan model's, and
+    an output with no fan or a fan with no tachometer is never kicked and
+    never alarmed — the config says which. The rule needs an
+    `mpc.fan_models` curve, so it is off in a legacy config, and each
+    channel's `spin_up` verdict says whether it ran.
+
     The Raspberry Pi itself is watched the same way (`host_health:`, §8
     item 103): `/api/state`'s `device_health.host` and the page's **Host**
     section show the board's temperature against the enclosure air, whether

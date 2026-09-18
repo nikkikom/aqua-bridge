@@ -3065,7 +3065,7 @@ a model converges only with them.
 - DAS core: `control/estimates.py`, `control/estimator.py`,
   `control/associate.py`, `control/thermal.py`, `control/noise.py`,
   `control/solver_das.py`, `control/persist.py`, `control/fancurve.py`,
-  `control/ident.py`,
+  `control/ident.py`, `control/spinup.py`,
   `sim/das.py`, and their suites (§4.10)
 - **DAS truth simulator** (`aqua_bridge.sim.das`), the reference plant for
   every DAS milestone and deliberately richer than any controller model:
@@ -3810,6 +3810,107 @@ a model converges only with them.
   and whether a bus hiccup can show it for one report only, no capture
   says (item 96). Pinned on the three captures in
   `tests/test_hw_aquacomputer.py`.
+- **Spin-up kick** (`control/spinup.py`, item 75). A fan's *starting* duty is
+  higher than its running duty — the owner's aquaero test fan stops at 13 %
+  and starts again only at 25 % — so a channel can sit at a healthy duty on a
+  healthy rail, with the duty read back matching the duty written, while the
+  rotor stands still and the enclosure is silently uncooled there. Only the
+  tachometer knows. The owner met exactly that after a restart (2026-09-17).
+  The answer is a **supervised sequence, never a blind boost**:
+
+  1. *Detect.* A channel whose commanded duty has stayed at or above its stall
+     duty and whose tachometer has read at or below `min_rpm` for `confirm_s`
+     of live, uninterrupted readings. A tick with no live reading (the read
+     failed, the write failed, the aquabus slot went away) starts every window
+     again — the same rule the health monitor follows.
+  2. *Kick.* Raise that channel to its own `kick_duty` for `kick_s`. The kick
+     is a **floor, never a level**: `compose` takes `max(what the solver or a
+     human asked for, the floor)` and then applies the same `d_pwm_max` rate
+     limit and the same `[pwm_min, pwm_max]` clamp as any other command. A
+     solver that already wants more is untouched, so a kick can reduce cooling
+     nowhere and `mpc.step` is not touched at all.
+  3. *Verify.* Watch the tachometer for `verify_s`. Motion ends the sequence;
+     no motion starts the next attempt, and after `max_attempts` the channel is
+     a **failed fan**: a `problems` line naming it, and (with
+     `failed_channel_floor`) a floor under every other channel of the zones it
+     served, at the duty they carried when the failure was declared, so the
+     zone cannot *lose* cooling because one of its fans died. The floor is a
+     hold, not a computed compensation: how much more air the zone needs is
+     something only the measured temperatures know, and they raise the
+     siblings through the solver like any other heat. A failed channel is
+     retried once every `retry_s`, so a fan replaced while the daemon runs is
+     picked up without a restart and a dead one is kicked at most once per
+     interval instead of for ever — and that retry runs *under* the floor,
+     which keeps the level recorded at the **first** failure rather than being
+     re-recorded, so repeated retries across a hot spell cannot ratchet the
+     siblings upward. Only the tachometer lifts it.
+  4. *At start too.* Every commanded channel is under the rule from the first
+     tick; the same confirmation window covers the seconds a healthy fan needs
+     to spin up. Nothing is boosted on start without evidence.
+
+  **The kick duty is per output, not one global number.** Measured on the
+  owner's hardware 2026-09-18: the same fan model reads **174 rpm on an
+  aquaero output and 255 rpm on an output behind the aquabus device at the
+  same nominal 20 %** (244 against 311 at 25 %) — 32–47 % apart at exactly the
+  duties where starting happens. The duty-to-rpm mapping belongs to the
+  output, so one global kick would be wasteful noise on the stronger output
+  and too weak on the other, and the one that failed to start is the weaker
+  one, the aquaero's own. `spin_up.channels.<ch>.kick_duty` carries it, with
+  `spin_up.kick_duty` as the documented fallback; `config.example-das.yaml`
+  ships 0.5 for `xt1..xt4` and 0.35 for `qd1..qd4`. Those are duties chosen
+  with margin over the measured start behaviour, **not a fitted curve** — two
+  points per output fit nothing — and `tools/fit_fans.py` measuring each
+  output's real start duty is what replaces them (item 75).
+
+  **Three things that look alike must not be confused, and the config is what
+  tells them apart**: an output with no fan on it
+  (`spin_up.channels.<ch>.fan: false`), an output whose fan drives no
+  tachometer (`tachometer: false`, and equally a channel with no `rpm:` in its
+  `aquacomputer:` binding, which reports no speed at all), and a fan that
+  should be turning and is not. The first two are **never kicked and never
+  alarmed**; their verdict carries `monitored` false with the reason, exactly
+  like the health rules that declare what they do not cover (item 117), so a
+  channel nothing watches can never read as a fan found healthy. A channel
+  with no fitted curve (`mpc.fans` / `mpc.fan_models`, which need
+  `mpc.topology`) is off for the same reason: without a curve nothing can say
+  what "implausibly low" means for that output. **A legacy config therefore
+  gets no kick at all and its command path is bit-identical.**
+
+  Where it sits: the tracker is the supervisor's — `record_tick` advances it
+  on the tick's own facts (the composed command's duty, `obs.rpm`, whether the
+  tick was live), `plan_tick` puts the floors in force into `TickPlan`, and
+  `compose` applies them last, in every mode, because they only raise. That is
+  also why a `fallback` command is no longer returned untouched while a floor
+  is in force; with no floor (every ordinary tick) `compose` behaves exactly as
+  before. Everything in `control/spinup.py` is pure and clock-free: the clock
+  is `obs.ts`. The verdict is published through `health.HealthMonitor`
+  (`fans.<ch>.spin_up`, and the failed fans in the payload's `problems`), so
+  `/api/state`, `/api/health`, the MQTT state blob and the page all show it.
+  Every threshold and timing is a `spin_up:` key with one default declared once
+  in `control.spinup.SpinUpConfig`, validated there and — for the per-channel
+  names and the reachability of the kick duty, which need `mpc` —
+  in `validate_spin_up`, both at startup before anything is opened.
+
+  **Noise cost of a kick**, measured on `config.example-das.yaml` at the shipped
+  defaults (`control/noise.py`'s energetic index, `noise.exponent: 5`, ten fans
+  on eight outputs; the index is relative — `noise_db_at_max: 30` is a
+  placeholder until item 94 measures the fans):
+
+  | enclosure at | index | kick `xt1` (2 fans) to 0.50 | kick `xt3` (1 fan) to 0.50 | kick `qd1` (1 fan) to 0.35 |
+  |---|---|---|---|---|
+  | 0.20 (`pwm_min`) | −7.7 dB | 15.4 dB (**+23.1**) | 12.4 dB (**+20.1**) | 2.6 dB (**+10.3**) |
+  | 0.30 | 7.3 dB | 15.9 dB (**+8.6**) | 13.5 dB (**+6.1**) | 8.2 dB (**+0.8**) |
+  | 0.50 | 22.4 dB | 22.4 dB (**+0.0**) | 22.4 dB (**+0.0**) | 22.4 dB (**+0.0**) |
+
+  The cost is paid for at most `kick_s` (30 s) per attempt and at most
+  `max_attempts` (3) attempts per sequence, so the worst case is 90 s of an
+  audible rise against a channel that is moving no air at all — and it is zero
+  whenever the solver already commands more than the kick, which is the whole
+  reason the kick is a floor. The quiet-enclosure figures are the expensive
+  ones, and the aquabus outputs' lower kick duty is most of why: the same
+  measurement that made the duty per output also made the kick cheaper on the
+  outputs that need less of it.
+
 - **The board itself** (`health.py`, item 103). The Raspberry Pi the daemon
   runs on is a **health signal, never a model input** (owner decision,
   §8.1, 2026-09-16): about a watt against the drives' tens of watts, and
@@ -4118,6 +4219,7 @@ aqua-bridge/
     control/persist.py       # apply a stored model to the controller memory (pure)
     control/fancurve.py      # online PWM -> RPM fit per fan model (pure)
     control/ident.py         # identification experiments on fan groups (pure)
+    control/spinup.py        # spin-up kick for a fan commanded but not turning (pure)
     control/intents.py       # intents, ControlSurface, ControlSnapshot, payloads
     control/supervisor.py    # control mode, overrides, setpoints, limits, bays, presets, experiments, compose
     control/loop.py          # read -> step -> compose -> apply -> watchdog
@@ -4959,6 +5061,8 @@ tests carry the `nightly` marker.
 | `tests/test_ident_replan_sim.py` | re-planned against frozen experiment levels on the truth sim (`rich`, the real loop and supervisor), both solvers and three seeds: no tick below the solver's own command (and the frozen plan does hold one back), no anchor more than `ident_amplitude` above the demand the frozen arm saw (the ratchet guard, which the pre-review `_replan` fails on the MPC arm), and the fit no worse than frozen beyond a loose margin | nightly |
 | `tests/test_ident_converge_sim.py` | closed-loop identification on the daemon's own path, 16 h on the truth sim (`rich`, the real loop and supervisor), three seeds. Item 102: a zone-wide `ident_parallel: true` schedule against a one-channel-at-a-time round robin over *all eight* channels on the same plant — the measured converged zones per seed on both arms (z0+z3 / z0+z2 / z0+z3 against none / none / z0), `pe_min` and `excited_windows` on the converged zones held to the values the runs reached rather than to the rule's own thresholds, which of the round robin's converged zones still hold `PE_MIN` at the end of the run rather than latching from a burst, the zones that close no window at all named per seed (none since §8 item 109), zero limit violations in either arm, both arms' true margin above a floor and the mean-PWM gap bounded both ways. Item 112: no channel is left with a floor above `pwm_min` after an experiment ends, and both the enclosure's mean PWM and qd1's own stay under what the old release spent (the channel mean is what separates the two releases on the seeds where qd1 already reached `pwm_min`). Item 111: the same schedule at 36 h — the zones that converge with more windows (6 of 12 at 16 h to 11 of 12 at 36 h since §8 item 109's fix), no zone blocked by an `E`'s relative standard error, the one bay that still blocks a zone (b15, seed 3) named, and `se(k)` under 0.12 on every bay | nightly |
 | `tests/test_sim_das.py` | the truth plant: energy balance through transients and hot swap, steady state, more airflow never warms anything, dead band and exponent, quantisation per sensor type, lags, SMART cadence, determinism per seed | PR |
+| `tests/test_spinup.py` | the spin-up kick's section and its sequence (§8 item 75), driving the supervisor the way the loop does with the tachometer scripted: every key, every rejection, the per-output kick duty and its clamp, the `mpc`-aware checks (an unknown channel, a `kick_s` shorter than a tick), both example configs at their defaults; confirm → kick → verify → the next kick → failed; a fan that starts on the first kick and one that needs two; the failed fan's message and its siblings' floor holding while the solver asks for less, with an unrelated zone's channel left alone; the kick as a no-op while the solver commands more; an output with no fan, a fan with no tachometer, a channel with no tachometer bound, a duty below the stall duty and a legacy config all off with their reason; a gap starting the window again; the floor applied under `fallback` too and absent from the diagnostics when nothing is in force; the log lines; a run with the rule on never below the same run with it off; the measured noise cost of a kick (§3 "Spin-up kick"); the health payload carrying the verdict and the failed fans, and a bad key or a channel typo exiting 2 before anything opens | PR |
+| `tests/test_spinup_sim.py` | the same rule through the real `Loop` against the DAS truth plant, where the rotor really does not turn (the simulator's `start_duty`): a stalled fan starting on the first kick and staying turning at `pwm_min` afterwards, one the first kick's `d_pwm_max` ramp does not reach given a second, a seized fan declared failed with its zone's other channels floored, an output with no fan and a fan with no tach wire never kicked, a kick that changes no command while the solver is above it, the command never lower than the same run with the rule off and never outside `[pwm_min, pwm_max]` or past `d_pwm_max`, a healthy enclosure never kicked, and `start_duty: 0` reproducing the plant bit for bit | PR |
 
 Test cost: the PR selection is about 1,900 tests in under five minutes
 on the development machine (`HYPOTHESIS_PROFILE=ci`); PR CI stays under
@@ -5192,7 +5296,12 @@ Config `http:` (parsed and validated by `HttpSettings` in
   `power_monitored`, `unmonitored` — the rules that did not run for that
   output and why, §8 item 117; a flag is true only when that rule actually
   ran, which needs the measurement *and* the configuration it is judged
-  against — and `problems`), `host` (§8 item 103: the board's own
+  against — `spin_up` (the spin-up kick's verdict for that output, §8 item
+  75: `state` — `off` | `idle` | `turning` | `confirming` | `kicking` |
+  `verifying` | `failed` — with `monitored`, `failed`, `attempts`, the last
+  `rpm` and `duty`, and, where the rule is off for that output, the
+  `reason`; a failed fan's line is in the top-level `problems` too), and
+  `problems`), `host` (§8 item 103: the board's own
   `cpu_temp_c`, the `air_c` reference it is compared against with the
   `air_temps` it was averaged from, the signed `divergence_c`, `load1`,
   `idle`, the `throttled` reading and this board's own `faults`,
@@ -8082,16 +8191,46 @@ Owner decision (2026-09-16):
     only if the owner wants to inspect it first).
 49. Digole: protocol, pages (Overview, Drives, Zones/Fans, Model, Host),
     touch, hit-test.
-75. Fan stall and restart: a fan below its stall duty stops and starts
-    again only at a higher duty (aquaero test fan: stops at 13 %, starts
-    at 25 %), and a fan can speed up in a low-duty band (Quadro test fan:
-    up to 860 rpm at 5–8 %). `mpc.pwm_min` is one global value. Per-output
-    stall and start duties in the config, a start kick when a channel
-    reads 0 rpm under a command above its stall duty, and
-    `tools/fit_fans.py` finding both duties and the unstable band. Open
-    question for the Quadro: whether its jump to 860 rpm at 5–8 % is a
-    firmware start boost; if so, it may restart a stalled fan without daemon
-    code. (For the aquaero that guess is withdrawn: the outputs that stayed
+75. **The kick is done; the measured duties behind it are not** (2026-09-18).
+    A fan below its stall duty stops and starts again only at a higher duty
+    (aquaero test fan: stops at 13 %, starts at 25 %), and a fan can speed up in
+    a low-duty band (Quadro test fan: up to 860 rpm at 5–8 %). `mpc.pwm_min` is
+    one global value.
+
+    **Shipped** (`control/spinup.py`, §3 "Spin-up kick"): the start kick this
+    item asked for, as a supervised sequence rather than a boost — detect a
+    channel commanded at or above its stall duty whose tachometer reads at or
+    below `spin_up.min_rpm` for `confirm_s` of live readings, kick it to its own
+    `kick_duty` for `kick_s`, verify by the tachometer for `verify_s`, and after
+    `max_attempts` call it a failed fan with a `problems` line and a floor under
+    its siblings so the zone cannot lose cooling. Every commanded channel is
+    under the rule from the first tick, which is the restart case the owner hit
+    on 2026-09-17. The kick is a floor applied in `Supervisor.compose` through
+    the same `d_pwm_max` and clamp as any command, so it can reduce cooling
+    nowhere; `mpc.step` is untouched and a legacy config gets no kick at all.
+    An output with no fan (`spin_up.channels.<ch>.fan: false`), a fan with no
+    tachometer (`tachometer: false`, or no `rpm:` in the `aquacomputer:`
+    binding) and a channel with no fitted curve are never kicked and never
+    alarmed, and each says so in its verdict.
+
+    **The duty-to-rpm mapping is the output's, not the fan model's** — measured
+    2026-09-18 on the owner's hardware: the same fan model reads 174 rpm on an
+    aquaero output and 255 rpm on an output behind the aquabus device at the
+    same nominal 20 % (244 against 311 at 25 %). So `kick_duty` is per channel,
+    with a documented fallback; `config.example-das.yaml` ships 0.5 for the
+    aquaero's own outputs (the weaker mapping, and the ones that failed to
+    start) and 0.35 for the aquabus ones.
+
+    **Still open.** Those are duties chosen with margin over the measured start
+    behaviour, not measured start duties: two points per output fit nothing, and
+    `spin_up.stall_duty` is still one number for every channel with a per-channel
+    override nothing has measured a value for. What closes it is
+    `tools/fit_fans.py` finding each output's stall duty, start duty and unstable
+    band from a recording, after which `stall_duty` and `kick_duty` come from
+    measurements per output instead of from margin. Open question for the Quadro:
+    whether its jump to 860 rpm at 5–8 % is a firmware start boost; if so, it may
+    restart a stalled fan without daemon code, and the kick would be a no-op
+    there. (For the aquaero that guess is withdrawn: the outputs that stayed
     at 100 % were in DC voltage mode, §2 "hidraw check".)
 76. What the aquaero channels hold after exit: each commanded channel
     keeps its manual preset (the stop write leaves `fallback_pwm`).
