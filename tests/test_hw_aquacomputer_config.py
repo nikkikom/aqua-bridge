@@ -280,7 +280,8 @@ def test_the_refusal_holds_below_the_config_parser_too() -> None:
     can build one that would reach the estimator (PROJECT.md section 8 item 113)."""
     with pytest.raises(ValueError, match="'soft1' is a software sensor"):
         DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"beat": "soft1"})
-    DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"air": "temp1", "coolant": "bus2"})
+    # bus2 needs one of that device's own aquabus outputs bound alongside it (item 92).
+    DeviceBinding(kind=AQUAERO, pwm_map={"qd2": 6}, temp_map={"air": "temp1", "coolant": "bus2"})
 
 
 @pytest.mark.parametrize(
