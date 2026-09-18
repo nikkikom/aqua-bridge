@@ -329,9 +329,12 @@ is not yet confirmed on real hardware, on either board.
     for `kick_s`, checks the tachometer again, and after `max_attempts` calls
     it a failed fan — a `problems` line, and a floor under the other channels
     of the zones it served so the enclosure cannot lose cooling because of
-    it. The kick is a floor and never a level: it goes through the same
-    `mpc.d_pwm_max` and `[pwm_min, pwm_max]` as any command and is a no-op
-    whenever the solver already wants more. **The kick duty is per output**,
+    it. That floor is capped at `failed_channel_floor_max` and is lifted only
+    when the tachometer has read above `min_rpm` for `clear_s` — never by one
+    sample and never by a dropped reading, because declaring a fan dead costs a
+    whole confirmation window and every attempt. The kick is a floor and never a
+    level: it goes through the same `mpc.d_pwm_max` and `[pwm_min, pwm_max]` as
+    any command and is a no-op whenever the solver already wants more. **The kick duty is per output**,
     because the duty-to-rpm mapping is the output's, not the fan model's, and
     an output with no fan or a fan with no tachometer is never kicked and
     never alarmed — the config says which. The rule needs an
