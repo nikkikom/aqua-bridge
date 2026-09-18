@@ -683,6 +683,72 @@ host_health:
                              # answers. A timeout is simply unknown, and the chain
                              # falls through to the rpi_volt hwmon under-voltage bit
 
+# The spin-up kick: a fan that is commanded but does not turn (PROJECT.md section 3
+# "Spin-up kick", section 8 item 75). A fan's STARTING duty is higher than its running
+# duty -- the owner's aquaero test fan stops at 13 % and starts at 25 % -- so a channel
+# can read a healthy duty on a healthy rail while the rotor stands still and the
+# enclosure is silently uncooled there. The owner met exactly that after a restart
+# (2026-09-17). Every key at its default except channels:, which carries the owner's
+# own outputs.
+spin_up:
+  enabled: true              # false: nothing is detected, nothing is kicked, and every
+                             # channel's verdict says the rule is off
+  stall_duty: 0.15           # a channel commanded below this output duty may
+                             # legitimately stand still and is not judged (0..1); above
+                             # the 13 % at which the owner's test fan stops. Per output:
+                             # channels.<ch>.stall_duty
+  kick_duty: 0.5             # the duty a kick raises a channel to (0..1) when that
+                             # channel has no kick_duty of its own: twice the 25 % start
+                             # duty measured on the owner's aquaero output, the margin an
+                             # uncharacterised output gets. Clamped into
+                             # [mpc.pwm_min, mpc.pwm_max] when it is applied
+  kick_s: 30.0               # how long one kick holds the channel there, seconds (> 0).
+                             # It has to cover the mpc.d_pwm_max ramp up to that duty as
+                             # well as the rotor's own start time; shorter than mpc.dt is
+                             # a config error, because no kick would ever reach the fans.
+                             # Here: 0.2 -> 0.5 at d_pwm_max 0.1 is 3 ticks = 15 s of
+                             # ramp, leaving 15 s at the kick duty
+  confirm_s: 30.0            # a channel must read at or below min_rpm under a duty at or
+                             # above its stall duty for this long of live, uninterrupted
+                             # readings before it is kicked, seconds (> 0). It is also
+                             # what covers the seconds a healthy fan needs to spin up
+  verify_s: 30.0             # after a kick, how long the tachometer is watched before
+                             # the next attempt, seconds (> 0)
+  max_attempts: 3            # kicks one channel gets before it is a failed fan (>= 1)
+  min_rpm: 60.0              # a speed at or below this is "not turning", rpm (>= 0). Not
+                             # zero: a tachometer reading a handful of rpm is a rotor
+                             # that is not moving air either
+  retry_s: 900.0             # a failed channel is tried once more after this long,
+                             # seconds (> 0), so a fan replaced while the daemon runs is
+                             # picked up without a restart -- and a dead one is kicked at
+                             # most once per this interval instead of for ever
+  failed_channel_floor: true # while a fan is declared failed, hold every other channel
+                             # of the zones it served at the duty it carried when the
+                             # failure was declared, so the zone cannot lose cooling
+                             # because one of its fans died. The rise above that floor
+                             # comes from the measured temperatures through the solver
+  log_interval_s: 300.0      # one log line per channel and transition at most this
+                             # often, seconds (> 0)
+  # Per output: {fan, tachometer, stall_duty, kick_duty}; an absent stall_duty /
+  # kick_duty means the section's value above. THE KICK DUTY IS PER OUTPUT, not one
+  # global number, because the duty-to-rpm mapping belongs to the output: measured
+  # 2026-09-18 on this hardware, the same fan model reads 174 rpm on an aquaero output
+  # and 255 rpm on an output behind the aquabus device at the same nominal 20 % (244
+  # against 311 at 25 %). At the low duties where starting happens the aquaero's own
+  # outputs turn the same fan 32-47 % slower, so they need the higher kick -- and they
+  # are the ones that failed to start. These are duties chosen with margin over the
+  # measured start behaviour, not a fitted curve: two points per output fit nothing.
+  # Replace them with measured start duties once tools/fit_fans.py has run (item 75).
+  channels:
+    xt1: {kick_duty: 0.5}    # the aquaero's own outputs: the weaker duty-to-rpm mapping
+    xt2: {kick_duty: 0.5}
+    xt3: {kick_duty: 0.5}
+    xt4: {kick_duty: 0.5}
+    qd1: {kick_duty: 0.35}   # behind the aquabus device: 47 % faster at the same nominal
+    qd2: {kick_duty: 0.35}   # duty, so the same rotor speed needs less of it
+    qd3: {kick_duty: 0.35}
+    qd4: {kick_duty: 0.35}
+
 # 1-Wire: two w1-gpio buses (dtoverlay=w1-gpio,gpiopin=4 and gpiopin=17 in
 # config.txt); bus masters are discovered under root (default /sys/bus/w1/devices).
 # Bind ROM ids with tools/w1_commission.py --list / --identify and verify the

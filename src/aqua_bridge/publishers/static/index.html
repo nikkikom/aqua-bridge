@@ -179,6 +179,14 @@ function renderDevices(health) {
     // what to expect. Say "not monitored" rather than print the number alone: neither
     // a blank nor a value must read as a rule that checked and passed.
     if (f.rpm_monitored === false) parts.push("rpm not monitored");
+    // The spin-up kick (section 8 item 75): a channel commanded but not turning. The
+    // failed fan's own line is in h.problems below; here it is the channel's state, and
+    // a channel the rule does not watch says so rather than showing nothing.
+    const s = f.spin_up;
+    if (s && s.state === "failed") parts.push("FAN DOES NOT TURN");
+    else if (s && (s.state === "kicking" || s.state === "confirming" || s.state === "verifying"))
+      parts.push("spin-up " + s.state + " (" + s.attempts + ")");
+    else if (s && s.monitored === false) parts.push("spin-up not monitored");
     parts.push(note(fmt(f.voltage_v) + " V", "rail", f.rail_monitored, f.voltage_v));
     parts.push(note(fmt(f.current_ma, 0) + " mA, " + fmt(f.power_w) + " W",
                     "power", f.power_monitored, f.power_w));

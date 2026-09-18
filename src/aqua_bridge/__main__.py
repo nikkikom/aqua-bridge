@@ -78,6 +78,7 @@ from typing import Any
 
 from aqua_bridge.config import AppConfig, ConfigError, load_config
 from aqua_bridge.control.loop import Loop, Sink, Source
+from aqua_bridge.control.spinup import SpinUpConfig, validate_spin_up
 from aqua_bridge.control.supervisor import Supervisor
 from aqua_bridge.health import (
     FanHealthConfig,
@@ -345,9 +346,9 @@ def build_health_monitor(
     app: AppConfig, supervisor: Supervisor, source: Any
 ) -> HealthMonitor | None:
     """The fan-, device- and host-health observer for ``on_tick``, or ``None`` when
-    both ``fan_health.enabled`` and ``host_health.enabled`` are false and the source
-    has no device health of its own to publish either (PROJECT.md section 8 items
-    79, 83 and 103).
+    ``fan_health.enabled``, ``host_health.enabled`` and ``spin_up.enabled`` are all
+    false and the source has no device health of its own to publish either (PROJECT.md
+    section 8 items 79, 83, 103 and 75).
 
     ``fan_health:`` and ``host_health:`` are validated here, so a bad threshold is a
     startup :class:`ConfigError` (exit 2) rather than a rule that silently never
@@ -370,7 +371,13 @@ def build_health_monitor(
     """
     settings = FanHealthConfig.from_section(app.section("fan_health"))
     host_settings = HostHealthConfig.from_section(app.section("host_health"))
-    if not settings.enabled and not host_settings.enabled and not hasattr(source, "device_health"):
+    spin_settings = SpinUpConfig.from_section(app.section("spin_up"))
+    if (
+        not settings.enabled
+        and not host_settings.enabled
+        and not spin_settings.enabled
+        and not hasattr(source, "device_health")
+    ):
         return None
     interval_s = float(app.section("host").get("interval_s", 5.0))
     reader = host_metrics_reader(host_settings)
@@ -381,6 +388,7 @@ def build_health_monitor(
         publish=supervisor.set_device_health,
         host_settings=host_settings,
         hostinfo=CachedHostInfo(interval_s=interval_s, reader=reader).get,
+        spin_up=supervisor.spin_up_status,
     )
 
 
@@ -500,6 +508,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         # let a typo'd sensor name escape as a traceback with the hidraw handles open
         # and the section 9 stop path -- the only fallback_pwm write -- skipped.
         validate_host_health(cfg, HostHealthConfig.from_section(app.section("host_health")))
+        # spin_up: the same treatment. Its per-channel names and the reachability of its
+        # kick duty need the controller config, so they cannot live in the section model
+        # either (section 8 item 75).
+        spin_up = SpinUpConfig.from_section(app.section("spin_up"))
+        validate_spin_up(cfg, spin_up)
         initial, persister = build_model_store(
             cfg,
             args.model_store,
@@ -531,7 +544,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 3
 
     notifier = SdNotifier()
-    supervisor = Supervisor(cfg, version=VERSION)
+    supervisor = Supervisor(cfg, version=VERSION, spin_up=spin_up)
     supervisors.append(supervisor)  # arms the ident_settle callable handed to the store
     sleep = _make_sleep(args.sim_speed) if args.source == "sim" else None
     loop = Loop(
