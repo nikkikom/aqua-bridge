@@ -7639,6 +7639,14 @@ Owner decision (2026-09-16):
     later reader cannot tell "this controller does not measure it" from
     "this tick had no reading". One boolean, the same argument that
     already keeps `power_reported`.
+129. Publish the bus state where a person sees it (items 92, 114, 115).
+    `device_health.aquabus` reaches `/api/state` and the MQTT blob
+    already; the HTML page and the Home Assistant entities do not show
+    it. One line on the page ("aquabus: a device answers / lost N s
+    ago") and a Home Assistant binary sensor would make item 92's signal
+    visible without reading the journal. Key both on `state`, not on
+    `lost` alone: `state` tells `never_seen` (a healthy aquaero with an
+    empty bus) from `lost`.
 
 ### 8.3 Open — needs the DAS hardware
 
@@ -8253,6 +8261,32 @@ Owner decision (2026-09-16):
     supply, or accept the rule on the reasoning. If taken, `N` and `W`
     are two new `fan_health:` keys with defaults derived from the
     measured refresh rate (23 measuring reports in 90).
+130. A bus device with no fan outputs (item 92's audit). Item 92 judges
+    an aquabus device present from the fan blocks 5-8, so a sensor-only
+    slave (a Farbwerk 360, a Quadro with no fans) reads as an empty bus
+    and its `busN` slots would read as missing for ever — safe, but
+    blind. The config model now refuses that binding outright (a `busN`
+    needs one of the device's aquabus outputs bound in the same entry),
+    which also shuts out a legitimate shape: a Quadro on aquabus whose
+    fans this daemon does not command. Decide whether either is in
+    scope; if so, find evidence of presence that does not need a bound
+    output (a `busN` that moves, a flow slot that is not `0x7FFF`, or a
+    field of the control report that lists the bus members) and key the
+    rule on that instead.
+131. The one experiment that names `+0x0A` (item 114). On the bench,
+    with writes allowed: set an aquabus output to three duties (say
+    25 %, 50 %, 75 %), capture ten reports at each, and check the
+    `field x duty ~ current` line against a third and fourth point;
+    then put one of the aquaero's own outputs in DC mode and see
+    whether the field stops reading 0 there. Either it is named, or
+    item 114 is closed as unidentified for good.
+132. Whether the aquabus poll rate is a device setting (item 115).
+    Owner action on the aquaero's own menu, not a daemon write: capture
+    the control report, change the aquabus setting on the device,
+    capture it again, diff the 2707 bytes. If a field turns up, the
+    interval becomes configurable, an aquabus output's current becomes
+    a health signal again and `aquabus_outputs_report_power` can be
+    True for a controller configured that way.
 
 ### 8.4 Open — Zero 2 W upgrade
 
