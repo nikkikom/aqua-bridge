@@ -290,8 +290,8 @@ Status machine per zone (the model's status is the least advanced zone, with
   (conservative: a fresh file does not make a model that never converged act).
 
 Hot swap (plan section 8 item 12): ``update`` takes ``reset_bays``, the bays the
-estimator reported as ``swapped`` this tick (the occupancy crossed the ``empty``
-boundary, or the fast-swap rule tripped). With ``model_reset_on_swap`` (default
+estimator reported as ``swap_reset`` this tick -- its rate-limited swap *event*, not its
+per-tick ``swapped`` verdict (the paragraph below). With ``model_reset_on_swap`` (default
 ``true``) each of them starts over from its prior -- ``g0``, ``k``, ``q_s``, the
 covariance, the counters, the PE monitor and the window in progress -- because those
 coefficients describe the drive that left, and the MPC's ``bay_settle_s`` exclusion
@@ -332,7 +332,8 @@ Memory (plain JSON)::
              "w": windows, "m": [...], "S": [[...]], "fm": [...] | None, "pe": float,
              "pd": [...], "se": [...] | None,
              "rel": [...] | None, "acc": {"x", "y", "h", "fan", "t0", "c"} | None,
-             "rst": resets so far, "rst_ts": ts of the last one | None (item 123)}
+             "rst": resets so far, "rst_ts": ts of the last one | None (item 123),
+             "inf": this block once had its excited windows *and* its PE (item 119)}
 
 ``pd`` (the ``pe`` diagonal) and ``se`` (the absolute standard errors behind ``rel``) are
 *derived*: refreshed with ``pe`` / ``rel`` at every closing window and rebuilt from ``m``,
@@ -1384,6 +1385,13 @@ def _fresh_block(spec: _BlockSpec, n_fan: int) -> dict[str, Any]:
         # point: the coefficients start over, the record does not.
         "rst": 0,
         "rst_ts": None,
+        # section 8 item 119: whether this block has *ever* had MIN_WINDOWS excited
+        # windows and a PE over PE_MIN at the same time, since its last reset. The
+        # excitation half of the ``converged`` rule is latched because ``pe`` is not a
+        # fact but an EWMA over the last PE_WINDOWS windows: it decays back to nothing an
+        # hour after the last experiment, which is the state a finished enclosure spends
+        # almost all of its time in. See :func:`_block_blockers`.
+        "inf": False,
     }
 
 
@@ -1473,6 +1481,13 @@ def _rls_window(
     block["pd"] = _pe_diag(m_arr, s_arr, int(block["w"]))
     block["se"] = _standard_errors(block, spec)
     block["rel"] = _rel_se(block, spec)
+    # section 8 item 119: latch the excitation half of the ``converged`` rule. ``n`` only
+    # ever grows, but ``pe`` is an EWMA over the last :data:`PE_WINDOWS` windows and falls
+    # back to nothing once the fans go quiet, so re-reading it later would call every
+    # block of a finished model uninformed again. Cleared only by a reset, which starts
+    # the block over at the prior (:func:`_fresh_block`).
+    if not block["inf"] and int(block["n"]) >= MIN_WINDOWS and float(block["pe"]) > PE_MIN:
+        block["inf"] = True
     return residual, excited
 
 
@@ -1696,6 +1711,16 @@ def _parse_block(raw: object, spec: _BlockSpec, n_fan: int) -> dict[str, Any]:
     resets = raw.get("rst", 0)
     if isinstance(resets, bool) or not isinstance(resets, int) or resets < 0:
         raise ValueError("reset count")
+    # section 8 item 119: a file written before the latch existed carries no ``inf``. It
+    # is derived once from what the block does say, which is the rule as it was evaluated
+    # live until now -- so a model store from an older build restores with the same
+    # informedness it would have been read with, instead of every block of it reading as
+    # never informed.
+    informed = raw.get("inf")
+    if informed is None:
+        informed = counts[0] >= MIN_WINDOWS and _num(raw.get("pe", 0.0)) > PE_MIN
+    elif not isinstance(informed, bool):
+        raise ValueError("informed flag")
     out = {
         "theta": theta,
         "P": _checked(raw["P"], (n, n)),
@@ -1710,6 +1735,7 @@ def _parse_block(raw: object, spec: _BlockSpec, n_fan: int) -> dict[str, Any]:
         "acc": None if acc is None else _parse_acc(acc, n, n_fan),
         "rst": resets,
         "rst_ts": _opt_num(raw.get("rst_ts")),
+        "inf": bool(informed),
     }
     # ``pd`` / ``se`` are derived from what was just parsed, not read from the file: the
     # two are a view of ``m``/``S`` and of ``P``, and deriving them here keeps every
@@ -2214,6 +2240,8 @@ def _block_blockers(
     occupied: Mapping[str, bool],
     zone_specs: Mapping[str, _BlockSpec],
     bay_specs: Mapping[str, _BlockSpec],
+    *,
+    latched: bool,
 ) -> dict[str, list[str]]:
     """Per block of the zone (its air block under the zone's own name, then each occupied
     bay under its own), every part of the ``converged`` rule that block still fails.
@@ -2224,17 +2252,35 @@ def _block_blockers(
     the decision the status machine takes, the ``blocked`` list the diagnostics publish
     and the bays :func:`current_model` derates, so none of the three can drift apart on
     the rule or on its input (section 8 items 110, 111, 119). The prediction error is the
-    caller's own check and is not in here."""
+    caller's own check and is not in here.
+
+    ``latched`` asks the **historical** question -- *has this block ever informed itself?*
+    -- instead of the live one, and it is what every reader after the fact wants (section
+    8 item 119). Two of the three terms are facts about the fit and are read live either
+    way: ``n`` only grows, and a relative standard error is a property of the covariance,
+    not of this minute's fan motion. ``pe`` is neither: it is an EWMA over the last
+    :data:`PE_WINDOWS` regression windows, so it decays back to nothing about an hour
+    after the last identification experiment at the shipped ``model_window_s``, which is
+    the state a finished enclosure is in nearly all of the time. Re-reading it would make
+    every block of a converged model uninformed again as soon as the fans went quiet --
+    ``blocked`` would fill up on a healthy model, ``partial`` would never clear, and
+    :func:`_derate_uninformed` would haircut every bay of every zone for ever. So the
+    excitation half is latched at the window that first satisfied it (``inf``, written in
+    :func:`_rls_window`, cleared only by a reset) and ``latched`` reads that latch.
+
+    The *entering* decision (:func:`_zone_blocks_converged`) keeps asking the live
+    question, so when a zone converges is exactly what it was."""
     checks = [(z, mem["zones"][z]["air"], zone_specs[z])]
     checks += [(b, mem["bays"][b], bay_specs[b]) for b in st.zones[z].bays if occupied[b]]
     out: dict[str, list[str]] = {}
     for name, block, spec in checks:
         rel = block["rel"]
         reasons: list[str] = []
-        if int(block["n"]) < MIN_WINDOWS:
-            reasons.append(f"windows:{name}")
-        if float(block["pe"]) <= PE_MIN:
-            reasons.append(f"pe:{name}")
+        if not (latched and block.get("inf")):
+            if int(block["n"]) < MIN_WINDOWS:
+                reasons.append(f"windows:{name}")
+            if float(block["pe"]) <= PE_MIN:
+                reasons.append(f"pe:{name}")
         if rel is None:
             reasons.extend(f"rel_se:{spec.keys[i]}" for i in spec.gain)
         else:
@@ -2253,9 +2299,11 @@ def _zone_converge_blockers(
     occupied: Mapping[str, bool],
     zone_specs: Mapping[str, _BlockSpec],
     bay_specs: Mapping[str, _BlockSpec],
+    *,
+    latched: bool,
 ) -> list[str]:
     """Every blocker of every block of the zone, flattened in block order."""
-    per = _block_blockers(mem, cfg, st, z, occupied, zone_specs, bay_specs)
+    per = _block_blockers(mem, cfg, st, z, occupied, zone_specs, bay_specs, latched=latched)
     return [reason for reasons in per.values() for reason in reasons]
 
 
@@ -2281,9 +2329,14 @@ def _uninformed_bays(
     zone_specs: Mapping[str, _BlockSpec],
     bay_specs: Mapping[str, _BlockSpec],
 ) -> list[str]:
-    """The occupied bays of ``z`` whose own block still fails the ``converged`` rule, in
-    topology order -- the bays a zone that converged has converged *without*."""
-    per = _block_blockers(mem, cfg, st, z, occupied, zone_specs, bay_specs)
+    """The occupied bays of ``z`` that have not informed themselves, in topology order --
+    the bays a zone that converged has converged *without*.
+
+    The **latched** reading of the rule (:func:`_block_blockers`): a bay that once had its
+    excited windows and its PE has informed itself and stays informed, whether or not the
+    fans have moved since. Otherwise a finished model would call every one of its bays
+    uninformed an hour after its last experiment."""
+    per = _block_blockers(mem, cfg, st, z, occupied, zone_specs, bay_specs, latched=True)
     return [b for b in st.zones[z].bays if occupied[b] and per.get(b)]
 
 
@@ -2320,9 +2373,14 @@ def _zone_blocks_converged(
     The zone's **air block** must always pass: it is the one block every bay of the zone
     is planned through, and no fraction of bays substitutes for it. Of the occupied bays,
     :func:`min_informed_bays` must have passed -- every one of them at the default
-    ``model_converged_bays_frac: 1.0``, so this is the old rule term for term."""
+    ``model_converged_bays_frac: 1.0``, so this is the old rule term for term.
+
+    The **live** reading of the rule, on purpose: this is the one caller that asks whether
+    the zone may converge *now*, and every term of it -- the PE monitor included -- is
+    read exactly as it was before item 119. What the readers after the fact ask is the
+    latched question (:func:`_block_blockers`)."""
     occupied = params.occupied
-    per = _block_blockers(mem, cfg, st, z, occupied, zone_specs, bay_specs)
+    per = _block_blockers(mem, cfg, st, z, occupied, zone_specs, bay_specs, latched=False)
     if per.get(z):
         return False
     bays = [b for b in st.zones[z].bays if occupied[b]]
@@ -2583,6 +2641,26 @@ def cached_structure(cfg: MpcConfig) -> Structure:
     return _derived(cfg).st
 
 
+def _k_used_se(
+    block: Mapping[str, Any], cfg: MpcConfig, spec: _BlockSpec, key: str, derated: bool
+) -> float | None:
+    """The standard error :func:`_k_used` measures the haircut in, or ``None`` on a bay
+    that is not derated (plan section 8 items 111, 119).
+
+    The block's own ``se`` where it has closed a regression window, and the square root of
+    its covariance where it has not. :func:`summary` refuses to publish the second *as*
+    ``se`` -- it is the prior, not a measurement -- so it publishes it here instead, under
+    its own name and only where it is actually spent: the derating is then reproducible
+    from the diagnostics alone (``k_used = max(k_lo, theta - model_partial_k_sigmas *
+    k_se_used)``) rather than being a number nobody outside the module can rebuild."""
+    if key not in spec.keys or not derated or cfg.model_converged_bays_frac >= 1.0:
+        return None
+    i = spec.keys.index(key)
+    stored = block.get("se")
+    se = list(stored) if stored is not None else _standard_errors(block, spec)
+    return float(se[i])
+
+
 def _k_used(
     block: Mapping[str, Any], cfg: MpcConfig, spec: _BlockSpec, key: str, derated: bool
 ) -> float | None:
@@ -2592,16 +2670,16 @@ def _k_used(
     lower confidence bound ``k - model_partial_k_sigmas * se(k)``, floored at the
     parameter's own bound. One function for the number the solver reads
     (:func:`_derate_uninformed`) and the number :func:`summary` publishes, so the two
-    cannot say different things about the same bay."""
+    cannot say different things about the same bay. The ``se`` it spends is published
+    beside it as ``k_se_used`` (:func:`_k_used_se`)."""
     if key not in spec.keys:
         return None
     i = spec.keys.index(key)
     value = float(block["theta"][i])
-    if not derated or cfg.model_converged_bays_frac >= 1.0:
+    se = _k_used_se(block, cfg, spec, key, derated)
+    if se is None:
         return value
-    stored = block.get("se")
-    se = list(stored) if stored is not None else _standard_errors(block, spec)
-    return max(PARAMETERS[_kind(key)].lo, value - cfg.model_partial_k_sigmas * float(se[i]))
+    return max(PARAMETERS[_kind(key)].lo, value - cfg.model_partial_k_sigmas * se)
 
 
 def _derate_uninformed(
@@ -2722,11 +2800,21 @@ def _blocked_reasons(
     8 item 119) keeps naming the bays it converged without, so ``blocked`` is empty
     exactly when every block of the zone has informed itself and not merely when the zone
     is accepted by the validity gate. ``partial`` and ``uninformed`` beside it say which
-    of the two a non-empty list on a converged zone is."""
+    of the two a non-empty list on a converged zone is. *Has informed itself* is the
+    latched reading of the rule, so a converged model whose fans have gone quiet still
+    reads as empty -- it is a finished model, not a stuck one."""
     status = memory["zones"][z]["status"]
     if status == "frozen":
         return []
-    out = list(_zone_converge_blockers(memory, cfg, st, z, occupied, zone_specs, bay_specs))
+    # A zone that has converged is read with the latch (:func:`_block_blockers`): what is
+    # left to say about it is which of its blocks never informed itself, not which of them
+    # happens not to be excited this minute. A zone still working toward ``converged`` is
+    # read live, since that is the question it is waiting on.
+    out = list(
+        _zone_converge_blockers(
+            memory, cfg, st, z, occupied, zone_specs, bay_specs, latched=status == "converged"
+        )
+    )
     if status == "converged":
         return out
     if pred is None or pred >= cfg.model_max_pred_err_c:
@@ -2850,6 +2938,11 @@ def summary(
             # converged *without* it, where it is that value's own lower confidence
             # bound -- so the derating is readable instead of only happening.
             "k_used": _k_used(block, cfg, bay_specs[b], f"k.{b}", b in uninformed[bay.zone]),
+            # the standard error that haircut was measured in, so it is reproducible from
+            # what is published. ``None`` on a bay that is not derated; on one that has
+            # closed no window it is the prior's own, which ``se`` above will not publish
+            # as a measurement (section 8 items 111, 119).
+            "k_se_used": _k_used_se(block, cfg, bay_specs[b], f"k.{b}", b in uninformed[bay.zone]),
         }
         if occupancy is not None and b in occupancy:
             bays_out[b]["occupancy"] = occupancy[b]

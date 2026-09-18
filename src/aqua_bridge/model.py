@@ -708,7 +708,8 @@ IDENT_LEVELS: tuple[str, ...] = ("above", "symmetric")
 #: ``ident_amplitude_mode`` values (section 8 item 120): ``fixed`` spends
 #: ``ident_amplitude`` on every channel, ``headroom`` spends the smallest step that
 #: reaches ``ident_pe_aim`` times the PE monitor's own bound from where that channel
-#: sits, capped by ``ident_amplitude`` and placed inside ``[pwm_min, pwm_max]``.
+#: sits, capped by ``ident_amplitude`` in *both* directions and cut into
+#: ``[pwm_min, pwm_max]``.
 IDENT_AMPLITUDE_MODES: tuple[str, ...] = ("fixed", "headroom")
 #: Largest ``ident_amplitude`` the config accepts. The owner-facing ceiling on how much
 #: PWM one experiment may add (``above``) or give up (``symmetric``) on a channel; it is
@@ -1412,7 +1413,11 @@ class EstimatorSpec:
     * ``bay_settle_max_s``         -- the most settling exemption one bay may draw from
       the ``sigma`` trust rule before it has to run this long without one, seconds
       (``>= bay_settle_s``; 0 grants none at all): a hot swap opens a window or two,
-      a sensor that keeps jumping cannot stay exempt for ever
+      a sensor that keeps jumping cannot stay exempt for ever. It is **also** the budget
+      the statistical half of the fast-swap rule spends (section 8 item 124): a bay-level
+      step resets the bay's thermal block only while there is exemption left, so
+      ``bay_settle_max_s: 0`` grants neither the exemption nor the reset and leaves
+      ``mpc.model_reset_on_swap`` acting on occupancy crossings alone
     * ``bay_uncertain_var_c2``     -- a bay whose drive variance ``sigma ** 2 -
       sigma_cal ** 2`` exceeds this, degC^2 (> 0), is too uncertain to score the thermal
       model against: the DAS MPC's validity gate leaves it out of the prediction-error,
@@ -1848,8 +1853,13 @@ class MpcConfig:
       relative airflow swing reaches ``ident_pe_aim`` times ``sqrt(PE_MIN)`` from where
       that channel is parked, and places the two levels inside ``[pwm_min, pwm_max]``
       using the room the channel really has on each side -- a symmetric telegraph whose
-      low level would fall through ``pwm_min`` slides up instead of being refused, which
-      keeps its swing and makes the dip *shallower*. It matters under
+      low level would fall through ``pwm_min`` is *cut* there and runs instead of being
+      refused, which makes the dip shallower and costs it swing. Neither level is ever
+      further from the base than ``ident_amplitude``, in either direction: that cap is the
+      owner's ceiling on what one experiment may move the fans by
+      (:data:`IDENT_AMPLITUDE_MAX`). The ``band:`` precondition then refuses the starts
+      whose remaining swing cannot reach ``PE_MIN`` at all, instead of the ones whose
+      levels leave the band. It matters under
       ``ident_levels: symmetric``, where the amplitude is cooling given up: there the
       smaller step comes straight off the owner-accepted dip. Under ``above`` the
       amplitude is cooling added and the solver takes it back, so sizing down buys almost

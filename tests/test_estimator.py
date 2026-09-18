@@ -2002,28 +2002,66 @@ def test_a_live_manual_entry_wins_over_a_stored_one():
 # ---------------------------------------------------------------------------
 
 
-def test_one_sensor_bay_the_two_swap_rules_are_the_same_arithmetic():
-    """Item 124's agreement, pinned. On a bay with one proximal member the bay-level test
-    (the *mean* innovation against the variance of that mean) and the per-sensor fast-swap
-    rule (that member's own innovation against its own variance) are the same two numbers,
-    so they can never disagree; the settling window the per-sensor rule opens and the
-    verdict the bay-level one publishes must therefore appear on exactly the same ticks.
+def test_one_sensor_bay_the_two_swap_rules_are_the_same_arithmetic(monkeypatch):
+    """Item 124's agreement, pinned on the **arithmetic** and not on a consequence.
 
-    Without this the two drift apart silently -- which is what item 124 is about, and the
-    one case where the drift is provable rather than a judgement call."""
+    On a bay with one proximal member the bay-level test (the *mean* innovation against
+    the variance of that mean) and the per-sensor fast-swap rule (that member's own
+    innovation against its own variance) are the same two numbers, so they can never
+    disagree. Asserting that the settling window follows the verdict cannot show it: the
+    production code now draws that consequence *from* the verdict, so the implication
+    holds by construction whatever the two statistics say. This watches the threshold
+    itself (:func:`estimator._crossed`, the one function both halves call) and asserts
+    that on a one-member bay the two calls of a tick carry the same ``nu``, the same
+    variance and the same verdict -- so a later change to the bay-level normalisation, to
+    ``jump_var``, or to either prediction fails here instead of shipping.
+
+    Review finding: the first version of this test could not fail on divergence."""
+    calls: list[tuple[float, float, bool]] = []
+    real = E._crossed
+
+    def spy(nu, var, jump_min_c, jump_var):
+        out = real(nu, var, jump_min_c, jump_var)
+        calls.append((float(nu), float(var), bool(out)))
+        return out
+
+    monkeypatch.setattr(E, "_crossed", spy)
     cfg = lcfg()
     mem = run_ticks(cfg, 20)[-1].memory
-    seen = 0
+    seen = pairs = 0
     for i, value in enumerate((PROX_C, PROX_C + 6.0, PROX_C + 6.0, PROX_C, PROX_C - 5.0)):
+        calls.clear()
         up = tick(cfg, mem, (20 + i) * cfg.dt, prox_a2=value)
         mem = up.memory
         block = up.bays["a2"]  # one proximal member, so the two statistics coincide
+        # a2 is the only one-member bay of the fixture; every other bay contributes its
+        # own calls, so the pair to compare is the one that produced this bay's verdict
+        matching = [c for c in calls if c[2] is bool(block["swapped"])]
+        assert matching, (block["swapped"], calls)
+        # the per-member call and the bay-level call of a one-member bay are identical
+        for nu, var, out in matching:
+            same = [c for c in matching if c[:2] == pytest.approx((nu, var))]
+            if len(same) >= 2:
+                pairs += 1
+                assert all(c[2] is out for c in same), same
         if block["swapped"]:
             seen += 1
-            # the per-sensor consequences always follow the bay-level verdict
             assert block["settling"] is True, block
             assert block["settling_reason"] == E.SETTLE_JUMP, block
-    assert seen >= 1
+    assert seen >= 1 and pairs >= 1
+
+
+def test_the_two_swap_rules_call_one_threshold_with_one_bays_two_statistics():
+    """The same agreement, stated directly: :func:`estimator._crossed` is the only place
+    either half of the rule compares an innovation with a variance, and on one member the
+    mean *is* the member -- so the bay-level call reduces to the per-sensor one term for
+    term (item 124)."""
+    for nu, var in ((0.0, 1.0), (0.6, 1e-4), (0.4, 1e-6), (9.0, 1.0)):
+        # the bay-level form on a single member: mean of one, variance of that mean
+        assert E._crossed(nu / 1, var / 1**2, 0.5, 36.0) is E._crossed(nu, var, 0.5, 36.0)
+    assert E._crossed(0.4, 1e-9, 0.5, 36.0) is False  # under jump_min_c whatever the sigma
+    assert E._crossed(9.0, 100.0, 0.5, 36.0) is False  # inside the noise whatever the step
+    assert E._crossed(9.0, 1e-3, 0.5, 36.0) is True
 
 
 def test_a_bay_level_step_always_widens_the_bay_the_way_a_jump_does():
@@ -2071,8 +2109,10 @@ def test_the_model_reset_spends_the_same_budget_as_the_trust_exemption():
         held += bool(up.bays["a2"]["swapped"] and not up.bays["a2"]["swap_reset"])
     assert verdicts > resets > 0  # the verdict still fires; the reset is rate-limited
     assert up.bays["a2"]["swap_count"] == resets
-    # ``swap_held`` counts the verdicts the *budget* refused; a verdict inside the
-    # refractory of its own event is that event continuing, not a second one refused
+    # ``swap_held`` counts the events the *budget* refused, at the cadence an accepted
+    # event would have had -- one per ``bay_settle_s``, not one per tick the verdict
+    # stands. A verdict inside the refractory of an accepted event is that event
+    # continuing and is counted nowhere.
     assert 0 < up.bays["a2"]["swap_held"] <= held
     assert up.bays["a2"]["swap_reason"] == E.SETTLE_JUMP
     assert up.bays["a2"]["swap_last_s"] is not None
@@ -2080,6 +2120,63 @@ def test_the_model_reset_spends_the_same_budget_as_the_trust_exemption():
     assert up.bays["a2"]["settling_spent_s"] == pytest.approx(up.bays["a2"]["settling_budget_s"])
     # and no more events than the cadence allows over the run
     assert resets <= 1 + int(200 * cfg.dt / cfg.estimator.bay_settle_s)
+
+
+def test_a_refused_swap_is_counted_as_an_event_not_as_a_tick():
+    """``swap_held`` is a count of *events*, at the cadence an accepted event would have
+    had (item 124). One continuous flapping episode after the budget is gone is one held
+    event per ``bay_settle_s``, not one per tick -- otherwise the number's rate depends on
+    ``dt``, and the health threshold the proposed item wants would be chosen against a
+    tick counter wearing an event's name.
+
+    Review finding: it used to increment once per refused tick."""
+    cfg = lcfg(bay_settle_s=10.0, bay_settle_max_s=20.0)
+    mem = run_ticks(cfg, 20)[-1].memory
+    refused = 0
+    hot = True
+    up = None
+    for i in range(200):
+        hot = not hot
+        up = tick(cfg, mem, (20 + i) * cfg.dt, prox_a2=PROX_C + (9.0 if hot else -9.0))
+        mem = up.memory
+        refused += bool(up.bays["a2"]["swapped"] and not up.bays["a2"]["swap_reset"])
+    held = up.bays["a2"]["swap_held"]
+    span = 200 * cfg.dt
+    assert 0 < held < refused  # not a tick counter
+    assert held <= span / cfg.estimator.bay_settle_s + 1  # at most one per settling window
+
+
+def test_a_bay_out_of_budget_is_scored_by_the_model_gate_not_excused_by_it():
+    """Item 124's fallback, made true. Exhausting the budget keeps the (possibly stale)
+    fit rather than throwing it away again -- and what makes that safe is that the fit is
+    then *scored* by the DAS MPC's validity gate. The bay-level widening the verdict
+    itself applies is what would otherwise keep the model gate's ``uncertain`` exemption
+    refreshed, so the bay would be neither reset nor scored. While a refused verdict
+    stands the mark is withheld.
+
+    Review finding: the code did the opposite of what item 124's reasoning claimed --
+    ``model_exempt: uncertain`` on every out-of-budget tick."""
+    cfg = lcfg(bay_settle_s=10.0, bay_settle_max_s=20.0)
+    mem = run_ticks(cfg, 20)[-1].memory
+    out_of_budget = exempt = 0
+    hot = True
+    for i in range(200):
+        hot = not hot
+        up = tick(cfg, mem, (20 + i) * cfg.dt, prox_a2=PROX_C + (9.0 if hot else -9.0))
+        mem = up.memory
+        block = up.bays["a2"]
+        if block["swapped"] and not block["swap_reset"] and not block["settling"]:
+            out_of_budget += 1
+            exempt += bool(block["model_exempt"])
+    assert out_of_budget > 10  # the episode really did run past the budget
+    assert exempt == 0, exempt
+    # a bay with budget left is still excused, as it always was: the widening is
+    # deliberate there and the settling window is what pays for it
+    calm = lcfg()
+    mem = run_ticks(calm, 20)[-1].memory
+    up = tick(calm, mem, 20 * calm.dt, prox_a2=PROX_C + 9.0)
+    assert up.bays["a2"]["swapped"] is True and up.bays["a2"]["swap_reset"] is True
+    assert up.bays["a2"]["model_exempt"] is True
 
 
 def test_an_occupancy_crossing_is_always_an_event_however_often_it_happens():

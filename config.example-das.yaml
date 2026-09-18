@@ -334,7 +334,10 @@ mpc:
     bay_settle_max_s: 1800  # ...and for at most this much in total, until the bay has run this
                          # long with neither a window nor a sigma over sigma_fault_c: a swap
                          # spends a window or two, a sensor that keeps jumping runs out and
-                         # faults its zone again. 0: no settling exemption at all
+                         # faults its zone again. The same budget the fast-swap rule spends
+                         # to reset a bay's thermal block, so 0 grants neither: no settling
+                         # exemption, and no statistical model reset either -- with 0,
+                         # mpc.model_reset_on_swap acts on occupancy crossings alone
     bay_uncertain_var_c2: 1.0  # the DAS MPC's model checks (prediction error, drift, air
                          # disturbance) skip a bay whose drive variance sigma^2 - sigma_cal^2
                          # is over this, degC^2, for bay_settle_s afterwards: a level, not an
@@ -502,9 +505,13 @@ mpc:
   # How big each channel's telegraph is (section 8 item 120). fixed: every channel spends
   # ident_amplitude whatever room it has. headroom: the smallest step in (0, ident_amplitude]
   # whose own relative airflow swing reaches ident_pe_aim * sqrt(PE_MIN) from where that
-  # channel is parked, placed inside [pwm_min, pwm_max] -- a symmetric pair whose low level
-  # would fall through pwm_min slides UP, keeping its swing and making the dip shallower,
-  # instead of being refused by the band: precondition. It pays under ident_levels:
+  # channel is parked, and cut into [pwm_min, pwm_max] -- a symmetric pair whose low level
+  # would fall through pwm_min is cut there and runs, with a shallower dip and a shorter
+  # swing, instead of being refused by the band: precondition. Neither level is ever
+  # further than ident_amplitude from the base in either direction: that cap is the ceiling
+  # on what one experiment may move the fans by, and it is not spent upward to buy swing.
+  # band:<ch> then refuses a start whose remaining swing cannot reach the model's PE bound
+  # at all -- the refusal the placement replaced. It pays under ident_levels:
   # symmetric, where the step is cooling given up; under above the solver takes the extra
   # cooling straight back off its own demand, so sizing down buys 0.004 mean PWM (item 110).
   ident_amplitude_mode: fixed

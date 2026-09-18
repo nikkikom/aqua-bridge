@@ -148,10 +148,15 @@ channel at its own solver command minus the planned dip, so a smaller step comes
 off the one accepted worst case in this module. The placement matters there too, and in
 both directions: a channel parked within ``ident_amplitude`` of ``pwm_min`` -- where item
 112 leaves most of them between experiments -- has its symmetric pair refused outright by
-the ``band:`` precondition today, while sliding the same pair up to sit on ``pwm_min``
-keeps every bit of its swing *and* shrinks the dip to the room the channel had. At
-``pwm_max`` there is nothing to slide: sliding down would dip further than the owner
-capped, so the high level is cut at the rail and ``excitable`` says the swing is short.
+the ``band:`` precondition today, while a pair cut at ``pwm_min`` runs the experiment at
+the dip the channel had room for. Neither level is ever further from the base than
+``ident_amplitude``, in either direction: that cap is the owner's ceiling on what one
+experiment may move the fans by, and sliding a pair off a rail to keep its swing would
+spend up to twice it *above* the solver's command, on a channel the solver had parked low
+for quiet. So a level the band will not take is cut at the rail and ``excitable`` says the
+swing is short, and a swing too short to reach the PE monitor's own floor is refused at
+the start as ``band:`` -- the refusal the placement replaced, asked of the swing that is
+left rather than of the levels.
 
 ``ident_require_excitable`` (default false) turns it into a refusal: ``check_start`` then
 rejects a start whose channel cannot clear the bound (``not_excitable:<ch>``), the way
@@ -159,8 +164,10 @@ rejects a start whose channel cannot clear the bound (``not_excitable:<ch>``), t
 informs the ``E`` split and the bays' ``g0`` / ``k``, and a zone-wide start is widened to
 channels the solver parks high, so refusing gives up the zones that do converge.
 
-A start is refused when a level would leave ``[pwm_min, pwm_max]`` (``band``),
-so no level is ever clipped at the start. The sequence is a two-level random
+A start is refused when a level would leave ``[pwm_min, pwm_max]`` (``band``), so no level
+is ever clipped at the start; under ``ident_amplitude_mode: headroom`` the levels are cut
+into the band by construction and ``band`` refuses the starts whose remaining swing cannot
+reach the PE monitor's floor instead. The sequence is a two-level random
 telegraph signal: every phase starts on the high level, the level alternates
 after each hold, and each hold is drawn from ``ident_hold_s`` by a 16-bit Galois
 LFSR (taps ``0xB400``) seeded from ``ident_seed``; the generator runs on across the
@@ -426,6 +433,7 @@ __all__ = [
     "levels_at",
     "lost_sensor_zones",
     "new_tracker",
+    "no_headroom",
     "planned_dip",
     "rel_swing",
     "resume_tracker",
@@ -834,20 +842,21 @@ def _placed(cfg: MpcConfig, base: float, amplitude: float) -> tuple[float, float
     the channel really has on each side (``ident_amplitude_mode: headroom``, section 8
     item 120).
 
-    Under ``symmetric`` a low level that would fall through ``pwm_min`` **slides the pair
-    up** instead of being cut off there: the telegraph keeps its full ``2 * amplitude``
-    swing -- the thing the PE monitor reads -- and the dip below the base shrinks to
-    whatever room the channel had, which is cooling given back. It never slides the other
-    way: that would put the low level further under the base than ``ident_amplitude``, and
-    that dip is exactly what the owner capped. A high level over ``pwm_max`` is therefore
-    cut there, and the swing is what the headroom allows and no more.
+    A level the band will not take is **cut** at the rail, never slid across the base.
+    ``ident_amplitude`` is the owner's ceiling on what one experiment may move the fans by
+    -- added PWM under ``above``, given up under ``symmetric``
+    (:data:`aqua_bridge.model.IDENT_AMPLITUDE_MAX`) -- and it bounds *both* directions, so
+    neither level is ever further from the base than the amplitude asked for. Sliding a
+    symmetric pair up off ``pwm_min`` would keep its full ``2 * amplitude`` swing, but it
+    would buy that swing by putting the high level up to ``2 * ident_amplitude`` above the
+    solver's own command: the loudest the enclosure gets, spent on the channel the solver
+    had parked at the rail precisely because it wanted quiet there. The cut costs swing
+    instead, ``excitable`` reports the short swing, and the sizing in :func:`_levels` then
+    spends what room there is rather than a cap the owner never set.
 
     Under ``above`` the low level *is* the base, which the solver already commands, so
-    there is nothing to slide; only the high level can be cut at ``pwm_max``."""
+    only the high level can be cut, at ``pwm_max``."""
     lo, hi = _levels_at(cfg, base, amplitude)
-    if cfg.ident_levels == "symmetric" and lo < cfg.pwm_min:
-        hi += cfg.pwm_min - lo
-        lo = cfg.pwm_min
     return _clamp(lo, cfg.pwm_min, cfg.pwm_max), _clamp(hi, cfg.pwm_min, cfg.pwm_max)
 
 
@@ -863,19 +872,27 @@ def _levels(cfg: MpcConfig, ch: str, base: float) -> tuple[float, float]:
     (:func:`rel_swing`), and falls back to ``ident_amplitude`` when even that falls short
     -- so a channel is never excited *less* than the fixed mode excites it, while one with
     room to spare spends less. Because the placement is inside the band by construction,
-    ``headroom`` also never trips the ``band:`` precondition: a channel parked within
-    ``ident_amplitude`` of a rail runs a telegraph sized to the room it has instead of
-    being refused a start.
+    the ``band:`` precondition no longer refuses a channel parked within
+    ``ident_amplitude`` of a rail; it refuses one whose *swing*, after the cut, cannot
+    reach the PE monitor's own floor (:func:`check_start`), which is the thing the band
+    refusal was standing in for. A start that could inform the model of nothing is still
+    refused; one that has room to say something now runs.
 
     The search is a fixed-length bisection on a swing that grows with the amplitude, so it
     is a pure function of the config, the channel and the base -- the schedule stays
     reproducible for the same three."""
+    return _sized(cfg, ch, base)[:2]
+
+
+def _sized(cfg: MpcConfig, ch: str, base: float) -> tuple[float, float, float]:
+    """:func:`_levels` plus the amplitude it settled on, for the callers that have to ask
+    what the band took away from it (:func:`check_start`)."""
     if cfg.ident_amplitude_mode != "headroom":
-        return _levels_at(cfg, base, cfg.ident_amplitude)
+        return (*_levels_at(cfg, base, cfg.ident_amplitude), cfg.ident_amplitude)
     aim = (cfg.ident_pe_aim**2) * thermal.PE_MIN
     full = _placed(cfg, base, cfg.ident_amplitude)
     if rel_swing(cfg, ch, *full) ** 2 <= aim:
-        return full
+        return (*full, cfg.ident_amplitude)
     lo_a, hi_a = 0.0, cfg.ident_amplitude
     for _ in range(_SIZE_ITERS):
         mid = 0.5 * (lo_a + hi_a)
@@ -883,7 +900,34 @@ def _levels(cfg: MpcConfig, ch: str, base: float) -> tuple[float, float]:
             hi_a = mid
         else:
             lo_a = mid
-    return _placed(cfg, base, hi_a)
+    return (*_placed(cfg, base, hi_a), hi_a)
+
+
+def no_headroom(cfg: MpcConfig, ch: str, base: float) -> bool:
+    """Whether ``ch`` has no room to run an experiment from ``base`` -- the question the
+    ``band:`` precondition asks (section 8 item 120).
+
+    Under ``fixed`` that is a level outside ``[pwm_min, pwm_max]``: the amplitude is
+    whatever the owner set, so a channel that cannot take it whole is refused.
+
+    Under ``headroom`` the levels are cut into the band by construction
+    (:func:`_placed`), so nothing is left outside it to refuse and the same question is
+    asked of what is left: the placement **cut** the pair, *and* what survived the cut
+    cannot reach the aim. Both halves matter. A pair the band never touched is the pair
+    ``fixed`` would have run, and refusing it would make ``headroom`` the stricter mode,
+    which it is not; a pair that was cut but still reaches ``ident_pe_aim * sqrt(PE_MIN)``
+    is exactly the start item 120 exists to let through -- a channel parked near a rail
+    running a telegraph sized to the room it has. What is refused is the third case: a
+    channel so near a rail that the band ate its step and the stub that is left cannot
+    inform the model of anything, which would hold the schedule and every sibling channel
+    for ``ident_max_duration_s`` to learn nothing."""
+    lo, hi, amplitude = _sized(cfg, ch, base)
+    if cfg.ident_amplitude_mode != "headroom":
+        return lo < cfg.pwm_min - _EPS or hi > cfg.pwm_max + _EPS
+    asked_lo, asked_hi = _levels_at(cfg, base, amplitude)
+    cut = asked_lo < cfg.pwm_min - _EPS or asked_hi > cfg.pwm_max + _EPS
+    aim = (cfg.ident_pe_aim**2) * thermal.PE_MIN
+    return cut and rel_swing(cfg, ch, lo, hi) ** 2 <= aim
 
 
 def _anchor(cfg: MpcConfig, lo: float, hi: float) -> float:
@@ -1038,7 +1082,11 @@ def check_start(
         if facts.saturated.get(ch) is not False:
             reasons.append(f"saturated:{ch}")
         lo, hi = _levels(cfg, ch, float(base))  # type: ignore[arg-type]
-        if lo < cfg.pwm_min - _EPS or hi > cfg.pwm_max + _EPS:
+        # "this channel has no room to run the experiment", in whichever form the sizing
+        # mode makes that question (:func:`no_headroom`, section 8 item 120). Asked
+        # whatever ``ident_require_excitable`` says, because the refusal it replaces was
+        # not optional either.
+        if no_headroom(cfg, ch, float(base)):  # type: ignore[arg-type]
             reasons.append(f"band:{ch}")
         elif (
             cfg.ident_require_excitable
