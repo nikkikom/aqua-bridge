@@ -8460,6 +8460,44 @@ Owner decision (2026-09-16):
     network, the rate-limit/margin/knob values, and the recovery
     script's re-association, give-up and silence behaviour against
     `nmcli`/`ip`/`ping` stubs.
+139. **Done** (2026-09-18): free space and a read-only filesystem as a
+    health signal, the shape item 103 established for the board's own
+    temperature and throttling extended to "the disk nobody watches"
+    (§3). `hostinfo` had always collected `disk_used_pct`/`disk_free_gb`
+    and both were always published — an MQTT sensor, a row on the
+    page — but nothing judged them. Two new `host_health` rules, both
+    published in the health payload, MQTT's `host_problem` sensor and
+    its attributes, and the page, and both kept out of
+    `PlantObservation` and the solver's `diagnostics`: a free-space hint
+    (`disk_free_min_gb`, default 2 GB; `disk_free_fault_s`, default
+    60 s) and a read-only-filesystem fault, detected from the kernel's
+    own `/proc/mounts` (`hostinfo.read_mount_ro()`) rather than a write
+    probe, reported the tick it is seen like "throttling now" since the
+    kernel has already remounted by the time this reads it. Both judge
+    a new `disk_path` config key (default `"/"`) rather than a
+    hardcoded root, since `record_path` and `--model-store` are not
+    pinned to `/` and an operator who moves either without moving
+    `disk_path` would have these rules watch a filesystem nobody writes
+    to. `disk_free_min_gb`'s default is argued from what actually
+    writes to the card, not a round number: the recorder's own worst
+    case (120 MB, item 79) plus the model store's measured floor (item
+    48) is under 125 MB, unconditionally; `deploy/install-board-
+    watchdogs.sh`'s `JOURNAL_MAX_USE` (item 134) is margin on top of
+    that, not a term the default depends on, since that script assumes
+    the journal is already persistent rather than making it so. The
+    free-space rule is a **hint**, not a fault, for the same reason the
+    divergence rule (item 103) is: a filling card can sit below the
+    threshold for days, and latching the daemon-wide `problems` list
+    for that long would mask an unrelated device fault. An unreadable
+    `statvfs` or mount table degrades both rules to unknown, never to a
+    fault and never to "fine". `deploy/install-pi.sh` does **not**
+    install a second journal cap: an earlier version of this change did
+    (its own drop-in, `SystemMaxUse` only), and it was withdrawn in
+    review in favor of the board-hardening script's, which already
+    covers the same setting plus `SystemMaxFileSize`, `MaxRetentionSec`
+    and `SyncIntervalSec` from one set of knobs — a board running both
+    scripts must not end up with two drop-ins governing one journal
+    from two different defaults.
 
 ### 8.3 Open — needs the DAS hardware
 
