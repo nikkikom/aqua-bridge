@@ -258,7 +258,15 @@ Status machine per zone (the model's status is the least advanced zone, with
 * ``learning`` -> ``converged`` when the air block and every constrained proximal
   block have :data:`MIN_WINDOWS` excited windows, ``pe_min > PE_MIN``, every
   in-zone ``E`` and every ``k`` a relative standard error below
-  ``model_converged_rel_se``, and ``pred_err_c < model_max_pred_err_c``;
+  ``model_converged_rel_se``, and ``pred_err_c < model_max_pred_err_c``.
+  **Partial convergence** (``model_converged_bays_frac``, plan section 8 item 119): below
+  1.0 the air block must still pass whole, but only :func:`min_informed_bays` of the
+  zone's occupied bays need to -- rounded up, never fewer than one. The zone then
+  publishes ``partial: true`` and the bays it converged without (``uninformed``), keeps
+  naming them in ``blocked``, is never entered as ``frozen``, and the DAS MPC reads each
+  such bay's ``k`` at its own lower confidence bound (``model_partial_k_sigmas``,
+  :func:`current_model`) so a half-informed zone is not planned as a fully informed one.
+  The default 1.0 is the all-or-nothing rule, term for term;
 * ``converged`` -> ``suspect`` when the window error exceeds 3x its level at
   convergence (floored at :data:`PRED_ERR_FLOOR_C`) for :data:`SUSPECT_WINDOWS`
   consecutive windows;
@@ -294,6 +302,14 @@ next identification experiment, while the bay simply relearns like a new one. A
 ``frozen`` zone is skipped: it never moves its coefficients, so a reset there would
 strand the bay at the prior.
 
+``reset_bays`` is the estimator's ``swap_reset``, not its per-tick ``swapped``: the
+estimator rate-limits the verdict to one event per ``estimator.bay_settle_s`` while the
+bay has ``estimator.bay_settle_max_s`` of settling budget left -- the same budget the
+``sigma`` trust exemption spends -- so the two halves of the rule agree on what an event
+is and on how often one may happen (plan section 8 item 124). Every reset is counted in
+the block's ``rst`` / ``rst_ts``, which are the one thing a reset carries over, and
+published per bay as ``resets`` / ``last_reset_s`` (plan section 8 item 123).
+
 Stale hold (model store, the owner's stale rule): a model restored from a file older
 than ``model_store_max_age_days`` (or one saved while such a hold was still pending)
 carries ``"hold": {"since": ts | None}``. Its zones restart at ``learning`` (a zone that
@@ -315,7 +331,8 @@ Memory (plain JSON)::
     block = {"theta": [...], "P": [[...]], "s2": float, "n": excited windows,
              "w": windows, "m": [...], "S": [[...]], "fm": [...] | None, "pe": float,
              "pd": [...], "se": [...] | None,
-             "rel": [...] | None, "acc": {"x", "y", "h", "fan", "t0", "c"} | None}
+             "rel": [...] | None, "acc": {"x", "y", "h", "fan", "t0", "c"} | None,
+             "rst": resets so far, "rst_ts": ts of the last one | None (item 123)}
 
 ``pd`` (the ``pe`` diagonal) and ``se`` (the absolute standard errors behind ``rel``) are
 *derived*: refreshed with ``pe`` / ``rel`` at every closing window and rebuilt from ``m``,
@@ -383,6 +400,7 @@ __all__ = [
     "discretise",
     "fresh_memory",
     "jacobians",
+    "min_informed_bays",
     "model_status",
     "model_params",
     "overall_status",
@@ -430,6 +448,9 @@ TRUST_REGION = 0.05
 HUBER_SIGMAS = 5.0
 PE_WINDOWS = 30
 PE_MIN = 0.05
+#: Rounding slack of ``model_converged_bays_frac * bays`` (:func:`min_informed_bays`), so
+#: 0.75 of four bays is three and not four on a float that lands a hair above.
+_FRAC_TOL = 1e-9
 #: Floor on the running mean the PE monitor normalises a fan regressor by, so a
 #: regressor whose mean sits at zero (a fan inside its dead band the whole time) reads
 #: as a bounded relative variation instead of an unbounded one.
@@ -1358,6 +1379,11 @@ def _fresh_block(spec: _BlockSpec, n_fan: int) -> dict[str, Any]:
         "se": None,
         "rel": None,
         "acc": None,
+        # section 8 item 123: how often this block was thrown away and when the last time
+        # was. Carried *across* a reset (:func:`_reset_swapped_bays`), which is the whole
+        # point: the coefficients start over, the record does not.
+        "rst": 0,
+        "rst_ts": None,
     }
 
 
@@ -1667,6 +1693,9 @@ def _parse_block(raw: object, spec: _BlockSpec, n_fan: int) -> dict[str, Any]:
             raise ValueError("rel")
         rel = [_opt_num(v) for v in rel]
     acc = raw.get("acc")
+    resets = raw.get("rst", 0)
+    if isinstance(resets, bool) or not isinstance(resets, int) or resets < 0:
+        raise ValueError("reset count")
     out = {
         "theta": theta,
         "P": _checked(raw["P"], (n, n)),
@@ -1679,6 +1708,8 @@ def _parse_block(raw: object, spec: _BlockSpec, n_fan: int) -> dict[str, Any]:
         "pe": _num(raw.get("pe", 0.0)),
         "rel": rel,
         "acc": None if acc is None else _parse_acc(acc, n, n_fan),
+        "rst": resets,
+        "rst_ts": _opt_num(raw.get("rst_ts")),
     }
     # ``pd`` / ``se`` are derived from what was just parsed, not read from the file: the
     # two are a view of ``m``/``S`` and of ``P``, and deriving them here keeps every
@@ -1927,9 +1958,9 @@ def update(
     d = _derived(cfg)
     st, zone_specs, bay_specs = d.st, d.zone_specs, d.bay_specs
     mem = _load(memory, cfg, st)
-    _reset_swapped_bays(mem, cfg, st, bay_specs, reset_bays)
-    maps = dict(maps or {})
     ts = float(ts)
+    _reset_swapped_bays(mem, cfg, st, bay_specs, reset_bays, ts)
+    maps = dict(maps or {})
     last_ts = mem["ts"]
     h = None if last_ts is None else ts - last_ts
     interval_ok = h is not None and 0.0 < h <= GAP_TICKS * cfg.dt
@@ -2133,6 +2164,7 @@ def _reset_swapped_bays(
     st: Structure,
     bay_specs: Mapping[str, _BlockSpec],
     reset_bays: Collection[str],
+    ts: float,
 ) -> None:
     """Start a hot-swapped bay's block over from the prior (plan section 8 item 12).
 
@@ -2150,6 +2182,15 @@ def _reset_swapped_bays(
 
     A ``frozen`` zone never moves its coefficients (a model loaded converged from a fresh
     store file), so resetting one of its bays would strand it at the prior: it is skipped.
+
+    **The reset leaves a record** (plan section 8 item 123). ``rst`` and ``rst_ts`` count
+    the resets this block has had and when the last one was, and they are the one thing a
+    reset carries *over*: the coefficients start at the prior, the count does not. Item
+    109 was found only because item 102 noticed a zone that closed no regression window;
+    a bay resetting once an hour would otherwise leave its zone permanently behind with
+    nothing anywhere saying so. ``summary`` publishes them per bay as ``resets`` and
+    ``last_reset_s``, and the estimator publishes the *reason* beside its own count
+    (``swap_reason``), since it is the one that knows it (item 100).
     """
     if not reset_bays or not cfg.model_reset_on_swap:
         return
@@ -2159,8 +2200,49 @@ def _reset_swapped_bays(
         z = st.bays[b].zone
         if mem["zones"][z]["status"] == "frozen":
             continue
+        count = int(mem["bays"][b]["rst"]) + 1
         mem["bays"][b] = _fresh_block(bay_specs[b], 1)
+        mem["bays"][b]["rst"], mem["bays"][b]["rst_ts"] = count, float(ts)
         mem["zones"][z]["air"]["acc"] = None
+
+
+def _block_blockers(
+    mem: Mapping[str, Any],
+    cfg: MpcConfig,
+    st: Structure,
+    z: str,
+    occupied: Mapping[str, bool],
+    zone_specs: Mapping[str, _BlockSpec],
+    bay_specs: Mapping[str, _BlockSpec],
+) -> dict[str, list[str]]:
+    """Per block of the zone (its air block under the zone's own name, then each occupied
+    bay under its own), every part of the ``converged`` rule that block still fails.
+
+    ``windows:<block>`` (fewer than :data:`MIN_WINDOWS` excited windows), ``pe:<block>``
+    (``pe_min`` at or under :data:`PE_MIN`) and ``rel_se:<coefficient>`` (a gain whose
+    relative standard error has not reached ``model_converged_rel_se``). One function for
+    the decision the status machine takes, the ``blocked`` list the diagnostics publish
+    and the bays :func:`current_model` derates, so none of the three can drift apart on
+    the rule or on its input (section 8 items 110, 111, 119). The prediction error is the
+    caller's own check and is not in here."""
+    checks = [(z, mem["zones"][z]["air"], zone_specs[z])]
+    checks += [(b, mem["bays"][b], bay_specs[b]) for b in st.zones[z].bays if occupied[b]]
+    out: dict[str, list[str]] = {}
+    for name, block, spec in checks:
+        rel = block["rel"]
+        reasons: list[str] = []
+        if int(block["n"]) < MIN_WINDOWS:
+            reasons.append(f"windows:{name}")
+        if float(block["pe"]) <= PE_MIN:
+            reasons.append(f"pe:{name}")
+        if rel is None:
+            reasons.extend(f"rel_se:{spec.keys[i]}" for i in spec.gain)
+        else:
+            for i in spec.gain:
+                if rel[i] is None or rel[i] >= cfg.model_converged_rel_se:  # type: ignore[operator]
+                    reasons.append(f"rel_se:{spec.keys[i]}")
+        out[name] = reasons
+    return out
 
 
 def _zone_converge_blockers(
@@ -2172,32 +2254,56 @@ def _zone_converge_blockers(
     zone_specs: Mapping[str, _BlockSpec],
     bay_specs: Mapping[str, _BlockSpec],
 ) -> list[str]:
-    """Every part of the ``converged`` rule the zone's blocks still fail, named.
+    """Every blocker of every block of the zone, flattened in block order."""
+    per = _block_blockers(mem, cfg, st, z, occupied, zone_specs, bay_specs)
+    return [reason for reasons in per.values() for reason in reasons]
 
-    ``windows:<block>`` (fewer than :data:`MIN_WINDOWS` excited windows), ``pe:<block>``
-    (``pe_min`` at or under :data:`PE_MIN`) and ``rel_se:<coefficient>`` (a gain whose
-    relative standard error has not reached ``model_converged_rel_se``), with
-    ``<block>`` the zone name for its air block and the bay name for a proximal one.
-    Empty exactly when :func:`_zone_blocks_converged` would be true, so the list the
-    diagnostics publish and the decision the status machine takes cannot drift apart
-    (section 8 items 110, 111). The prediction error is the caller's own check and is
-    not in here."""
-    checks = [(z, mem["zones"][z]["air"], zone_specs[z])]
-    checks += [(b, mem["bays"][b], bay_specs[b]) for b in st.zones[z].bays if occupied[b]]
-    out: list[str] = []
-    for name, block, spec in checks:
-        rel = block["rel"]
-        if int(block["n"]) < MIN_WINDOWS:
-            out.append(f"windows:{name}")
-        if float(block["pe"]) <= PE_MIN:
-            out.append(f"pe:{name}")
-        if rel is None:
-            out.extend(f"rel_se:{spec.keys[i]}" for i in spec.gain)
-            continue
-        for i in spec.gain:
-            if rel[i] is None or rel[i] >= cfg.model_converged_rel_se:  # type: ignore[operator]
-                out.append(f"rel_se:{spec.keys[i]}")
-    return out
+
+def min_informed_bays(count: int, frac: float) -> int:
+    """How many of ``count`` occupied bays must have informed themselves for the zone to
+    converge, at ``model_converged_bays_frac`` (section 8 item 119).
+
+    ``frac >= 1`` is every one of them -- the all-or-nothing rule, exactly as it was.
+    Below that it rounds **up** and never falls under one: a zone may not converge on its
+    air block alone, whatever the fraction, because a bay block is the only evidence
+    there is about the bay the solver plans for."""
+    if frac >= 1.0:
+        return count
+    return max(1, math.ceil(frac * count - _FRAC_TOL))
+
+
+def _uninformed_bays(
+    mem: Mapping[str, Any],
+    cfg: MpcConfig,
+    st: Structure,
+    z: str,
+    occupied: Mapping[str, bool],
+    zone_specs: Mapping[str, _BlockSpec],
+    bay_specs: Mapping[str, _BlockSpec],
+) -> list[str]:
+    """The occupied bays of ``z`` whose own block still fails the ``converged`` rule, in
+    topology order -- the bays a zone that converged has converged *without*."""
+    per = _block_blockers(mem, cfg, st, z, occupied, zone_specs, bay_specs)
+    return [b for b in st.zones[z].bays if occupied[b] and per.get(b)]
+
+
+def _zone_partial(
+    mem: Mapping[str, Any],
+    cfg: MpcConfig,
+    st: Structure,
+    z: str,
+    occupied: Mapping[str, bool],
+    zone_specs: Mapping[str, _BlockSpec],
+    bay_specs: Mapping[str, _BlockSpec],
+) -> bool:
+    """Whether this zone is (or would be) converged **without** some of its bays.
+
+    Gated on the knob and not only on the bays, so it is false at the default
+    ``model_converged_bays_frac: 1.0`` whatever the blocks say -- the all-or-nothing rule
+    has no such thing as a half-informed zone (plan section 8 item 119)."""
+    if cfg.model_converged_bays_frac >= 1.0:
+        return False
+    return bool(_uninformed_bays(mem, cfg, st, z, occupied, zone_specs, bay_specs))
 
 
 def _zone_blocks_converged(
@@ -2209,7 +2315,19 @@ def _zone_blocks_converged(
     zone_specs: Mapping[str, _BlockSpec],
     bay_specs: Mapping[str, _BlockSpec],
 ) -> bool:
-    return not _zone_converge_blockers(mem, cfg, st, z, params.occupied, zone_specs, bay_specs)
+    """The block half of the ``converged`` rule (module docstring, *Status machine*).
+
+    The zone's **air block** must always pass: it is the one block every bay of the zone
+    is planned through, and no fraction of bays substitutes for it. Of the occupied bays,
+    :func:`min_informed_bays` must have passed -- every one of them at the default
+    ``model_converged_bays_frac: 1.0``, so this is the old rule term for term."""
+    occupied = params.occupied
+    per = _block_blockers(mem, cfg, st, z, occupied, zone_specs, bay_specs)
+    if per.get(z):
+        return False
+    bays = [b for b in st.zones[z].bays if occupied[b]]
+    informed = sum(1 for b in bays if not per.get(b))
+    return informed >= min_informed_bays(len(bays), cfg.model_converged_bays_frac)
 
 
 def _advance_status(
@@ -2230,19 +2348,24 @@ def _advance_status(
     if status in ("prior", "error", "suspect") and excited:
         status = "learning"
         zm["bad"] = 0
+    # section 8 item 119: a zone that converged on some of its bays is not finished, so
+    # ``model_freeze`` never enters or holds it as ``frozen`` -- the switch means "this
+    # model is finished", and a half-informed one is not. It is always false at the
+    # default ``model_converged_bays_frac: 1.0``.
+    partial = _zone_partial(mem, cfg, st, z, params.occupied, zone_specs, bay_specs)
     if (
         status == "learning"
         and pred_err < cfg.model_max_pred_err_c
         and _zone_blocks_converged(mem, cfg, st, z, params, zone_specs, bay_specs)
     ):
         # model_freeze: enter the converged model as frozen, so nothing adapts it further
-        status = "frozen" if cfg.model_freeze else "converged"
+        status = "frozen" if cfg.model_freeze and not partial else "converged"
         zm["conv"] = max(pred_err, PRED_ERR_FLOOR_C)
         zm["bad"] = 0
     elif status in ("converged", "frozen"):
         # a zone that converged before the switch was turned on freezes at its next
         # window: the switch means "this model is finished", whenever it is set
-        if status == "converged" and cfg.model_freeze:
+        if status == "converged" and cfg.model_freeze and not partial:
             status = "frozen"
         level = max(float(zm["conv"] or PRED_ERR_FLOOR_C), PRED_ERR_FLOOR_C)
         zm["bad"] = int(zm["bad"]) + 1 if window_err > SUSPECT_FACTOR * level else 0
@@ -2460,7 +2583,68 @@ def cached_structure(cfg: MpcConfig) -> Structure:
     return _derived(cfg).st
 
 
-def current_model(memory: object, cfg: MpcConfig) -> tuple[str, dict[str, float]]:
+def _k_used(
+    block: Mapping[str, Any], cfg: MpcConfig, spec: _BlockSpec, key: str, derated: bool
+) -> float | None:
+    """The airflow sensitivity the DAS MPC plans a bay with (plan section 8 item 119).
+
+    The fitted value, or -- on a bay whose zone converged *without* it -- that value's own
+    lower confidence bound ``k - model_partial_k_sigmas * se(k)``, floored at the
+    parameter's own bound. One function for the number the solver reads
+    (:func:`_derate_uninformed`) and the number :func:`summary` publishes, so the two
+    cannot say different things about the same bay."""
+    if key not in spec.keys:
+        return None
+    i = spec.keys.index(key)
+    value = float(block["theta"][i])
+    if not derated or cfg.model_converged_bays_frac >= 1.0:
+        return value
+    stored = block.get("se")
+    se = list(stored) if stored is not None else _standard_errors(block, spec)
+    return max(PARAMETERS[_kind(key)].lo, value - cfg.model_partial_k_sigmas * float(se[i]))
+
+
+def _derate_uninformed(
+    mem: Mapping[str, Any],
+    cfg: MpcConfig,
+    d: _Derived,
+    theta: dict[str, float],
+    occupied: Mapping[str, bool],
+) -> dict[str, float]:
+    """``theta`` with the airflow sensitivity of every bay its zone converged *without*
+    pulled down to its own lower confidence bound (plan section 8 item 119).
+
+    ``k.<bay>`` becomes ``max(k - model_partial_k_sigmas * se(k), k's lower bound)`` for
+    each bay of a ``converged`` or ``frozen`` zone whose own block still fails the rule.
+    The asymmetry is the reason: an **under**-estimated ``k`` makes the DAS MPC believe
+    airflow helps that bay less than it does, so it runs the fans higher, which is the
+    safe side; an over-estimated one runs them lower. Nothing else is touched -- the air
+    block is a precondition of converging at all, and ``g0`` is not a gain of the rule.
+
+    ``se`` is the block's own standard error where it has closed a window and the square
+    root of its covariance otherwise. :func:`summary` refuses to *publish* the second as
+    a standard error (it is the prior, not a measurement, section 8 item 111); using it
+    here is the opposite case, since a block that has measured nothing is exactly the one
+    whose value may not be taken at face value.
+
+    Inert at the default ``model_converged_bays_frac: 1.0``: a converged zone has no such
+    bay, so this returns ``theta`` unchanged, object for object."""
+    if cfg.model_converged_bays_frac >= 1.0:
+        return theta
+    for z in d.st.zones:
+        if mem["zones"][z]["status"] not in ("converged", "frozen"):
+            continue
+        for b in _uninformed_bays(mem, cfg, d.st, z, occupied, d.zone_specs, d.bay_specs):
+            key = f"k.{b}"
+            value = _k_used(mem["bays"][b], cfg, d.bay_specs[b], key, True)
+            if value is not None and key in theta:
+                theta[key] = value
+    return theta
+
+
+def current_model(
+    memory: object, cfg: MpcConfig, *, occupancy: Mapping[str, str] | None = None
+) -> tuple[str, dict[str, float]]:
     """``(status, theta)`` of a thermal memory, for the DAS MPC's validity gate.
 
     ``status`` is the model's status (:func:`model_status`) and ``theta``
@@ -2468,13 +2652,23 @@ def current_model(memory: object, cfg: MpcConfig) -> tuple[str, dict[str, float]
     ``None`` (no ``model_shadow``) reads ``("off", prior)``; a memory that does not
     match the config's structure, or is malformed, reads as the fresh prior
     (``"prior"``), exactly as :func:`update` would start over from it.
-    """
+
+    With ``model_converged_bays_frac`` below 1.0 the bays a zone converged without are
+    derated first (:func:`_derate_uninformed`), so what the solver plans with is never the
+    face value of a coefficient the ``converged`` rule did not accept. ``occupancy`` is
+    the estimator's own reading per bay, the same input :func:`summary` uses; without it
+    the declared ``constrained`` flag decides, as everywhere else here."""
     d = _derived(cfg)
     if memory is None:
         return "off", dict(d.prior)
     mem = _load(memory, cfg, d.st)
-    theta = theta_from_memory(cfg, mem, st=d.st)
-    return model_status(mem), {k: float(v) for k, v in theta.items()}
+    theta = {k: float(v) for k, v in theta_from_memory(cfg, mem, st=d.st).items()}
+    declared = {} if cfg.topology is None else cfg.topology.bays
+    occupied = {
+        b: _bay_occupied(declared, b, None if occupancy is None else occupancy.get(b))
+        for b in d.st.bays
+    }
+    return model_status(mem), _derate_uninformed(mem, cfg, d, theta, occupied)
 
 
 def overall_status(zone_statuses: Collection[str]) -> str:
@@ -2520,12 +2714,21 @@ def _blocked_reasons(
     one-window prediction error has not reached ``model_max_pred_err_c``, in the rule's
     own words -- so a zone that sits in ``learning`` for hours says *which* gate is shut
     (a group that is not moving, a bay whose ``k`` has not been pinned down) instead of
-    leaving the owner to guess (section 8 items 110, 111). Empty for a zone that is
-    ``converged`` or ``frozen``; for a ``suspect`` or ``error`` zone it reads the same
-    blocks and says what would have to hold again."""
-    if memory["zones"][z]["status"] in ("converged", "frozen"):
+    leaving the owner to guess (section 8 items 110, 111). Empty for a ``frozen`` zone and
+    for a ``converged`` one that converged on every bay; for a ``suspect`` or ``error``
+    zone it reads the same blocks and says what would have to hold again.
+
+    A zone that converged **partially** (``model_converged_bays_frac`` below 1.0, section
+    8 item 119) keeps naming the bays it converged without, so ``blocked`` is empty
+    exactly when every block of the zone has informed itself and not merely when the zone
+    is accepted by the validity gate. ``partial`` and ``uninformed`` beside it say which
+    of the two a non-empty list on a converged zone is."""
+    status = memory["zones"][z]["status"]
+    if status == "frozen":
         return []
     out = list(_zone_converge_blockers(memory, cfg, st, z, occupied, zone_specs, bay_specs))
+    if status == "converged":
+        return out
     if pred is None or pred >= cfg.model_max_pred_err_c:
         out.append("pred_err")
     return out
@@ -2556,6 +2759,14 @@ def summary(
         b: _bay_occupied(declared, b, None if occupancy is None else occupancy.get(b))
         for b in st.bays
     }
+    # section 8 item 119: which bays a zone converged without, so the per-bay block can
+    # publish the ``k`` the solver actually plans with beside the one that was fitted
+    uninformed = {
+        z: _uninformed_bays(memory, cfg, st, z, occupied, zone_specs, bay_specs)
+        if memory["zones"][z]["status"] in ("converged", "frozen")
+        else []
+        for z in st.zones
+    }
     zones_out: dict[str, Any] = {}
     worst: float | None = None
     for z, zone in st.zones.items():
@@ -2584,7 +2795,16 @@ def summary(
             "rel_se": dict(zip(zone.air_keys, rel, strict=True)),
             # why this zone is still learning, in the words of the rule itself
             "blocked": _blocked_reasons(memory, cfg, st, z, occupied, zone_specs, bay_specs, pred),
+            # section 8 item 119: the occupied bays whose own block has not informed
+            # itself, and whether the zone is accepted by the validity gate *without*
+            # them. ``partial`` is how a reader tells a half-informed ``converged`` zone
+            # from a fully informed one; it is never true at the default
+            # ``model_converged_bays_frac: 1.0``.
+            "uninformed": _uninformed_bays(memory, cfg, st, z, occupied, zone_specs, bay_specs),
         }
+        zones_out[z]["partial"] = zm["status"] in ("converged", "frozen") and _zone_partial(
+            memory, cfg, st, z, occupied, zone_specs, bay_specs
+        )
         if any(gr.splits for gr in zone.groups):
             # what the split says each channel contributes, W/K (module docstring, *Split*)
             per_channel: dict[str, float] = {}
@@ -2616,6 +2836,20 @@ def summary(
             # the relative gate on a fit no worse than its neighbours' (section 8 item
             # 111). ``None`` per coefficient while the block has closed no window.
             "se": dict(zip(bay.keys, se, strict=True)),
+            # section 8 item 123: how often this block was thrown away for a hot swap and
+            # how long ago the last one was (``None``: never). A bay whose windows keep
+            # restarting says so here instead of only looking slow.
+            "resets": int(block.get("rst", 0)),
+            "last_reset_s": (
+                None
+                if block.get("rst_ts") is None or memory.get("ts") is None
+                else float(memory["ts"]) - float(block["rst_ts"])
+            ),
+            # section 8 item 119: the airflow sensitivity the DAS MPC plans this bay
+            # with. The same number as ``theta["k.<b>"]`` except on a bay whose zone
+            # converged *without* it, where it is that value's own lower confidence
+            # bound -- so the derating is readable instead of only happening.
+            "k_used": _k_used(block, cfg, bay_specs[b], f"k.{b}", b in uninformed[bay.zone]),
         }
         if occupancy is not None and b in occupancy:
             bays_out[b]["occupancy"] = occupancy[b]

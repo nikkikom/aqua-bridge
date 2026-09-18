@@ -1035,3 +1035,153 @@ def test_malformed_estimator_bay_info_never_raises_out_of_step(das_example_cfg, 
     assert [r.cmd.pwm for r in run.records] == [r.cmd.pwm for r in reference.records]
     last = run.records[-1].cmd.diagnostics["thermal"]
     assert last["status"] == "error" and "TypeError" in last["error"]
+
+
+# ---------------------------------------------------------------------------
+# partial convergence (section 8 item 119)
+# ---------------------------------------------------------------------------
+
+
+def _informed(memory: dict[str, Any], spec_keys: tuple[str, ...], block: dict[str, Any]) -> None:
+    """Make one block pass every part of the ``converged`` rule but the caller's choice."""
+    block["n"] = thermal.MIN_WINDOWS
+    block["w"] = thermal.MIN_WINDOWS
+    block["pe"] = 1.0
+    block["rel"] = [0.0] * len(spec_keys)
+
+
+def _zone_ready(c: MpcConfig, zone: str, *, blind_bays: tuple[str, ...] = ()) -> dict[str, Any]:
+    """A memory in which ``zone``'s air block and every bay but ``blind_bays`` has informed
+    itself; the blind ones keep the prior's own (useless) standard error."""
+    d = thermal._derived(c)
+    mem = thermal.fresh_memory(c)
+    _informed(mem, d.st.zones[zone].air_keys, mem["zones"][zone]["air"])
+    for b in d.st.zones[zone].bays:
+        block = mem["bays"][b]
+        if b in blind_bays:
+            block["n"] = thermal.MIN_WINDOWS
+            block["w"] = thermal.MIN_WINDOWS
+            block["pe"] = 1.0
+            block["rel"] = [0.9] * len(d.st.bays[b].keys)  # far over model_converged_rel_se
+        else:
+            _informed(mem, d.st.bays[b].keys, block)
+    # through the parser, which *derives* ``se`` and ``pd`` from ``P`` and ``m``/``S``:
+    # a live memory always carries the derived pair, and the test must too
+    return thermal._load(mem, c, d.st)
+
+
+def test_min_informed_bays_rounds_up_and_never_falls_under_one():
+    """The rule's own arithmetic (item 119): 1.0 is every bay, below that it rounds up,
+    and a zone may never converge on its air block alone whatever the fraction -- a bay
+    block is the only evidence there is about the bay the solver plans for."""
+    assert thermal.min_informed_bays(4, 1.0) == 4
+    assert thermal.min_informed_bays(4, 0.75) == 3
+    assert thermal.min_informed_bays(4, 0.5) == 2
+    assert thermal.min_informed_bays(3, 0.5) == 2  # rounded up, not down
+    assert thermal.min_informed_bays(4, 0.01) == 1  # never zero
+    assert thermal.min_informed_bays(0, 0.5) == 1
+
+
+def test_a_zone_converges_on_the_bays_that_informed_themselves(small):
+    """Item 119's policy, and its default. At ``model_converged_bays_frac: 1.0`` one
+    stubborn bay holds the whole zone for ever; below it the zone converges on the rest --
+    and says so, so a reader never takes a half-informed zone for a finished one."""
+    d = thermal._derived(small)
+    params = thermal.model_params(small, st=d.st)
+    mem = _zone_ready(small, "za", blind_bays=("a2",))
+
+    strict = thermal._zone_blocks_converged(
+        mem, small, d.st, "za", params, d.zone_specs, d.bay_specs
+    )
+    assert strict is False  # today's rule: a2 holds za back
+
+    partial_cfg = dataclasses.replace(small, model_converged_bays_frac=0.5)
+    assert thermal._zone_blocks_converged(
+        mem, partial_cfg, d.st, "za", params, d.zone_specs, d.bay_specs
+    )
+    # and the air block is never substitutable: with both bays blind nothing converges
+    blind_both = _zone_ready(small, "za", blind_bays=("a1", "a2"))
+    assert not thermal._zone_blocks_converged(
+        blind_both, partial_cfg, d.st, "za", params, d.zone_specs, d.bay_specs
+    )
+    air_blind = _zone_ready(small, "za")
+    air_blind["zones"]["za"]["air"]["pe"] = 0.0
+    assert not thermal._zone_blocks_converged(
+        air_blind, partial_cfg, d.st, "za", params, d.zone_specs, d.bay_specs
+    )
+
+
+def test_a_partly_converged_zone_says_which_bays_it_converged_without(small):
+    """How a reader tells the two apart (item 119): ``partial``, ``uninformed`` and a
+    ``blocked`` list that stays non-empty on a converged zone. ``blocked`` is empty
+    exactly when every block of the zone has informed itself, not merely when the
+    validity gate accepts the zone."""
+    c = dataclasses.replace(small, model_converged_bays_frac=0.5)
+    mem = _zone_ready(c, "za", blind_bays=("a2",))
+    mem["zones"]["za"]["status"] = "converged"
+    out = thermal.summary(mem, c)["zones"]["za"]
+    assert out["partial"] is True
+    assert out["uninformed"] == ["a2"]
+    assert [r for r in out["blocked"] if r.endswith("a2")], out["blocked"]
+    assert not [r for r in out["blocked"] if ".a1" in r or r.endswith("za")]
+
+    # the default is the old contract to the letter: nothing partial, nothing blocked
+    mem_full = _zone_ready(small, "za")
+    mem_full["zones"]["za"]["status"] = "converged"
+    full = thermal.summary(mem_full, small)["zones"]["za"]
+    assert full["partial"] is False and full["uninformed"] == [] and full["blocked"] == []
+
+
+def test_the_bays_a_zone_converged_without_are_planned_at_their_lower_bound(small):
+    """The safety edge (item 119). An under-estimated ``k`` makes the DAS MPC believe
+    airflow helps that bay less than it does, so it runs the fans higher -- safe; an
+    over-estimated one runs them lower. A bay its zone converged *without* is therefore
+    handed to the solver at ``k - model_partial_k_sigmas * se(k)``, and the published
+    ``k_used`` is the same number, so the diagnostics cannot say one thing while the
+    solver plans with another."""
+    c = dataclasses.replace(small, model_converged_bays_frac=0.5, model_partial_k_sigmas=2.0)
+    mem = _zone_ready(c, "za", blind_bays=("a2",))
+    mem["zones"]["za"]["status"] = "converged"
+    fitted = thermal.theta_from_memory(c, mem)
+    bays = thermal.summary(mem, c)["bays"]
+    se = bays["a2"]["se"]["k.a2"]
+    _, used = thermal.current_model(mem, c)
+    lo = thermal.PARAMETERS["k"].lo
+    assert used["k.a2"] == pytest.approx(max(lo, fitted["k.a2"] - 2.0 * se))
+    assert used["k.a2"] < fitted["k.a2"]
+    assert used["k.a1"] == pytest.approx(fitted["k.a1"])  # an informed bay is untouched
+    assert used["g0.a2"] == pytest.approx(fitted["g0.a2"])  # only the airflow gain moves
+    assert bays["a2"]["k_used"] == pytest.approx(used["k.a2"])
+    assert bays["a1"]["k_used"] == pytest.approx(fitted["k.a1"])
+
+    # at the default fraction there is no such bay and nothing is derated at all
+    _, plain = thermal.current_model(mem, small)
+    assert plain["k.a2"] == pytest.approx(fitted["k.a2"])
+    assert thermal.summary(mem, small)["bays"]["a2"]["k_used"] == pytest.approx(fitted["k.a2"])
+
+
+def test_model_freeze_never_freezes_a_half_informed_zone(small, monkeypatch):
+    """``model_freeze`` means "this model is finished"; a zone that converged without some
+    of its bays is not (item 119). It stays ``converged``, keeps adapting, and freezes as
+    soon as the last bay informs itself."""
+    c = dataclasses.replace(small, model_converged_bays_frac=0.5, model_freeze=True)
+    d = thermal._derived(c)
+    params = thermal.model_params(c, st=d.st)
+    mem = _zone_ready(c, "za", blind_bays=("a2",))
+    zm = _zone_state(status="learning")
+    thermal._advance_status(zm, mem, c, d.st, "za", 0.05, True, params, d.zone_specs, d.bay_specs)
+    assert zm["status"] == "converged"  # not frozen: a2 has informed nothing
+
+    whole = _zone_ready(c, "za")
+    zm = _zone_state(status="learning")
+    thermal._advance_status(zm, whole, c, d.st, "za", 0.05, True, params, d.zone_specs, d.bay_specs)
+    assert zm["status"] == "frozen"
+
+
+def test_model_converged_bays_frac_and_partial_k_sigmas_are_validated(small):
+    for bad in (0.0, -0.5, 1.5):
+        with pytest.raises(ConfigError, match="model_converged_bays_frac must be in"):
+            dataclasses.replace(small, model_converged_bays_frac=bad)
+    with pytest.raises(ConfigError, match="model_partial_k_sigmas must be >= 0"):
+        dataclasses.replace(small, model_partial_k_sigmas=-1.0)
+    assert small.model_converged_bays_frac == 1.0 and small.model_partial_k_sigmas == 1.0

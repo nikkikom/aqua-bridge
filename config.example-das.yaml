@@ -308,6 +308,20 @@ mpc:
                          # the combination slope * rise + offset and the pair would otherwise
                          # walk along that combination for ever; its offset half is a random
                          # walk with q_offset above, so a placement that drifts is followed
+    proximal_gap_sigmas: 3.0  # how many prior sigmas the LEARNED disagreement between two
+                         # proximal sensors of one bay may reach before the bay's placement
+                         # diagnostic reports it (>= 0; 0 reports every gap). The prior is
+                         # the box the two keys above describe at this tick's drive-to-air
+                         # rise, sqrt((slope_spread * rise)^2 + offset_c^2), so it widens
+                         # with the load as the disagreement itself does. What the verdict
+                         # MEANS depends on the layout (section 8 item 125): with a node per
+                         # sensor the slope and the offset are separated, so a gap outside
+                         # the box is a placement the config does not allow -- a sensor come
+                         # loose, fouling or ageing. With one fused node per bay the offset
+                         # state carries ds * rise + db as one drifting number, so a gap
+                         # outside the box may equally be a load that layout cannot resolve;
+                         # the verdict says which case it is instead of pretending the two
+                         # layouts know the same thing
     smart_max_age_s: 300 # older SMART samples are ignored; a silent serial loses its bay
     smart_reject_c: 8.0  # a SMART value this far from the estimate is dropped
     occupied_dT_c: 2.0   # proximal minus zone air above this: a drive is there
@@ -368,6 +382,18 @@ mpc:
   model_p_trace_max: 100.0
   model_converged_rel_se: 0.25  # every fan gain's relative standard error below this ...
   model_max_pred_err_c: 1.0     # ... and the one-window prediction error below this: converged
+  # Partial convergence (section 8 item 119). A zone converges when its AIR block has
+  # informed itself and at least this fraction of its occupied bays has (rounded up, never
+  # fewer than one). 1.0 is all-or-nothing, what shipped before, and one stubborn bay then
+  # holds a whole zone for ever. Below 1.0 the zone converges without the rest -- and the
+  # model may not treat them as informed: each such bay is planned at k minus
+  # model_partial_k_sigmas of its own standard error, the safe side of the asymmetry (an
+  # under-estimated k makes the solver think airflow helps that bay less, so it runs the
+  # fans higher). Such a zone publishes partial: true, the bays in uninformed, keeps naming
+  # them in blocked, and is never frozen. Measured on the 16 h harness: 6 of 12 zone-seeds
+  # converge at 1.0, 9 at 0.75, 10 at 0.5; at 36 h 11 of 12 at 1.0 and 12 of 12 at 0.5.
+  model_converged_bays_frac: 1.0
+  model_partial_k_sigmas: 1.0
   model_use_rpm: false   # airflow from the tachometer instead of the PWM curve where one reports
   model_reset_on_swap: true  # a hot-swapped bay's g0, k and q_s start over from the prior
   # Freeze a converged model: with model_freeze the zone that reaches the converged rule is
@@ -473,6 +499,16 @@ mpc:
   ident_enabled: false   # true: allow POST /api/ident and MQTT cmd/ident to start one
   ident_amplitude: 0.15  # PWM step, (0, 0.3]
   ident_levels: above    # above: never less cooling than the solver asks for
+  # How big each channel's telegraph is (section 8 item 120). fixed: every channel spends
+  # ident_amplitude whatever room it has. headroom: the smallest step in (0, ident_amplitude]
+  # whose own relative airflow swing reaches ident_pe_aim * sqrt(PE_MIN) from where that
+  # channel is parked, placed inside [pwm_min, pwm_max] -- a symmetric pair whose low level
+  # would fall through pwm_min slides UP, keeping its swing and making the dip shallower,
+  # instead of being refused by the band: precondition. It pays under ident_levels:
+  # symmetric, where the step is cooling given up; under above the solver takes the extra
+  # cooling straight back off its own demand, so sizing down buys 0.004 mean PWM (item 110).
+  ident_amplitude_mode: fixed
+  ident_pe_aim: 2.0      # > 0; below about 1.5 no zone converges (measured, item 110)
   ident_replan: true     # re-plan the levels from the live solver demand every tick; false
                          # freezes them at the base of the start (the Zero W behaviour)
   ident_parallel: false  # false: one group at a time, the siblings held. true: one experiment

@@ -90,13 +90,19 @@ mpc:
   fan_models: {}         # <model>: {rpm_max, deadband, exponent, noise_db_at_max}
   zones: null            # {trust_rule: strict|sigma, fault_coupling: declared|none, sigma_floor_hold_s: 1800, sigma_floor_growth_c: 1.0, sigma_floor_release_per_min: 0.0025}
   noise: null            # {exponent: 5, weight_noise: 1.0, band_hysteresis: 0.02}
-  estimator: null        # drive estimator: {k_sigma: 2.0, sigma_fault_c, sigma_air_fault_c, q_t_air, q_d_air, q_t_drive, q_t_sensor, q_heat, q_offset, sensor_noise_c, proximal_offset_c, proximal_slope_spread, air_blind_fault_s, smart_max_age_s, smart_reject_c, occupied_dT_c, empty_dT_c, empty_confirm_s, occupancy_hold_s, bay_settle_s, bay_settle_max_s, bay_uncertain_var_c2, bay_cal_step_c, calibration_max_age_days, manual_calibration_max_age_days, calibrate_min_c, calibrate_max_c, associate_window_s, associate_min_corr, associate_margin, associate_drop_corr, associate_drop_checks, sigma_uncalibrated_c, p0_t_air, p0_d_air, p0_t_drive, p0_t_sensor, p0_heat, reset_drive_var, jump_min_c, jump_sigmas}
+  estimator: null        # drive estimator: {k_sigma: 2.0, sigma_fault_c, sigma_air_fault_c, q_t_air, q_d_air, q_t_drive, q_t_sensor, q_heat, q_offset, sensor_noise_c, proximal_offset_c, proximal_slope_spread, proximal_gap_sigmas, air_blind_fault_s, smart_max_age_s, smart_reject_c, occupied_dT_c, empty_dT_c, empty_confirm_s, occupancy_hold_s, bay_settle_s, bay_settle_max_s, bay_uncertain_var_c2, bay_cal_step_c, calibration_max_age_days, manual_calibration_max_age_days, calibrate_min_c, calibrate_max_c, associate_window_s, associate_min_corr, associate_margin, associate_drop_corr, associate_drop_checks, sigma_uncalibrated_c, p0_t_air, p0_d_air, p0_t_drive, p0_t_sensor, p0_heat, reset_drive_var, jump_min_c, jump_sigmas}
   # DAS thermal model identification (control/thermal.py); inert in legacy mode.
   model_shadow: false    # true (needs topology): learn and predict the zoned thermal model without acting
   model_window_s: 120.0  # sin^2-weighted regression window, (0, 600]; >= 2 * dt with model_shadow
   model_lambda: 0.9995   # RLS forgetting per excited window, (0.99, 1]
   model_p_trace_max: 100.0     # covariance trace bound (scaled units), > 0
   model_converged_rel_se: 0.25 # relative standard error of every fan gain for "converged", (0, 1)
+  model_converged_bays_frac: 1.0  # DAS only (inert here): the fraction of a zone's occupied bays
+                         # that must have informed themselves for the zone to converge, (0, 1].
+                         # 1.0 is all-or-nothing; the zone's air block must pass whatever this is
+  model_partial_k_sigmas: 1.0  # DAS only (inert here): with the fraction below 1.0, a bay its zone
+                         # converged without is planned at k - this many standard errors (>= 0),
+                         # its own lower confidence bound -- the safe side (fans higher)
   model_max_pred_err_c: 1.0    # one-window prediction error allowed for "converged", degC, > 0
   model_use_rpm: false   # true (needs topology): airflow from the tachometer where one reports
   model_reset_on_swap: true  # DAS only (inert here): a hot-swapped bay's identified g0, k, q_s
@@ -143,6 +149,12 @@ mpc:
   ident_enabled: false   # true (needs topology): an explicit start intent may run an experiment
   ident_amplitude: 0.15  # PWM step of the two-level sequence, (0, 0.3]
   ident_levels: above    # above: base and base + amplitude | symmetric: base +- amplitude
+  ident_amplitude_mode: fixed  # fixed: every channel spends ident_amplitude | headroom: the
+                         # smallest step that reaches ident_pe_aim * sqrt(PE_MIN) from where the
+                         # channel is parked, placed inside [pwm_min, pwm_max]. Worth it under
+                         # ident_levels: symmetric, where the step is cooling given up
+  ident_pe_aim: 2.0      # multiple of sqrt(PE_MIN) a headroom-sized telegraph aims for, > 0;
+                         # below about 1.5 no zone converges (measured)
   ident_replan: true     # levels follow the live solver demand every tick (false: frozen at the start)
   ident_parallel: false  # true: one experiment excites every channel of the target's own zones at
                          # once, each on its own code -- what the thermal model needs to converge.

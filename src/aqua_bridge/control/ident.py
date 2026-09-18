@@ -130,6 +130,29 @@ zone from this base, ``true`` is permission for the schedule to try. The measure
 the thermal model's own ``pe_diag``, the diagonal beside ``pe_min``, which names the group
 that is short after the fact, and its ``blocked`` list, which names the gate.
 
+Sizing the telegraph to that headroom (``ident_amplitude_mode``, section 8 item 120)
+----------------------------------------------------------------------------------------
+``fixed`` (the default) spends ``ident_amplitude`` on every channel whatever room it has,
+which is what shipped before. ``headroom`` spends the **smallest** amplitude in
+``(0, ident_amplitude]`` whose own ``rel_swing`` reaches ``ident_pe_aim * sqrt(PE_MIN)``
+from where that channel is parked -- falling back to ``ident_amplitude`` when even that
+falls short, so no channel is ever excited less than ``fixed`` excites it -- and places
+the two levels **inside** ``[pwm_min, pwm_max]`` with the room the channel really has on
+each side.
+
+Why it is worth a key under ``symmetric`` and not under ``above``. Under ``above`` the
+amplitude is cooling *added* and the solver takes it straight back off its own demand, so
+sizing down buys 0.004 mean PWM (measured over 16 h on three seeds, item 110) -- nothing.
+Under ``symmetric`` the amplitude is cooling *given up*: ``compose`` floors an experiment
+channel at its own solver command minus the planned dip, so a smaller step comes directly
+off the one accepted worst case in this module. The placement matters there too, and in
+both directions: a channel parked within ``ident_amplitude`` of ``pwm_min`` -- where item
+112 leaves most of them between experiments -- has its symmetric pair refused outright by
+the ``band:`` precondition today, while sliding the same pair up to sit on ``pwm_min``
+keeps every bit of its swing *and* shrinks the dip to the room the channel had. At
+``pwm_max`` there is nothing to slide: sliding down would dip further than the owner
+capped, so the high level is cut at the rail and ``excitable`` says the swing is short.
+
 ``ident_require_excitable`` (default false) turns it into a refusal: ``check_start`` then
 rejects a start whose channel cannot clear the bound (``not_excitable:<ch>``), the way
 ``band:`` and ``saturated:`` reject. It is off by default deliberately -- such a run still
@@ -431,6 +454,10 @@ RESULT_COMPLETED = "completed"
 RESULT_ABORTED = "aborted"
 
 _EPS = 1e-9
+#: Bisection steps of ``ident_amplitude_mode: headroom`` (:func:`_levels`). Fixed, so the
+#: sizing is a pure function of the config, the channel and the base; 40 halvings of a
+#: ``(0, 0.3]`` interval land far inside the PWM quantisation of any controller here.
+_SIZE_ITERS = 40
 
 
 # ---------------------------------------------------------------------------
@@ -802,10 +829,61 @@ def _levels_at(cfg: MpcConfig, base: float, amplitude: float) -> tuple[float, fl
     return base, base + amplitude
 
 
-def _levels(cfg: MpcConfig, base: float) -> tuple[float, float]:
-    """The two levels around ``base``, unclamped (the start refuses a base whose levels
-    would leave the band; a re-planned base clamps them, :func:`_replan`)."""
-    return _levels_at(cfg, base, cfg.ident_amplitude)
+def _placed(cfg: MpcConfig, base: float, amplitude: float) -> tuple[float, float]:
+    """The two levels at ``amplitude``, placed inside ``[pwm_min, pwm_max]`` with the room
+    the channel really has on each side (``ident_amplitude_mode: headroom``, section 8
+    item 120).
+
+    Under ``symmetric`` a low level that would fall through ``pwm_min`` **slides the pair
+    up** instead of being cut off there: the telegraph keeps its full ``2 * amplitude``
+    swing -- the thing the PE monitor reads -- and the dip below the base shrinks to
+    whatever room the channel had, which is cooling given back. It never slides the other
+    way: that would put the low level further under the base than ``ident_amplitude``, and
+    that dip is exactly what the owner capped. A high level over ``pwm_max`` is therefore
+    cut there, and the swing is what the headroom allows and no more.
+
+    Under ``above`` the low level *is* the base, which the solver already commands, so
+    there is nothing to slide; only the high level can be cut at ``pwm_max``."""
+    lo, hi = _levels_at(cfg, base, amplitude)
+    if cfg.ident_levels == "symmetric" and lo < cfg.pwm_min:
+        hi += cfg.pwm_min - lo
+        lo = cfg.pwm_min
+    return _clamp(lo, cfg.pwm_min, cfg.pwm_max), _clamp(hi, cfg.pwm_min, cfg.pwm_max)
+
+
+def _levels(cfg: MpcConfig, ch: str, base: float) -> tuple[float, float]:
+    """The two levels this channel's telegraph runs between, from ``base`` (item 120).
+
+    ``ident_amplitude_mode: fixed`` (the default) is :func:`_levels_at` at
+    ``ident_amplitude``, unclamped and unchanged: the start refuses a base whose levels
+    would leave the band, and a re-planned base clamps them (:func:`_replan`).
+
+    ``headroom`` asks for the *smallest* amplitude in ``(0, ident_amplitude]`` whose
+    placed levels reach ``ident_pe_aim * sqrt(PE_MIN)`` of relative airflow swing
+    (:func:`rel_swing`), and falls back to ``ident_amplitude`` when even that falls short
+    -- so a channel is never excited *less* than the fixed mode excites it, while one with
+    room to spare spends less. Because the placement is inside the band by construction,
+    ``headroom`` also never trips the ``band:`` precondition: a channel parked within
+    ``ident_amplitude`` of a rail runs a telegraph sized to the room it has instead of
+    being refused a start.
+
+    The search is a fixed-length bisection on a swing that grows with the amplitude, so it
+    is a pure function of the config, the channel and the base -- the schedule stays
+    reproducible for the same three."""
+    if cfg.ident_amplitude_mode != "headroom":
+        return _levels_at(cfg, base, cfg.ident_amplitude)
+    aim = (cfg.ident_pe_aim**2) * thermal.PE_MIN
+    full = _placed(cfg, base, cfg.ident_amplitude)
+    if rel_swing(cfg, ch, *full) ** 2 <= aim:
+        return full
+    lo_a, hi_a = 0.0, cfg.ident_amplitude
+    for _ in range(_SIZE_ITERS):
+        mid = 0.5 * (lo_a + hi_a)
+        if rel_swing(cfg, ch, *_placed(cfg, base, mid)) ** 2 > aim:
+            hi_a = mid
+        else:
+            lo_a = mid
+    return _placed(cfg, base, hi_a)
 
 
 def _anchor(cfg: MpcConfig, lo: float, hi: float) -> float:
@@ -825,7 +903,17 @@ def holds_cover_window(cfg: MpcConfig) -> bool:
     return bool(cfg.ident_hold_s) and min(cfg.ident_hold_s) >= cfg.model_window_s
 
 
-def excitation(cfg: MpcConfig, levels: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+def _at_amplitude(cfg: MpcConfig, base: float, amplitude: float) -> tuple[float, float]:
+    """The two levels an experiment planned *now* would use at ``amplitude``, in whichever
+    way ``ident_amplitude_mode`` places them."""
+    if cfg.ident_amplitude_mode == "headroom":
+        return _placed(cfg, base, amplitude)
+    return _levels_at(cfg, base, amplitude)
+
+
+def excitation(
+    cfg: MpcConfig, levels: Mapping[str, Any], bases: Mapping[str, Any] | None = None
+) -> dict[str, dict[str, Any]]:
     """Per channel of ``levels`` (``{channel: [low, high]}``), how much airflow variation
     that telegraph can put into the thermal model's PE monitor.
 
@@ -853,7 +941,12 @@ def excitation(cfg: MpcConfig, levels: Mapping[str, Any]) -> dict[str, dict[str,
             continue
         lo, hi = float(pair[0]), float(pair[1])
         swing = rel_swing(cfg, ch, lo, hi)
-        cap_lo, cap_hi = _levels_at(cfg, _anchor(cfg, lo, hi), IDENT_AMPLITUDE_MAX)
+        # The base the pair was drawn around. ``ident_amplitude_mode: headroom`` may place
+        # the two levels asymmetrically about it, so the caller's own base wins where it
+        # has one and the midpoint/low-level rule is the fallback (section 8 item 120).
+        base = bases.get(ch) if isinstance(bases, Mapping) else None
+        anchor = float(base) if _finite(base) else _anchor(cfg, lo, hi)  # type: ignore[arg-type]
+        cap_lo, cap_hi = _at_amplitude(cfg, anchor, IDENT_AMPLITUDE_MAX)
         cap = rel_swing(cfg, ch, cap_lo, cap_hi)
         out[ch] = {
             "rel_swing": swing,
@@ -866,12 +959,14 @@ def excitation(cfg: MpcConfig, levels: Mapping[str, Any]) -> dict[str, dict[str,
     return out
 
 
-def unexcitable(cfg: MpcConfig, levels: Mapping[str, Any]) -> list[str]:
+def unexcitable(
+    cfg: MpcConfig, levels: Mapping[str, Any], bases: Mapping[str, Any] | None = None
+) -> list[str]:
     """The channels of ``levels`` whose telegraph cannot reach ``PE_MIN`` at the
     configured ``ident_amplitude`` (in order). See :func:`excitation`: a channel is
     listed here whatever ``excitable_at_cap`` says, so the list answers "which channel
     cannot inform the model on this run", not "which one never could"."""
-    return [ch for ch, e in excitation(cfg, levels).items() if not e["excitable"]]
+    return [ch for ch, e in excitation(cfg, levels, bases).items() if not e["excitable"]]
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -883,7 +978,13 @@ def dip_below_solver(cfg: MpcConfig) -> float:
 
     ``0`` under ``above`` (the experiment never commands less cooling than the
     solver), ``ident_amplitude`` under ``symmetric`` (the owner-accepted dip). A
-    *running* experiment is floored by its own plan instead (:func:`planned_dip`)."""
+    *running* experiment is floored by its own plan instead (:func:`planned_dip`).
+
+    It stays the worst case under ``ident_amplitude_mode: headroom`` (section 8 item 120),
+    where the per-channel dip is smaller: the sizing only ever shrinks the amplitude and
+    the placement only ever slides the pair *up*, so no channel is ever further under the
+    solver's command than ``ident_amplitude``. A bound that cannot be exceeded is the
+    right fallback for a floor."""
     return cfg.ident_amplitude if cfg.ident_levels == "symmetric" else 0.0
 
 
@@ -936,10 +1037,13 @@ def check_start(
             continue
         if facts.saturated.get(ch) is not False:
             reasons.append(f"saturated:{ch}")
-        lo, hi = _levels(cfg, float(base))  # type: ignore[arg-type]
+        lo, hi = _levels(cfg, ch, float(base))  # type: ignore[arg-type]
         if lo < cfg.pwm_min - _EPS or hi > cfg.pwm_max + _EPS:
             reasons.append(f"band:{ch}")
-        elif cfg.ident_require_excitable and not excitation(cfg, {ch: (lo, hi)})[ch]["excitable"]:
+        elif (
+            cfg.ident_require_excitable
+            and not excitation(cfg, {ch: (lo, hi)}, {ch: base})[ch]["excitable"]
+        ):
             reasons.append(f"not_excitable:{ch}")
     for ch in cfg.channels:
         if facts.fan_stall.get(ch):
@@ -1105,7 +1209,7 @@ def start(
         "base": base,
         "plan_base": dict(base),
         "replan": bool(cfg.ident_replan),
-        "levels": {ch: list(_levels(cfg, base[ch])) for ch in channels},
+        "levels": {ch: list(_levels(cfg, ch, base[ch])) for ch in channels},
         "phases": _schedule(cfg, phases),
         "apply_failures": 0,
         # the overrides of the tick whose applied PWM the next tick reports as its
@@ -1147,7 +1251,7 @@ def _replan(
             floor = max(wanted, float(base[ch]), plan_base[ch] - cfg.d_pwm_max)
             plan_base[ch] = min(plan_base[ch], floor)
     levels = {
-        ch: [_clamp(v, cfg.pwm_min, cfg.pwm_max) for v in _levels(cfg, plan_base[ch])]
+        ch: [_clamp(v, cfg.pwm_min, cfg.pwm_max) for v in _levels(cfg, ch, plan_base[ch])]
         for ch in exp["channels"]
     }
     return {"plan_base": plan_base, "levels": levels}
@@ -1343,8 +1447,8 @@ def status(
             "base": dict(exp["base"]),
             "plan_base": dict(exp.get("plan_base") or exp["base"]),
             "levels": {ch: list(v) for ch, v in exp["levels"].items()},
-            "excitation": excitation(cfg, exp["levels"]),
-            "unexcitable": unexcitable(cfg, exp["levels"]),
+            "excitation": excitation(cfg, exp["levels"], exp.get("plan_base")),
+            "unexcitable": unexcitable(cfg, exp["levels"], exp.get("plan_base")),
             "replan": bool(exp.get("replan")),
             "elapsed_s": elapsed,
             "remaining_s": max(0.0, float(exp["duration_s"]) - elapsed),
