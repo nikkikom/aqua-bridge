@@ -16,6 +16,7 @@ them.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -467,6 +468,39 @@ def test_aquabus_presence_is_judged_from_the_speed_field_alone() -> None:
     assert aquabus_present(QUADRO, decode_status(QUADRO, _bin("quadro-status.bin"))) is None
     with pytest.raises(ValueError, match="status report of a quadro, not a aquaero"):
         aquabus_present(AQUAERO, decode_status(QUADRO, _bin("quadro-status.bin")))
+
+
+def test_aquabus_presence_also_reads_the_flow_slot_for_a_device_with_no_fan_outputs() -> None:
+    """Item 130's audit: the fan blocks alone cannot tell a bus device with no fan
+    outputs from an empty bus (every block reads speed ``0xFFFF`` either way). The
+    aquabus flow slot (``flow3``) is confirmed to carry the same two-state shape as the
+    ``bus1..8`` temperature slots without needing a fan behind any block -- "no data"
+    with an empty bus, a real value with the Quadro present, in every capture -- so it
+    is the second witness that closes the gap.
+    """
+    with_power = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-power.bin"))
+    empty = decode_status(AQUAERO, _bin("aquaero-status-no-aquabus.bin"))
+    # Confirmed against the live devices (PROJECT.md section 2): flow3 (index 2) is
+    # "no data" with an empty bus and 0 ("present, nothing connected") with the Quadro
+    # on it, in both captures that have a device on aquabus at all.
+    assert empty.flows[2] is None
+    assert with_power.flows[2] == 0
+
+    # A bus device with no fan outputs at all: every block still reads 0xFFFF (built
+    # from the empty-bus fixture, so the fan blocks are already exactly that), but the
+    # flow slot carries data -- the shape a sensor-only slave (a Farbwerk 360) or a
+    # Quadro whose fans this daemon does not command would read.
+    no_fans = bytearray(_bin("aquaero-status-no-aquabus.bin"))
+    flow3 = AQUAERO.flow_offsets[2]
+    no_fans[flow3 : flow3 + 2] = (0).to_bytes(2, "big")
+    report = decode_status(AQUAERO, bytes(no_fans))
+    assert all(report.fans[k].rpm == FAN_ABSENT_RPM for k in range(4, 8))  # still no fan block
+    assert aquabus_present(AQUAERO, report) is True  # ... but the flow witness says present
+
+    # A kind with no aquabus flow witness (aquabus_flow_index=None) falls back to the fan
+    # blocks alone, unchanged from before this item.
+    no_witness = dataclasses.replace(AQUAERO, aquabus_flow_index=None)
+    assert aquabus_present(no_witness, report) is False
 
 
 def test_the_aquaeros_own_blocks_report_no_current() -> None:

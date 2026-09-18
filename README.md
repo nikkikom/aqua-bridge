@@ -150,13 +150,15 @@ is not yet confirmed on real hardware, on either board.
    software-sensor heartbeat (`heartbeat_sensor`, `heartbeat_value_c`,
    off by default — 0 is right only while no software sensor is enabled
    on the controller, §8 item 84) are shown at their defaults,
-   PROJECT.md §3 Track B; a `busN` input may be bound since §8 item 92,
-   provided the same entry also commands one of that device's aquabus
-   outputs (`pwm5..8`) — the config is rejected otherwise, because the
-   daemon judges a bus device's presence from those fan blocks. While no
-   device answers on the aquabus the slot then reads as missing instead of
-   as the value the controller keeps serving for it, and the loss is
-   reported in the device health),
+   PROJECT.md §3 Track B; a `busN` input may be bound since §8 item 92 --
+   on the aquaero, without needing to also command one of that device's
+   aquabus outputs (`pwm5..8`): its aquabus flow slot is a second witness
+   of the bus device's presence that needs no fan behind it either (§8
+   item 130), so a sensor-only slave or a Quadro whose fans this daemon
+   does not command is judged the same as one whose outputs are bound.
+   While no device answers on the aquabus the slot then reads as missing
+   instead of as the value the controller keeps serving for it, and the
+   loss is reported in the device health),
    `onewire.sensors`
    (bound in step 8), the MQTT host and credentials, `http.enabled` /
    `mqtt.enabled`. Every declared name must be bound exactly once — the

@@ -7,6 +7,7 @@ a write).
 
 from __future__ import annotations
 
+import dataclasses
 import errno
 import math
 import shutil
@@ -1544,17 +1545,23 @@ def test_apply_before_any_status_report_cannot_know_about_aquabus() -> None:
 
 
 def _bus_device_gone(template: bytes) -> bytes:
-    """The status report item 92 saw: every aquabus fan block reads rpm 0xFFFF while the
-    aquabus temperature slots still hold the value they read before the device left.
+    """The status report item 92 saw: every aquabus fan block reads rpm 0xFFFF and the
+    aquabus flow slot reads "no data" while the aquabus temperature slots still hold the
+    value they read before the device left.
 
     Built from the capture rather than captured: on 2026-09-15 the aquaero kept reporting
     24.12 degC in ``bus2`` for over an hour after the Quadro was unplugged from aquabus,
-    and no capture of that hour exists. Everything else in the report is the live one.
+    while its fans read rpm 0xFFFF and flow 3 read 0x7FFF in the same window (PROJECT.md
+    section 8 item 92's original report), and no capture of that hour exists. Everything
+    else in the report is the live one.
     """
     status = bytearray(template)
     for number in AQUAERO.aquabus_outputs:
         speed = AQUAERO.fan_blocks[number - 1] + AQUAERO.fan_layout.speed
         status[speed : speed + 2] = b"\xff\xff"
+    if AQUAERO.aquabus_flow_index is not None:
+        flow = AQUAERO.flow_offsets[AQUAERO.aquabus_flow_index - 1]
+        status[flow : flow + 2] = b"\x7f\xff"
     return bytes(status)
 
 
@@ -1832,16 +1839,22 @@ def test_binding_rejects_numbers_outside_the_kind() -> None:
         DeviceBinding(kind=QUADRO, pwm_map={}, temp_map={"t": "bus1"})
     with pytest.raises(ValueError, match="share one"):
         DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"t": "bus1", "u": "bus1"})
-    # A busN is a reading only while a device answers on aquabus, which is judged from
-    # the aquabus fan blocks: without one of them bound the binding is refused (item 92).
-    with pytest.raises(ValueError, match="no aquabus output"):
-        DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"t": "bus1", "u": "virt4"})
+    # A busN is a reading only while a device answers on aquabus (item 92). The aquaero
+    # can judge that from its aquabus flow slot alone (item 130), so bus1 needs no
+    # aquabus output bound in the same entry any more.
+    DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"t": "bus1", "u": "virt4"})
     DeviceBinding(
         kind=AQUAERO,
         pwm_map={"qd1": 5},
         temp_map={"t": "bus1", "u": "virt4"},
     )
     DeviceBinding(kind=AQUAERO, pwm_map={}, temp_map={"u": "virt4"})
+    # A kind with neither an aquabus flow witness nor a bound aquabus output is still
+    # refused (item 130's fallback, exercised directly since no such kind ships today).
+    no_witness = dataclasses.replace(AQUAERO, aquabus_flow_index=None)
+    with pytest.raises(ValueError, match="no aquabus flow witness"):
+        DeviceBinding(kind=no_witness, pwm_map={}, temp_map={"t": "bus1", "u": "virt4"})
+    DeviceBinding(kind=no_witness, pwm_map={"qd1": 5}, temp_map={"t": "bus1", "u": "virt4"})
     # A softN software sensor is never a bindable input (item 113), busN aside.
     with pytest.raises(ValueError, match="software sensor"):
         DeviceBinding(kind=AQUAERO, pwm_map={"qd1": 5}, temp_map={"v": "soft8"})

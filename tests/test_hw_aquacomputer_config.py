@@ -22,6 +22,7 @@ from aqua_bridge.hw.aquacomputer_adapter import (
     AquacomputerAdapter,
     AquacomputerTiming,
     DeviceBinding,
+    aquabus_binding_problem,
     build_adapter_from_config,
     check_watchdog,
     parse_device_section,
@@ -620,24 +621,37 @@ def test_bus_absent_s_defaults_and_is_bounded_only_by_being_a_positive_time() ->
     assert quadro.timing.bus_absent_s == 0.5
 
 
-def test_a_busn_needs_an_aquabus_output_bound_in_the_same_entry() -> None:
-    """Item 92's teeth, where PROJECT.md section 3 used to have only a warning. A
-    ``busN`` slot keeps the last value it read when the device on aquabus leaves, so it
-    is a reading only while a device answers there -- and that is judged from the
-    aquabus fan blocks. A bus device with no fan outputs is therefore indistinguishable
-    from an empty bus, and such a binding would read as missing for ever: a zone with no
-    temperature on a healthy system. The config model refuses it, naming the entry."""
+def test_a_busn_no_longer_needs_an_aquabus_output_bound_on_the_aquaero() -> None:
+    """Item 92's teeth, and item 130's loosening of them. A ``busN`` slot keeps the last
+    value it read when the device on aquabus leaves, so it is a reading only while a
+    device answers there -- judged, on the aquaero, from the aquabus fan blocks **or**
+    the aquabus flow slot (item 130): the flow slot needs no fan behind any block, so a
+    bus device with no fan outputs is no longer indistinguishable from an empty bus, and
+    an aquaero entry may bind a ``busN`` with no aquabus output bound alongside it."""
     fans = {"radiator": {"pwm": "pwm1", "rpm": "fan1"}, "intake": {"pwm": "pwm2"}}
     sensor_only = dict(_SECTION, fans=fans, temp_map={"coolant": "temp1", "air": "bus2"})
-    with pytest.raises(ConfigError, match=re.escape("xt6.temp_map: ['air'] are bound to aquaero")):
-        _parse(sensor_only)
-    with pytest.raises(ConfigError, match="no aquabus output .pwm5, pwm6, pwm7, pwm8."):
-        _parse(sensor_only)
-    # One of the bus device's own outputs commanded (the supported topology) is accepted,
+    assert _parse(sensor_only).temp_map == {"coolant": "temp1", "air": "bus2"}
+    # One of the bus device's own outputs commanded (the supported topology) still works,
     with_output = dict(sensor_only, fans=dict(fans, quadro1={"pwm": "pwm7", "rpm": "fan7"}))
     assert _parse(with_output).temp_map == {"coolant": "temp1", "air": "bus2"}
     # ... and so is the same entry with no aquabus temperature bound at all.
     assert _parse(dict(_SECTION, fans=fans)).temp_map == {"coolant": "temp1", "air": "temp2"}
+
+
+def test_a_busn_still_needs_a_witness_on_a_kind_without_the_aquabus_flow_slot() -> None:
+    """Item 130's fallback: a kind with neither a bound aquabus output nor an aquabus
+    flow witness (``aquabus_flow_index=None``) still has the binding refused, naming the
+    entry -- dead in the supported topology (the aquaero always has the flow witness),
+    exercised directly against a synthetic kind since no shipped kind lacks one."""
+    no_witness = dataclasses.replace(AQUAERO, aquabus_flow_index=None)
+    problem = aquabus_binding_problem(no_witness, {}, {}, {"coolant": "temp1", "air": "bus2"})
+    assert problem is not None
+    assert "no aquabus output" in problem
+    assert "no aquabus flow witness" in problem
+    with pytest.raises(ValueError, match="no aquabus flow witness"):
+        DeviceBinding(kind=no_witness, pwm_map={}, temp_map={"air": "bus2"})
+    # One of the bus device's own outputs bound is still accepted, same as before item 130.
+    DeviceBinding(kind=no_witness, pwm_map={"qd1": 5}, temp_map={"air": "bus2"})
 
 
 # --- the software-sensor heartbeat (item 84) -----------------------------------------------

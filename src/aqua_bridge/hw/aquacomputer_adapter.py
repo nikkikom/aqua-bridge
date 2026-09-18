@@ -81,12 +81,18 @@ The device on aquabus
     controller does on the bus can look like a departure however short this
     window is.
 
-    What this cannot see is a bus device with **no fan outputs** at all: presence
-    is judged from the fan blocks, so such a device reads as an empty bus and its
-    temperature slots would stay missing for ever. That is why binding a ``busN``
-    needs an aquabus output of the same device bound in the same entry, which the
-    config model enforces (:class:`DeviceBinding`) rather than leaving to a line
-    in the documentation.
+    A bus device with **no fan outputs** at all used to be indistinguishable from an
+    empty bus here, since presence was judged from the fan blocks alone (item 130's
+    audit). That gap is closed the same way the temperature slots are (the aquaero's
+    aquabus flow slot, confirmed to carry the same two-state "no data" / "present"
+    shape without needing any fan behind it --
+    :func:`~aqua_bridge.hw.aquacomputer.aquabus_present`,
+    :attr:`~aqua_bridge.hw.aquacomputer.DeviceKind.aquabus_flow_index`), so binding a
+    ``busN`` on a kind with that witness (today, only the aquaero) needs nothing more
+    than the temperature binding itself; a kind with neither the witness nor a bound
+    aquabus output still has the config model refuse it
+    (:func:`aquabus_binding_problem`, :class:`DeviceBinding`) rather than leaving it to
+    a line in the documentation.
 
 Writing
     ``apply()`` opens the node without waiting for a status report, so the
@@ -543,18 +549,26 @@ def aquabus_binding_problem(
     """Why this binding may not read the kind's aquabus temperature slots, or ``None``.
 
     A ``busN`` slot keeps the last value it read when the device on aquabus leaves
-    (PROJECT.md section 8 item 92), so it is a reading only while a device answers
-    there -- and that is judged from the aquabus *fan* blocks
-    (:func:`~aqua_bridge.hw.aquacomputer.aquabus_present`). A bus device with no fan
-    outputs is therefore indistinguishable from an empty bus, and its slots would read
-    as missing for ever: a zone that never gets a temperature on a healthy system. The
-    config model refuses that shape instead of warning about it -- binding one of the
-    device's aquabus outputs in the same entry is how a config says the device on the
-    bus is one whose presence can be seen.
+    (PROJECT.md section 8 item 92), so it is a reading only while
+    :func:`~aqua_bridge.hw.aquacomputer.aquabus_present` says a device answers there.
+    That judgement no longer needs a bound aquabus output (item 130): with
+    ``kind.aquabus_flow_index`` set (the aquaero, confirmed against the live devices),
+    presence is read from the aquabus flow slot too, which the bus device fills whether
+    or not it drives any fan -- so a sensor-only slave (a Farbwerk 360) or a Quadro
+    whose fans this daemon does not command is judgeable the same as one whose outputs
+    are bound. Only a kind with **no** such witness -- no aquabus output bound *and* no
+    ``aquabus_flow_index`` -- is refused: its ``busN`` slots would be indistinguishable
+    from an empty bus and read as missing for ever, a zone that never gets a
+    temperature on a healthy system. There is no such kind today (the aquaero is the
+    only one with aquabus temperature slots, and it always has the flow witness), so
+    this refusal is dead in the supported topology and stays only for a future kind
+    that adds aquabus temperature slots without one.
     """
     bus_inputs = frozenset(kind.aquabus_temp_names)
     bound = sorted(name for name, value in temp_map.items() if value in bus_inputs)
     if not bound:
+        return None
+    if kind.aquabus_flow_index is not None:
         return None
     aquabus = frozenset(kind.aquabus_outputs)
     if any(number in aquabus for mapping in (pwm_map, fan_map) for number in mapping.values()):
@@ -562,13 +576,13 @@ def aquabus_binding_problem(
     outputs = ", ".join(f"pwm{n}" for n in sorted(aquabus))
     return (
         f"{bound} are bound to {kind.name} aquabus temperature slots while no aquabus output "
-        f"({outputs}) is bound in the same entry. Such a slot keeps the last value it read when "
-        f"the device leaves the bus, so it is a reading only while a device answers on aquabus "
-        f"-- which is judged from the aquabus fan blocks, so a bus device with no fan outputs "
-        f"cannot be told from an empty bus and those names would read as missing for ever. Bind "
-        f"one of the device's aquabus outputs here (the supported topology commands the Quadro "
-        f"through {outputs}), or drop the aquabus temperature binding (PROJECT.md section 8 "
-        f"item 92)"
+        f"({outputs}) is bound in the same entry and {kind.name} has no aquabus flow witness "
+        f"either. Such a slot keeps the last value it read when the device leaves the bus, so "
+        f"it is a reading only while a device answers on aquabus -- which this kind cannot "
+        f"judge without either one, so a bus device with no fan outputs cannot be told from an "
+        f"empty bus and those names would read as missing for ever. Bind one of the device's "
+        f"aquabus outputs here (the supported topology commands the Quadro through {outputs}), "
+        f"or drop the aquabus temperature binding (PROJECT.md section 8 items 92, 130)"
     )
 
 

@@ -87,6 +87,26 @@ def test_bench_tool_refuses_a_non_scratch_path_before_running_anything(capsys):
         tool.main(["--warm-ticks", "5", "--repeats", "2", "--path", "/etc/aqua-bridge/model.json"])
 
 
+def test_warm_up_populates_calibration_and_fan_curves(capsys):
+    """Section 8 item 133: the warm-up's whole point is a document at a representative
+    steady-state size, not one sitting at the store's near-empty floor. 900 ticks (75
+    simulated minutes) is enough for at least one bay's SMART calibration to accept and,
+    with the dwell scan the warm-up always appends, for the one fan model to reach an
+    accepted curve -- both are asserted non-empty here rather than merely present-or-not,
+    so a warm-up that silently regressed to the item's original, unpopulated state would
+    fail this test the same way it would fail a reviewer reading the file by hand."""
+    tool = _load_tool()
+    assert tool.main(["--warm-ticks", "900", "--repeats", "2"]) == 0
+    result = json.loads(capsys.readouterr().out)["result"]
+    assert result["fan_curve_online_forced"] is True
+    assert result["calibrated_bays"] > 0
+    assert result["fan_curve_fit_accepted"] == ["case120"]
+    # bigger than item 48's originally-measured floor (1424 bytes) by a comfortable
+    # margin, not simply "greater than zero" -- a document this small could still be
+    # missing a whole section.
+    assert result["size_bytes"] > 2000
+
+
 def test_bench_tool_refuses_a_legacy_config(capsys):
     tool = _load_tool()
     with pytest.raises(SystemExit):

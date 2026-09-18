@@ -190,10 +190,11 @@ xt6:
                          # which reads exactly like a measurement (PROJECT.md section 8 item 113). The
                          # slots are published in device_health.devices[].software_sensors
                          # instead. Upgrading: a temp_map that binds one must be repointed
-                         # first -- the daemon now refuses to start (exit 2). A bus1-8 may only be
-                         # bound in an entry that also binds one of that device's aquabus outputs
-                         # (pwm5-8): presence on aquabus is judged from those fan blocks, and such
-                         # a slot is a reading only while a device answers there (section 8 item 92)
+                         # first -- the daemon now refuses to start (exit 2). A bus1-8 is a
+                         # reading only while a device answers on aquabus (section 8 item 92);
+                         # on the aquaero that presence is judged from the aquabus fan blocks
+                         # or the aquabus flow slot (section 8 item 130), so no other key here
+                         # needs to change for a bus1-8 to be bound
   # Timing, defaults shown (PROJECT.md section 3, Track B). Writes take effect at once and
   # are not saved in the controller's memory; a power cycle brings back its saved configuration.
   status_max_age_s: 3.0         # an older status report is no observation: fallback (> 0)

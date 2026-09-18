@@ -1014,9 +1014,10 @@ the field off for good.
 **The device that leaves the bus (item 92).** On 2026-09-15 the Quadro left
 aquabus with the aquaero running and nothing noticed. That is now a health
 signal. A device answers on aquabus while at least one of the blocks 5–8 has a
-device behind it (`aquabus_present`, speed field only — the field every report
-carries); every block reading `0xFFFF` is an empty bus. The consequences are
-split by how much they cost:
+device behind it, or (§8 item 130) the aquabus flow slot carries data
+(`aquabus_present`, the speed field and, on the aquaero, the flow field — fields
+every report carries); every block reading `0xFFFF` and the flow slot reading
+"no data" is an empty bus. The consequences are split by how much they cost:
 
 - **at once, from the first such report**: every logical name bound to one of the
   aquabus temperature slots `bus1..8` reads `None` in the observation. Those
@@ -1036,14 +1037,18 @@ split by how much they cost:
   re-enumerating (item 90's transient `0xFFFF`); a skipped aquabus poll never
   could reach it, since presence is read from the speed field.
 
-What the rule cannot see: a bus device with **no fan outputs** (a sensor-only
-slave) is indistinguishable from an empty bus, because presence is judged from
-the fan blocks — its `busN` slots would read as missing for ever, which is a zone
-with no temperature on a healthy system. That is not left to a warning: the
-config model refuses a `busN` binding unless the same entry also binds one of
-that device's aquabus outputs (`aquabus_binding_problem`), which is how a config
-says the device on the bus is one whose presence can be seen. In the supported
-topology the slave is a Quadro with four outputs, commanded through `pwm5..8`.
+A bus device with **no fan outputs** (a sensor-only slave) used to be
+indistinguishable from an empty bus on the fan blocks alone — its `busN` slots
+would have read as missing for ever, a zone with no temperature on a healthy
+system (§8 item 130's audit). The aquabus flow slot closes that: confirmed
+against the live devices to carry the same two-state "no data" / "present" shape
+without needing any fan behind it, so a sensor-only slave, or a Quadro on
+aquabus whose fans this daemon does not command, is judged the same as one
+whose outputs are bound. The config model still refuses a `busN` binding on a
+kind with **neither** witness — no bound aquabus output and no aquabus flow
+slot (`aquabus_binding_problem`) — which is dead in the supported topology (the
+aquaero always has the flow witness) and stays only for a future controller
+kind that adds aquabus temperature slots without one.
 
 What still needs the board: run `tools/aquabus_watch.py --seconds 900`
 against the healthy bus and confirm it reports no empty stretch at all (the rule
@@ -3588,17 +3593,19 @@ a model converges only with them.
     (a single transient `0xFFFF` costs that channel one tick of `None`, not a
     fallback tick for the whole composite); the aquaero's
     own outputs 1–4 are never checked. **Every** aquabus block reading `0xFFFF`
-    at once says more: no device answers on that aquabus (§8 item 92). Then each
+    at once (and, on the aquaero, the aquabus flow slot reading "no data" too, §8
+    item 130) says more: no device answers on that aquabus (§8 item 92). Then each
     logical name bound to an aquabus temperature slot `bus1..8` reads `None` from
     that first report — those slots keep serving the last value they read, which
     nothing in the report marks as old — while the rest of the observation is
     untouched; and after `bus_absent_s` of such reports the loss is reported (one
     error line, `device_health.aquabus`, a `problems` entry). Nothing here lowers
     a duty: the missing reading makes its zone untrusted, which holds and then
-    raises. A bus device with no fan outputs cannot be told from an empty bus,
-    since presence is judged from the fan blocks — which is why binding a `busN`
-    without one of that device's aquabus outputs is a config error (Track B
-    below). `ts` comes from the
+    raises. A bus device with no fan outputs can still be told from an empty bus
+    on the aquaero, since its aquabus flow slot is a second, output-independent
+    witness (§8 item 130); a kind with neither that witness nor a bound aquabus
+    output still has binding a `busN` refused as a config error (Track B below).
+    `ts` comes from the
     injected monotonic clock. `last_status` keeps the newest decoded
     report for tools and diagnostics; voltage, current and power are not in
     the observation (§8 item 79).
@@ -3879,18 +3886,22 @@ a model converges only with them.
   tells apart from a measurement, so both `parse_device_section` and
   `DeviceBinding.__post_init__` refuse it — see "Fan and device health"
   below and §8 item 113 for what is published instead. A `busN` **may** be
-  bound since §8 item 92, on one condition the config model enforces: the
-  same entry must also bind one of that device's aquabus outputs
-  (`pwm5..8`, or a `fanN` of one of them), or the entry is rejected. While
-  no device answers on that aquabus the slot reads as missing instead of
-  as the value the controller keeps serving for it, so a frozen
-  temperature can no longer reach the solver as an ordinary reading — but
-  presence is judged from the aquabus *fan* blocks, so a bus device with
-  **no fan outputs** is indistinguishable from an empty bus and its slots
-  would read as missing for ever. Binding one of its outputs is how a
-  config says the device on the bus is one whose presence can be seen; a
-  sensor-only slave is out of scope until the presence evidence for one
-  is found. A
+  bound since §8 item 92. While no device answers on that aquabus the
+  slot reads as missing instead of as the value the controller keeps
+  serving for it, so a frozen temperature can no longer reach the solver
+  as an ordinary reading — and presence needs evidence the config model
+  can find without a live report: on the aquaero, its aquabus flow slot
+  (§8 item 130), confirmed to carry data whether or not the bus device
+  behind it has any fan output at all, so a sensor-only slave (a Farbwerk
+  360) or a Quadro on aquabus whose fans this daemon does not command is
+  in scope the same as one whose outputs are bound. A kind with **no**
+  such witness still has the config model enforce the older condition —
+  the same entry must also bind one of that device's aquabus outputs
+  (`pwm5..8`, or a `fanN` of one of them), or the entry is rejected, since
+  presence would otherwise be judged from the aquabus *fan* blocks alone,
+  which cannot tell a bus device with no fan outputs from an empty bus.
+  There is no such kind today (the aquaero is the only one with aquabus
+  temperature slots, and it always has the flow witness). A
   name of the hwmon driver's numbering that means another input now is
   rejected with the new name: aquaero `temp17..20` (`virt1..4`) and the
   Quadro's flow sensor `fan5`, which is not a tachometer. The hwmon names
@@ -8629,21 +8640,36 @@ Owner decision (2026-09-16):
     model (`publishers/mqtt_ha.py`, `_sensor_with_attributes`). Nothing here
     reaches `PlantObservation` or the solver's `diagnostics`; both keys were
     already published, this only puts them where a person looks.
-122. The nightly cost and the third seed. `test_ident_converge_sim.py` is
-    now **18 cases at 16:47 measured alone on a quiet 32-core host** (it was
-    9 at ~12.5 min): the 36 h item-111 case is ~60 s per
-    seed, the 16 h A/B two runs per seed, and nine cases more — item 119's
-    two 16 h runs per seed and one 36 h run per seed, item 120's two 12 h
-    runs per seed. That is the same question again with twice the answer to
-    weigh, and the 36 h cases are now two of the three families rather than
-    one. (Re-measured after item 109's fix:
+122. **Done** (2026-09-18): the nightly cost and the third seed.
+    `test_ident_converge_sim.py` was 9 cases at ~12.5 min: the 36 h
+    item-111 case ~60-136 s per seed depending on contention and the 16 h
+    A/B two runs per seed similarly. (Re-measured after item 109's fix:
     with b03 no longer reported swapped, seed 3's zone-wide arm now
     converges z0 and z2 too, so all three seeds separate the two arms at
-    16 h, not just two of three as first measured — this line was written
-    against the pre-item-109 numbers.) Still worth deciding together
-    whether the 36 h case needs all three seeds or would lose little at
-    one, given the same fix takes it to 11 of 12 zones converged rather
-    than 7.
+    16 h, not just two of three as first measured — the original line was
+    written against the pre-item-109 numbers.) Re-measured for this item,
+    isolated: the 36 h case ~67 s/seed, the 16 h A/B pair ~59 s/seed, the
+    single 16 h release-check ~32 s/seed — the full 9-case module 821 s
+    (13 min 41 s) under this machine's own contention (three other
+    branches' suites at once), each of the three tests' slowest instance
+    54-137 s against 32-67 s isolated, confirming item 126's point that
+    contention roughly doubles wall clock here rather than singling out
+    one test.
+    **Decision**: the 36 h case now runs one seed (3) instead of three,
+    dropping the module from 9 cases to 7. Seed 3 is the one with a real
+    `blocked_bays` entry (b15) to exercise; seeds 2 and 4 fully converge
+    with no blocked bay at 36 h and mainly re-confirm what seed 3 already
+    demonstrates (the mechanism: the air block never blocks, `se(k)` falls
+    with excited windows). **What is lost**: nightly no longer re-verifies
+    that seeds 2 and 4 also reach full, unblocked convergence at 36 h —
+    that stays a one-time, dated measurement in the test's own
+    `MEASURED_LONG` rather than a nightly-checked fact, and a regression
+    specific to seed 2 or seed 4 at 36 h (not at 16 h, not on seed 3) would
+    go unnoticed until someone re-runs those seeds by hand. The 16 h tests
+    keep all three seeds — they are the primary evidence for items 102 and
+    112 and are not, individually, the expensive case. See the module
+    docstring's "Nightly cost" section (`tests/test_ident_converge_sim.py`)
+    for the full accounting.
 123. **Done** (2026-09-18): the reset leaves a record, in both places that know
     something about it. The estimator publishes per bay, beside the unchanged
     per-tick `swapped`: `swap_reset` (this tick's verdict *as an event* — the only
@@ -8786,31 +8812,48 @@ Owner decision (2026-09-16):
     positives above, and on the per-sensor layout that turn is item 99's decision,
     since `proximal_slope_spread > 0` moves the four DAS goldens. See the proposed
     items.
-126. The relative step-budget gate loses its margin on a shared machine
-    (item 109). `test_das_mpc_step_p99_within_the_relative_budget`
-    divides the DAS MPC's p99 by the legacy MPC's, measured back to back
-    in one process, and asks for at most 12x; the method notes were
-    written against "a runner hiccup during one repeat", which the
-    warm-up and the 75th percentile do handle. Sustained contention is a
-    different failure: it loads the DAS side harder than the legacy one.
-    Measured independently on items 109 and 110/111/112's own PRs (and
-    again during this merge): the gate fails intermittently under an
-    8-way parallel `ci_pytest_shards.py` run and passes alone every time,
-    while the ratio's own distribution does not move (10.4–10.6 on one
-    measurement, 10.57–10.62 on another). A fourth independent
-    measurement (item 95's PR): the same test flaked once under a host
-    load average over 160 on 32 cores from concurrent workflow runs, and
-    passed reliably both alone and in a single-process (`--shards 1`)
-    full run on the same host — a single-process run sidesteps the
-    contention this item is about, at the cost of the wall-clock time
-    sharding buys. Measured again during items 119/120/123/124/125 and
-    once more on that PR's review pass, both times with three other
-    branches building on the same machine: 12.8x and 15.7x under the
-    8-way run, and 3.1 s / 5.2 s alone straight afterwards.
-    Worth deciding whether the gate should measure with
-    the machine quiesced, take the median of more repeats, or report the
-    ratio and fail only on a trend, so that a red CI run means a
-    regression rather than a busy runner.
+126. **Done** (2026-09-18): the relative step-budget gate loses its
+    margin on a shared machine (item 109).
+    `test_das_mpc_step_p99_within_the_relative_budget` divides the DAS
+    MPC's p99 by the legacy MPC's, measured back to back in one process,
+    and asks for at most 12x; the method notes were written against "a
+    runner hiccup during one repeat", which the warm-up and the 75th
+    percentile do handle. Sustained contention is a different failure: it
+    loads the DAS side harder than the legacy one. Measured independently
+    on items 109 and 110/111/112's own PRs (and again during this merge):
+    the gate fails intermittently under an 8-way parallel
+    `ci_pytest_shards.py` run and passes alone every time, while the
+    ratio's own distribution does not move (10.4–10.6 on one measurement,
+    10.57–10.62 on another). A fourth independent measurement (item 95's
+    PR): the same test flaked once under a host load average over 160 on
+    32 cores from concurrent workflow runs, and passed reliably both
+    alone and in a single-process (`--shards 1`) full run on the same
+    host — a single-process run sidesteps the contention this item is
+    about, at the cost of the wall-clock time sharding buys.
+    **Fixed by measuring what the gate means**: both sides now time with
+    `time.process_time()` (CPU time) instead of `time.perf_counter()`
+    (wall clock). Wall clock counts a repeat's *entire* elapsed span,
+    including any stretch this process spent preempted while a runner
+    running four branches' suites at once served someone else's turn; CPU
+    time only counts cycles this process actually used, so a preemption
+    costs it nothing on either side. Demonstrated on the machine this item
+    was fixed on, itself running three other branches' suites throughout:
+    five independent single-repeat samples read `perf_counter` ratios of
+    3.1x–39.3x — both under and over the 12x budget, on the very same
+    code, back to back — against `process_time` ratios of 9.6x–11.7x, in
+    the same band the item's own prior, less-contended measurements
+    report (10.4x–10.6x, 10.57x–10.62x). The gate itself, run repeatedly
+    on that same busy machine after the fix, passed every time. The
+    absolute Pi-only gate (`test_das_mpc_step_p99_within_budget_ms_on_the_pi`)
+    keeps wall clock: there the question really is elapsed time against
+    `dt` on hardware that runs this suite alone, not a ratio between two
+    solvers on a shared runner, so `perf_counter` measures exactly what
+    that gate means. `_timed`/`das_mpc_times`/`legacy_mpc_times` take an
+    optional `clock` (default `time.perf_counter`, so the absolute gate is
+    unaffected) rather than hardcoding one, since the two gates now
+    legitimately want different clocks for the same helper
+    (`tests/test_bench_budget.py`, both docstrings state the choice and
+    why).
 127. **Done** (2026-09-18): the recorder keeps `rail_reported` next to
     `power_reported` on every `fans.<channel>` entry (`recorder.py`,
     `_fan_readings`), and `rail_known`/`power_known` read a fan entry's
@@ -8847,16 +8890,65 @@ Owner decision (2026-09-16):
     `bound`), index for index — a JSON object, because Home Assistant's
     MQTT attributes mixin discards anything else (`publishers/mqtt_ha.py`,
     `health.py`).
-133. `tools/bench_model_store.py`'s warm-up loop never gets `calibration`
-    or `fan_curves` populated against the shipped
+133. **Done** (2026-09-18): `tools/bench_model_store.py`'s warm-up loop
+    never got `calibration` or `fan_curves` populated against the shipped
     `config.example-das.yaml` (`fan_curve_online: false`, and the DAS
     truth-plant closed loop doesn't accumulate an accepted SMART
     calibration in a modest number of ticks), so its dev-machine size
-    sanity check (1424 bytes, item 48) is close to the store's floor
-    rather than a representative steady-state size. Worth deciding
-    whether the tool should force those on (a rich-enough preset/config
-    override) for a size estimate that means something without the
-    board, or whether only a live board run ever answers this.
+    sanity check (1424 bytes, item 48) was close to the store's floor
+    rather than a representative steady-state size.
+    **Diagnosed further than "a modest number of ticks", to two separate
+    causes.** First, `calibration`: none of the shipped examples declare
+    a bay's serial (§3 "no SES backplane"), and the truth simulator reads
+    `serial` straight off the topology dict
+    (`aqua_bridge.sim.das.DriveSpec`) — with none, `_schedule_smart` never
+    schedules a sample for that bay at all, so the closed loop carried
+    **zero** SMART traffic however long it ran, confirmed by running it
+    six simulated hours and reading `estimator.smart` back empty.
+    `fan_curve_online: false` was the second, obvious cause, but forcing
+    it on alone was not enough: a closed loop that is always actively
+    regulating practically never holds a duty within
+    `control.fancurve.SETTLE_TOL` (1e-6) for `fan_curve_settle_s`
+    straight — sensor noise alone moves the MPC/PI output by more than
+    that on almost every tick. Measured directly: six simulated hours of
+    ordinary closed-loop operation left the fit's bin accumulator with
+    exactly **one** usable bin (the `pwm_max` clamp, the one duty that
+    ever holds bit-for-bit), never the four bins across a 0.25 span a fit
+    needs — not a "modest number of ticks" problem, a structural one
+    about what a continuously-regulating closed loop's own duty does.
+    **Fix, in `tools/bench_step.py` and `tools/bench_model_store.py`**:
+    `das_plant(..., inject_smart_serials=True)` gives the *truth* plant
+    (never `cfg.topology`, which stays exactly as loaded) a synthetic
+    serial per occupied bay with none, so the estimator has SMART traffic
+    to correlate and calibrate against — the same way a real enclosure's
+    unlabelled drives do (off by default, so `tools/bench_step.py`'s own
+    solver-timing benchmark is unaffected). The warm-up runs against
+    `dataclasses.replace(cfg, fan_curve_online=True)`, and appends a
+    short, separate dwell scan after the closed loop
+    (`_fan_curve_dwell_scan`): holds every channel at six fixed duties
+    spanning `[pwm_min, pwm_max]`, each long enough to settle and clear a
+    whole `fan_curve_refit_s` window (2x the interval, since the closed
+    loop above leaves that clock at an unknown phase), feeding the *same*
+    `control.fancurve.update` the daemon's own `step()` calls — a
+    commissioning-style sweep through the real online-fit code, not a
+    fabricated curve. `--warm-ticks` defaults to 4320 (6 h simulated,
+    ~9-15 s wall): measured on this change, 11 of 15 bays reach an
+    accepted calibration and the one fan model reaches an accepted curve,
+    and the document grows from the 1424-byte floor to 4774 bytes — over
+    3x, and no longer close to empty. The report gains three fields so a
+    reader is never left guessing: `fan_curve_online_forced` (true
+    whenever `--config` itself leaves the flag off), `calibrated_bays`
+    and `fan_curve_fit_accepted` (which models, `[]` if none). Tested at
+    a smaller, faster scale too (`--warm-ticks 900`, ~2 s wall): at least
+    one bay calibrated and the one model's curve accepted, asserted in
+    `tests/test_bench_model_store.py::test_warm_up_populates_calibration_and_fan_curves`,
+    so a warm-up that regressed back to the item's original, unpopulated
+    state would fail a test, not merely read smaller in a report nobody
+    is diffing.
+    Not done: the aquaero board itself was never involved (this whole
+    item is a dev-machine tool), and what a *sensor-only* bus device (no
+    fan outputs, unrelated to this item's `fan_curve_online`) does to
+    SMART or fan-curve accumulation is not this item's question.
 134. **Done** (2026-09-18): board watchdogs, and the network proved to be
     outside the cooling path, argued from the owner's board rather than
     copied (§2 *Watchdog layering, and the network outside the cooling
@@ -9374,11 +9466,15 @@ Owner decision (2026-09-16):
     `0xFFFF`, a controller with nothing bound on the bus, a bus that was never
     there, and a reopen of the node (which does not restart the clock on an
     empty bus, so `lost` and `absent_s` stay one pair). §3 Track B and the
-    README no longer forbid binding a `busN` — they require, and the config
-    model now checks, that the same entry binds one of that device's aquabus
-    outputs: a bus device with **no fan outputs** is indistinguishable from an
-    empty bus here, so its slots would read as missing for ever, and that shape
-    is refused rather than warned about. Not done on the hardware: the board
+    README no longer forbid binding a `busN` — at the time this item shipped,
+    they required the same entry to bind one of that device's aquabus outputs
+    too, because a bus device with **no fan outputs** was indistinguishable
+    from an empty bus on the fan blocks alone, so its slots would read as
+    missing for ever and that shape was refused rather than warned about.
+    **Superseded by item 130** (2026-09-18): the aquabus flow slot is a second
+    witness that needs no fan output on the bus device at all, so on the
+    aquaero that condition is no longer enforced — see item 130 for the
+    evidence and what still falls back to it. Not done on the hardware: the board
     was unreachable all session, so the rule has not been shown quiet on the
     real bus over a long
     run (`tools/aquabus_watch.py --seconds 900`), and the departure has not
@@ -9772,18 +9868,57 @@ Owner decision (2026-09-16):
     supply, or accept the rule on the reasoning. If taken, `N` and `W`
     are two new `fan_health:` keys with defaults derived from the
     measured refresh rate (23 measuring reports in 90).
-130. A bus device with no fan outputs (item 92's audit). Item 92 judges
-    an aquabus device present from the fan blocks 5-8, so a sensor-only
-    slave (a Farbwerk 360, a Quadro with no fans) reads as an empty bus
-    and its `busN` slots would read as missing for ever — safe, but
-    blind. The config model now refuses that binding outright (a `busN`
-    needs one of the device's aquabus outputs bound in the same entry),
-    which also shuts out a legitimate shape: a Quadro on aquabus whose
-    fans this daemon does not command. Decide whether either is in
-    scope; if so, find evidence of presence that does not need a bound
-    output (a `busN` that moves, a flow slot that is not `0x7FFF`, or a
-    field of the control report that lists the bus members) and key the
-    rule on that instead.
+130. **Done** (2026-09-18): a bus device with no fan outputs (item 92's
+    audit). Item 92 judged an aquabus device present from the fan blocks
+    5-8 alone, so a sensor-only slave (a Farbwerk 360, a Quadro with no
+    fans) would read as an empty bus and its `busN` slots would read as
+    missing for ever — safe, but blind — and the config model refused
+    the binding outright, which also shut out a legitimate shape: a
+    Quadro on aquabus whose fans this daemon does not command.
+    **In scope, and the flow slot is the evidence.** The aquaero's third
+    flow slot (`flow3`, `0xFD`) is already confirmed against the live
+    devices (§2, "aquabus fields checked against the live devices"):
+    `0x7FFF` ("no data") with nothing on aquabus, 0 ("present, nothing
+    connected") with the Quadro on it, in every capture that has been
+    taken. It needs no fan behind any block — the aquaero relays it
+    whether or not the bus device drives anything — so it is exactly the
+    witness item 130 asked for, already gathered rather than a new bench
+    session. `aquabus_present` now reads it as a second, independent
+    check after the fan blocks (`DeviceKind.aquabus_flow_index`, 3 on the
+    aquaero, `None` on the Quadro, which has no aquabus of its own to
+    judge): present if either says so, absent only when both do.
+    `aquabus_binding_problem` drops its requirement to bind one of the
+    device's aquabus outputs on a kind with that witness, so a `busN` may
+    now be bound on the aquaero with nothing else in the same entry — the
+    rule still refuses a kind with **neither** the flow witness nor a
+    bound output, which is dead in the supported topology (the aquaero
+    is the only kind with aquabus temperature slots, and it always has
+    the flow witness) and stays only for a future controller kind that
+    adds one without the other.
+    A departing device was already confirmed to blank the flow slot at
+    the same time as the fan blocks (the original 2026-09-15 report:
+    "fans 5–8 then read rpm `0xFFFF` and 0 V and flow 3 `0x7FFF`"), so the
+    new witness goes stale exactly when the old one does — nothing here
+    changes when a departure is reported, only whether a fan-less device
+    is ever seen as present at all. Tests: the flow slot's two states
+    pinned against the same fixtures item 92's own test uses
+    (`test_aquabus_presence_also_reads_the_flow_slot_for_a_device_with_no_fan_outputs`),
+    a synthetic "every fan block absent, flow slot present" report reading
+    `aquabus_present` `True`, a kind with `aquabus_flow_index` cleared
+    falling back to the old fan-blocks-only behaviour on the same report,
+    and `DeviceBinding`'s own construction test updated for both directions
+    (a bare `busN` on the aquaero now accepted, a synthetic no-witness kind
+    still refusing it). The three fake "bus device gone" fixtures
+    (`tests/test_hw_aquacomputer_adapter.py`, `tests/test_hw_sources.py`)
+    now blank the flow slot too, matching the original report instead of
+    only the fan blocks — without that they would have read a departed
+    device as still present through the new witness alone, silently
+    contradicting the item 92 capture they are built from.
+    Not done: a sensor-only device (no fan outputs on the bus at all) has
+    never actually been on the owner's bus, so the flow slot's behaviour
+    behind one — as opposed to behind the Quadro, whose own flow header is
+    what has been captured — is inferred from the aquaero relaying
+    whatever answers, not measured against a second device kind.
 131. The one experiment that names `+0x0A` (item 114; **restated
     2026-09-18**, because what it asked for is no longer a question that
     can be answered). It asked for the `field x duty ~ current` line to be

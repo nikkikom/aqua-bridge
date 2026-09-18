@@ -578,9 +578,10 @@ mpc:
 # published in device_health.devices[].software_sensors instead, so a human can see what
 # it is. Upgrading from a config that binds one: repoint it before the upgrade, or the
 # daemon refuses to start (exit 2) and the controller falls back to its saved preset.
-# A bus1-8 may only be bound in an entry that also binds one of that device's aquabus
-# outputs (pwm5-8): presence on the bus is judged from those fan blocks, and such a slot
-# is a reading only while a device answers there (PROJECT.md section 8 item 92).
+# A bus1-8 is a reading only while a device answers on aquabus (PROJECT.md section 8
+# item 92); on the aquaero that presence is judged from the aquabus fan blocks or the
+# aquabus flow slot (section 8 item 130), so binding one needs no aquabus output (pwm5-8)
+# bound alongside it any more.
 # A Quadro on aquabus ignores writes over its own USB, so a config that commands aquaero
 # pwm5-8 and the outputs of a quadro entry is refused either way, with or without serial:
 # a second controlling controller there is not a supported topology (PROJECT.md section 2

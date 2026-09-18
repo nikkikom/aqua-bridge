@@ -201,9 +201,32 @@ def bench_solver(
 
 
 def das_plant(
-    cfg: MpcConfig, ticks: int, seed: int, *, preset: str = "basic"
+    cfg: MpcConfig,
+    ticks: int,
+    seed: int,
+    *,
+    preset: str = "basic",
+    inject_smart_serials: bool = False,
 ):  # -> DasPlant (lazy import)
-    """The DAS truth plant of the benchmark (module docstring)."""
+    """The DAS truth plant of the benchmark (module docstring).
+
+    ``inject_smart_serials`` (default ``False``, so every existing caller of this
+    function is unaffected) gives every occupied bay that ``cfg.topology`` does not
+    already declare a serial for a synthetic truth one (``SN0000``, ``SN0001``, ...) in
+    the *truth* topology handed to :func:`~aqua_bridge.sim.das.build_das_plant` -- never
+    in ``cfg.topology`` itself, which stays exactly as loaded. Without this, a bay's
+    :class:`~aqua_bridge.sim.das.DriveSpec` has ``serial=None`` and the truth plant
+    never emits a SMART sample for it at all
+    (:meth:`~aqua_bridge.sim.das.DasPlant._schedule_smart`): a config that leaves serials
+    undeclared -- every shipped example, by design (PROJECT.md section 3, "no SES
+    backplane") -- would run a closed loop with zero SMART traffic, however long, and
+    the estimator's correlation and calibration (``control/estimator.py``) would never
+    see a sample to work with. Set for a caller that wants the estimator's SMART side
+    actually exercised (``tools/bench_model_store.py``, PROJECT.md section 8 item 133);
+    left off for a solver-timing benchmark (this module's own ``main``), where SMART
+    traffic is not what is being timed and a second, unexplained source of variance
+    between runs is not worth adding.
+    """
     from aqua_bridge.sim.das import SENSOR_TYPES, build_das_plant, topology_from_config
 
     topology = topology_from_config(cfg)
@@ -217,6 +240,10 @@ def das_plant(
         bays[len(bays) // 2]: [(0.3 * span, 1.0)],
         bays[-1]: [(0.0, 0.5), (0.7 * span, 1.0)],
     }
+    if inject_smart_serials:
+        for i, (_, entry) in enumerate(topology["bays"].items()):
+            if entry.get("occupied", True) and "serial" not in entry:
+                entry["serial"] = f"SN{i:04d}"
     return build_das_plant(
         topology, preset=preset, dt=cfg.dt, initial_pwm=0.5, seed=seed, heat_schedule=heat
     )
