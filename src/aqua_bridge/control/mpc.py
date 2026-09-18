@@ -1050,7 +1050,12 @@ def _thermal_shadow(
                 cal = info.get("calibration")
                 if info.get("serial") is not None and cal is not None and cal.get("accepted_once"):
                     maps[b] = (float(cal["slope"]), float(cal["offset_c"]))
-                if info.get("swapped"):  # a hot swap: those coefficients were another drive's
+                # a hot swap: those coefficients were another drive's. ``swap_reset``, not
+                # ``swapped``: the estimator rate-limits the verdict to one event per
+                # ``bay_settle_s`` on the same budget the trust exemption spends, so a
+                # bay that keeps tripping the rule cannot restart its zone's regression
+                # on every tick (section 8 items 109, 123, 124).
+                if info.get("swap_reset"):
                     reset_bays.add(b)
         faulted_set = set(faulted)
         zones_ok = {z for z, v in verdicts.items() if v.trusted and z not in faulted_set}

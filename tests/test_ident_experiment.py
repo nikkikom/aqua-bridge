@@ -1829,3 +1829,130 @@ def test_snapshot_extra_experiment_in_das_mode_only(cfg):
     shown = das.snapshot().extra["experiment"]
     assert shown["running"] is False and shown["enabled"] is True
     assert isinstance(Supervisor(cfg).snapshot().extra, Mapping)
+
+
+# ---------------------------------------------------------------------------
+# sizing the telegraph to the headroom (section 8 item 120)
+# ---------------------------------------------------------------------------
+
+
+def test_ident_amplitude_mode_defaults_to_fixed_and_is_validated(cfg):
+    assert cfg.ident_amplitude_mode == "fixed" and cfg.ident_pe_aim == 2.0
+    with pytest.raises(ConfigError, match="ident_amplitude_mode"):
+        dataclasses.replace(cfg, ident_amplitude_mode="nonsense")
+    for bad in (0.0, -1.0):
+        with pytest.raises(ConfigError, match="ident_pe_aim must be > 0"):
+            dataclasses.replace(cfg, ident_pe_aim=bad)
+
+
+def test_fixed_sizing_is_the_old_levels_to_the_digit():
+    """The default mode is what shipped: ``ident_amplitude`` on every channel, unclamped,
+    so a base whose levels leave the band is still refused by ``band:`` rather than
+    quietly reshaped (section 8 item 120)."""
+    cfg = ident_cfg()
+    for base in (0.05, 0.2, 0.5, 0.95):
+        assert ident._levels(cfg, "fa1", base) == (base, base + cfg.ident_amplitude)
+    sym = ident_cfg(ident_levels="symmetric")
+    for base in (0.05, 0.2, 0.5, 0.95):
+        lo, hi = ident._levels(sym, "fa1", base)
+        assert (lo, hi) == (base - sym.ident_amplitude, base + sym.ident_amplitude)
+
+
+def test_headroom_sizing_never_excites_less_than_the_fixed_mode():
+    """The sizing only ever spends *less*, and only where less still reaches the aim: a
+    channel with no room to spare keeps the full ``ident_amplitude``, so ``headroom`` can
+    never make a channel blinder than ``fixed`` leaves it (section 8 item 120)."""
+    for levels in ("above", "symmetric"):
+        fixed = ident_cfg(ident_levels=levels)
+        head = ident_cfg(ident_levels=levels, ident_amplitude_mode="headroom")
+        for base in (0.2, 0.3, 0.45, 0.6, 0.8, 0.95):
+            f_lo, f_hi = ident._levels(fixed, "fa1", base)
+            h_lo, h_hi = ident._levels(head, "fa1", base)
+            f_swing = ident.rel_swing(fixed, "fa1", f_lo, f_hi)
+            h_swing = ident.rel_swing(head, "fa1", h_lo, h_hi)
+            aim = head.ident_pe_aim * math.sqrt(thermal.PE_MIN)
+            # either the aim is met, or the full amplitude was spent trying
+            assert h_swing >= aim - 1e-9 or h_swing == pytest.approx(f_swing, rel=1e-6), (
+                base,
+                levels,
+                h_swing,
+                f_swing,
+            )
+            assert h_hi - h_lo <= 2.0 * head.ident_amplitude + 1e-9
+
+
+def test_headroom_places_a_symmetric_pair_inside_the_band_and_never_dips_deeper():
+    """ "Sized to the real headroom in both directions" (section 8 item 120). A symmetric
+    pair whose low level would fall through ``pwm_min`` slides **up**: it keeps its full
+    swing -- what the PE monitor reads -- and the dip below the base shrinks to whatever
+    room the channel had. It never slides the other way, because that would put the low
+    level further under the base than the owner's own ``ident_amplitude`` cap."""
+    cfg = ident_cfg(ident_levels="symmetric", ident_amplitude_mode="headroom")
+    for base in (cfg.pwm_min, cfg.pwm_min + 0.01, 0.3, 0.5, 0.9, cfg.pwm_max):
+        lo, hi = ident._levels(cfg, "fa1", base)
+        assert cfg.pwm_min - 1e-9 <= lo <= hi <= cfg.pwm_max + 1e-9, (base, lo, hi)
+        assert base - lo <= cfg.ident_amplitude + 1e-9, (base, lo)  # the accepted dip
+    # right on the rail the pair sits entirely above it, with its swing intact
+    lo, hi = ident._levels(cfg, "fa1", cfg.pwm_min)
+    assert lo == pytest.approx(cfg.pwm_min)
+    assert hi > cfg.pwm_min
+    # and the fixed mode would have put the low level under the rail, i.e. out of band
+    assert ident._levels(ident_cfg(ident_levels="symmetric"), "fa1", cfg.pwm_min)[0] < cfg.pwm_min
+
+
+def test_headroom_lets_a_channel_near_the_rail_start_where_fixed_refuses_it():
+    """The measurable consequence (section 8 item 120). Under ``symmetric`` today the
+    ``band:`` precondition refuses every start whose base is within ``ident_amplitude`` of
+    a rail -- which, since item 112 stopped experiments leaving their level on the fans,
+    is where the solver parks most channels between runs. Sized to the headroom, the same
+    start runs."""
+    fixed = ident_cfg(ident_levels="symmetric")
+    head = ident_cfg(ident_levels="symmetric", ident_amplitude_mode="headroom")
+    parked = fixed.pwm_min + 0.02  # where item 112 leaves a channel between experiments
+    facts = good_facts(fixed, pwm=parked)
+    reasons = ident.check_start(
+        fixed, settled_tracker(fixed), facts, "channel", "fa1", human_control=False
+    )
+    assert any(r.startswith("band:") for r in reasons), reasons
+    reasons = ident.check_start(
+        head,
+        settled_tracker(head),
+        good_facts(head, pwm=parked),
+        "channel",
+        "fa1",
+        human_control=False,
+    )
+    assert not [r for r in reasons if r.startswith("band:")], reasons
+
+
+def test_a_headroom_sized_plan_carries_its_own_dip_per_channel():
+    """``compose`` floors an experiment channel at its own solver command minus the dip its
+    *plan* carries, per channel (:func:`ident.planned_dip`), so a channel the sizing moved
+    gives up exactly what its own levels say and never more than ``ident_amplitude``."""
+    cfg = ident_cfg(ident_levels="symmetric", ident_amplitude_mode="headroom")
+    exp = {"plan_base": {"fa1": 0.22, "fa2": 0.6}, "levels": {}}
+    for ch, base in exp["plan_base"].items():
+        exp["levels"][ch] = list(ident._levels(cfg, ch, base))
+    dips = {ch: ident.planned_dip(exp, ch, cfg) for ch in exp["plan_base"]}
+    assert dips["fa1"] < cfg.ident_amplitude  # parked on the rail: less is given up
+    assert dips["fa2"] == pytest.approx(cfg.ident_amplitude)  # room on both sides: the full step
+    assert all(0.0 <= d <= cfg.ident_amplitude + 1e-9 for d in dips.values())
+    # the worst case a *planned* experiment could reach is still the owner's own cap
+    assert ident.dip_below_solver(cfg) == pytest.approx(cfg.ident_amplitude)
+
+
+def test_excitation_reads_the_cap_around_the_plans_own_base():
+    """With the levels placed asymmetrically the midpoint is no longer the base, so
+    ``excitation`` takes the base the caller hands it and falls back to the old rule only
+    without one (section 8 item 120)."""
+    cfg = ident_cfg(ident_levels="symmetric", ident_amplitude_mode="headroom")
+    base = cfg.pwm_min
+    lo, hi = ident._levels(cfg, "fa1", base)
+    assert 0.5 * (lo + hi) != pytest.approx(base)  # the pair slid up off its midpoint
+    with_base = ident.excitation(cfg, {"fa1": (lo, hi)}, {"fa1": base})["fa1"]
+    cap_lo, cap_hi = ident._placed(cfg, base, IDENT_AMPLITUDE_MAX)
+    assert with_base["pe_reach_at_cap"] == pytest.approx(
+        ident.rel_swing(cfg, "fa1", cap_lo, cap_hi) ** 2
+    )
+    without = ident.excitation(cfg, {"fa1": (lo, hi)})["fa1"]
+    assert without["pe_reach"] == pytest.approx(with_base["pe_reach"])  # the swing is the swing

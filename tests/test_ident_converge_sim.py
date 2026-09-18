@@ -200,6 +200,10 @@ def _run(cfg: MpcConfig, seed: int, order: tuple[str, ...], hours: float = HOURS
     pe_max: dict[str, float] = {}
     ch_min: dict[str, float] = {}
     ch_mean: dict[str, float] = {}
+    # section 8 item 120: the deepest any channel ever sat under the solver's own command
+    # on one tick, and the starts the ``band:`` precondition refused
+    max_dip = 0.0
+    band_refusals = 0
     summary: dict[str, Any] = {}
     for _ in range(int(hours * 3600.0 / cfg.dt)):
         r = rig.loop.tick()
@@ -218,13 +222,19 @@ def _run(cfg: MpcConfig, seed: int, order: tuple[str, ...], hours: float = HOURS
         for ch, value in r.cmd.pwm.items():
             ch_min[ch] = min(ch_min.get(ch, 1.0), float(value))
             ch_mean[ch] = ch_mean.get(ch, 0.0) + float(value)
+            want = r.mpc_cmd.pwm.get(ch)
+            if want is not None:
+                max_dip = max(max_dip, float(want) - float(value))
         if rig.sup.snapshot().extra["experiment"]["running"]:
             continue
         try:
             rig.sup.submit(Ident("start", channel=order[nxt % len(order)]))
             starts += 1
-        except (IntentConflict, IntentInvalid):
-            pass
+        except (IntentConflict, IntentInvalid) as exc:
+            # ``band:<ch>`` only -- ``start_band:<bay>`` is a different precondition that
+            # happens to end in the same five characters
+            reasons = str(exc).rsplit(": ", 1)[-1].split(", ")
+            band_refusals += any(r.startswith("band:") for r in reasons)
         nxt += 1
     zones = summary.get("zones") or {}
     return {
@@ -237,6 +247,8 @@ def _run(cfg: MpcConfig, seed: int, order: tuple[str, ...], hours: float = HOURS
         "worst_margin_c": worst_margin,
         "violations": violations,
         "mean_pwm": pwm_sum / max(ticks, 1),
+        "max_dip": max_dip,
+        "band_refusals": band_refusals,
         "ch_min": ch_min,
         "ch_mean": {ch: v / max(ticks, 1) for ch, v in ch_mean.items()},
     }
@@ -422,3 +434,175 @@ def test_the_bays_second_gate_closes_on_observations_not_on_more_excitation(das_
         assert bay["rel_se"][f"k.{b}"] == pytest.approx(
             bay["se"][f"k.{b}"] / abs(bay["theta"][f"k.{b}"]), rel=1e-6
         )
+
+
+#: Section 8 item 119, measured on this very scenario: zones converged per seed at
+#: ``model_converged_bays_frac`` 1.0 (today's all-or-nothing rule), 0.75 and 0.5, and the
+#: bays each converged zone was converged *without*. 6 of 12 zone-seeds at 16 h become 9
+#: at 0.75 and 10 at 0.5; at 36 h 11 of 12 become 12 at 0.5 (z3 on seed 3, whose b15 has
+#: a genuinely small ``k``, is the one the whole-zone rule never reaches).
+PARTIAL_16: dict[int, dict[str, Any]] = {
+    2: {
+        0.75: {"converged": ("z0", "z2", "z3"), "without": {"z2": ("b10",)}},
+        0.5: {"converged": ("z0", "z2", "z3"), "without": {"z2": ("b10",)}},
+    },
+    3: {
+        0.75: {"converged": ("z0", "z1", "z2"), "without": {"z1": ("b05",)}},
+        0.5: {"converged": ("z0", "z1", "z2"), "without": {"z1": ("b05",)}},
+    },
+    4: {
+        0.75: {"converged": ("z0", "z1", "z3"), "without": {"z1": ("b05",)}},
+        0.5: {
+            "converged": ("z0", "z1", "z2", "z3"),
+            "without": {"z1": ("b05",), "z2": ("b11", "b12")},
+        },
+    },
+}
+#: The same at 36 h and ``model_converged_bays_frac: 0.5``: every zone of every seed.
+PARTIAL_LONG: dict[int, dict[str, Any]] = {
+    2: {"converged": ("z0", "z1", "z2", "z3"), "without": {}},
+    3: {"converged": ("z0", "z1", "z2", "z3"), "without": {"z3": ("b15",)}},
+    4: {"converged": ("z0", "z1", "z2", "z3"), "without": {}},
+}
+
+
+@pytest.mark.nightly
+@pytest.mark.parametrize("seed", sorted(PARTIAL_16))
+def test_a_zone_may_converge_on_the_bays_that_have_informed_themselves(das_example_cfg, seed):
+    """Section 8 item 119, on the same closed loop as the rest of this module.
+
+    All-or-nothing is what item 111 left: at 16 h the air block is never the blocker and
+    3 to 5 bays of 15 hold four zones back on their own ``rel_se(k)``, so one stubborn bay
+    keeps a whole zone in ``learning`` for ever. ``model_converged_bays_frac`` lets the
+    zone converge on its air block plus the bays that did inform themselves --
+    :data:`PARTIAL_16` and :data:`PARTIAL_LONG` are what that reaches, 6 of 12 zone-seeds
+    at 16 h becoming 9 at 0.75 and 10 at 0.5, and 11 of 12 at 36 h becoming 12 at 0.5.
+
+    The safety half is asserted with it, and it is the point of the item: a zone converged
+    this way is **not** trusted as a fully informed one. It publishes ``partial``, it names
+    the bays in ``uninformed`` and in ``blocked``, and the ``k`` the DAS MPC plans those
+    bays with is their own lower confidence bound, never the fitted value -- an
+    under-estimated ``k`` makes the solver believe airflow helps that bay less than it
+    does, so it runs the fans higher.
+    """
+    want = PARTIAL_16[seed]
+    strict = set(MEASURED[seed]["parallel"])
+    for frac in (0.75, 0.5):
+        cfg = dataclasses.replace(
+            _config(das_example_cfg, parallel=True), model_converged_bays_frac=frac
+        )
+        run = _run(cfg, seed, ORDER)
+        assert run["violations"] == 0
+        assert run["worst_margin_c"] >= MARGIN_FLOOR_C
+        got = set(run["converged"])
+        assert got >= set(want[frac]["converged"]), (frac, run["converged"])
+        # a lower fraction can only ever converge more zones, never fewer
+        assert got >= strict, (frac, run["converged"], sorted(strict))
+        for z, zone in run["zones"].items():
+            uninformed = tuple(zone["uninformed"])
+            if z in got:
+                assert uninformed == want[frac]["without"].get(z, ()), (frac, z, uninformed)
+                assert zone["partial"] is bool(uninformed)
+                # the reader is told, in the rule's own words, which bays it converged
+                # without -- ``blocked`` is empty exactly for a *whole* converged zone
+                assert bool(zone["blocked"]) is bool(uninformed), (z, zone["blocked"])
+                for b in uninformed:
+                    assert any(r == f"rel_se:k.{b}" for r in zone["blocked"]), zone["blocked"]
+                    bay = run["bays"][b]
+                    assert bay["k_used"] < bay["theta"][f"k.{b}"], (b, bay["k_used"])
+                    assert bay["k_used"] == pytest.approx(
+                        max(
+                            thermal.PARAMETERS["k"].lo,
+                            bay["theta"][f"k.{b}"]
+                            - cfg.model_partial_k_sigmas * bay["se"][f"k.{b}"],
+                        )
+                    )
+            else:
+                assert zone["partial"] is False
+        # and a bay of a zone that converged *whole* is planned at its fitted value
+        for b, bay in run["bays"].items():
+            zone = run["zones"][bay["zone"]]
+            if b not in zone["uninformed"]:
+                assert bay["k_used"] == pytest.approx(bay["theta"][f"k.{b}"])
+
+
+@pytest.mark.nightly
+@pytest.mark.parametrize("seed", sorted(PARTIAL_LONG))
+def test_partial_convergence_closes_the_last_zone_the_long_run_leaves(das_example_cfg, seed):
+    """The 36 h picture of item 119. Item 111 measured the same schedule at 36 h reaching
+    11 of 12 zones, the one hold-out being z3 on seed 3, blocked on b15 alone -- a bay
+    whose fitted ``k`` is under half the prior, so more observations narrow ``se`` but
+    cannot inflate ``k``. At ``model_converged_bays_frac: 0.5`` that zone converges on its
+    other two bays and says it did, which is the whole of the policy question."""
+    want = PARTIAL_LONG[seed]
+    cfg = dataclasses.replace(
+        _config(das_example_cfg, parallel=True), model_converged_bays_frac=0.5
+    )
+    run = _run(cfg, seed, ORDER, hours=LONG_HOURS)
+    assert run["violations"] == 0 and run["worst_margin_c"] >= MARGIN_FLOOR_C
+    assert set(run["converged"]) >= set(want["converged"]), {
+        z: v["status"] for z, v in run["zones"].items()
+    }
+    assert set(run["converged"]) >= set(MEASURED_LONG[seed]["converged"])
+    for z, bays in want["without"].items():
+        assert tuple(run["zones"][z]["uninformed"]) == bays
+        assert run["zones"][z]["partial"] is True
+    whole = [z for z in run["converged"] if z not in want["without"]]
+    assert all(run["zones"][z]["partial"] is False for z in whole)
+
+
+#: Section 8 item 120, measured over 12 h of this scenario at the shipped
+#: ``ident_amplitude: 0.15`` under ``ident_levels: symmetric``: starts taken and the mean
+#: PWM given up per tick, ``fixed`` against ``headroom``. Since item 112 the solver parks
+#: the channels near ``pwm_min`` between experiments, which is exactly where a symmetric
+#: pair does not fit, so the ``band:`` precondition refuses most of the programme; sizing
+#: the telegraph to the room the channel really has runs every start instead -- and gives
+#: up *less* per experiment while doing it (seed 3: 0.00151 over 4 starts against 0.00099
+#: over 12; seed 4: 0.00662 over 7 against 0.00340 over 12; seed 2: 0.00724 over 11
+#: against 0.00753 over 12). The deepest dip any single tick took also falls where the
+#: sizing bites: 0.1500 against 0.1164 on seed 3.
+SYM_HOURS = 12.0
+SYM_STARTS: dict[int, dict[str, int]] = {
+    2: {"fixed": 11, "headroom": 12},
+    3: {"fixed": 4, "headroom": 12},
+    4: {"fixed": 7, "headroom": 12},
+}
+
+
+@pytest.mark.nightly
+@pytest.mark.parametrize("seed", sorted(SYM_STARTS))
+def test_sizing_the_telegraph_to_the_headroom_runs_the_starts_symmetric_refuses(
+    das_example_cfg, seed
+):
+    """Section 8 item 120, on the closed loop. Under ``symmetric`` the amplitude is
+    cooling **given up**, and the ``band:`` precondition refuses any start whose low level
+    would fall through ``pwm_min``. Since item 112 that is most of them: 11, 4 and 7 of
+    the 12 starts offered over 12 h on the three seeds.
+
+    ``ident_amplitude_mode: headroom`` sizes each channel's step to the smallest that
+    reaches the PE bound and places the pair inside the band -- a symmetric pair on the
+    rail slides *up*, keeping its swing and giving up less cooling. Asserted here: every
+    start runs, none is refused for the band, and no channel is ever further under the
+    solver's own command than ``ident_amplitude`` -- the owner's accepted dip is a cap the
+    sizing only ever undercuts, never a figure it may exceed.
+    """
+    want = SYM_STARTS[seed]
+    base = dataclasses.replace(
+        _config(das_example_cfg, parallel=True),
+        ident_levels="symmetric",
+        ident_amplitude=das_example_cfg.ident_amplitude,  # the shipped 0.15
+    )
+    fixed = _run(base, seed, ORDER, hours=SYM_HOURS)
+    head = _run(
+        dataclasses.replace(base, ident_amplitude_mode="headroom"), seed, ORDER, hours=SYM_HOURS
+    )
+    assert fixed["violations"] == 0 and head["violations"] == 0
+    assert head["worst_margin_c"] >= MARGIN_FLOOR_C
+    assert fixed["starts"] <= want["fixed"] and head["starts"] >= want["headroom"]
+    assert head["starts"] > fixed["starts"], (head["starts"], fixed["starts"])
+    assert head["band_refusals"] == 0, head["band_refusals"]
+    assert fixed["band_refusals"] > 0, fixed["band_refusals"]
+    # the dip is the accepted worst case and stays one: no tick gives up more than the cap
+    for run in (fixed, head):
+        assert run["max_dip"] <= base.ident_amplitude + TOL, run["max_dip"]
+    assert head["max_dip"] <= fixed["max_dip"] + TOL

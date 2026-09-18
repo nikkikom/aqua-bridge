@@ -396,6 +396,22 @@ class PenaltyQp:
     hi: np.ndarray
 
 
+def _occupancy(req: SolverRequest, st: thermal.Structure) -> dict[str, str]:
+    """Each bay's occupancy as the estimator published it, falling back to the request's
+    own map -- one reading for the model's parameters, its linearisation and the bays a
+    partly converged zone derates (:func:`aqua_bridge.control.thermal.current_model`), so
+    none of the three can read a different occupancy from another."""
+    plant = req.plant if isinstance(req.plant, Mapping) else {}
+    bays_in = plant.get("bays", {})
+    out: dict[str, str] = {}
+    for b in st.bays:
+        info = bays_in.get(b) if isinstance(bays_in.get(b), Mapping) else {}
+        occ = info.get("occupancy") or req.occupancy.get(b)
+        if isinstance(occ, str):
+            out[b] = occ
+    return out
+
+
 def objective(qp: PenaltyQp, x: np.ndarray) -> float:
     """The true penalised objective at ``x``."""
     y = qp.y0 + qp.s @ x
@@ -1639,7 +1655,7 @@ class DasMpcSolver:
         """Model inputs from the request and, when possible, the prediction."""
         st = thermal.cached_structure(cfg)
         try:
-            status, theta = thermal.current_model(req.thermal, cfg)
+            status, theta = thermal.current_model(req.thermal, cfg, occupancy=_occupancy(req, st))
         except Exception as exc:  # a thermal memory that cannot be read is no model
             status, theta = "error", thermal.prior_theta(cfg, st)
             model = _Model(st, status, theta, rows, {}, {}, error=f"{type(exc).__name__}")
@@ -1682,13 +1698,10 @@ class DasMpcSolver:
             x_air[z] = known_air.get(z, hottest)
             t_in[z] = float(info["t_in"]) if _finite(info.get("t_in")) else x_air[z]
             d_air[z] = float(dist["d"].get(z, 0.0))
-        occupancy: dict[str, str] = {}
+        occupancy = _occupancy(req, st)
         classes: dict[str, str] = {}
         for b in st.bays:
             info = bays_in.get(b) if isinstance(bays_in.get(b), Mapping) else {}
-            occ = info.get("occupancy") or req.occupancy.get(b)
-            if isinstance(occ, str):
-                occupancy[b] = occ
             if isinstance(info.get("class"), str) and info["class"] in cfg.drive_classes:
                 classes[b] = info["class"]
         params = thermal.model_params(

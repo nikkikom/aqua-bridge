@@ -1995,3 +1995,193 @@ def test_a_live_manual_entry_wins_over_a_stored_one():
     mem, warnings = E.restore_manual_calibration(up.memory, stored, cfg, ts=1000.0)
     assert mem["manual"]["a1"]["cal"]["th"] != [0.4, 9.0]
     assert warnings == []
+
+
+# ---------------------------------------------------------------------------
+# the swap event: one definition, one rate limit, one record (items 123, 124)
+# ---------------------------------------------------------------------------
+
+
+def test_one_sensor_bay_the_two_swap_rules_are_the_same_arithmetic():
+    """Item 124's agreement, pinned. On a bay with one proximal member the bay-level test
+    (the *mean* innovation against the variance of that mean) and the per-sensor fast-swap
+    rule (that member's own innovation against its own variance) are the same two numbers,
+    so they can never disagree; the settling window the per-sensor rule opens and the
+    verdict the bay-level one publishes must therefore appear on exactly the same ticks.
+
+    Without this the two drift apart silently -- which is what item 124 is about, and the
+    one case where the drift is provable rather than a judgement call."""
+    cfg = lcfg()
+    mem = run_ticks(cfg, 20)[-1].memory
+    seen = 0
+    for i, value in enumerate((PROX_C, PROX_C + 6.0, PROX_C + 6.0, PROX_C, PROX_C - 5.0)):
+        up = tick(cfg, mem, (20 + i) * cfg.dt, prox_a2=value)
+        mem = up.memory
+        block = up.bays["a2"]  # one proximal member, so the two statistics coincide
+        if block["swapped"]:
+            seen += 1
+            # the per-sensor consequences always follow the bay-level verdict
+            assert block["settling"] is True, block
+            assert block["settling_reason"] == E.SETTLE_JUMP, block
+    assert seen >= 1
+
+
+def test_a_bay_level_step_always_widens_the_bay_the_way_a_jump_does():
+    """The other half of item 124: a bay whose *mean* crosses the thresholds gets the
+    per-sensor rule's own consequences -- the drive variance widened, the settling window
+    opened, the tick's SMART held back -- even where no single member crossed them. Before
+    this the thermal block was thrown away while the estimator kept calling that bay's
+    drive estimate confident, which is exactly the reading a model may not be scored
+    against."""
+    cfg, ups = _disagreeing_run(30, 4.0)
+    assert not ups[-1].bays["a1"]["swapped"]
+    sigma_before = ups[-1].estimates["a1"]["sigma"]
+    up = tick(
+        cfg,
+        ups[-1].memory,
+        30.0 * cfg.dt,
+        prox_a1=PROX_C + 6.0,
+        prox_a1b=PROX_C - 4.0 + 6.0,
+        smart={"A": {"temp_c": 44.0, "age_s": 0.0, "model": "M"}},
+    )
+    assert up.bays["a1"]["swapped"] is True
+    assert up.bays["a1"]["settling"] is True
+    assert up.bays["a1"]["settling_reason"] == E.SETTLE_JUMP
+    assert up.bays["a1"]["swap_reset"] is True
+    assert up.estimates["a1"]["sigma"] > sigma_before
+
+
+def test_the_model_reset_spends_the_same_budget_as_the_trust_exemption():
+    """Item 124's rate limit. ``swapped`` keeps its per-tick meaning -- every consequence
+    the estimator itself draws from it is unchanged -- but ``swap_reset``, the only thing
+    that reaches ``thermal.update``, is one event per ``bay_settle_s`` while the bay has
+    ``bay_settle_max_s`` of settling budget left. A bay that keeps tripping the rule
+    therefore stops throwing its fit away, and says how often it was refused."""
+    cfg = lcfg(bay_settle_s=10.0, bay_settle_max_s=20.0)
+    mem = run_ticks(cfg, 20)[-1].memory
+    resets = held = verdicts = 0
+    hot = True
+    up = None
+    for i in range(200):  # flap the one-sensor bay a2 hard and for a long time
+        hot = not hot
+        up = tick(cfg, mem, (20 + i) * cfg.dt, prox_a2=PROX_C + (9.0 if hot else -9.0))
+        mem = up.memory
+        verdicts += bool(up.bays["a2"]["swapped"])
+        resets += bool(up.bays["a2"]["swap_reset"])
+        held += bool(up.bays["a2"]["swapped"] and not up.bays["a2"]["swap_reset"])
+    assert verdicts > resets > 0  # the verdict still fires; the reset is rate-limited
+    assert up.bays["a2"]["swap_count"] == resets
+    # ``swap_held`` counts the verdicts the *budget* refused; a verdict inside the
+    # refractory of its own event is that event continuing, not a second one refused
+    assert 0 < up.bays["a2"]["swap_held"] <= held
+    assert up.bays["a2"]["swap_reason"] == E.SETTLE_JUMP
+    assert up.bays["a2"]["swap_last_s"] is not None
+    # the budget is the trust exemption's own: once it is spent, nothing more resets
+    assert up.bays["a2"]["settling_spent_s"] == pytest.approx(up.bays["a2"]["settling_budget_s"])
+    # and no more events than the cadence allows over the run
+    assert resets <= 1 + int(200 * cfg.dt / cfg.estimator.bay_settle_s)
+
+
+def test_an_occupancy_crossing_is_always_an_event_however_often_it_happens():
+    """The half of the rule the rate limit deliberately leaves alone (item 124). An
+    occupancy crossing is a declared or debounced fact with its own rate limit (item 19),
+    not a statistic, and refusing one would model an arriving drive with the coefficients
+    of the drive that left -- two crossings in opposite directions inside one settling
+    window are two events."""
+    cfg = lcfg(empty_confirm_s=2.0, bay_settle_s=1e6, bay_settle_max_s=1e6)
+    mem = run_ticks(cfg, 6, prox_b1=SP + 0.1)[-1].memory
+    crossings = []
+    was = None
+    for i in range(40):
+        # in for four ticks, out for six: the bay crosses ``empty`` again and again
+        value = SP + (4.0 if (i % 10) < 4 else 0.1)
+        up = tick(cfg, mem, (6 + i) * cfg.dt, prox_b1=value)
+        mem = up.memory
+        now = up.bays["b1"]["occupancy"]
+        if was is not None and (was == E.EMPTY) != (now == E.EMPTY):
+            crossings.append((i, up.bays["b1"]["swapped"], up.bays["b1"]["swap_reset"]))
+        was = now
+    assert len(crossings) >= 3, crossings
+    # every crossing is a verdict *and* an event, however close together they come --
+    # the settling window of the previous one never swallows the next
+    assert all(swapped and reset for _, swapped, reset in crossings), crossings
+    assert up.bays["b1"]["swap_count"] >= len(crossings)
+
+
+def test_a_reset_bay_says_so_afterwards():
+    """Item 123: the record the reset leaves. ``swapped`` was a per-tick flag with no
+    memory, so a bay whose block had been thrown away looked like any other bay that had
+    simply learnt nothing yet. The count, the age of the last one and the reason are
+    published beside it, and the thermal block carries its own count *across* the reset."""
+    cfg = dataclasses.replace(lcfg(empty_confirm_s=10.0), model_shadow=True)
+    state = MpcState.cold()
+    ts = 0.0
+    for _ in range(40):
+        _, state = step(das_obs(cfg, ts, prox_b1=SP + 0.1), cfg, state)
+        ts += cfg.dt
+    state.solver_memory["thermal"]["bays"]["b1"]["w"] = 11
+    cmd = None
+    for k in range(6):
+        value = min(SP + 0.1 + 1.5 * (k + 1), SP + 4.5)
+        cmd, state = step(das_obs(cfg, ts, prox_b1=value), cfg, state)
+        ts += cfg.dt
+    bay = cmd.diagnostics["bays"]["b1"]
+    assert bay["swap_count"] >= 1
+    assert bay["swap_reason"] == E.SETTLE_OCCUPANCY
+    assert bay["swap_last_s"] is not None and bay["swap_last_s"] >= 0.0
+    block = cmd.diagnostics["thermal"]["bays"]["b1"]
+    assert block["windows"] == 0  # the coefficients started over ...
+    assert block["resets"] == bay["swap_count"]  # ... and the count did not
+    assert block["last_reset_s"] is not None
+    # a bay nothing happened to carries the record's empty form, never ``None`` counts
+    quiet = cmd.diagnostics["bays"]["a1"]
+    assert quiet["swap_count"] == 0 and quiet["swap_held"] == 0
+    assert quiet["swap_reason"] is None and quiet["swap_last_s"] is None
+    assert cmd.diagnostics["thermal"]["bays"]["a1"]["resets"] == 0
+
+
+# ---------------------------------------------------------------------------
+# what each proximal layout can learn about a placement (item 125)
+# ---------------------------------------------------------------------------
+
+
+def test_the_placement_verdict_names_the_layout_and_what_it_separates():
+    """Item 125. Two sensors on one bay disagree by ``ds * rise + db``. The per-sensor
+    layout fits both halves; the fused layout has one state for the pair and absorbs
+    ``ds * rise`` into it as drift, so it cannot learn the *shape* -- and the published
+    verdict says which of the two it is instead of letting a reader take them for the same
+    evidence. Both layouts publish the gap, the box the config's own priors allow it at
+    this tick's rise, and whether it has walked out."""
+    cases = ((0.0, E.LAYOUT_FUSED, "offset"), (0.1, E.LAYOUT_PER_SENSOR, "offset+slope"))
+    for spread, layout, learns in cases:
+        cfg = das_cfg(setpoints={}, estimator={"proximal_slope_spread": spread})
+        ups = run_ticks(cfg, 30, prox_a1=PROX_C, prox_a1b=PROX_C - 4.0)
+        view = ups[-1].bays["a1"]["placement"]
+        assert set(view) == {"prox_a1b"}, view  # the anchor has no gap with itself
+        entry = view["prox_a1b"]
+        assert entry["layout"] == layout and entry["learns"] == learns
+        assert entry["gap_c"] == pytest.approx(ups[-1].bays["a1"]["offsets_c"]["prox_a1b"])
+        assert entry["bound_c"] > 0.0
+        assert entry["over"] is (abs(entry["gap_c"]) > entry["bound_c"])
+        # a bay with one proximal member has no pair and no verdict
+        assert ups[-1].bays["a2"]["placement"] == {}
+
+
+def test_a_gap_outside_the_prior_box_is_reported():
+    """The signal itself: a pair that walks further apart than the config's priors allow
+    is a sensor coming loose or fouling, and until now nothing said so. The bound is read
+    at this tick's rise, so it widens with the load exactly as the disagreement does."""
+    tight = das_cfg(setpoints={}, estimator={"proximal_offset_c": 0.5, "proximal_gap_sigmas": 1.0})
+    ups = run_ticks(tight, 40, prox_a1=PROX_C, prox_a1b=PROX_C - 6.0)
+    entry = ups[-1].bays["a1"]["placement"]["prox_a1b"]
+    assert entry["over"] is True
+    assert abs(entry["gap_c"]) > entry["bound_c"]
+    wide = das_cfg(setpoints={}, estimator={"proximal_offset_c": 0.5, "proximal_gap_sigmas": 40.0})
+    ups = run_ticks(wide, 40, prox_a1=PROX_C, prox_a1b=PROX_C - 6.0)
+    assert ups[-1].bays["a1"]["placement"]["prox_a1b"]["over"] is False
+
+
+def test_proximal_gap_sigmas_is_validated():
+    with pytest.raises(ConfigError, match="proximal_gap_sigmas must be >= 0"):
+        das_cfg(setpoints={}, estimator={"proximal_gap_sigmas": -1.0})
+    assert ESTIMATOR_DEFAULTS["proximal_gap_sigmas"] == 3.0

@@ -2357,7 +2357,28 @@ innovations, so it carries the offsets the same way: the prediction of the mean
 reading is the node plus the mean of the members' offsets, and its variance
 carries the offsets' (§8 item 109). Against the bare node it would hold half the
 pair's disagreement — a gap proportional to the drive-to-air rise — and none of
-its uncertainty. A bay with one
+its uncertainty.
+
+**One event, one rate limit, one record** (§8 items 123, 124). The two halves of
+the rule agree on what an event is: a bay-level step now draws the per-sensor
+rule's own consequences — the drive variance widened by the very statistic that
+said so, the settling window opened, that tick's SMART held back, the correlation
+pair dropped, the placement row of item 101 not absorbed — so a block the model
+throws away is never scored against a drive estimate the filter still calls
+confident. And what reaches `thermal.update` is `swap_reset`, the verdict at one
+event per `estimator.bay_settle_s` while the bay has `estimator.bay_settle_max_s`
+of settling budget left: **the same budget, with the same clean-run recovery,
+that the `sigma` trust exemption spends**. Exhausting it keeps the (possibly
+stale) fit rather than throwing it away again — resetting without a limit is what
+left a zone at the prior for a whole run before item 109, while a stale fit is
+scored by the MPC's own prediction-error gate, and a bay out of budget is no
+longer exempt from that gate. An occupancy crossing is *not* rate-limited: it is
+a debounced fact (item 19), not a statistic, and refusing one would model an
+arriving drive with the coefficients of the drive that left. Every bay publishes
+`swap_reset`, `swap_count`, `swap_last_s`, `swap_reason` and `swap_held`
+(verdicts the budget refused), and the thermal block carries `resets` /
+`last_reset_s` **across** the reset — the one thing a reset does not throw away.
+A bay with one
 proximal sensor has no offset state at all, so a config without redundant
 proximal pairs keeps the arithmetic it had; `proximal_offset_c: 0` fuses every
 member on one node, as before the key existed. Measured on `sim/das.py`
@@ -2385,6 +2406,23 @@ cannot be learnt. The member's own innovation variance carries `h P hᵀ` of tha
 map, so an unconverged placement still cannot look like a swap. The bay's own
 node stays the anchor's: `t_sensor`, the occupancy ΔT, the association series and
 the SMART calibration all read it, so the model store's `cal` schema is unchanged.
+
+**Which layout learns what, and what follows** (§8 item 125). The per-sensor
+layout fits both halves of `Δs·rise + Δb`; the fused layout has **one** state for
+the pair, and that state is the whole disagreement *at the current rise*, so it
+absorbs `Δs·rise` as drift and has no slope to separate it from. The fused layout
+therefore cannot learn the *shape* of a placement difference, and nothing will
+make it: giving the pair a slope **is** the per-sensor layout, at the same state
+size and a cheaper measurement. What both layouts can carry is the number itself,
+so every bay with a redundant pair publishes a `placement` verdict per further
+member — `gap_c`, `bound_c` (the box the config's own priors allow at this tick's
+rise, `estimator.proximal_gap_sigmas·√((Δs spread·rise)² + proximal_offset_c²)`,
+so it widens with the load as the disagreement does), `over`, `evidence`, and
+`layout` with `learns` (`offset` | `offset+slope`). On the per-sensor layout an
+`over` is a placement the config does not allow — a sensor coming loose, fouling
+or ageing; on the fused one it may equally be a load that layout cannot resolve,
+and the verdict says which case it is instead of letting a reader take the two
+for the same evidence. Nothing acts on it: it is a diagnostic, not a gate.
 
 Two things keep that RLS honest, and without either it is *worse* than the offset
 state it replaces. **`Δb` is a random walk** (`estimator.q_offset`, the same key
@@ -2731,7 +2769,21 @@ still becomes `suspect` and learns again, and a stale file's hold counts
 windows, `pe_min` above its floor, every in-zone `E` and every `k` with a
 relative standard error below `model_converged_rel_se`, and `pred_err_c
 < model_max_pred_err_c`. The model's status is the least advanced zone's;
-`stale` while a stale store file re-confirms (below). Measured on
+`stale` while a stale store file re-confirms (below).
+
+**Partial convergence** (`model_converged_bays_frac`, default 1.0 = the rule
+above, §8 item 119). Below 1.0 the zone's **air block** must still pass whole,
+but only that fraction of its occupied bays need to — rounded up, never fewer
+than one, since a bay block is the only evidence there is about the bay the
+solver plans for. The model is not allowed to treat the rest as informed: the DAS
+MPC reads each such bay's `k` at `max(k − model_partial_k_sigmas·se(k), 0.05)`,
+its own lower confidence bound, which is the safe side of the asymmetry (an
+under-estimated `k` makes the solver believe airflow helps that bay less than it
+does, so it runs the fans higher). The zone publishes `partial: true` and
+`uninformed`, `blocked` keeps naming those bays — it is empty exactly when every
+block of the zone has informed itself, not merely when the gate accepts the zone
+— every bay publishes the `k_used` the solver plans with beside its fitted
+`theta`, and `model_freeze` never enters or holds a partial zone as `frozen`. Measured on
 `sim/das.py` with group experiments, realistic quantisation, lags and
 placement: per-bay `k` within 7–16 % and in-zone `E` within 9–22 %
 across 8 seeds. `E` is sensitive to relative zone-air/inlet sensor
@@ -3186,6 +3238,28 @@ on the start log line, and the thermal model publishes the measured half:
 smallest diagonal, so a group whose own entry sits at or under `PE_MIN` shuts its
 zone's gate by itself and `pe_diag` names it. `ident_require_excitable` (default
 `false`) turns the prediction into a refusal, `not_excitable:<ch>`.
+
+**Sizing the telegraph to that headroom** (`ident_amplitude_mode`, item 120;
+`fixed` by default = every channel spends `ident_amplitude`). In `headroom` a
+channel's step is the **smallest** amplitude in `(0, ident_amplitude]` whose
+`rel_swing` reaches `ident_pe_aim·√PE_MIN` from where it is parked — falling back
+to `ident_amplitude` when even that falls short, so no channel is excited *less*
+than `fixed` excites it — and the two levels are placed **inside**
+`[pwm_min, pwm_max]` with the room the channel really has on each side. Downward
+a symmetric pair whose low level would fall through `pwm_min` slides *up* onto
+the rail: it keeps its whole `2A` swing and the dip below the base shrinks to
+whatever room the channel had. Upward there is nothing to slide — sliding down
+would dip further than `ident_amplitude`, which is the owner's cap — so a high
+level over `pwm_max` is cut there and `excitable` reports the short swing. It is
+for `symmetric`, where the amplitude is cooling *given up*: since item 112 the
+solver parks the channels near `pwm_min` between runs, which is exactly where a
+symmetric pair does not fit, so `band:` refuses most of the programme (11 / 4 / 7
+of 12 starts over 12 h on the three `rich` seeds at the shipped
+`ident_amplitude: 0.15`, against 12 / 12 / 12 sized to the headroom), and the dip
+per experiment falls by 13 / 83 / 71 %. Under `above` the amplitude is cooling
+*added* and the solver takes it straight back, so sizing down buys 0.002–0.008
+mean PWM and costs a zone — item 110's own judgement, which is why the default is
+`fixed`.
 
 **The published reach is an upper bound**, not a prediction. The monitor never
 sees the telegraph's two levels: it accumulates one sin²-weighted mean of the
@@ -5436,11 +5510,11 @@ tests carry the `nightly` marker.
 | `tests/test_sigma_trust.py` | `trust_rule: sigma` (§3, §8 item 8): thresholds inclusive, empty and undeclared bays, an uninitialised zone, a sigma that is not a number, time faults, unknown keys and setpoint groups still fault, `strict` ignores the estimator; the `sigma_fault_c` floor; switching rules by config only; the verdict reads this tick's σ across a crossing; an estimator fault applies `strict`; a zone in fault returns without its lost sensor only under `sigma`; on the truth sim 2 % DS18B20 dropouts fault far fewer zones than `strict` with no violation (both DAS solvers), a replay without a bay's only proximal sensor never lowers its zone's airflow beyond 2 % and raises it within ten minutes (PI-like DAS), losing either member of a redundant pair changes almost nothing, a bay's or a zone's sensors lost for good fault the zone (on the drive σ, or on the blind air clock of item 70) and it holds, then ramps high; the example's redundant pairs fault no zone on `rich` with their σ at the floor (item 67); a hot swap no longer faults its zone but a swapped bay that goes blind faults at once, and a flapping proximal sensor spends `bay_settle_max_s` and then faults its zone on every jump again (item 69); a zone that loses only its air sensor faults on `air_blind_fault_s`, and never at all with that key set wide (item 70); the soft sigma floor (§8 item 68): it holds the command before the loss, ends on the σ growth or the hold time, falls at its rate, reopens on a further lost group, keeps its episode on an estimator fault, starts over from malformed memory, its config keys; on the DAS MPC without a bay's only sensor the no-floor run reproduces the drop (−0.04, about 21 % less airflow) and the soft floor holds, then releases | PR: `basic`; nightly: dropout sweep on `basic` and `rich`, the redundant pairs on `rich` seeds 0–5 and both solvers, a sensor lost for good on both presets and solvers, the soft floor's margin, noise and no-ratchet bounds on `basic` seeds 1–5 and `rich` 0–2, both solvers, two sensors, and its margin bounds on the DAS MPC until the floor has released (`basic` b02 and b13, `rich` b02) |
 | `tests/test_das_core.py` | the core invariants, closed loops and DAS goldens for `pi_das` and `mpc_das` (§4.2) | PR |
 | `tests/test_pi_das.py`, `tests/test_estimates.py`, `tests/test_das_config.py` | the margin-deficit PI (served zones, unconstrained channels, fixed channels, occupancy), the estimates block and prior map, `noise` / `limit_c` / served-zone config | PR |
-| `tests/test_estimator.py` | exact discretisation and Joseph form (random sequences keep P symmetric PSD); first tick and constant readings; σ grows while a bay is unobserved and shrinks back; redundant members; placement offsets (a constant disagreement is an offset and not a swap, `proximal_offset_c: 0` reproduces item 67, one sensor carries no offset state, a swap still widens a bay with two, either member keeps the bay observed); a node per proximal sensor (item 101: the slope between two placements learned from the two readings alone, the same state size, a config with one sensor per bay bit-identical either way, a member that returns after the load moved a swap only on the fused node, both members / one absent / one lying the other way / a hot swap on both layouts, a member that *drifts* followed by its own map on both layouts instead of biasing the shared drive, the learned map bounded so it cannot run along the combination its rows identify, and the diagnostics publishing the map the filter predicts with); the two notions of settling (item 100: the reason and the seconds left of each exemption, an occupancy change and a calibration step named, and a bay nobody reads out of the model checks but still faulting its zone); the fast-swap rule needs a bay's proximal members to agree, so a standing disagreement between a redundant pair never locks the bay's SMART out while a step both members see together still fires it (§8 item 17); the bay-level `swapped` report of a redundant pair (§8 item 109: a standing gap is not a swap on any tick, a step both members of a disagreeing pair take still is, and on the `rich` truth sim over five seeds neither redundant pair is ever reported swapped while a drive replaced in place by one 12 °C hotter is caught on b03 and b10 no later than on the single-sensor b02, each bay silent on every tick before its own swap so that a standing alarm cannot pass for a detection); per-bay seeding (a bay missing on the first tick is seeded by its first reading, a sensor returning after a later loss still widens its bay), `settling` expiring and its wall-clock budget (repeated jumps at four cadences spend `bay_settle_max_s` and stop exempting, a clean run earns it back, an empty bay spends nothing, 0 grants none), `air_blind_s` and a tick gap counted in full; the occupancy machine incl. "never empty while zone air is unobserved"; SMART calibration acceptance, rejection, serial change and expiry after `calibration_max_age_days`; a guessed serial never relaxes a class; the manual-calibration half of item 104 (a bay whose occupancy crosses `empty` drops its manual entry on that tick while a bay the rule did not fire on keeps its own, and a bare proximal step inflates the entry instead of deleting it, `inflate` / `confirm` set and `σ_cal` doubled); `restore_manual_calibration` never raising over a malformed section and raising only for a legacy config, and a live manual entry winning over a stored one; determinism, JSON round trip, malformed memory | PR |
+| `tests/test_estimator.py` | exact discretisation and Joseph form (random sequences keep P symmetric PSD); first tick and constant readings; σ grows while a bay is unobserved and shrinks back; redundant members; placement offsets (a constant disagreement is an offset and not a swap, `proximal_offset_c: 0` reproduces item 67, one sensor carries no offset state, a swap still widens a bay with two, either member keeps the bay observed); a node per proximal sensor (item 101: the slope between two placements learned from the two readings alone, the same state size, a config with one sensor per bay bit-identical either way, a member that returns after the load moved a swap only on the fused node, both members / one absent / one lying the other way / a hot swap on both layouts, a member that *drifts* followed by its own map on both layouts instead of biasing the shared drive, the learned map bounded so it cannot run along the combination its rows identify, and the diagnostics publishing the map the filter predicts with); the two notions of settling (item 100: the reason and the seconds left of each exemption, an occupancy change and a calibration step named, and a bay nobody reads out of the model checks but still faulting its zone); the fast-swap rule needs a bay's proximal members to agree, so a standing disagreement between a redundant pair never locks the bay's SMART out while a step both members see together still fires it (§8 item 17); the bay-level `swapped` report of a redundant pair (§8 item 109: a standing gap is not a swap on any tick, a step both members of a disagreeing pair take still is, and on the `rich` truth sim over five seeds neither redundant pair is ever reported swapped while a drive replaced in place by one 12 °C hotter is caught on b03 and b10 no later than on the single-sensor b02, each bay silent on every tick before its own swap so that a standing alarm cannot pass for a detection); per-bay seeding (a bay missing on the first tick is seeded by its first reading, a sensor returning after a later loss still widens its bay), `settling` expiring and its wall-clock budget (repeated jumps at four cadences spend `bay_settle_max_s` and stop exempting, a clean run earns it back, an empty bay spends nothing, 0 grants none), `air_blind_s` and a tick gap counted in full; the occupancy machine incl. "never empty while zone air is unobserved"; SMART calibration acceptance, rejection, serial change and expiry after `calibration_max_age_days`; a guessed serial never relaxes a class; the manual-calibration half of item 104 (a bay whose occupancy crosses `empty` drops its manual entry on that tick while a bay the rule did not fire on keeps its own, and a bare proximal step inflates the entry instead of deleting it, `inflate` / `confirm` set and `σ_cal` doubled); `restore_manual_calibration` never raising over a malformed section and raising only for a legacy config, and a live manual entry winning over a stored one; determinism, JSON round trip, malformed memory; the swap event (§8 items 123, 124: on a one-sensor bay the bay-level verdict and the per-sensor rule are the same two numbers and open the settling window on the same ticks, a bay-level step widens the bay the way a jump does even where no member crossed, the model reset spends the trust exemption's own budget and stops once it is gone while the verdict goes on firing, an occupancy crossing is never rate-limited however often it comes, and a reset bay's count / last time / reason are published and survive the reset); the placement verdict (§8 item 125: the layout and what it separates named per member, the gap read against the prior box at this tick's rise, a pair outside the box reported and a wide box not) | PR |
 | `tests/test_associate.py` | detrended correlation, greedy assignment with margins, confirmation, full-window history, drops on silence / jump / empty, a declared serial wins; on the truth sim the right bays are found and indistinguishable bays refused | PR |
 | `tests/test_stuck_sim.py` | Stuck evidence on the truth sim (§3 Stuck sizing, §8 items 3 and 58): healthy `rich` runs flag no sensor and fault no zone; a frozen DS18B20 or thermistor proximal reading is flagged once its zone's airflow moves, or, with the fans held by the rate limit, once its zone air has risen past `stuck_zone_air_dT_c` and another bay has followed it; a zone-air sensor drifting on a healthy enclosure flags no proximal reading; only a bay's last proximal sensor faults its zone | PR: 2 seeds, 3 frozen runs, 1 drifting-air run; nightly: 48 seeds, 2.5-hour runs of both DAS solvers, and the per-seed coverage sweep (each proximal reading frozen in turn) |
 | `tests/test_hotswap.py` | slow swap, quick swap (never through `empty`, margin widens, class follows the new drive) and empty-at-boot on the truth sim: no limit violation, no zone fault, fans rise, constraints removed on empty | PR |
-| `tests/test_thermal_model.py` | structure, fan groups, parameter table, Jacobians vs finite differences, `eig` vs matrix exponential and the Euler fallback, windows, lag correction, RLS safeguards, status machine, never raising in `step`, shadow never changes the command; the diagnostics that say why a zone is still learning (items 110, 111): `pe_diag` is the diagonal of the matrix `pe_min` is the smallest eigenvalue of (so `pe_min ≤ min(pe_diag)`) and reads 0 on a block with no windows, `blocked` names exactly the gates the `converged` rule fails and is empty exactly for a `converged` or `frozen` zone, and a bay's `se` is its `rel_se` times the coefficient and `null` wherever `rel_se` is, including on a block that has closed no window | PR |
+| `tests/test_thermal_model.py` | structure, fan groups, parameter table, Jacobians vs finite differences, `eig` vs matrix exponential and the Euler fallback, windows, lag correction, RLS safeguards, status machine, never raising in `step`, shadow never changes the command; the diagnostics that say why a zone is still learning (items 110, 111): `pe_diag` is the diagonal of the matrix `pe_min` is the smallest eigenvalue of (so `pe_min ≤ min(pe_diag)`) and reads 0 on a block with no windows, `blocked` names exactly the gates the `converged` rule fails and is empty exactly for a `frozen` zone and for a `converged` one that converged on every bay (§8 item 119), and a bay's `se` is its `rel_se` times the coefficient and `null` wherever `rel_se` is, including on a block that has closed no window; partial convergence (§8 item 119: `min_informed_bays` rounds up and never falls under one, the air block is never substitutable, a zone converges on the bays that informed themselves and publishes `partial` / `uninformed` / a non-empty `blocked`, those bays reach the solver at their own lower confidence bound and an informed one at its fitted value, `model_freeze` never freezes a half-informed zone, and the default 1.0 is the old rule with nothing derated) | PR |
 | `tests/test_thermal_split.py` | the per-channel split (item 13): only a multi-channel group gets keys, the prior split reproduces the shared-`E` prediction and Jacobians bit for bit, a split redistributes without changing the group total, the Jacobian of a split group against finite differences, a whole-group experiment leaves the split at 0 while single-channel phases find a 60 % difference, a store file written with the switch the other way is converted (and a corrupt coefficient on that path drops the thermal section alone, not the seed), and a split that would make a channel cool less than nothing is projected back so the zone's airflow and its Jacobian stay usable | PR |
 | `tests/test_thermal_ident.py` | identifiability with group experiments on the truth sim: in-zone `E` within 15 % (PR seed), per-bay `k` within 25 %, `leak` / `κ` at prior, convergence; regulation only never converges; the seed sweep (bound 25 %), sensor offsets, the rich preset | PR: 4 cases; nightly: sweeps |
 | `tests/test_solver_das.py` | active-piece SQP vs a projected-gradient reference, monotone objective, iteration cap, forbidden-band snap and hysteresis, zero-order hold, prediction vs thermal Jacobians, noise index and surrogate, bumpless offset, fixed channels, validity gate and model fallback with dwell (the entry dwell, the model rate through the drives' filter, the air-disturbance check, the prediction guard on eligible rows only), a clock stepped back, horizon and block extremes, the estimator's own exemption read rather than re-derived (a real fast-swap jump driven through `mpc.step` reaching the gate as `uncertain`, and the set surviving a solver restart, §8 item 100) | PR |
@@ -5452,7 +5526,7 @@ tests carry the `nightly` marker.
 | `tests/test_ident_experiment.py` | config rules; groups, targets and served zones; the seeded two-level sequence; every precondition with its reason; the envelope at its threshold; the aborts (human intent, stop, fallback, every zone in fault, emergency command, apply failures, a frozen sensor); the re-planned levels of item 52 (the echo of the experiment's own level taken out of the want and no ratchet over a run of high ticks, a fan the solver's own floor lifted still read as demand, the anchor rising at once and falling only at a switch and never below the frozen base, a held sibling with it, the band, `symmetric` dipping at most the amplitude below the live demand, the same aborts on the same tick with and without re-planning, a re-planned level never below the frozen one, the dip and the floor read off the running experiment's own plan, the demand copied only on its ticks, and through the loop a warming zone followed instead of held back, a spent load released instead of pinning the fans, and an experiment ending later than the frozen one and never earlier — against `ident_replan: false`, which still holds it back); bumpless release; overrides through `compose` and fallback beating them; a restart never resumes a run but the settle timers come back from the store and a start between `plan_tick` and `record_tick` keeps its tick (§8 item 20); `k·σ` counted once and the absolute abort from `ident_abort_below_limit_c` (items 53, 54); a lost sensor group blocks a start and aborts a run (item 72); the excitation reach of item 110 (`rel_swing` matches the plan's closed form and the fan's own curve, falls with the base, rises with the amplitude and is read off the clamped pair; `excitation` / `unexcitable` / `holds_cover_window` in the status; `pe_bound` is the constant and not `pe_min`; `excitable` at the configured amplitude against `excitable_at_cap` at the `0.3` cap, which separates "raise the amplitude" from "only a lower park reaches it"; the published reach met by the monitor's own `pe_diag` when a window sits inside a hold and missed when it straddles a switch; `ident_require_excitable` refusing with `not_excitable:<ch>` and a channel the band already refuses getting one reason, not two); the release of item 112 (the experiment's channels are never put into `released`, the solver keeps its integrator through a completion and through every human intent, and a run stopped on its high level hands back the solver's own level while the fan walks down at `d_pwm_max`); legacy refuses | PR |
 | `tests/test_ident_sim.py` | an experiment on the truth plant never takes a drive over a limit and never leaves the enclosure hotter than the same seed without one, with the excitation visible on the fans; a drawn enclosure that is already saturated refuses the start; and, with the room warming 20 °C/h so the envelope actually binds, the run aborts on `envelope:<bay>` with `T̂_d + k·σ` still below the absolute abort and no drive over its limit from the abort on, on `ident_levels: above` and `symmetric` (§8 item 53) | PR: `basic` seed 1, both `ident_levels`; nightly: `basic` and `rich` seeds 1–5, envelope sweep `basic` seeds 1–5 × both `ident_levels` |
 | `tests/test_ident_replan_sim.py` | re-planned against frozen experiment levels on the truth sim (`rich`, the real loop and supervisor), both solvers and three seeds: no tick below the solver's own command (and the frozen plan does hold one back), no anchor more than `ident_amplitude` above the demand the frozen arm saw (the ratchet guard, which the pre-review `_replan` fails on the MPC arm), and the fit no worse than frozen beyond a loose margin | nightly |
-| `tests/test_ident_converge_sim.py` | closed-loop identification on the daemon's own path, 16 h on the truth sim (`rich`, the real loop and supervisor), three seeds. Item 102: a zone-wide `ident_parallel: true` schedule against a one-channel-at-a-time round robin over *all eight* channels on the same plant — the measured converged zones per seed on both arms (z0+z3 / z0+z2 / z0+z3 against none / none / z0), `pe_min` and `excited_windows` on the converged zones held to the values the runs reached rather than to the rule's own thresholds, which of the round robin's converged zones still hold `PE_MIN` at the end of the run rather than latching from a burst, the zones that close no window at all named per seed (none since §8 item 109), zero limit violations in either arm, both arms' true margin above a floor and the mean-PWM gap bounded both ways. Item 112: no channel is left with a floor above `pwm_min` after an experiment ends, and both the enclosure's mean PWM and qd1's own stay under what the old release spent (the channel mean is what separates the two releases on the seeds where qd1 already reached `pwm_min`). Item 111: the same schedule at 36 h — the zones that converge with more windows (6 of 12 at 16 h to 11 of 12 at 36 h since §8 item 109's fix), no zone blocked by an `E`'s relative standard error, the one bay that still blocks a zone (b15, seed 3) named, and `se(k)` under 0.12 on every bay | nightly |
+| `tests/test_ident_converge_sim.py` | closed-loop identification on the daemon's own path, 16 h on the truth sim (`rich`, the real loop and supervisor), three seeds. Item 102: a zone-wide `ident_parallel: true` schedule against a one-channel-at-a-time round robin over *all eight* channels on the same plant — the measured converged zones per seed on both arms (z0+z3 / z0+z2 / z0+z3 against none / none / z0), `pe_min` and `excited_windows` on the converged zones held to the values the runs reached rather than to the rule's own thresholds, which of the round robin's converged zones still hold `PE_MIN` at the end of the run rather than latching from a burst, the zones that close no window at all named per seed (none since §8 item 109), zero limit violations in either arm, both arms' true margin above a floor and the mean-PWM gap bounded both ways. Item 112: no channel is left with a floor above `pwm_min` after an experiment ends, and both the enclosure's mean PWM and qd1's own stay under what the old release spent (the channel mean is what separates the two releases on the seeds where qd1 already reached `pwm_min`). Item 111: the same schedule at 36 h — the zones that converge with more windows (6 of 12 at 16 h to 11 of 12 at 36 h since §8 item 109's fix), no zone blocked by an `E`'s relative standard error, the one bay that still blocks a zone (b15, seed 3) named, and `se(k)` under 0.12 on every bay. Item 119: the same schedule at `model_converged_bays_frac` 0.75 and 0.5 — the zones each fraction converges per seed and the bays each converged zone was converged *without*, that a lower fraction never converges fewer zones than a higher one, that such a zone publishes `partial` and keeps naming those bays in `blocked`, and that every one of them is planned at its own `k_used` lower bound while an informed bay keeps its fitted value; and at 36 h that `0.5` closes the one zone the whole-zone rule never reaches (z3, seed 3, blocked on b15). Item 120: `ident_levels: symmetric` at the shipped amplitude over 12 h, `fixed` against `headroom` — the starts the `band:` precondition refuses (11 / 4 / 7 of 12 against none), that no start is refused for the band once the telegraph is sized to the headroom, and that no tick ever gives up more than `ident_amplitude` under either | nightly |
 | `tests/test_sim_das.py` | the truth plant: energy balance through transients and hot swap, steady state, more airflow never warms anything, dead band and exponent, quantisation per sensor type, lags, SMART cadence, determinism per seed | PR |
 | `tests/test_spinup.py` | the spin-up kick's section and its sequence (§8 item 75), driving the supervisor the way the loop does with the tachometer scripted: every key, every rejection, the per-output kick duty and its clamp, the `mpc`-aware checks (an unknown channel, a `kick_s` shorter than a tick), both example configs at their defaults; confirm → kick → verify → the next kick → failed; a fan that starts on the first kick and one that needs two; the failed fan's message and its siblings' floor holding while the solver asks for less, with an unrelated zone's channel left alone; the kick as a no-op while the solver commands more; an output with no fan, a fan with no tachometer, a channel with no tachometer bound, a duty below the stall duty and a legacy config all off with their reason; a gap starting the window again; the floor surviving both a gap during a retry and one windmilled reading, and going only after `clear_s`; a second dead fan neither ratcheting the floor nor being pinned by it, and a hold recorded in a hot spell capped; a `kick_s` too short for the `d_pwm_max` ramp refused; the floor applied under `fallback` too, pinned against the same run with the rule off, and absent from the diagnostics when nothing is in force; the log lines; a run with the rule on never below the same run with it off; the measured noise cost of a kick (§3 "Spin-up kick"); the health payload carrying the verdict and the failed fans, and a bad key or a channel typo exiting 2 before anything opens | PR |
 | `tests/test_spinup_sim.py` | the same rule through the real `Loop` against the DAS truth plant, where the rotor really does not turn (the simulator's `start_duty`): a stalled fan starting on the first kick and staying turning at `pwm_min` afterwards, a `kick_s` too short for the `d_pwm_max` ramp refused rather than condemning the fan, a seized fan declared failed with its zone's other channels floored, an output with no fan and a fan with no tach wire never kicked, a kick that changes no command while the solver is above it, the command never lower than the same run with the rule off and never outside `[pwm_min, pwm_max]` or past `d_pwm_max`, a healthy enclosure never kicked, and `start_duty: 0` reproducing the plant bit for bit | PR |
@@ -8298,33 +8372,130 @@ Owner decision (2026-09-16):
     time to answer a move before a flat proximal sensor is called stuck. The old experiment release happened to mask this on the
     experiment path (it pinned the solver at the same stale value), which is how
     it surfaced.
-119. A zone that converges on its air block plus the bays that have
-    informed themselves, rather than all-or-nothing (item 111's own
-    question, left to the owner because it is a policy call about acting
-    on a partly identified model, not an identification problem). Measured
-    when this was written, 4 of the 5 zones still short at 36 h were item
-    109's swap-damaged bays (b03, b10); item 109's fix (§8, this section)
-    resolved that estimator defect directly, and the 36 h picture is now
-    11 of 12 zones converged, with a single zone (z3, seed 3) blocked by
-    one bay (b15) whose fitted `k` is genuinely small, not swap-damaged.
-    The policy question survives on that narrower case: the safety
-    asymmetry to weigh is that an *under*-estimated `k` makes the DAS MPC
-    believe airflow helps that bay less than it does, so it runs the fans
-    higher — safe; an over-estimated one runs them lower. `pred_err_c`
-    still gates zone-wide and the bay blocks' residuals feed it, the
-    empirical check `rel_se` is the parametric version of. A candidate
-    key: `model_converged_bays_frac` (default 1.0, today's rule) or a
-    bound on `se(k)` rather than on `rel_se(k)`.
-120. Size the telegraph to the headroom under `ident_levels: symmetric`
-    (item 110). Under `above` the amplitude is cooling *added* and the
-    solver gives it straight back, which is why sizing it down buys only
-    0.004 mean PWM (measured, item 110). Under `symmetric` the amplitude
-    is cooling *given up* — `compose` floors each experiment channel at
-    its own solver command minus `ident_amplitude` — so sizing each
-    channel's step to the smallest that reaches the PE bound would
-    directly shrink the accepted dip, on the one path where that dip is
-    the owner's stated worst case. Not measured in item 110's PR: every
-    run there was `above`.
+119. **Done** (2026-09-18), and the answer is *yes, on the bays that informed
+    themselves, but never as if the rest had*. Two config keys.
+    `mpc.model_converged_bays_frac` (default **1.0**, the all-or-nothing rule,
+    bit-identical to what came before): a zone reaches `converged` when its **air
+    block** has informed itself and at least this fraction of its occupied bays
+    has, rounded up and never fewer than one. The air block is not substitutable
+    at any fraction — it is the one block every bay of the zone is planned
+    through — and neither is the last bay: a zone may not converge on the air
+    block alone.
+
+    **What the model may do with the bays that have not**, which is the safety
+    half. Item 119 named the asymmetry and it decides this: an *under*-estimated
+    `k` makes the DAS MPC believe airflow helps that bay less than it does, so it
+    runs the fans higher — safe; an over-estimated one runs them lower. So the
+    solver reads such a bay's `k` at its own lower confidence bound,
+    `max(k − model_partial_k_sigmas · se(k), 0.05)` (`thermal.current_model`,
+    second new key, default 1.0). Nothing else moves: `g0` is not a gain of the
+    rule, and the air block had to pass whole. The fitted value stays in `theta`
+    and the number the solver plans with is published beside it as `k_used`, from
+    the same function, so the diagnostics cannot say one thing while the solver
+    plans another.
+
+    **How a reader tells the two apart.** The zone publishes `partial: true` and
+    `uninformed` (the bays it converged without, in topology order), and
+    `blocked` — which used to be empty for any `converged` zone — keeps naming
+    them in the rule's own words (`rel_se:k.b10`). `blocked` is now empty exactly
+    when every block of the zone has informed itself, not merely when the gate
+    accepts the zone. And `model_freeze` never enters or holds a partial zone as
+    `frozen`: the switch means *this model is finished*, which a half-informed one
+    is not.
+
+    **Measured** on item 102's closed-loop scenario (`tests/test_ident_converge_sim.py`,
+    `rich` seeds 2/3/4, zone-wide schedule, PI-DAS). Zones converged, per seed:
+
+    | | 16 h | 36 h |
+    |---|---|---|
+    | `1.0` (today) | z0+z3 / z0+z2 / z0+z3 — **6 of 12** | **11 of 12** |
+    | `0.75` | z0+z2+z3 / z0+z1+z2 / z0+z1+z3 — **9 of 12** | 11 of 12 |
+    | `0.5` | z0+z2+z3 / z0+z1+z2 / z0+z1+z2+z3 — **10 of 12** | **12 of 12** |
+
+    The bays each zone was converged without are named in the test: seed 2 z2
+    without b10, seeds 3 and 4 z1 without b05, and at 0.5 seed 4 z2 without b11
+    and b12. At 36 h the one hold-out of item 111 — z3 on seed 3, blocked on b15,
+    whose fitted `k` is 0.215 — converges at 0.5 and not at 0.75, because b15 is
+    one of that zone's *three* bays and 2/3 = 0.667.
+
+    **What it costs, measured where it can cost anything.** Under PI-DAS nothing
+    moves: mean PWM and the worst true margin are identical to the digit at every
+    fraction, because the PI-like solver never reads the thermal model. The cost
+    is on the **DAS MPC**, and it is the cost of *acting on the model sooner* — the
+    model's status is its least advanced zone, so converging the stragglers is
+    what lets the MPC act at all. Same scenario, `solver: mpc`, 36 h:
+
+    | seed | mean PWM at 1.0 | at 0.5 | MPC ticks of 25920, 1.0 -> 0.5 |
+    |---|---|---|---|
+    | 2 | 0.3165 | 0.3656 | 370 -> 11146 |
+    | 3 | 0.2553 | 0.2904 | 0 -> 6754 |
+    | 4 | 0.2976 | 0.3566 | 5266 -> 20074 |
+
+    +0.035 to +0.059 mean PWM, and **the derating is almost none of it**: the same
+    runs with `model_partial_k_sigmas: 0` (partial convergence, no lower bound)
+    read 0.3647 / 0.2885 / 0.3514, so the safety haircut itself costs **+0.0009 /
+    +0.0019 / +0.0052** mean PWM. Worst true margin 4.133 / 4.510 / 4.026 degC in
+    every arm, zero limit violations everywhere. That the DAS MPC is the louder
+    of the two solvers on this simulated enclosure is a separate observation about
+    the example's weights, not about this item; it is in the proposed items.
+
+    **Left at 1.0** all the same. The evidence says the rule works and says what
+    it costs; which fraction an enclosure should run is the owner's call on a real
+    one, and shipping a default that changes when the MPC starts acting is not a
+    decision to take from three simulated seeds.
+120. **Done** (2026-09-18): `mpc.ident_amplitude_mode` (`fixed` | `headroom`,
+    default `fixed` = what shipped) and `mpc.ident_pe_aim` (default 2.0, the aim
+    item 110 measured at). In `headroom` a channel's telegraph is the **smallest**
+    amplitude in `(0, ident_amplitude]` whose own `rel_swing` reaches
+    `ident_pe_aim · sqrt(PE_MIN)` from where that channel is parked — falling back
+    to `ident_amplitude` when even that falls short, so no channel is ever excited
+    *less* than `fixed` excites it — and the two levels are **placed inside
+    `[pwm_min, pwm_max]`** with the room the channel really has on each side.
+
+    Both directions, and they are not symmetric. Downward: a symmetric pair whose
+    low level would fall through `pwm_min` **slides up** to sit on the rail. It
+    keeps its whole `2A` swing — the thing the PE monitor reads — and the dip
+    below the base shrinks to whatever room the channel had, which is cooling
+    given back. Upward there is nothing to slide: sliding down would put the low
+    level further under the base than `ident_amplitude`, and that dip is exactly
+    what the owner capped, so a high level over `pwm_max` is cut there and
+    `excitable` reports the short swing (item 110's machinery, unchanged).
+
+    **Why this matters now, measured.** Since item 112 stopped a finished
+    experiment leaving its level on the fans, the solver parks the channels near
+    `pwm_min` between runs — which is exactly where a symmetric pair does not fit,
+    so the `band:` precondition refuses the start. On item 102's scenario at the
+    shipped `ident_amplitude: 0.15` over 12 h, `ident_levels: symmetric` takes
+    **11 / 4 / 7** of the 12 starts offered (seeds 2/3/4); sized to the headroom it
+    takes **12 / 12 / 12** and refuses none for the band. At the harness's own
+    `ident_amplitude: 0.25` the same comparison is **2 / 0 / 2** against
+    **16 / 16 / 16** — under `symmetric` at that amplitude the experiment
+    programme is effectively dead today.
+
+    **What the dip costs at the shipped defaults.** 16 h, `ident_amplitude: 0.15`,
+    `symmetric`, mean PWM given up per tick against the solver's own command:
+
+    | seed | `fixed` | `headroom` | per start |
+    |---|---|---|---|
+    | 2 | 0.00668 over 13 starts | 0.00718 over 16 | 0.000514 -> 0.000449 |
+    | 3 | 0.00113 over 4 starts | 0.00077 over 16 | 0.000283 -> 0.000048 |
+    | 4 | 0.00582 over 8 starts | 0.00336 over 16 | 0.000728 -> 0.000210 |
+
+    **13 % / 83 % / 71 % less cooling given up per experiment**, while twice to
+    four times as many experiments run. The deepest dip any single tick took falls
+    where the sizing bites: 0.1500 on all three seeds under `fixed` against
+    0.1500 / 0.1164 / 0.1496. Worst true margin 4.161 / 4.287 / 4.379 degC against
+    4.171 / 4.387 / 4.128, no limit crossed either way, against 4.065 / 4.287 /
+    4.302 with no experiment at all.
+
+    **Under `above` the default stays `fixed`, and the measurement says why.**
+    16 h at `ident_amplitude: 0.25`: `headroom` reads mean PWM 0.3563 / 0.2552 /
+    0.2932 against 0.3587 / 0.2636 / 0.2969 — 0.002 to 0.008 quieter — while
+    converging z0+z3 / **nothing** / z0+z3 against z0+z3 / z0+z2 / z0+z3. A zone
+    for 0.005 PWM is item 110's own judgement restated with the key in hand:
+    under `above` the amplitude is cooling *added* and the solver takes it
+    straight back, so there is nothing there to save. Under `symmetric` it is
+    cooling *given up*, and that is the path the key is for.
 121. Put the new diagnostics in front of the owner. `pe_diag`, `blocked`
     and `excitation` (items 110, 111) are published in
     `diagnostics["thermal"]` and `snapshot().extra["experiment"]`, but
@@ -8333,8 +8504,13 @@ Owner decision (2026-09-16):
     the page; one line naming the gate and the group or bay it waits on
     would put items 110 and 111's answer where it is read.
 122. The nightly cost and the third seed. `test_ident_converge_sim.py` is
-    now 9 cases at ~12.5 min: the 36 h item-111 case is ~60 s per seed and
-    the 16 h A/B two runs per seed. (Re-measured after item 109's fix:
+    now **18 cases at 16:47 measured alone on a quiet 32-core host** (it was
+    9 at ~12.5 min): the 36 h item-111 case is ~60 s per
+    seed, the 16 h A/B two runs per seed, and nine cases more — item 119's
+    two 16 h runs per seed and one 36 h run per seed, item 120's two 12 h
+    runs per seed. That is the same question again with twice the answer to
+    weigh, and the 36 h cases are now two of the three families rather than
+    one. (Re-measured after item 109's fix:
     with b03 no longer reported swapped, seed 3's zone-wide arm now
     converges z0 and z2 too, so all three seeds separate the two arms at
     16 h, not just two of three as first measured — this line was written
@@ -8342,36 +8518,132 @@ Owner decision (2026-09-16):
     whether the 36 h case needs all three seeds or would lose little at
     one, given the same fix takes it to 11 of 12 zones converged rather
     than 7.
-123. A bay whose thermal block is reset should say so (item 109).
-    `swapped` is a per-tick flag with no memory: `model_reset_on_swap`
-    throws away a bay's `g0`, `k`, `q_s`, its covariance, its counters,
-    its PE monitor and its window in progress, plus its zone's air
-    window, and nothing counts how often that happens. Item 109 was
-    found only because item 102 noticed a zone that closed no regression
-    window; a bay resetting once an hour would leave a zone permanently
-    behind without ever being visible. Worth deciding whether `/api/model`
-    should carry a per-bay reset count and last-reset time, and whether a
-    rate above some threshold should be a health finding rather than a
-    diagnostic.
-124. The bay-level swap test and the per-sensor fast-swap rule disagree
-    about what an event is, and only one of them is rate-limited (item
-    109). `jumped` grants the `sigma` trust exemption under
-    `bay_settle_s` per window and `bay_settle_max_s` in total, exactly so
-    a flapping sensor cannot stay exempt for ever; `stepped` resets the
-    thermal model with no budget at all. The two fire on the same kind of
-    evidence at almost the same thresholds. Worth deciding whether the
-    model reset should spend a budget of its own, and if so whether
-    exhausting it should fall back to *not* resetting (keeping a possibly
-    stale fit) or to something louder.
-125. A redundant pair identifies its own placement difference, and on
-    the fused layout that difference is the only thing the offset state
-    carries (item 109) — so the filter already holds the number that
-    says whether the two sensors still sit where they did. A pair whose
-    learned gap walks away from the `ds*rise + db` shape it should have
-    is a sensor coming loose or fouling, which nothing currently reports.
-    Worth deciding whether the offset (or, on the per-sensor layout, the
-    learned map) should be checked against its own prior box and
-    published as a per-sensor health signal.
+123. **Done** (2026-09-18): the reset leaves a record, in both places that know
+    something about it. The estimator publishes per bay, beside the unchanged
+    per-tick `swapped`: `swap_reset` (this tick's verdict *as an event* — the only
+    thing that reaches `thermal.update`, item 124), `swap_count`, `swap_last_s`,
+    `swap_reason` (`jump` | `occupancy`, the estimator being the one that knows
+    which, item 100) and `swap_held` (verdicts the rate limit refused for want of
+    budget). The thermal block carries its own `resets` / `last_reset_s`, and they
+    are the **one thing a reset carries over**: `g0`, `k`, `q_s`, the covariance,
+    the counters, the PE monitor and the window in progress all start at the
+    prior, the count does not. Both ride to `/api/state` and `/api/model` with the
+    other per-bay diagnostics.
+
+    Why the thermal side counts separately rather than reading the estimator's:
+    `model_reset_on_swap` can be off and a `frozen` zone is skipped, so "how often
+    this bay was reported swapped" and "how often this block was thrown away" are
+    different numbers, and a reader who is trying to explain a zone that closes no
+    window needs the second.
+
+    The rate above which this should become a health finding rather than a
+    diagnostic is *not* decided here, and after item 124 the urgency is gone: the
+    reset now spends the settling budget, so the pathology item 109 found — a bay
+    resetting on nearly every tick, taking its zone's air accumulator with it —
+    cannot recur at any rate. What the record adds is that it would be visible
+    afterwards. The health rule is in the proposed items.
+
+    **Measured**: nothing moves. Re-run over item 102's 16 h and 36 h scenarios on
+    `rich` seeds 2/3/4, both arms, every converged zone, every mean PWM and every
+    worst margin reproduces the pre-change numbers to the digit — because since
+    item 109 no bay of that example is ever reported swapped, so there is no event
+    to record. That is the honest measurement of a diagnostic: on a healthy
+    enclosure it costs nothing and says nothing.
+124. **Done** (2026-09-18): they agree now, on both halves, and a test fails if
+    they stop.
+
+    **The definition.** Since item 109 the two rules read the *same per-member
+    innovations at the same thresholds*; what they did not share was the
+    consequence. Two ways they could part, and both are closed:
+
+    - on a bay with **one** proximal member the two statistics are arithmetically
+      the same two numbers (the mean of one thing is that thing, and the variance
+      of that mean is its own), so they cannot disagree — and
+      `test_one_sensor_bay_the_two_swap_rules_are_the_same_arithmetic` asserts
+      that the settling window the per-sensor rule opens appears on exactly the
+      ticks the bay-level verdict does. That is the case where the agreement is
+      provable rather than a judgement call, which is why it is the one pinned;
+    - on a bay with a **redundant pair** the mean can cross while no single member
+      does. That used to throw the thermal block away while the estimator went on
+      calling the bay's drive estimate confident — a model scored against a
+      reading nothing had widened. A bay-level step now *implies* the per-sensor
+      consequences: the drive variance is widened by the very statistic that said
+      so (through the bay's own map), the settling window opens, the tick's SMART
+      is held back, a correlation pair is dropped, and the placement row of item
+      101 is not absorbed on a tick the drive itself moved.
+
+    **The rate limit.** `swapped` keeps its per-tick meaning and every consequence
+    the estimator draws from it. What `mpc.step` hands to `thermal.update` is now
+    `swap_reset`: the same verdict at **one event per `estimator.bay_settle_s`**
+    while the bay has `estimator.bay_settle_max_s` of settling budget left — the
+    same budget, with the same clean-run recovery, that `jumped` spends for the
+    `sigma` trust exemption. A swap moves the readings for as long as the filter
+    takes to follow them; that is one event and one reset, which is what item 12
+    measured anyway ("one swap produced exactly one reset"). `bay_settle_max_s: 0`
+    now grants neither exemption nor reset, and the config comment says so.
+
+    **Exhausting it keeps the fit, and that is the louder of the two.** Resetting
+    without a limit is what left z0 at the prior for a whole run in item 109; a
+    stale fit, by contrast, is *judged* — the DAS MPC's prediction-error gate
+    scores it and falls back to `solver_pi` when it is wrong, and a bay whose
+    budget is gone is no longer exempt from that gate, so the stale fit is scored
+    rather than excused. The record (item 123) counts the refusals in `swap_held`,
+    so "this bay stopped resetting" is a number rather than a silence.
+
+    **The occupancy half is deliberately not rate-limited.** A crossing of the
+    `empty` boundary is not a statistic but a declared or debounced fact with its
+    own rate limit (item 19's `empty_confirm_s`, three consecutive ticks, the
+    owner's flag). Refusing one would model an arriving drive with the
+    coefficients of the drive that left, which is the whole of item 12: two
+    crossings in opposite directions inside one settling window are two events,
+    and a test asserts every one of them is honoured.
+
+    **Measured**: nothing moves on the healthy example — item 102's 16 h and 36 h
+    scenarios reproduce to the digit on all three `rich` seeds, since no bay there
+    is ever reported swapped. The rate limit is a bound on a pathology, not a
+    change to the ordinary path.
+125. **Done** (2026-09-18), and the answer to "does the fused layout learn it
+    too" is **no, it cannot, and the code and the docs now say so** rather than
+    leaving the two layouts looking alike.
+
+    **What follows for the fused layout.** Two placements on one bay disagree by
+    `ds·(T_d − T_a) + db`. The per-sensor layout (item 101) fits both halves: `ds`
+    has no process noise, because a placement's geometry does not drift, and `db`
+    is a random walk, so a sensor that moves is followed. The fused layout (item
+    67) has **one** state for the pair, and that state is the whole disagreement
+    *at the current rise* — it absorbs `ds·rise` as drift and has no slope to
+    separate it from. So the fused layout cannot learn the *shape* of a placement
+    difference, and there is nothing to add that would let it: giving the pair a
+    slope **is** the per-sensor layout, at the same state size and a cheaper
+    measurement (item 101's own finding). The estimator's docstring said "two
+    sensors sit differently and carry different offsets", which reads as though
+    the offset were the whole story; it now states the limitation where the layout
+    is described, and the config comment for `proximal_slope_spread` and
+    `proximal_offset_c` does too.
+
+    **The consequence that ships** is the signal both layouts *can* carry, which
+    item 125 asked for: every bay with a redundant pair publishes `placement` per
+    further member — `gap_c` (the learned disagreement now), `bound_c` (the box the
+    config's own priors allow it **at this tick's drive-to-air rise**,
+    `proximal_gap_sigmas · sqrt((slope_spread·rise)² + offset_c²)`, so it widens
+    with the load exactly as the disagreement does), `over`, `evidence` (rows the
+    per-sensor map has taken), and — the point — `layout` with `learns`
+    (`offset` | `offset+slope`). One new key,
+    `estimator.proximal_gap_sigmas` (default 3.0, `>= 0`).
+
+    What a reader may conclude from `over` therefore depends on the layout, and
+    the verdict says which: with a node per sensor the slope and the offset are
+    separated, so a gap outside the box is a placement the config does not allow —
+    a sensor coming loose, fouling or ageing; with one fused node the gap may
+    equally be a load that layout cannot resolve. Publishing one flag for both and
+    letting a health rule read it would have been the third way to imply they know
+    the same thing, which is what the item is against.
+
+    Not done: nothing *acts* on `over` — it is a diagnostic, not a health finding
+    and not a gate. On the fused layout it cannot be one without the false
+    positives above, and on the per-sensor layout that turn is item 99's decision,
+    since `proximal_slope_spread > 0` moves the four DAS goldens. See the proposed
+    items.
 126. The relative step-budget gate loses its margin on a shared machine
     (item 109). `test_das_mpc_step_p99_within_the_relative_budget`
     divides the DAS MPC's p99 by the legacy MPC's, measured back to back

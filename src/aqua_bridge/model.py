@@ -705,6 +705,11 @@ SETPOINT_GROUP_PREFIX = "setpoint:"
 #: ``ident_levels`` values: ``above`` (base and base + amplitude, never less cooling
 #: than the solver's level at start) or ``symmetric`` (base +- amplitude, owner opt-in).
 IDENT_LEVELS: tuple[str, ...] = ("above", "symmetric")
+#: ``ident_amplitude_mode`` values (section 8 item 120): ``fixed`` spends
+#: ``ident_amplitude`` on every channel, ``headroom`` spends the smallest step that
+#: reaches ``ident_pe_aim`` times the PE monitor's own bound from where that channel
+#: sits, capped by ``ident_amplitude`` and placed inside ``[pwm_min, pwm_max]``.
+IDENT_AMPLITUDE_MODES: tuple[str, ...] = ("fixed", "headroom")
 #: Largest ``ident_amplitude`` the config accepts. The owner-facing ceiling on how much
 #: PWM one experiment may add (``above``) or give up (``symmetric``) on a channel; it is
 #: also what :func:`aqua_bridge.control.ident.excitation` evaluates ``excitable_at_cap``
@@ -1266,6 +1271,7 @@ ESTIMATOR_DEFAULTS: dict[str, float] = {
     "sensor_noise_c": 0.03,
     "proximal_offset_c": 3.0,
     "proximal_slope_spread": 0.0,
+    "proximal_gap_sigmas": 3.0,
     "air_blind_fault_s": 900.0,
     "smart_max_age_s": 300.0,
     "smart_reject_c": 8.0,
@@ -1367,6 +1373,19 @@ class EstimatorSpec:
       contribution moves with the drive-to-air rise; the spread is the prior on that
       difference, so 0 is exactly the statement "both sensors see the same fraction of
       the drive", which is what the fused node assumes
+    * ``proximal_gap_sigmas``      -- how many prior standard deviations the *learned*
+      disagreement between two proximal sensors of one bay may reach before the bay's
+      ``placement`` diagnostic reports it (``>= 0``; 0 reports every gap). The prior is
+      the box the two keys above describe, evaluated at this tick's drive-to-air rise:
+      ``sqrt((proximal_slope_spread * rise) ** 2 + proximal_offset_c ** 2)``, so it widens
+      with the load exactly as the disagreement itself does. **What the verdict means
+      depends on the layout** (PROJECT.md section 8 item 125): with a node per sensor the
+      slope and the offset are separated, so a gap outside the box is a placement the
+      config does not allow -- a sensor coming loose, fouling or ageing; with one fused
+      node per bay the offset state carries ``ds * rise + db`` as a single drifting
+      number, so a gap outside the box may equally be a load the layout cannot resolve.
+      The published verdict says which case it is rather than pretending the two layouts
+      know the same thing
     * ``smart_max_age_s``          -- a SMART sample older than this is ignored and an
       association whose serial stays silent this long is dropped (``>= dt``)
     * ``smart_reject_c``           -- a SMART value this far from the estimate is dropped
@@ -1440,6 +1459,7 @@ class EstimatorSpec:
     sensor_noise_c: float = ESTIMATOR_DEFAULTS["sensor_noise_c"]
     proximal_offset_c: float = ESTIMATOR_DEFAULTS["proximal_offset_c"]
     proximal_slope_spread: float = ESTIMATOR_DEFAULTS["proximal_slope_spread"]
+    proximal_gap_sigmas: float = ESTIMATOR_DEFAULTS["proximal_gap_sigmas"]
     air_blind_fault_s: float = ESTIMATOR_DEFAULTS["air_blind_fault_s"]
     smart_max_age_s: float = ESTIMATOR_DEFAULTS["smart_max_age_s"]
     smart_reject_c: float = ESTIMATOR_DEFAULTS["smart_reject_c"]
@@ -1512,6 +1532,7 @@ class EstimatorSpec:
         for key in (
             "sensor_noise_c",
             "proximal_offset_c",
+            "proximal_gap_sigmas",
             "air_blind_fault_s",
         ):
             if getattr(self, key) < 0:
@@ -1770,6 +1791,20 @@ class MpcConfig:
       reaches ``converged`` is frozen there instead of adapting on, and whether a fan
       group's effectiveness carries per-channel split coefficients the single-channel
       experiment phases identify.
+    * ``model_converged_bays_frac`` / ``model_partial_k_sigmas`` -- partial convergence
+      (``control/thermal.py``, section 8 item 119). A zone reaches ``converged`` when its
+      **air block** has informed itself and at least this fraction of its occupied bays
+      has (rounded up, never fewer than one); ``1.0``, the default, is the all-or-nothing
+      rule and is bit-identical to what came before. Below 1.0 a zone may converge on the
+      bays that have informed themselves, and the model is not allowed to treat the rest
+      as if they had: the DAS MPC reads each such bay's airflow sensitivity ``k`` at
+      ``k - model_partial_k_sigmas * se(k)``, its own lower confidence bound, floored at
+      the parameter's bound. That is the safe side of the asymmetry -- an *under*-
+      estimated ``k`` makes the solver believe airflow helps that bay less than it does,
+      so it runs the fans higher. A zone that converged this way publishes ``partial:
+      true`` and the bays it converged without (``uninformed``), keeps naming them in
+      ``blocked``, and is never entered as ``frozen``: ``model_freeze`` means "this model
+      is finished", which a half-informed one is not.
     * ``model_reset_on_swap`` -- reset a bay's identified coefficients (``g0``, ``k``,
       ``q_s``) to the prior when the estimator reports a hot swap on it (default
       ``true``; they describe the drive that left). Validated always, inert in legacy
@@ -1806,6 +1841,19 @@ class MpcConfig:
       between two writes of ``model.json``, the age above which a stored model loads
       ``stale``, and how long a stale model must stay converged with its prediction
       error in bounds before it may act again. Inert in legacy mode.
+    * ``ident_amplitude_mode`` / ``ident_pe_aim`` -- how big each channel's telegraph is
+      (``control/ident.py``, section 8 item 120). ``fixed`` (default) spends
+      ``ident_amplitude`` on every channel, whatever headroom it has, and is what shipped
+      before. ``headroom`` spends the smallest step in ``(0, ident_amplitude]`` whose own
+      relative airflow swing reaches ``ident_pe_aim`` times ``sqrt(PE_MIN)`` from where
+      that channel is parked, and places the two levels inside ``[pwm_min, pwm_max]``
+      using the room the channel really has on each side -- a symmetric telegraph whose
+      low level would fall through ``pwm_min`` slides up instead of being refused, which
+      keeps its swing and makes the dip *shallower*. It matters under
+      ``ident_levels: symmetric``, where the amplitude is cooling given up: there the
+      smaller step comes straight off the owner-accepted dip. Under ``above`` the
+      amplitude is cooling added and the solver takes it back, so sizing down buys almost
+      nothing (measured, item 110). ``ident_pe_aim`` below about 1.5 converges nothing.
     * ``ident_enabled`` / ``ident_amplitude`` / ``ident_levels`` / ``ident_replan`` /
       ``ident_parallel`` / ``ident_require_excitable`` /
       ``ident_hold_s`` / ``ident_max_duration_s`` / ``ident_settle_s`` /
@@ -1883,6 +1931,8 @@ class MpcConfig:
     model_lambda: float = 0.9995
     model_p_trace_max: float = 100.0
     model_converged_rel_se: float = 0.25
+    model_converged_bays_frac: float = 1.0
+    model_partial_k_sigmas: float = 1.0
     model_max_pred_err_c: float = 1.0
     model_use_rpm: bool = False
     model_reset_on_swap: bool = True
@@ -1912,6 +1962,8 @@ class MpcConfig:
     model_reconfirm_s: float = 3600.0
     ident_enabled: bool = False
     ident_amplitude: float = 0.15
+    ident_amplitude_mode: str = "fixed"
+    ident_pe_aim: float = 2.0
     ident_levels: str = "above"
     ident_replan: bool = True
     ident_parallel: bool = False
@@ -2021,6 +2073,8 @@ class MpcConfig:
             "model_lambda",
             "model_p_trace_max",
             "model_converged_rel_se",
+            "model_converged_bays_frac",
+            "model_partial_k_sigmas",
             "model_max_pred_err_c",
             "mpc_pred_dt_s",
             "rho_soft",
@@ -2046,6 +2100,11 @@ class MpcConfig:
         _cfg_bool("ident_parallel", self.ident_parallel)
         _cfg_bool("ident_require_excitable", self.ident_require_excitable)
         s(self, "ident_levels", _choice("ident_levels", self.ident_levels, IDENT_LEVELS))
+        s(
+            self,
+            "ident_amplitude_mode",
+            _choice("ident_amplitude_mode", self.ident_amplitude_mode, IDENT_AMPLITUDE_MODES),
+        )
         holds = _cfg_list("ident_hold_s", self.ident_hold_s)
         s(
             self,
@@ -2054,6 +2113,7 @@ class MpcConfig:
         )
         for name in (
             "ident_amplitude",
+            "ident_pe_aim",
             "ident_max_duration_s",
             "ident_settle_s",
             "ident_start_band_c",
@@ -2361,6 +2421,15 @@ class MpcConfig:
             raise ConfigError(
                 f"mpc.model_converged_rel_se must be in (0, 1), got {self.model_converged_rel_se}"
             )
+        if not 0.0 < self.model_converged_bays_frac <= 1.0:
+            raise ConfigError(
+                "mpc.model_converged_bays_frac must be in (0, 1], "
+                f"got {self.model_converged_bays_frac}"
+            )
+        if self.model_partial_k_sigmas < 0:
+            raise ConfigError(
+                f"mpc.model_partial_k_sigmas must be >= 0, got {self.model_partial_k_sigmas}"
+            )
         if self.model_max_pred_err_c <= 0:
             raise ConfigError(
                 f"mpc.model_max_pred_err_c must be > 0, got {self.model_max_pred_err_c}"
@@ -2385,6 +2454,8 @@ class MpcConfig:
                 f"mpc.ident_amplitude must be in (0, {IDENT_AMPLITUDE_MAX}], "
                 f"got {self.ident_amplitude}"
             )
+        if self.ident_pe_aim <= 0:
+            raise ConfigError(f"mpc.ident_pe_aim must be > 0, got {self.ident_pe_aim}")
         if not self.ident_hold_s or any(h <= 0 for h in self.ident_hold_s):
             raise ConfigError(
                 "mpc.ident_hold_s must be a non-empty list of positive seconds, "

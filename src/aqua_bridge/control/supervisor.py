@@ -976,7 +976,7 @@ class Supervisor:
         self._experiment = ident.start(
             cfg, facts, kind, name, skip_ticks=1 if self._plan_pending else 0
         )
-        reach = ident.excitation(cfg, self._experiment["levels"])
+        reach = ident.excitation(cfg, self._experiment["levels"], self._experiment["plan_base"])
         blind = [ch for ch, e in reach.items() if not e["excitable"]]
         _LOG.info(
             "experiment started on %s %r: channels %s, base %s",

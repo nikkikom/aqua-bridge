@@ -65,6 +65,21 @@ the association series and the SMART calibration all read it, so ``mem["cal"]`` 
 model store are untouched. A config with one proximal sensor per bay is bit-identical
 either way (there is no further member to give a node to).
 
+**Which layout learns what, and the consequence** (plan section 8 item 125). Two
+placements on one bay disagree by ``ds * (T_d - T_a) + db``. The per-sensor layout fits
+both halves; the fused layout has **one** state for the pair, and that state is the whole
+disagreement at the current rise, so it absorbs ``ds * rise`` as drift. The fused layout
+therefore cannot learn the *shape* of a placement difference, and nothing here is going to
+make it: doing so **is** the per-sensor layout, at the same state size and a cheaper
+measurement. What both layouts can carry is the number itself, so every bay with a
+redundant pair publishes a ``placement`` verdict per further member
+(:func:`_placement_view`) -- the learned gap, the box the config's own priors allow it at
+this tick's rise (``estimator.proximal_gap_sigmas``), whether it has walked out of that
+box, and **the layout with what that layout separates**. On the per-sensor layout ``over``
+is a placement the config does not allow: a sensor coming loose, fouling or ageing. On the
+fused layout it may equally be a load the layout has no slope for, and the verdict says so
+rather than letting a reader take the two for the same evidence.
+
 Priors (plan section 3 table): ``C_a = 200``, ``leak = 1``, ``kappa = 3`` for
 declared ``coupled_to`` pairs (the neighbour's previous air estimate is a
 known input), ``g0 = 0.3``, ``k = 0.5``, ``C_d = tau_d_s * (g0 + k)`` (the
@@ -271,8 +286,37 @@ now form the same quantity out of the same per-member innovations the rule alrea
 computes: the fused layout's node-plus-offset, the per-sensor layout's own nodes and
 maps. A bay with one proximal sensor is one member, so its statistic is unchanged.
 
-``mpc.step`` hands those bays to :func:`aqua_bridge.control.thermal.update`, which
-resets their identified coefficients to the prior (plan section 8 item 12).
+**One event, one rate limit** (plan section 8 item 124). The two halves of the rule used
+to disagree about both. A per-sensor jump widened the bay's drive variance, opened a
+settling window and held the tick's SMART back, all bounded by ``bay_settle_s`` per window
+and ``bay_settle_max_s`` in total; the bay-level step reset the whole thermal block with
+no budget at all, and on a bay where the mean crossed the thresholds while no single
+member did, it reset that block without widening anything. Now:
+
+* a bay-level step **implies** the per-sensor consequences. Where no member of the bay
+  was itself a jump, the drive variance is widened by the mean innovation the statistic
+  itself used, the settling window opens and the tick's SMART and correlation pair are
+  treated exactly as a jump's, so a block the model just threw away can never be scored
+  against a drive estimate the filter still calls confident;
+* the **model reset** spends the *same* budget as the trust exemption. ``swap_reset`` is
+  the ``swapped`` verdict rate-limited to one event per ``bay_settle_s`` (a swap is one
+  event, not one per tick it is still visible on) while the bay has exemption left
+  (``settling_spent_s < bay_settle_max_s``), and it is what ``mpc.step`` hands to
+  :func:`aqua_bridge.control.thermal.update`. ``bay_settle_max_s: 0`` therefore grants
+  neither: with no exemption to spend there is no reset either. The rate limit is on the
+  *statistical* half only -- an occupancy crossing has the debounce of item 19 for its
+  rate limit and is always an event, since refusing one would model an arriving drive
+  with the coefficients of the drive that left.
+
+Exhausting the budget falls back to **keeping the fit**, not to resetting it, and says so
+(item 123). A bay that trips the rule oftener than the budget allows is not a drive being
+swapped three times an hour; resetting it every time is what left a zone at the prior for
+ever (item 109's pathology), while a stale fit is judged by the DAS MPC's own
+prediction-error gate and lands the solver in its PI-like fallback -- and the bay is not
+exempt from that gate once the budget is gone, so the stale fit is *scored* instead of
+excused. The record is published beside the verdict: ``swapped`` (this tick's verdict),
+``swap_reset`` (the event the reset follows), ``swap_count``, ``swap_last_s``,
+``swap_reason`` and ``swap_held`` (verdicts the rate limit refused).
 
 The per-bay output shows a change in progress: ``pending_empty_s`` (seconds of
 evidence toward ``empty`` counted so far), ``pending_occupied_ticks`` (ticks of
@@ -412,6 +456,8 @@ Memory (plain JSON)::
      "bays": {bay: {"occ", "low", "rise", "blind", "rej" (failed re-checks),
                     "ver" (a re-check passed), "since", "assoc", "map", "init",
                     "disturb", "why", "spent", "clean",
+                    "swaps", "swap_ts", "swap_why", "swap_held" (the swap record,
+                     items 123, 124),
                     "unc", "calstep", "calseen" (the model gate's marks, item 100),
                     "dmap": {sensor: {"th", "P", "n"}} (item 101)}},
      "cal": {bay: {serial: {"th", "P", "n", "fresh", "rms2", "ts", "used"
@@ -900,6 +946,12 @@ def _fresh_bay() -> dict[str, Any]:
         "why": None,
         "spent": 0.0,
         "clean": 0.0,
+        # items 123, 124: the swap record -- declared events, when the last one was, why,
+        # and how many verdicts the rate limit refused
+        "swaps": 0,
+        "swap_ts": None,
+        "swap_why": None,
+        "swap_held": 0,
         # item 100: the model gate's own marks, beside the trust rule's ``disturb``
         "unc": None,
         "calstep": None,
@@ -976,6 +1028,10 @@ def _parse(memory: object, st: _Structure) -> dict[str, Any]:
         rej = raw.get("rej", 0)
         if isinstance(rej, bool) or not isinstance(rej, int) or rej < 0:
             raise ValueError("rej")
+        swaps, held = raw.get("swaps", 0), raw.get("swap_held", 0)
+        for count in (swaps, held):
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError("swap count")
         out["bays"][b] = {
             "occ": occ,
             "low": _num(raw.get("low", 0.0)),
@@ -993,6 +1049,10 @@ def _parse(memory: object, st: _Structure) -> dict[str, Any]:
             "why": _settle_reason(raw.get("why")),
             "spent": spent,
             "clean": clean,
+            "swaps": swaps,
+            "swap_ts": _opt_num(raw.get("swap_ts")),
+            "swap_why": _settle_reason(raw.get("swap_why")),
+            "swap_held": held,
             "unc": _opt_num(raw.get("unc")),
             "calstep": _opt_num(raw.get("calstep")),
             "calseen": _opt_num(raw.get("calseen")),
@@ -1425,6 +1485,48 @@ def _mark_disturbed(bm: dict[str, Any], ts: float, budget: float, why: str) -> N
         bm["why"] = why
 
 
+def _swap_event(bm: dict[str, Any], ts: float, spec: Any, why: str, *, limited: bool) -> bool:
+    """Whether this tick's swap verdict is a new **event**, and record it (items 123, 124).
+
+    The *statistical* half of the rule -- the bay-level step, ``why`` :data:`SETTLE_JUMP`
+    -- is rate-limited, and on both halves of what a rate limit is it now agrees with the
+    per-sensor fast-swap rule that reads the same innovations at the same thresholds:
+
+    * *cadence* -- one event per ``bay_settle_s``, the very window one deliberate widening
+      opens. A swap moves the readings for as long as it takes the filter to follow them,
+      so the verdict stands for several ticks; that is one event, and one model reset;
+    * *budget* -- the same ``bay_settle_max_s`` the trust exemption spends. When it is
+      gone the event is refused and counted in ``swap_held`` (only the budget's refusals:
+      a verdict inside the refractory of its own event is that event still visible, not a
+      second one held back). The thermal fit is then kept
+      (possibly stale) rather than thrown away again, and with no exemption left the bay's
+      prediction error is *scored* by the DAS MPC's validity gate instead of excused by
+      it, which is the loud half. ``bay_settle_max_s: 0`` grants neither exemption nor
+      reset, exactly as it grants no settling window.
+
+    An **occupancy crossing** (``limited=False``) is always an event. It is not a
+    statistic but a declared or debounced fact -- ``empty_confirm_s`` of evidence, three
+    consecutive ticks the other way, or the owner's own ``occupied`` flag -- and that
+    debounce (item 19) is its rate limit. Refusing one would leave an arriving drive
+    modelled with the coefficients of the drive that just left, which is the whole of
+    item 12: two crossings in opposite directions inside one settling window are two
+    events, not one.
+
+    A clock that steps back is one event's worth of refractory at most: a mark in the
+    future is treated as expired, like every other window here.
+    """
+    if limited:
+        last = bm["swap_ts"]
+        if last is not None and 0.0 <= float(ts) - float(last) < spec.bay_settle_s:
+            return False
+        if bm["spent"] >= spec.bay_settle_max_s:
+            bm["swap_held"] += 1
+            return False
+    bm["swaps"] += 1
+    bm["swap_ts"], bm["swap_why"] = float(ts), why
+    return True
+
+
 def _account_settle(
     bm: dict[str, Any], *, settling: bool, checked: bool, over: bool, h: float, budget: float
 ) -> None:
@@ -1571,6 +1673,80 @@ def _proximal_map_view(
                 and CAL_OFFSET_BOUNDS[0] <= raw_b <= CAL_OFFSET_BOUNDS[1]
             ),
             "samples": entry["n"],
+        }
+    return out
+
+
+def _bay_rise(zone: _Zone, bay: _Bay, arrays: tuple[np.ndarray, np.ndarray] | None) -> float:
+    """This tick's drive-to-air rise of the bay, degC, or 0 with no filter state: the
+    scale on which two placements on one bay disagree (item 125)."""
+    if arrays is None:
+        return 0.0
+    x = arrays[0]
+    return float(x[2 + bay.index] - x[0])
+
+
+#: What each proximal layout can identify about a redundant pair's placement difference
+#: (plan section 8 item 125). Two sensors on one bay disagree by ``ds * rise + db``.
+LAYOUT_FUSED = "fused"
+LAYOUT_PER_SENSOR = "per_sensor"
+#: Which halves of ``ds * rise + db`` the layout separates, published beside the verdict.
+_LAYOUT_LEARNS: dict[str, str] = {
+    LAYOUT_FUSED: "offset",
+    LAYOUT_PER_SENSOR: "offset+slope",
+}
+
+
+def _placement_view(
+    bay: _Bay,
+    bm: Mapping[str, Any],
+    offsets: Mapping[str, float],
+    spec: Any,
+    per_sensor: bool,
+    rise: float,
+) -> dict[str, dict[str, Any]]:
+    """What ``/api/state`` says about whether a redundant pair still sits where it did
+    (plan section 8 item 125), per further proximal member of the bay.
+
+    A pair of sensors on one bay disagrees by ``ds * (T_d - T_a) + db`` -- a slope
+    difference in the fraction of the drive each sees, and a constant offset. Both layouts
+    learn *a* number for that disagreement; only one of them learns its **shape**, and
+    this view says which, so nothing downstream reads the two as the same evidence:
+
+    * ``per_sensor`` (``estimator.proximal_slope_spread > 0``, item 101) carries ``(ds,
+      db)`` as a two-parameter fit, so the load-dependent half and the constant half are
+      separated. A gap outside the prior box is then a placement the config does not
+      allow: a sensor coming loose, fouling or ageing. ``learns: offset+slope``;
+    * ``fused`` (item 67, the default) carries one random-walk offset state per member.
+      That state is the *whole* disagreement at the current rise, so it absorbs ``ds *
+      rise`` as drift and the layout cannot tell a moved sensor from a load it has no
+      slope for. ``learns: offset`` -- and the honest consequence is that its ``over`` is
+      a diagnostic, not a fault: the fused layout **cannot** learn the shape, and making
+      it do so is the per-sensor layout, which is the same state size and a cheaper
+      measurement. Nothing here pretends otherwise.
+
+    ``gap_c`` is the learned disagreement at this tick's rise, ``bound_c`` the prior box
+    at the same rise (``proximal_gap_sigmas`` standard deviations of ``ds * rise + db``
+    under independent priors, so it widens with the load as the disagreement does), and
+    ``over`` whether the gap has walked out of it. ``evidence`` is how many rows the
+    per-sensor map has taken; on the fused layout it is ``None``, since an offset state
+    has no row count of its own."""
+    out: dict[str, dict[str, Any]] = {}
+    layout = LAYOUT_PER_SENSOR if per_sensor else LAYOUT_FUSED
+    spread = spec.proximal_slope_spread if per_sensor else 0.0
+    bound = spec.proximal_gap_sigmas * math.sqrt((spread * rise) ** 2 + spec.proximal_offset_c**2)
+    for name in bay.sensors:
+        if name == bay.primary or name not in offsets:
+            continue
+        gap = float(offsets[name])
+        entry = bm["dmap"].get(name) if per_sensor else None
+        out[name] = {
+            "layout": layout,
+            "learns": _LAYOUT_LEARNS[layout],
+            "gap_c": gap,
+            "bound_c": bound,
+            "over": abs(gap) > bound,
+            "evidence": None if entry is None else int(entry["n"]),
         }
     return out
 
@@ -1985,6 +2161,7 @@ def update(
             # updated one, and the members have to agree (module docstring): one bay,
             # one drive, so a swap moves every proximal sensor of the bay the same way.
             rise = float(x[i_d + j] - x[0]) if per_sensor else 0.0
+            step_nu = 0.0  # the bay-level statistic, when it crosses (item 124)
             members: list[tuple[str, float, float, float, bool, int | None, int]] = []
             for name in present:
                 value = float(temps[name])
@@ -2028,11 +2205,23 @@ def update(
                 s_bay = var_bay / len(members) ** 2
                 if abs(nu_bay) > spec.jump_min_c and nu_bay * nu_bay > jump_var * s_bay:
                     stepped[b] = True
+                    step_nu = nu_bay
             jump = any(m[4] for m in members) and not (
                 any(m[3] > spec.jump_min_c for m in members)
                 and any(m[3] < -spec.jump_min_c for m in members)
             )
-            if per_sensor and not jump and occ != EMPTY and bay.primary in temps:
+            # item 124: a bay-level step is an event for the per-sensor rule too. Both
+            # halves read the same per-member innovations at the same thresholds (item
+            # 109), and on a one-member bay they are the same number, so they can only
+            # part on a bay with a redundant pair -- where the mean can cross while no
+            # single member does. The drive itself moved, so the placement row this tick
+            # would carry that move instead of the two sensors' geometry.
+            if (
+                per_sensor
+                and not (jump or stepped.get(b))
+                and occ != EMPTY
+                and bay.primary in temps
+            ):
                 # Only the two readings enter the row: both members see the same drive and
                 # the same air, so their difference identifies the placement without any
                 # SMART (item 101). Not on a jump tick, where the drive itself moved.
@@ -2064,6 +2253,15 @@ def update(
                     _scalar_update(x, p, idx, value, r)
                 else:
                     _pair_update(x, p, idx, i_off + k_off, value, r)
+            if stepped.get(b) and not jumped.get(b):
+                # The bay's mean crossed the thresholds while no single member did (item
+                # 124). The thermal block is about to be thrown away, so the drive
+                # estimate it would be scored against must not stay confident: widen it
+                # by the very statistic that said so, through the bay's own map, and give
+                # the bay the rest of a jump's consequences (the settling window, this
+                # tick's SMART, the correlation pair) below.
+                p[i_d + j, i_d + j] += (step_nu / s_map) ** 2
+                jumped[b] = True
         arrays[z] = (x, p)
         geometry[z] = (q_flow, qn, t_in, fan_curve)
         mem["zones"][z]["t_in"] = t_in
@@ -2137,6 +2335,9 @@ def update(
     # Bays whose drive may be a different one from this tick on (item 12): the thermal
     # model's coefficients for them describe a drive that is no longer there.
     swapped: dict[str, bool] = dict(stepped)
+    # the half of ``swapped`` that is an occupancy crossing, so the record below names the
+    # stronger of the two reasons when a tick carries both (items 123, 124)
+    crossed: set[str] = set()
     for b, bay in st.bays.items():
         bm = mem["bays"][b]
         if jumped.get(b):  # the fast-swap rule widened this bay on purpose
@@ -2221,6 +2422,7 @@ def update(
                     _mark_disturbed(bm, float(ts), spec.bay_settle_max_s, SETTLE_OCCUPANCY)
             if (before == EMPTY) != (after == EMPTY):
                 swapped[b] = True
+                crossed.add(b)
                 _forget_pair(mem, b, bm["assoc"])
                 if b in assoc and assoc[b][1] == "correlation":
                     _forget_pair(mem, b, assoc[b][0])
@@ -2254,6 +2456,24 @@ def update(
         if was_stepped and known is not None and known["cal"] is not None:
             known["cal"]["inflate"] = STALE_SIGMA_CAL_FACTOR
             known["cal"]["confirm"] = CAL_MIN_SAMPLES
+
+    # -- the swap *event*, rate-limited, and the record it leaves (items 123, 124) -------
+    # ``swapped`` above is this tick's verdict and keeps every consequence it had.
+    # ``resets`` is the subset that is a new event: one per ``bay_settle_s`` while the
+    # bay has ``bay_settle_max_s`` of exemption left, the same budget the trust rule
+    # spends. Only these reach ``thermal.update(reset_bays=...)``.
+    resets: dict[str, bool] = {}
+    for b, was_swapped in swapped.items():
+        if not was_swapped:
+            continue
+        occ_event = b in crossed
+        resets[b] = _swap_event(
+            mem["bays"][b],
+            float(ts),
+            spec,
+            SETTLE_OCCUPANCY if occ_event else SETTLE_JUMP,
+            limited=not occ_event,
+        )
 
     # -- store the filter ----------------------------------------------------------------
     for z, (x, p) in arrays.items():
@@ -2385,6 +2605,8 @@ def update(
             if calibrated
             else spec.sigma_uncalibrated_c
         )
+        offsets_c = _offsets_view(st.zones[bay.zone], bay, arrays.get(bay.zone), per_sensor)
+        bay_rise = _bay_rise(st.zones[bay.zone], bay, arrays.get(bay.zone))
         info: dict[str, Any] = {
             "zone": bay.zone,
             "occupancy": bm["occ"],
@@ -2395,10 +2617,22 @@ def update(
             "pending_unknown_s": float(bm["blind"]),
             "assoc_check_fails": int(bm["rej"]),
             "swapped": bool(swapped.get(b, False)),
+            # items 123, 124: the verdict's rate-limited *event* -- what ``mpc.step``
+            # hands to ``thermal.update(reset_bays=...)`` -- and the record it leaves, so
+            # a bay whose model was thrown away says so afterwards instead of only on
+            # the tick it happened.
+            "swap_reset": bool(resets.get(b, False)),
+            "swap_count": int(bm["swaps"]),
+            "swap_last_s": None if bm["swap_ts"] is None else float(ts) - float(bm["swap_ts"]),
+            "swap_reason": bm["swap_why"],
+            "swap_held": int(bm["swap_held"]),
             "observed": observed.get(b, False),
             "seeded": bool(bm["init"]),
-            "offsets_c": _offsets_view(st.zones[bay.zone], bay, arrays.get(bay.zone), per_sensor),
+            "offsets_c": offsets_c,
             "proximal_map": _proximal_map_view(bay, bm["dmap"], member_map, sensor_map(b)[:2]),
+            # item 125: whether the pair still sits where it did, and -- said plainly --
+            # which of the two halves of ``ds * rise + db`` this layout can separate
+            "placement": _placement_view(bay, bm, offsets_c, spec, per_sensor, bay_rise),
             "class": cls,
             "class_source": cls_source,
             "serial": serial,
