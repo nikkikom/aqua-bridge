@@ -52,13 +52,21 @@ tick's ``prev``), ``trusted_temps``, ``zones_ok``, ``bays``, ``read_error``,
 which needs no topology.
 
 ``fans`` (PROJECT.md section 8 item 79) is ``{channel: {duty, rpm, voltage_v,
-current_ma, power_w, power_reported}}``, straight from ``PlantObservation.inputs
-["fans"]`` -- what the aquaero or Quadro reported for that output this tick. It
-is a new key of the same schema version, not a new version: every reader here and
-in ``tools/`` takes fields by name with a default, a recording made before it
-existed simply has ``{}``, and a source that reports no such readings (the
-simulator) writes ``{}`` too. ``power_reported`` is false for an aquaero's own
-outputs, which report 0 mA and 0 W in PWM mode whatever the fan does.
+current_ma, power_w, power_reported, rail_reported}}``, straight from
+``PlantObservation.inputs["fans"]`` -- what the aquaero or Quadro reported for that
+output this tick. It is a new key of the same schema version, not a new version:
+every reader here and in ``tools/`` takes fields by name with a default, a
+recording made before it existed simply has ``{}``, and a source that reports no
+such readings (the simulator) writes ``{}`` too. ``power_reported`` is false for
+an aquaero's own outputs, which report 0 mA and 0 W in PWM mode whatever the fan
+does. ``rail_reported`` (PROJECT.md section 8 items 117, 127) is false for an
+aquabus output, whose block holds the aquaero's own rail in every report that
+missed the bus device's sample: without it a recorded ``voltage_v: null`` is
+ambiguous, and a reader (:mod:`tools.fit_fans`, a health report built from a
+recording) cannot tell "this controller does not measure it" from "this tick had
+no reading". A recording made before this field existed has neither key on a fan
+entry; :func:`rail_known`/:func:`power_known` read a missing flag as ``False`` --
+unknown, never measured -- exactly like a missing ``power_reported`` already did.
 """
 
 from __future__ import annotations
@@ -81,6 +89,8 @@ __all__ = [
     "Recorder",
     "chain_on_tick",
     "iter_records",
+    "power_known",
+    "rail_known",
     "record_from_tick",
     "thermal_inputs",
 ]
@@ -112,15 +122,35 @@ def _mapping(value: object) -> dict[str, Any]:
 #: The numeric fields of one channel's fan readings that a record keeps
 #: (``PlantObservation.inputs["fans"]``, PROJECT.md section 8 item 79). The
 #: descriptive ones (device, output, aquabus) repeat the config every tick and
-#: are left out; ``power_reported`` stays, since without it a recorded 0 W cannot
-#: be told from a fault.
+#: are left out; ``power_reported``/``rail_reported`` stay, since without them a
+#: recorded 0 W or 0.00 V cannot be told from a field nobody measures (items 79,
+#: 117, 127).
 FAN_READING_FIELDS: tuple[str, ...] = ("duty", "rpm", "voltage_v", "current_ma", "power_w")
 
 
+def power_known(reading: Mapping[str, Any]) -> bool:
+    """Whether ``reading["power_w"]``/``["current_ma"]`` is this output's own
+    measurement, from a fan-reading mapping (live ``inputs["fans"][ch]`` or one
+    decoded from a record's ``fans`` key). A recording made before ``power_reported``
+    existed has no such key on the entry at all -- :meth:`Mapping.get` then returns
+    ``None``, and ``bool(None)`` is ``False``: unknown reads as *not measured*, never
+    as measured (PROJECT.md section 8 item 127)."""
+    return bool(reading.get("power_reported"))
+
+
+def rail_known(reading: Mapping[str, Any]) -> bool:
+    """The same question as :func:`power_known`, for ``reading["voltage_v"]``
+    (PROJECT.md section 8 items 117, 127): ``False`` -- unknown, not measured --
+    for a reading with no ``rail_reported`` key at all, which is every recording
+    made before this field existed."""
+    return bool(reading.get("rail_reported"))
+
+
 def _fan_readings(obs: Any) -> dict[str, dict[str, Any]]:
-    """``{channel: {duty, rpm, voltage_v, current_ma, power_w, power_reported}}`` from
-    the observation's ``inputs["fans"]``; ``{}`` for a source that reports none (the
-    simulator, a legacy recording), so the record shape only ever grows a key."""
+    """``{channel: {duty, rpm, voltage_v, current_ma, power_w, power_reported,
+    rail_reported}}`` from the observation's ``inputs["fans"]``; ``{}`` for a source
+    that reports none (the simulator, a legacy recording), so the record shape only
+    ever grows a key."""
     inputs = getattr(obs, "inputs", None)
     readings = _mapping(inputs).get("fans")
     out: dict[str, dict[str, Any]] = {}
@@ -131,7 +161,8 @@ def _fan_readings(obs: Any) -> dict[str, dict[str, Any]]:
             field: (float(reading[field]) if _finite(reading.get(field)) else None)
             for field in FAN_READING_FIELDS
         }
-        entry["power_reported"] = bool(reading.get("power_reported"))
+        entry["power_reported"] = power_known(reading)
+        entry["rail_reported"] = rail_known(reading)
         out[str(channel)] = entry
     return out
 

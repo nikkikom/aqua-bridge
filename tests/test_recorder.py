@@ -157,6 +157,7 @@ def test_record_from_tick_keeps_the_per_output_fan_readings(cfg: MpcConfig) -> N
         "current_ma": 27.0,
         "power_w": 0.32,
         "power_reported": True,
+        "rail_reported": True,
         "aquabus": True,
     }
     obs = PlantObservation(
@@ -177,9 +178,47 @@ def test_record_from_tick_keeps_the_per_output_fan_readings(cfg: MpcConfig) -> N
             "current_ma": 27.0,
             "power_w": 0.32,
             "power_reported": True,
+            "rail_reported": True,
         }
     }
     json.dumps(rec, allow_nan=False)  # a record must stay serialisable
+
+
+def test_record_from_tick_keeps_rail_reported_false_for_an_unmeasured_aquabus_rail(
+    cfg: MpcConfig,
+) -> None:
+    """Item 127: a rail this controller does not measure (an aquabus output reading
+    the aquaero's own rail) is kept as ``rail_reported: False`` next to whatever
+    ``voltage_v`` the adapter substituted, so a later reader does not mistake it for
+    a real 0.00 V measurement."""
+    reading = {
+        "duty": 0.2,
+        "rpm": 400.0,
+        "voltage_v": None,
+        "current_ma": None,
+        "power_w": None,
+        "power_reported": False,
+        "rail_reported": False,
+    }
+    obs = PlantObservation(
+        temps={}, rpm={"fa1": 400.0}, pwm={"fa1": 0.2}, ts=1.0, inputs={"fans": {"fa1": reading}}
+    )
+    cmd = MpcCommand(pwm=dict.fromkeys(cfg.channels, 0.2), mode=Mode.AUTO)
+    result = TickResult(index=1, obs=obs, mpc_cmd=cmd, cmd=cmd, state=MpcState.cold(), applied=True)
+    rec = record_from_tick(result, cfg)
+    assert rec["fans"]["fa1"]["voltage_v"] is None
+    assert rec["fans"]["fa1"]["rail_reported"] is False
+
+
+def test_a_fan_entry_with_no_rail_reported_key_reads_as_not_measured(cfg: MpcConfig) -> None:
+    """A recording made before item 127 has fan entries with no ``rail_reported`` key
+    at all; :func:`aqua_bridge.recorder.rail_known` (and, through it, every later
+    reader) must treat that as unknown, never as measured."""
+    from aqua_bridge.recorder import power_known, rail_known
+
+    old_entry = {"duty": 0.5, "rpm": 900.0, "voltage_v": 0.0}
+    assert rail_known(old_entry) is False
+    assert power_known(old_entry) is False
 
 
 @pytest.mark.parametrize(

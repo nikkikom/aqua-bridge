@@ -5901,7 +5901,9 @@ the basic-auth credentials once and sends them with every poll): it polls
 `/api/state` and `/api/health` every 2 s (no websockets until 2W) and shows
 Overview, Temps, Fans, Controllers, MPC and Host from those two — Controllers
 being `/api/state`'s `device_health`: per controller the status age with any
-stuck, absent, non-PWM or unconfigured outputs, the flow sensors and the
+stuck, absent, non-PWM or unconfigured outputs, the flow sensors, the aquabus
+line (§8 item 129: "a device answers" / "lost `<n>` s ago" / "empty" / "never
+connected" / "unknown", from `aquabus.state`) and the
 active profile when one is published, then per channel rpm against the fitted
 curve with rail voltage, current and power (a channel with a drift is marked
 DRIFT), then every problem line. In DAS mode (`"bays" in
@@ -5911,8 +5913,10 @@ occupancy and class, and where that bay's sensor-to-drive map comes from —
 `cal smart`, `cal manual` or `uncal`), Zones (trust, fault and which channels are
 held or ramped) and Model (thermal identification status, model store, noise
 index, experiment running, the calibrated bays by source and the handheld
-readings still pending, item 23); those three sections stay hidden on a legacy
-config.
+readings still pending, item 23; plus, per zone, its identification status with
+any `blocked` reasons and `pe_diag` values, and an "Unexcitable channels" line
+from the running or last experiment's `unexcitable`, §8 item 121); those three
+sections stay hidden on a legacy config.
 The FAULT banner shows when `solver` is `fallback` or `fault`, or when a
 poll fails; a **DEGRADED** banner names the zones from
 `cmd.diagnostics.zones_in_fault` when `solver` is `degraded`. Controls are
@@ -6160,6 +6164,16 @@ availability topic and one device block. Entities:
   fact for the same reason divergence is: it can sit true for days once a
   card starts filling, and latching the daemon-wide flag for that long
   would be indistinguishable from a missing aquabus device.
+- binary sensor `aquabus_problem` (`device_class: problem`, diagnostic,
+  §8 items 92, 114, 115, 129): on whenever some controller's
+  `device_health.devices[].aquabus.lost` is true — a device that had
+  answered has now been missing for that controller's `bus_absent_s`. A
+  bus that has never had anything on it (`aquabus.state: "never_seen"`,
+  the normal state of an aquaero with nothing on its aquabus) or one
+  reading empty for less than `bus_absent_s` never turns this on. Its
+  `json_attributes` are the `aquabus` block of every controller in
+  `device_health.devices` (`state`, `present`, `seen`, `absent_s`,
+  `lost`, `temps_missing`).
 - number `setpoint_<temp>` per setpoint (range `temp_min_c..temp_max_c`,
   step 0.5); a DAS config without setpoints publishes none
 - number `pwm_cmd_<channel>` per channel (range `pwm_min..pwm_max`, step
@@ -6177,11 +6191,26 @@ availability topic and one device block. Entities:
   zone's one-window prediction error, °C); binary sensor `ident_running`;
   number `limit_<class>` per drive class (range `temp_min_c` .. the
   configured limit, state from `limits.classes.<class>`)
+- DAS mode: sensor `unexcitable_channels` (§8 item 121, `excitation()`):
+  state is `extra.experiment.unexcitable` joined with `, `, or `none`
+  when every channel can clear the model's PE bound at `ident_amplitude`
+  from where it sits; `json_attributes` the full per-channel `excitation`
+  mapping (`rel_swing`, `pe_reach`, `pe_bound`, `excitable`,
+  `pe_reach_at_cap`, `excitable_at_cap`). A value, not a fault: no
+  `device_class`.
 - DAS mode, per zone: sensor `zone_status_<zone>` (`diagnostics.zones.
   <zone>.policy`: `solver` while trusted and fault-free, `hold` /
   `ramp_high` while its own fault holds or ramps its channels, `coupled`
   while it only carries a coupled zone's channels under fallback; `off`
-  before the first DAS tick) (item 22)
+  before the first DAS tick) (item 22); and sensor `model_block_<zone>`
+  (§8 items 110, 111, 121): state is `diagnostics["thermal"]["zones"]
+  [<zone>]["blocked"]` joined with `, `, or `none` once the zone has
+  nothing left to wait on (`windows:<block>`, `pe:<block>`,
+  `rel_se:<coefficient>`, `pred_err`, naming the gate and the group or
+  bay it names); `json_attributes` the whole per-zone thermal summary
+  (`pe_diag` included). Also a value: an unconverged zone is not a
+  fault, so this is a `sensor`, never a `binary_sensor` with
+  `device_class: problem`.
 
 HA sends a **setpoint** (legacy) or a **limit** (DAS), not raw PWM, while
 Auto. A raw PWM command in `auto` is rejected by the supervisor exactly
@@ -8577,13 +8606,21 @@ Owner decision (2026-09-16):
     under `above` the amplitude is cooling *added* and the solver takes it
     straight back, so there is nothing there to save. Under `symmetric` it is
     cooling *given up*, and that is the path the key is for.
-121. Put the new diagnostics in front of the owner. `pe_diag`, `blocked`
-    and `excitation` (items 110, 111) are published in
-    `diagnostics["thermal"]` and `snapshot().extra["experiment"]`, but
-    nothing on the HTML page (§5/§6 Model panel) or in MQTT shows them.
-    A zone that has sat in `learning` for a day still looks the same on
-    the page; one line naming the gate and the group or bay it waits on
-    would put items 110 and 111's answer where it is read.
+121. **Done** (2026-09-18): the page's Model panel gets one line per zone
+    (`<zone> model`: status, `-- blocked: <reasons>` when the zone is not
+    `converged`/`frozen`, `(pe <group>=<value>, …)` from `pe_diag`) and one
+    "Unexcitable channels" line from `experiment.unexcitable`
+    (`publishers/static/index.html`, `renderModel`). Home Assistant gets a
+    `sensor` per zone, `model_block_<zone>` (state: `blocked` joined, or
+    `none`; `json_attributes` the whole per-zone `diagnostics["thermal"]
+    ["zones"][<zone>]` block, `pe_diag` included), and one `sensor`
+    `unexcitable_channels` (state: `unexcitable` joined, or `none`;
+    attributes the per-channel `excitation` mapping) — values, not a
+    `device_class: problem` binary sensor: a zone still `learning` is not a
+    fault, only a reading about the model (`publishers/mqtt_ha.py`,
+    `_sensor_with_attributes`). Nothing here reaches `PlantObservation` or
+    the solver's `diagnostics`; both keys were already published, this
+    only puts them where a person looks.
 122. The nightly cost and the third seed. `test_ident_converge_sim.py` is
     now **18 cases at 16:47 measured alone on a quiet 32-core host** (it was
     9 at ~12.5 min): the 36 h item-111 case is ~60 s per
@@ -8766,22 +8803,29 @@ Owner decision (2026-09-16):
     the machine quiesced, take the median of more repeats, or report the
     ratio and fail only on a trend, so that a red CI run means a
     regression rather than a busy runner.
-127. `tools/fit_fans.py` and the recorder do not keep `rail_reported`
-    (item 117's audit). The recorder whitelists `duty, rpm, voltage_v,
-    current_ma, power_w` plus `power_reported`. A recorded
-    `voltage_v: null` is unambiguous today (the adapter publishes `None`,
-    never 0.0), but nothing in the record says *why* it is null, so a
-    later reader cannot tell "this controller does not measure it" from
-    "this tick had no reading". One boolean, the same argument that
-    already keeps `power_reported`.
-129. Publish the bus state where a person sees it (items 92, 114, 115).
-    `device_health.aquabus` reaches `/api/state` and the MQTT blob
-    already; the HTML page and the Home Assistant entities do not show
-    it. One line on the page ("aquabus: a device answers / lost N s
-    ago") and a Home Assistant binary sensor would make item 92's signal
-    visible without reading the journal. Key both on `state`, not on
-    `lost` alone: `state` tells `never_seen` (a healthy aquaero with an
-    empty bus) from `lost`.
+127. **Done** (2026-09-18): the recorder keeps `rail_reported` next to
+    `power_reported` on every `fans.<channel>` entry (`recorder.py`,
+    `_fan_readings`), and `rail_known`/`power_known` read a fan entry's
+    flag as `False` — unknown, not measured — whether the flag is
+    explicitly `false` or the key is missing entirely (a recording made
+    before this item). `tools/fit_fans.py` carries the same distinction
+    into its output: each model's `channels_with_rail_reported` names a
+    channel only where some record's `fans.<ch>.rail_reported` was `true`,
+    read through `rail_known`, so a reader of the written-out
+    `fan_curves.json` can tell which channels' `voltage_v` in the source
+    recordings meant something; it plays no part in the curve fit itself
+    (only `pwm`/`rpm` do).
+129. **Done** (2026-09-18): the page's Controllers section gets one line
+    per controller, `<label> aquabus`, from `device_health.devices[].
+    aquabus.state` ("a device answers" / "lost `<absent_s>` s ago" /
+    "empty" / "never connected" / "unknown"; `publishers/static/
+    index.html`, `renderDevices`). Home Assistant gets `aquabus_problem`
+    (`device_class: problem`, diagnostic, both modes), keyed on `state`
+    through `lost` — a bus with `state: "never_seen"` (a healthy aquaero
+    with an empty bus) or `"empty"` never turns it on, only a device that
+    answered and then has been missing for `bus_absent_s` does; its
+    attributes are the `aquabus` block of every controller in
+    `device_health.devices` (`publishers/mqtt_ha.py`).
 133. `tools/bench_model_store.py`'s warm-up loop never gets `calibration`
     or `fan_curves` populated against the shipped
     `config.example-das.yaml` (`fan_curve_online: false`, and the DAS

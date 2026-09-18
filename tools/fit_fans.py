@@ -30,6 +30,14 @@ The daemon can fit the same curve **online** (``mpc.fan_curve_online``,
 :mod:`aqua_bridge.control.fancurve`), over the same grid, and then reads it from the
 model store instead of ``fan_models``. This tool stays the way to fit from a recording
 and to see the residual before trusting a curve.
+
+Each model's output also carries ``channels_with_rail_reported`` (PROJECT.md section 8
+item 127): the channels of that model for which some record's ``fans.<ch>.rail_reported``
+was true, i.e. the rail was this output's own measurement at least once, read with
+:func:`aqua_bridge.recorder.rail_known` so a recording made before that flag existed (no
+key at all) counts as not measured rather than as measured. It plays no part in the curve
+fit itself (only ``pwm``/``rpm`` do); it is here so a reader of the written-out JSON can
+tell which channels' ``voltage_v`` in the source recordings meant something.
 """
 
 from __future__ import annotations
@@ -46,7 +54,7 @@ from aqua_bridge.config import AppConfig, ConfigError, load_config
 from aqua_bridge.control import fancurve
 from aqua_bridge.control.thermal import phi
 from aqua_bridge.model import MpcConfig
-from aqua_bridge.recorder import iter_records
+from aqua_bridge.recorder import iter_records, rail_known
 
 __all__ = ["build_parser", "fit_fan_curves", "fit_one_model", "main"]
 
@@ -129,6 +137,20 @@ def fit_fan_curves(cfg: MpcConfig, records: list[dict[str, Any]]) -> dict[str, A
         fitted["channels"] = sorted(channels)
         fitted["channels_with_tach"] = sorted(
             {ch for ch in channels for rec in records if _finite((rec.get("rpm") or {}).get(ch))}
+        )
+        # A channel whose rail this recording ever actually measured (item 127): an
+        # aquabus output's 0.00 V is the aquaero's own rail, not a reading, so a
+        # channel with no entry here is not "the rail was always 0 V" -- it is "no
+        # record here ever measured it", exactly like a channel absent from
+        # channels_with_tach. rail_known reads a fan entry with no rail_reported key
+        # at all (a recording made before item 127) as not measured, never as measured.
+        fitted["channels_with_rail_reported"] = sorted(
+            {
+                ch
+                for ch in channels
+                for rec in records
+                if rail_known((rec.get("fans") or {}).get(ch) or {})
+            }
         )
         out[model] = fitted
     return out

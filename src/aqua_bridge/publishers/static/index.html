@@ -129,7 +129,7 @@ function renderModel(model, diag) {
   const store = (model || {}).store || {};
   const experiment = (model || {}).experiment || {};
   const noise = (diag || {}).noise || {};
-  table("model", [
+  const rows = [
     row("Thermal model", fmt(thermal.status)),
     row("Prediction error", fmt(thermal.pred_err_c) + " C"),
     row("Model store", fmt(store.source)),
@@ -137,7 +137,27 @@ function renderModel(model, diag) {
     row("Experiment running", fmt(experiment.running)),
     row("Calibrated bays", calibratedBays(model)),
     row("Manual readings", offeredCalibrations(model)),
-  ]);
+  ];
+  // Item 121: why a zone still stuck in "learning" hasn't converged, in the words
+  // of the rule itself (§8 items 110, 111) -- the gate
+  // ("windows"/"pe"/"rel_se"/"pred_err") and the group or bay it names, plus the
+  // measured pe_diag beside it. Nothing here changes control; a zone with no
+  // blocked entries just says so.
+  const zones = thermal.zones || {};
+  for (const zone of Object.keys(zones).sort()) {
+    const zi = zones[zone];
+    const blocked = zi.blocked || [];
+    const peDiag = zi.pe_diag || {};
+    const peParts = Object.keys(peDiag).sort().map(g => g + "=" + fmt(peDiag[g], 3));
+    rows.push(row(zone + " model", fmt(zi.status)
+      + (blocked.length ? " -- blocked: " + blocked.join(", ") : "")
+      + (peParts.length ? " (pe " + peParts.join(", ") + ")" : "")));
+  }
+  // Item 121: which channels the running (or last) experiment could not excite past
+  // the model's PE bound at the configured amplitude (control/ident's excitation).
+  const unexcitable = experiment.unexcitable || [];
+  rows.push(row("Unexcitable channels", unexcitable.length ? unexcitable.join(", ") : "none"));
+  table("model", rows);
 }
 
 // Controllers: /api/state's "device_health" -- per controller what the adapter
@@ -166,6 +186,17 @@ function renderDevices(health) {
     const age = d.status_age_s === null || d.status_age_s === undefined
       ? "no status report" : "status " + fmt(d.status_age_s, 1) + " s ago";
     rows.push(row(d.label || d.device, age + (flags.length ? " | " + flags.join(" | ") : " | ok")));
+    // Item 129: the aquabus itself, keyed on "state" (not on "lost" alone) so a
+    // healthy aquaero with nothing on its bus ("never_seen") reads apart from a
+    // device that answered and then stopped ("lost").
+    const bus = d.aquabus || {};
+    const busText = {
+      present: "a device answers",
+      lost: "lost " + fmt(bus.absent_s, 0) + " s ago",
+      empty: "empty",
+      never_seen: "never connected",
+    }[bus.state] || "unknown";
+    rows.push(row((d.label || d.device) + " aquabus", busText));
   }
   const fans = h.fans || {};
   for (const ch of Object.keys(fans).sort()) {
