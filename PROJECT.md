@@ -7495,6 +7495,14 @@ Owner decision (2026-09-16):
     should measure with the machine quiesced, take the median of more
     repeats, or report the ratio and fail only on a trend, so that a red
     CI run means a regression rather than a busy runner.
+127. `tools/fit_fans.py` and the recorder do not keep `rail_reported`
+    (item 117's audit). The recorder whitelists `duty, rpm, voltage_v,
+    current_ma, power_w` plus `power_reported`. A recorded
+    `voltage_v: null` is unambiguous today (the adapter publishes `None`,
+    never 0.0), but nothing in the record says *why* it is null, so a
+    later reader cannot tell "this controller does not measure it" from
+    "this tick had no reading". One boolean, the same argument that
+    already keeps `power_reported`.
 
 ### 8.3 Open — needs the DAS hardware
 
@@ -7797,6 +7805,12 @@ Owner decision (2026-09-16):
     if the sensor can be bound or read cheaply every tick, make that read-back
     drive `heartbeat_ok` so a queued-but-lost heartbeat is visible instead of
     showing a healthy watchdog while the controller runs down its timeout.
+    Item 113's `software_sensor_settings()` decode makes this cheaper than
+    it was: the control report now gives the slot's timeout and fallback
+    directly, so the read-back can say not only "the value came through"
+    but "the value is fresher than the timeout and is not the fallback" —
+    folded in here rather than carried as its own item (proposed by item
+    113's PR).
     Then set `heartbeat_sensor: 1` on the owner's deployment and decide
     whether it goes into `config.example-das.yaml` as well, against the
     convention that both example files show every timing key at its default
@@ -8003,6 +8017,24 @@ Owner decision (2026-09-16):
     document that `pip install -e .[http,mqtt]` is required before running
     the full suite documented in this file, so a clean checkout does not
     surprise the next person running it.
+128. A sagging aquabus rail from the readings below the window (item
+    117's audit). Item 117 accepts that a rail behind a bus device is
+    undetected, on the grounds that no per-report marker says which
+    reading an aquabus block carries. One asymmetry survives that
+    argument: the aquaero's substitute is *its own rail*, which is
+    itself judged on blocks 1-4, so a reading strictly between 0 V and
+    `fan_health.rail_min_v` cannot be the substitute and must be the bus
+    device's own measurement. A rule could fire on "this block read
+    below the window at least N times in the last W seconds, while the
+    aquaero's own rail stayed inside it", keeping a sustained-evidence
+    shape at about a quarter of the sample rate. Not shipped because
+    nothing read-only shows what a *sagging* bus rail actually puts in
+    that field — the captures only ever show a healthy one — so the
+    rule would be coverage claimed from reasoning. To settle it the
+    owner would have to run a Quadro output on a deliberately sagging
+    supply, or accept the rule on the reasoning. If taken, `N` and `W`
+    are two new `fan_health:` keys with defaults derived from the
+    measured refresh rate (23 measuring reports in 90).
 
 ### 8.4 Open — Zero 2 W upgrade
 
