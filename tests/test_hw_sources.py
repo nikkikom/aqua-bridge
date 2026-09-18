@@ -774,18 +774,23 @@ def test_read_merges_the_fan_readings_of_every_controller() -> None:
     # is None rather than a 0.0 the power rule could read as a dead fan (item 89)
     assert radiator["current_ma"] is None and radiator["power_w"] is None
     assert radiator["power_reported"] is False
-    exhaust = obs.inputs["fans"]["exhaust"]  # a Quadro's own output does measure
-    assert exhaust["power_reported"] is True and exhaust["current_ma"] is not None
+    # A Quadro's own output *does* measure a current -- and samples it inside the PWM
+    # cycle, so no single report may be judged on it either (2026-09-18): the rail it
+    # reports, the current and power it does not.
+    exhaust = obs.inputs["fans"]["exhaust"]
+    assert exhaust["rail_reported"] is True and exhaust["voltage_v"] is not None
+    assert exhaust["power_reported"] is False and exhaust["current_ma"] is None
+    assert "sampled inside the PWM cycle" in exhaust["not_measured"]["power"]
     # and none of it reached the observation the gate and the solver read
     assert set(obs.temps) == {"air_z0", "air_z1"} and set(obs.rpm) == {"radiator"}
 
 
 def test_an_aquabus_outputs_electrical_fields_are_published_as_unknown() -> None:
-    """The aquaero fills its aquabus blocks with the bus device's measurements in about
-    one report in four and with substitutes -- its own rail voltage, 0 mA, 0 W -- in the
-    rest (PROJECT.md section 2, 2026-09-17), so a single report's figure is not a
+    """An aquabus block's electrical group is one sample taken inside the output's PWM
+    cycle: at a low duty most reports read 0 mA and the aquaero's own rail with the fan
+    turning (PROJECT.md section 2, 2026-09-18), so a single report's figure is not a
     measurement: rpm and duty are published, voltage, current and power are None, and
-    ``power_reported`` / ``rail_reported`` say why (item 89)."""
+    ``power_reported`` / ``rail_reported`` say why (items 89, 115)."""
     clock = FakeClock()
     device = aquabus_aquaero(clock)
     adapter = AquacomputerAdapter(
@@ -936,7 +941,7 @@ def test_a_reading_names_the_health_rules_it_cannot_feed() -> None:
     bus, own = readings["qd3"]["not_measured"], readings["radiator"]["not_measured"]
     assert sorted(bus) == ["power", "rail"] and sorted(own) == ["power"]
     assert "aquabus" in bus["rail"] and "NOT detected" in bus["rail"]
-    assert "one report in four" in bus["power"]
+    assert "sample, taken inside the PWM cycle" in bus["power"]
     assert "PWM mode" in own["power"]
     # Constant text: built once per output and handed out unchanged, not reformatted
     # for every output on every tick and shipped twice over MQTT.

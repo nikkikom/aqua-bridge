@@ -23,10 +23,11 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from aqua_bridge.hw import aquacomputer
 from aqua_bridge.hw.aquacomputer import (
-    AQUABUS_REFRESH_REPORTS,
-    AQUABUS_REFRESH_S,
     AQUAERO,
+    AQUAERO_CTRL_BLOCKS,
+    CONTROL_BLOCK_UNDECODED,
     DUTY_MAX,
     FAN_ABSENT_RPM,
     KINDS,
@@ -48,6 +49,7 @@ from aqua_bridge.hw.aquacomputer import (
     crc16_usb,
     decode_status,
     finalize_control_report,
+    format_undecoded_words,
     is_status_report,
     kind_by_name,
     output_mode,
@@ -213,12 +215,18 @@ def test_aquaero_with_the_quadro_on_aquabus(name: str, duty: int, rpm: int, bus2
 def test_the_aquabus_blocks_electrical_fields_are_not_a_per_report_reading() -> None:
     """Two status reports one second apart, the Quadro on aquabus, every output on
     preset 1 at 20.00 %, a fan on the Quadro's output 3 (aquaero block 7) turning at
-    255 rpm in both. One report carries the bus device's own measurements -- block 7 at
-    6 mA / 0.07 W, the three outputs with no fan at 0.00 V -- and the next carries
-    substitutes: the rail voltage on all four and 0 mA / 0 W on the turning fan. So a
-    single report says nothing about an aquabus output's draw *or its rail*, and both
-    ``reports_power`` and ``reports_rail`` are False for the aquaero's aquabus outputs
-    (``reports_power`` for its own four as well; their rail it does measure).
+    255 rpm in both. In one the block's electrical group carries a sample taken in the
+    on phase of the 20 % duty -- block 7 at 6 mA / 0.07 W, the three outputs with no fan
+    at 0.00 V -- and the next carries what a sample in the off phase reads: the rail
+    voltage on all four and 0 mA / 0 W on the turning fan. So a single report says
+    nothing about an aquabus output's draw *or its rail*, and both ``reports_power`` and
+    ``reports_rail`` are False for the aquaero's aquabus outputs.
+
+    ``reports_power`` is False for every output of both kinds (2026-09-18): the aquaero
+    measures no current on its own four, and the Quadro -- the device behind these very
+    numbers -- measures one it samples inside the PWM cycle, so the share of reports
+    carrying a non-zero current follows the duty (4 of 14 at 25 %, 16 of 16 at 60 %) and
+    no single report may be judged. The aquaero's own four do report their own rail.
     """
     with_power = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-power.bin"))
     without = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-no-power.bin"))
@@ -235,7 +243,12 @@ def test_the_aquabus_blocks_electrical_fields_are_not_a_per_report_reading() -> 
     assert [without.fans[k].voltage_cv for k in (4, 5, 7)] == [1209, 1209, 1209]
     assert [AQUAERO.reports_power(n) for n in range(1, 9)] == [False] * 8
     assert not AQUAERO.own_outputs_report_power and not AQUAERO.aquabus_outputs_report_power
-    assert all(QUADRO.reports_power(n) for n in range(1, 5))
+    assert [QUADRO.reports_power(n) for n in range(1, 5)] == [False] * 4
+    # Two different facts behind the one refusal, and the reason says which.
+    assert "0 mA and 0 W for its own outputs" in AQUAERO.no_power_reason(1)
+    assert "sampled inside the PWM cycle" in QUADRO.no_power_reason(1)
+    assert "the bus device's own sample" in AQUAERO.no_power_reason(7)
+    assert not AQUAERO.own_outputs_measures_current and QUADRO.own_outputs_measures_current
     # The rail goes the same way: block 7's 1210 is the Quadro's and 1209 the aquaero's
     # own, one second apart, at one unchanged duty -- so no aquabus block's voltage is
     # that output's rail, while the aquaero's own blocks 1-4 report theirs.
@@ -248,16 +261,17 @@ def test_the_aquabus_blocks_electrical_fields_are_not_a_per_report_reading() -> 
 def test_the_unidentified_u16_of_a_fan_block_is_read_but_named_nothing() -> None:
     """Item 114. The ``u16`` at ``+0x0A`` is decoded raw and carries no unit: it is not
     the current (26 against that block's 6 mA) and not the power (7 cW), and it is 0 on
-    every one of the aquaero's own blocks and 0 on an aquabus block in a report that
-    refreshed nothing.
+    every one of the aquaero's own blocks and 0 on an aquabus block whose sample fell in
+    the off phase.
 
-    The suspicion -- a current over the output's on-time, of which the current field is
-    the duty average -- is pinned here as the arithmetic it really is, so nobody reads
-    more into it than the captures hold. One capture is informative: at duty 20 %,
-    ``raw x duty`` is 5.2 against a measured 6 mA, 0.8 mA (13 %) low. The other is at
-    duty 100 %, where ``raw x duty`` is the raw value itself and therefore says nothing
-    about duty at all. The bound below is that observed miss, not an instrument
-    tolerance."""
+    The suspicion that used to be recorded here -- a current over the output's on-time,
+    of which the current field is the duty average -- is **withdrawn** (2026-09-18): the
+    current field is not an average over the report at all but one sample taken inside
+    the PWM cycle, so the two numbers are two coordinates of one instant and no duty
+    relation can be fitted to them. What is pinned instead is the pair that no scaling of
+    the current survives: at one duty this field read 26 with 6 mA, and at full duty 27
+    with 27 mA.
+    """
     with_power = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-power.bin"))
     without = decode_status(AQUAERO, _bin("aquaero-status-aquabus-block7-no-power.bin"))
     full = decode_status(AQUAERO, _bin("aquaero-status-aquabus-fan7-100.bin"))
@@ -266,14 +280,12 @@ def test_the_unidentified_u16_of_a_fan_block_is_read_but_named_nothing() -> None
     assert (seven.duty, seven.current_ma, seven.power_cw) == (2000, 6, 7)
     assert full.fans[6].unidentified_raw == 27
     assert (full.fans[6].duty, full.fans[6].current_ma) == (10000, 27)
-    scaled = seven.unidentified_raw * seven.duty / DUTY_MAX
-    assert scaled == pytest.approx(5.2)
-    assert seven.current_ma - scaled == pytest.approx(0.8)  # the miss, in the one direction
-    hundred = full.fans[6]
-    assert hundred.unidentified_raw is not None and hundred.duty == DUTY_MAX
-    # Vacuous by construction: at full duty the product IS the raw value.
-    assert hundred.unidentified_raw * hundred.duty / DUTY_MAX == hundred.unidentified_raw
-    # 0 on the aquaero's own blocks, and on an aquabus block that refreshed nothing.
+    # Two duties, two ratios to the current field: 4.33 at 20 % and 1.00 at 100 %.
+    # No constant scaling of the current explains both, and the 2026-09-18 run adds a
+    # report that read 2 mA with this field at 0.
+    assert seven.unidentified_raw / seven.current_ma == pytest.approx(4.33, abs=0.01)
+    assert full.fans[6].unidentified_raw == full.fans[6].current_ma
+    # 0 on the aquaero's own blocks, and on an aquabus block whose sample missed.
     assert [with_power.fans[k].unidentified_raw for k in range(4)] == [0] * 4
     assert [without.fans[k].unidentified_raw for k in range(4, 8)] == [0] * 4
     # The Quadro's own blocks have no such field at all.
@@ -284,18 +296,127 @@ def test_the_unidentified_u16_of_a_fan_block_is_read_but_named_nothing() -> None
     assert QUADRO.fan_layout.unidentified is None and AQUAERO.fan_layout.unidentified == 0x0A
 
 
-def test_the_measured_aquabus_refresh_window_is_carried_on_the_kind() -> None:
-    """Item 115: the interval the captures measured (one report in about four, 3.85 s
-    over 90 reports) is on the kind, where a caller can act on it, and the Quadro --
-    which has no aquabus outputs -- carries none."""
-    assert (AQUAERO.aquabus_refresh_reports, AQUAERO.aquabus_refresh_s) == (
-        AQUABUS_REFRESH_REPORTS,
-        AQUABUS_REFRESH_S,
-    )
-    assert (AQUABUS_REFRESH_REPORTS, AQUABUS_REFRESH_S) == (4, 4.0)
-    assert QUADRO.aquabus_refresh_reports is None and QUADRO.aquabus_refresh_s is None
+def test_no_kind_carries_an_aquabus_refresh_interval_any_more() -> None:
+    """Item 115, corrected 2026-09-18. The kind used to carry a mean "aquabus refresh
+    interval" of 4 reports / 4.0 s, measured by counting the reports whose aquabus block
+    held a non-zero current. That count is now known to follow the output's duty -- 4 of
+    14 at 25 %, 16 of 16 at 60 % -- which no fixed poll can produce, so the number was
+    withdrawn rather than re-rounded, together with the two module constants and the
+    ``device_health`` key that published it. Nothing was bounded by it: presence is read
+    from the speed field, which every report carries."""
+    assert not hasattr(AQUAERO, "aquabus_refresh_reports")
+    assert not hasattr(AQUAERO, "aquabus_refresh_s")
+    assert not hasattr(aquacomputer, "AQUABUS_REFRESH_REPORTS")
+    assert not hasattr(aquacomputer, "AQUABUS_REFRESH_S")
     assert AQUAERO.aquabus_temp_names == tuple(f"bus{i}" for i in range(1, 9))
     assert QUADRO.aquabus_temp_names == ()
+
+
+# --- the controller block, and the start boost that is not in it yet -------------------
+
+
+def _ctrl_block(data: bytes, k: int) -> bytes:
+    """Controller block ``k`` (0-based) of an aquaero control report, raw.
+
+    The offsets are spelled out here rather than taken from the module, because what
+    these tests pin is that the module's layout matches the captures.
+    """
+    base = 0x20C + 20 * k
+    return data[base : base + 20]
+
+
+def test_the_aquaero_has_twelve_controller_blocks_and_the_spare_four_are_the_default() -> None:
+    """The block array runs to ``k`` = 11 (4 own outputs + 8 aquabus), ending at
+    ``0x2FB``. Blocks 9-12 of both captures are byte-identical to each other and to the
+    block 8 that the 2026-09-15 capture caught while it was unconfigured -- source
+    ``0xFFFF``, minimum power 35.00 %, maximum 100.00 % -- which is what makes them
+    readable as the firmware's default for an output nothing is assigned to, and the
+    reference a later capture's changed block is diffed against.
+
+    This project drives the first eight (its own four and one Quadro's four); the last
+    four are recorded, not used."""
+    firmware = _bin("aquaero-ctrl-firmware.bin")
+    owner = _bin("aquaero-ctrl-aquabus-all-on-preset1.bin")
+    assert AQUAERO_CTRL_BLOCKS == 12
+    assert 0x20C + 20 * AQUAERO_CTRL_BLOCKS == 0x2FC <= AQUAERO.ctrl_size
+    assert AQUAERO.pwm_count == 8  # what the daemon commands, not what the report holds
+    default = _ctrl_block(firmware, 8)
+    for report in (firmware, owner):
+        assert [_ctrl_block(report, k) for k in range(8, 12)] == [default] * 4
+    # Block 8 was unconfigured when the firmware capture was taken: the same bytes.
+    assert _ctrl_block(firmware, 7) == default
+    assert int.from_bytes(default[0x04:0x06], "big") == 3500  # minimum power 35.00 %
+    assert int.from_bytes(default[0x06:0x08], "big") == DUTY_MAX
+    assert int.from_bytes(default[0x10:0x12], "big") == SOURCE_UNCONFIGURED
+
+
+def test_the_undecoded_words_of_a_controller_block_are_read_and_named_nothing() -> None:
+    """The six ``u16`` of a controller block nobody here has identified are decoded raw
+    into ``ChannelState.undecoded`` so a probe can print them and a later capture can be
+    diffed against this one. The aquaero's per-output **start boost** is one of them and
+    a read-only capture cannot say which: in the owner's report all eight outputs carry
+    the same value in each of the six.
+
+    What the captures do show, and what is pinned here so a later one can be compared
+    against it: ``+0x08`` is a per-output centi-percent field that read 50.00 % on the
+    seven outputs the owner had configured and 100.00 % on the unconfigured eighth, and
+    reads 100.00 % everywhere since; ``+0x0A`` and ``+0x0C`` both read 2 in every block
+    of every capture, so a boost duration in seconds and a tachometer's pulses per
+    revolution could not be told apart even if both were there."""
+    firmware = _bin("aquaero-ctrl-firmware.bin")
+    owner = _bin("aquaero-ctrl-aquabus-all-on-preset1.bin")
+    assert CONTROL_BLOCK_UNDECODED == (0x00, 0x02, 0x08, 0x0A, 0x0C, 0x12)
+    states = [channel_state(AQUAERO, owner, k) for k in range(AQUAERO.pwm_count)]
+    for k, state in enumerate(states):
+        assert [offset for offset, _ in state.undecoded] == list(CONTROL_BLOCK_UNDECODED)
+        block = _ctrl_block(owner, k)
+        assert [value for _, value in state.undecoded] == [
+            int.from_bytes(block[offset : offset + 2], "big") for offset in CONTROL_BLOCK_UNDECODED
+        ]
+    # Nothing separates the eight outputs in any of the six: no start boost to read.
+    assert len({tuple(value for _, value in state.undecoded) for state in states}) == 2
+    assert {dict(state.undecoded)[0x08] for state in states} == {DUTY_MAX}
+    assert {dict(state.undecoded)[0x0A] for state in states} == {2}
+    assert {dict(state.undecoded)[0x0C] for state in states} == {2}
+    # The one difference between the outputs is +0x00, and only on output 1.
+    assert [dict(state.undecoded)[0x00] for state in states] == [100] + [450] * 7
+    # +0x08 was 50.00 % on the seven configured outputs of the earlier capture.
+    before = [channel_state(AQUAERO, firmware, k) for k in range(AQUAERO.pwm_count)]
+    assert [dict(state.undecoded)[0x08] for state in before] == [5000] * 7 + [DUTY_MAX]
+    # The Quadro's channels have no such block at all.
+    assert all(
+        state.undecoded == ()
+        for state in (
+            channel_state(QUADRO, _bin("quadro-ctrl-firmware.bin"), k)
+            for k in range(QUADRO.pwm_count)
+        )
+    )
+
+
+def test_a_duty_write_touches_none_of_the_undecoded_words() -> None:
+    """Whatever those six words are -- the start boost among them -- the daemon never
+    moves one: a duty write touches the preset, the control source and the two power
+    limits, and nothing else in the block. Pinned so that decoding one later cannot
+    quietly turn into writing it."""
+    data = bytearray(_bin("aquaero-ctrl-aquabus-all-on-preset1.bin"))
+    patch_duties(AQUAERO, data, {k: 7000 for k in range(AQUAERO.pwm_count)})
+    finalize_control_report(AQUAERO, data)
+    for k in range(AQUAERO.pwm_count):
+        before = channel_state(AQUAERO, _bin("aquaero-ctrl-aquabus-all-on-preset1.bin"), k)
+        assert channel_state(AQUAERO, data, k).undecoded == before.undecoded
+        touched = set(AQUAERO.ctrl_channels[k].offsets())
+        assert touched.isdisjoint(offset for _, offset in AQUAERO.ctrl_channels[k].undecoded)
+
+
+def test_the_undecoded_words_are_printed_for_a_tool_and_nothing_else() -> None:
+    """They reach a human through the probe's listing and no further: the line names
+    them by their offset in the block, with no unit and no name."""
+    owner = _bin("aquaero-ctrl-aquabus-all-on-preset1.bin")
+    line = format_undecoded_words(channel_state(AQUAERO, owner, 0))
+    assert line == "not decoded: +0x00 100  +0x02 2000  +0x08 10000  +0x0A 2  +0x0C 2  +0x12 1000"
+    assert "boost" not in line
+    quadro = channel_state(QUADRO, _bin("quadro-ctrl-firmware.bin"), 0)
+    assert format_undecoded_words(quadro) == ""
 
 
 def test_aquabus_presence_is_judged_from_the_speed_field_alone() -> None:

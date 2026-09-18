@@ -15,7 +15,6 @@ import subprocess
 import pytest
 
 from aqua_bridge.hw.aquacomputer import (
-    AQUABUS_REFRESH_REPORTS,
     AQUAERO,
     DUTY_MAX,
     QUADRO,
@@ -1606,7 +1605,7 @@ def test_a_bus_device_that_leaves_makes_its_temperature_slots_missing_not_frozen
         health = adapter.device_health()
         assert health["aquabus"]["lost"] is True and health["aquabus"]["state"] == "lost"
         assert health["aquabus"]["absent_s"] >= AQUAERO_T.bus_absent_s
-        assert health["aquabus"]["refresh_reports"] == AQUABUS_REFRESH_REPORTS
+        assert "refresh_reports" not in health["aquabus"]  # withdrawn, item 115
         (problem,) = [p for p in health["problems"] if "item 92" in p]
         assert problem == (
             "aquaero: the device on its aquabus stopped answering; the temperatures it fed "
@@ -1630,17 +1629,18 @@ def test_a_bus_device_that_leaves_makes_its_temperature_slots_missing_not_frozen
     ]
 
 
-def test_the_aquabus_refresh_gap_is_never_read_as_a_missing_bus_device() -> None:
-    """The line between item 92 and item 115. The aquaero fills its aquabus blocks with
-    the bus device's measurements about once in four reports and with substitutes in the
-    rest; the two captured reports are one such pair. Over four times ``bus_absent_s`` of
-    them nothing is ever judged absent, because presence is read from the speed field,
-    which every report carries -- not from a voltage or a current (item 116)."""
+def test_a_report_whose_electrical_sample_missed_is_never_read_as_a_missing_device() -> None:
+    """The line between item 92 and item 115. An aquabus block's electrical fields hold
+    one sample taken inside the output's PWM cycle, so at the captures' 20 % duty three
+    reports in four read 0 mA and the aquaero's own rail with the fan turning; the two
+    captured reports are one such pair. Over four times ``bus_absent_s`` of them nothing
+    is ever judged absent, because presence is read from the speed field, which every
+    report carries -- not from a voltage or a current (item 116)."""
     adapter, device, clock = _aquabus_all_configured(_bus_binding())
     measuring = fixture_bytes("aquaero-status-aquabus-block7-power.bin")
     substituted = fixture_bytes("aquaero-status-aquabus-block7-no-power.bin")
     for i in range(4 * int(AQUAERO_T.bus_absent_s)):
-        device.status_template = measuring if i % AQUABUS_REFRESH_REPORTS == 0 else substituted
+        device.status_template = measuring if i % 4 == 0 else substituted
         clock.advance(1.0)
         device.emit()
         obs = adapter.read()
@@ -1653,7 +1653,6 @@ def test_the_aquabus_refresh_gap_is_never_read_as_a_missing_bus_device() -> None
         "absent_s": None,
         "lost": False,
         "temps_missing": [],
-        "refresh_reports": AQUABUS_REFRESH_REPORTS,
     }
     assert adapter.device_health()["problems"] == []
 
@@ -1768,7 +1767,6 @@ def test_the_quadro_itself_never_judges_an_aquabus() -> None:
         "absent_s": None,
         "lost": False,
         "temps_missing": [],
-        "refresh_reports": None,
     }
     assert adapter.device_health()["problems"] == []
 

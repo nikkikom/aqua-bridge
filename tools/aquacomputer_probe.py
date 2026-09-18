@@ -13,19 +13,24 @@ aquabus temperature slots ``busN``, software sensors ``softN``, the aquaero's
 virtual sensors ``virtN``), each output's rpm, output duty, voltage, current
 and power (the aquaero's outputs 5-8 belong to a device on its aquabus, and
 read "no device" without one; the raw figures of a field the kind does not
-measure for that output are shown but marked as not measured, since the
-aquaero's are placeholders -- current and power on its own outputs, and on its
-aquabus outputs the voltage as well, which is the aquaero's own rail in three
-reports out of four), flow ``flowN``, and the Quadro's power-cycle
+measure for that output are shown but marked as not measured -- the aquaero
+measures no current on its own outputs at all, a bus device's current and
+voltage are sampled inside the PWM cycle and read 0 mA and the aquaero's own
+rail in most reports at a low duty), flow ``flowN``, and the Quadro's power-cycle
 count -- then the profile the aquaero runs (control report byte 0x06), each
 software sensor's settings (enabled, fallback temperature, timeout: what makes a
 ``softN`` reading readable at all, since an unfed slot shows its fallback and
 nothing in the status report says so) and each
 output's duty in the control report, with the aquaero's
 control source and power limits (the daemon's duty is in effect only while the
-channel follows its own preset with limits 0 / 100 %) and output mode (PWM or
+channel follows its own preset with limits 0 / 100 %), output mode (PWM or
 DC voltage; not interpreted on the aquabus outputs; a block with no control
-source says so, and the daemon leaves that channel out of its writes). Use it to
+source says so, and the daemon leaves that channel out of its writes) and the
+six ``u16`` of that output's controller block nobody here has identified, raw.
+The firmware's per-output start boost is one of the things that could be in
+there and is decoded by nothing; the way to find out is to set the boost
+differently on two outputs and diff those lines
+(PROJECT.md section 2, "The controller's own start boost"). Use it to
 pick the input names for the config and a ``serial:`` when several of one kind
 are attached.
 
@@ -57,6 +62,7 @@ from aqua_bridge.hw.aquacomputer import (
     decode_status,
     format_channel_state,
     format_percent,
+    format_undecoded_words,
     is_status_report,
     software_sensor_settings,
 )
@@ -148,7 +154,11 @@ def _print_control(kind: DeviceKind, data: bytes, out: TextIO) -> None:
         print(f"  active profile: {profile}", file=out)
     print("  outputs (control report):", file=out)
     for k in range(kind.pwm_count):
-        print(f"    {format_channel_state(channel_state(kind, data, k), k)}", file=out)
+        state = channel_state(kind, data, k)
+        print(f"    {format_channel_state(state, k)}", file=out)
+        words = format_undecoded_words(state)
+        if words:
+            print(f"      {words}", file=out)
     _print_soft_sensors(kind, data, out)
 
 

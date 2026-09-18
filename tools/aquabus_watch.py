@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Read-only watch of an aquaero's aquabus: the refresh interval, presence, and the
-unidentified fan-block field (PROJECT.md section 8 items 115, 114, 92).
+"""Read-only watch of an aquaero's aquabus: how the electrical fields are sampled,
+presence, and the unidentified fan-block field (PROJECT.md section 8 items 115, 114, 92).
 
 Run on the Pi (the service user, or any user in ``plugdev``)::
 
@@ -11,13 +11,16 @@ It reads status reports and **nothing else**: no feature report is fetched, no
 control report is written, no duty is touched. It is the measurement behind three
 questions the captures left open.
 
-*How often does the aquaero refresh an aquabus fan block?* Only speed and output
-duty are in every report; the electrical fields of blocks 5-8 carry the bus
-device's own measurements once in about four reports and substitutes -- the
-aquaero's own rail, 0 mA, 0 W -- in the rest
-(:data:`~aqua_bridge.hw.aquacomputer.AQUABUS_REFRESH_REPORTS`). This prints, per
-block, how many reports carried a measurement, the interval between them in
-reports and in seconds, its spread, and whether the four blocks refresh together.
+*How are an aquabus block's electrical fields sampled?* Only speed and output duty
+are in every report. The voltage, current, power and the ``+0x0A`` word of blocks
+5-8 come from one instantaneous sample inside the output's PWM cycle, so the share
+of reports carrying a non-zero current follows the **duty**: 4 of 14 at 25 %, 16 of
+16 at 60 %, 18 of 20 at 100 %, 11 of 45 at 20 % (PROJECT.md section 2). This prints,
+per block, how many reports carried one against that block's duty, and whether the
+blocks alternate together -- they did in all 45 reports of 2026-09-18, which is one
+sampling instant for the whole device and not a per-block refresh. An earlier
+version of this tool read the same count as a fixed bus-poll interval of about four
+reports; that reading is withdrawn, and a run at two duties is what shows why.
 
 *Is a bus device there the whole time?* An aquabus block with no device behind it
 reads speed ``0xFFFF``, and that is how the daemon judges the bus
@@ -26,19 +29,17 @@ with no device, so a healthy bus can be shown to stay quiet under the daemon's
 ``bus_absent_s``.
 
 *What is the ``u16`` at ``+0x0A`` of a fan block?* Unidentified (item 114). It is
-printed raw next to that block's duty, current and power, together with
-``field x duty`` against the current field -- the relation the captures suggest at
-the one duty that can test it (20 %, where it lands 13 % low) and cannot test at
-the other (100 %, where the product is the raw value itself). This is how to
-collect that evidence at a duty the captures do not cover. Nothing in the daemon
-reads the field.
+printed raw next to that block's duty, current and power, which are three
+coordinates of the same sample -- no scaling of the current fits it (one report
+read 2 mA with the field at 0 next to nine that read 6 mA with 26). Nothing in the
+daemon reads the field.
 
-Classifying a report as one that refreshed a block is a judgement from what the
-fields hold: a block that reads 0.00 V (an output with no fan, which reads the
-rail in the reports that refreshed nothing) or any non-zero current, power or
-``+0x0A`` carried a measurement. A *stopped* fan on a populated output measures 0
-mA legitimately, so a block like that cannot be told apart, and ``--raw`` prints
-every report's fields for the owner to look at instead.
+Classifying a report as one whose sample fell in the on phase is a judgement from
+what the fields hold: a block that reads 0.00 V (an output with no fan, which reads
+the rail when the sample misses) or any non-zero current, power or ``+0x0A``
+carried one. A *stopped* fan on a populated output measures 0 mA legitimately, so a
+block like that cannot be told apart, and ``--raw`` prints every report's fields
+for the owner to look at instead.
 """
 
 from __future__ import annotations
@@ -86,12 +87,13 @@ class Sample:
     status: StatusReport
 
 
-def _measured(fan: FanStatus) -> bool:
-    """This block's electrical fields carry the bus device's own measurement.
+def _sampled(fan: FanStatus) -> bool:
+    """This block's electrical fields carry a sample taken in the on phase of the
+    output's PWM cycle.
 
-    Module docstring: a populated block that refreshed nothing reads the aquaero's
-    own rail with 0 mA / 0 W, and an empty output reads 0.00 V in a report that did
-    refresh. A block with no device behind it at all (speed ``0xFFFF``) measures
+    Module docstring: a populated block whose sample missed reads the aquaero's own
+    rail with 0 mA / 0 W, and an empty output reads 0.00 V in a report whose sample
+    landed. A block with no device behind it at all (speed ``0xFFFF``) carries
     nothing either way.
     """
     if not fan.present:
@@ -160,56 +162,80 @@ def _seconds_of_longest_empty(samples: Sequence[Sample], present: Sequence[bool]
     return best
 
 
-def _refresh(kind: DeviceKind, samples: Sequence[Sample], out: TextIO) -> None:
-    print("  aquabus block refreshes (the bus device's own voltage and current):", file=out)
-    measured: dict[int, list[bool]] = {}
+def _sampling(kind: DeviceKind, samples: Sequence[Sample], out: TextIO) -> None:
+    """How often a block's electrical group carried a sample, against its duty.
+
+    The share is the measurement that matters: it tracks the duty, so a run at one
+    duty says nothing on its own and two runs at different duties say everything
+    (module docstring). The spread of the gaps is printed as well, because it is what
+    an interval would have to be read from -- and is not one.
+    """
+    print(
+        "  aquabus blocks carrying a sample (the bus device's own voltage and current):", file=out
+    )
+    sampled: dict[int, list[bool]] = {}
     for number in kind.aquabus_outputs:
-        flags = [_measured(s.status.fans[number - 1]) for s in samples]
-        measured[number] = flags
+        flags = [_sampled(s.status.fans[number - 1]) for s in samples]
+        sampled[number] = flags
         indices = [i for i, flag in enumerate(flags) if flag]
         gaps = [float(b - a) for a, b in zip(indices, indices[1:], strict=False)]
         seconds = [samples[b].t - samples[a].t for a, b in zip(indices, indices[1:], strict=False)]
-        line = f"    pwm{number}  {len(indices)} of {len(samples)} reports"
+        duties = {s.status.fans[number - 1].duty for s in samples}
+        duty = (
+            format_percent(next(iter(duties)))
+            if len(duties) == 1
+            else f"{format_percent(min(duties))}..{format_percent(max(duties))}"
+        )
+        share = len(indices) / len(samples)
+        line = (
+            f"    pwm{number}  duty {duty:>8}  {len(indices)} of {len(samples)} "
+            f"reports ({share:.0%})"
+        )
         if gaps:
             line += f"  {_spread(gaps, 'reports')}  {_spread(seconds, 's')}"
         print(line, file=out)
-    together = sum(1 for i in range(len(samples)) if all(f[i] for f in measured.values()))
-    any_block = sum(1 for i in range(len(samples)) if any(f[i] for f in measured.values()))
+    together = sum(1 for i in range(len(samples)) if all(f[i] for f in sampled.values()))
+    any_block = sum(1 for i in range(len(samples)) if any(f[i] for f in sampled.values()))
     if any_block:
         verdict = (
-            "the refresh is atomic"
+            "one sampling instant for the whole device"
             if together == any_block
-            else "so the blocks do not all refresh together"
+            else "so the blocks are not sampled together"
         )
         print(
-            f"    {together} of {any_block} refreshing reports refreshed every block: {verdict}",
+            f"    {together} of {any_block} sampling reports carried every block: {verdict}",
             file=out,
         )
 
 
 def _unidentified(kind: DeviceKind, samples: Sequence[Sample], out: TextIO) -> None:
-    """Item 114's evidence: the field next to the duty and current of the same block."""
-    print("  the unidentified u16 at +0x0A, in the reports that carried a measurement:", file=out)
+    """Item 114's evidence: the field next to the duty, current and power of the
+    same sample.
+
+    They are printed as the distinct combinations they took and how often, because
+    that is the shape of the evidence: all four come from one instant inside the PWM
+    cycle, so a pair of them is not a relation between two quantities and nothing
+    here fits one for the reader (module docstring).
+    """
+    print("  the unidentified u16 at +0x0A, in the reports that carried a sample:", file=out)
     seen = False
     for number in kind.aquabus_outputs:
         rows: dict[tuple[int, int, int, int], int] = {}
         for sample in samples:
             fan = sample.status.fans[number - 1]
-            if not _measured(fan) or fan.unidentified_raw is None:
+            if not _sampled(fan) or fan.unidentified_raw is None:
                 continue
             key = (fan.duty, fan.current_ma, fan.power_cw, fan.unidentified_raw)
             rows[key] = rows.get(key, 0) + 1
         for (duty, current, power, raw), count in sorted(rows.items()):
             seen = True
-            scaled = raw * duty / 10000.0
             print(
                 f"    pwm{number}  duty {format_percent(duty):>8}  {current:4d} mA  "
-                f"{power / 100:5.2f} W  +0x0A {raw:5d}  (+0x0A x duty = {scaled:5.2f} mA)  "
-                f"x{count}",
+                f"{power / 100:5.2f} W  +0x0A {raw:5d}  x{count}",
                 file=out,
             )
     if not seen:
-        print("    no aquabus block carried a measurement in this run", file=out)
+        print("    no aquabus block carried a sample in this run", file=out)
 
 
 def _raw(kind: DeviceKind, samples: Sequence[Sample], out: TextIO) -> None:
@@ -225,13 +251,13 @@ def _raw(kind: DeviceKind, samples: Sequence[Sample], out: TextIO) -> None:
             parts.append(
                 f"pwm{number} {fan.rpm:5d} {fan.duty:5d} {fan.voltage_v:5.2f} "
                 f"{fan.current_ma:4d} {fan.power_cw:4d} {fan.unidentified_raw:5d}"
-                f"{'*' if _measured(fan) else ' '}"
+                f"{'*' if _sampled(fan) else ' '}"
             )
         print(f"    {i:4d} {sample.t - first:7.2f}s  " + "  ".join(parts), file=out)
 
 
 def summarise(kind: DeviceKind, samples: Sequence[Sample], out: TextIO, *, raw: bool) -> None:
-    """Prints what the run measured; ``*`` marks a block that carried a measurement."""
+    """Prints what the run measured; ``*`` marks a block that carried a sample."""
     if not samples:
         print("  no status report arrived", file=out)
         return
@@ -247,7 +273,7 @@ def summarise(kind: DeviceKind, samples: Sequence[Sample], out: TextIO, *, raw: 
         print(f"  the {kind.name} has no aquabus outputs", file=out)
         return
     _presence(kind, samples, out)
-    _refresh(kind, samples, out)
+    _sampling(kind, samples, out)
     _unidentified(kind, samples, out)
     values = {
         name: [s.status.temp(name) for s in samples if s.status.temp(name) is not None]

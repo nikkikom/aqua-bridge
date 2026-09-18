@@ -502,21 +502,22 @@ def _captured_reading(name: str, channel: str, number: int) -> dict[str, Any]:
     return adapter.fan_readings(status)[channel]
 
 
-def test_no_aquaero_output_gives_the_power_rule_a_number_to_judge() -> None:
-    """Neither the aquaero's own outputs (0 mA in PWM mode) nor its aquabus blocks
-    (the bus device's current in about one report in four, 0 mA in the rest,
-    2026-09-17) give the power rule anything to judge; the Quadro's own outputs do.
-    The same fan block reads 27 mA in one capture and 0 mA in another at the same
-    duty and speed, which is why a number there may never reach the rule -- so the
-    rule is run here over the captured readings and must stay silent whatever the
-    model expects (PROJECT.md section 8 item 89)."""
+def test_no_supported_output_gives_the_power_rule_a_number_to_judge() -> None:
+    """No output of either kind gives the power rule anything to judge. The aquaero's
+    own outputs measure no current at all (0 mA in PWM mode), and a bus device's
+    outputs -- which is what its aquabus blocks carry, and what a Quadro reports for
+    itself -- sample the current inside the PWM cycle, so the share of reports with a
+    non-zero one follows the duty (2026-09-18, PROJECT.md section 2). The same fan block
+    reads 27 mA in one capture and 0 mA in another at the same speed, which is why a
+    number there may never reach the rule -- so the rule is run here over the captured
+    readings and must stay silent whatever the model expects (section 8 items 89, 115)."""
     status = decode_status(AQUAERO, fixture_bytes("aquaero-status-aquabus-fan7-100.bin"))
     assert not any(AQUAERO.reports_power(n) for n in range(1, 9))
     assert (status.fans[0].current_ma, status.fans[0].power_cw) == (0, 0)  # own output, 349 rpm
     assert (status.fans[6].current_ma, status.fans[6].power_w) == (27, pytest.approx(0.32))
     turning = decode_status(AQUAERO, fixture_bytes("aquaero-status-aquabus-block7-no-power.bin"))
     assert turning.rpm(7) == 255 and turning.fans[6].current_ma == 0
-    assert all(QUADRO.reports_power(n) for n in range(1, 5))
+    assert not any(QUADRO.reports_power(n) for n in range(1, 5))
     # the rule itself, over the reading that report produces: the aquabus block at
     # 100 % duty reports 0.32 W where the model expects 2 W, so the only thing
     # keeping the rule quiet is power_reported -- forcing it on fires the rule.
@@ -536,12 +537,13 @@ def test_no_aquaero_output_gives_the_power_rule_a_number_to_judge() -> None:
 
 
 def test_an_aquabus_outputs_rail_is_never_judged_however_the_reports_alternate() -> None:
-    """The aquaero puts the bus device's rail in an aquabus block in about one report
-    in four and its *own* rail there in the rest, and nothing in a single report tells
-    them apart, so the block's voltage is published as unknown and the rail rule never
-    sees it: it neither fires on the aquaero's rail nor has its timer reset by one
-    (PROJECT.md section 2, 2026-09-17; section 8 item 89). The aquaero's own outputs
-    report their own rail and are judged as before."""
+    """An aquabus block's voltage holds the bus device's rail in the reports whose
+    electrical sample fell in the on phase of the output's duty and the aquaero's *own*
+    rail in the rest -- most of them at a low duty -- and nothing in a single report
+    tells them apart, so the block's voltage is published as unknown and the rail rule
+    never sees it: it neither fires on the aquaero's rail nor has its timer reset by one
+    (PROJECT.md section 2; section 8 item 89). The aquaero's own outputs report their own
+    rail and are judged as before."""
     measuring = _captured_reading("aquaero-status-aquabus-block7-power.bin", "qd3", 7)
     substitute = _captured_reading("aquaero-status-aquabus-block7-no-power.bin", "qd3", 7)
     assert [r["rail_reported"] for r in (measuring, substitute)] == [False, False]
