@@ -9132,18 +9132,34 @@ Owner decision (2026-09-16):
     are not exercised by anything that runs on the Pi. Worth a one-line note
     in PROJECT.md section 4 pointing future readers at item 133 if the bench
     tool's warm-up ever needs revisiting again.
-148. **`bench_model_store.py`'s scratch-root check doesn't look at what
-    filesystem backs the path** (item 48). The module docstring's *Safety*
-    check accepts any path under `tempfile.gettempdir()` or `/tmp` without
-    checking what filesystem backs it. On the owner's board `/tmp` is
-    `tmpfs`, a different mount from the SD card the daemon's own store
-    lives on, so every write this tool times there is RAM write-and-fsync,
-    not disk, and the tool gives no signal that it measured the wrong thing
-    (item 48's board run). Worth deciding whether the tool should read the
-    resolved path's filesystem (`os.statvfs` or `/proc/mounts`) and warn,
-    or refuse, when it isn't disk-backed, and whether the owner wants to
-    grant a disk-backed scratch path for a run that actually answers item
-    48's write-latency question.
+148. **Done** (2026-09-18): `bench_model_store.py`'s scratch-root check
+    now looks at what filesystem backs the path, not only whether the
+    path is under one of a fixed list of directory names. A new
+    `detect_medium()` resolves `--path` against `/proc/mounts` -- the
+    same source `findmnt` reads -- for the longest-matching mount before
+    anything is timed, prints what it found to stderr (filesystem type,
+    device, mountpoint) and records it in the report's `medium` key
+    (`fstype`, `device`, `mountpoint`, `ram_backed`) regardless of what it
+    turns out to be, so an operator reading either the terminal or the
+    JSON is told the medium, not left to guess it from the write time
+    after the fact. When that medium is RAM-backed (`tmpfs` or `ramfs`)
+    the tool now refuses to run, the same shape of refusal as an out-of-
+    scratch `--path` already had, unless `--allow-ram-backed` says the RAM
+    numbers are wanted on purpose -- in which case it still runs, but
+    behind a loud warning banner and `medium.ram_backed: true` in the
+    report, so a labelled RAM run and an unlabelled one can never be
+    confused again. The scratch-root whitelist itself grew to include
+    `/var/tmp` alongside `tempfile.gettempdir()` and `/tmp`, so a
+    disk-backed run on the board (`/var/tmp` is the SD card's root
+    filesystem there) does not need a path outside what the tool already
+    allows; the guard that motivated the check in the first place --
+    never write over the daemon's own store -- is unchanged and unrelated
+    to the medium check (`/opt/aqua-bridge`, `/etc/aqua-bridge` and the
+    state directory are still refused regardless of what backs them). Used
+    to re-run item 48 on the board with a disk-backed path and, separately
+    and explicitly, with `--allow-ram-backed` against `/tmp` again for a
+    labelled comparison; see that item for both sets of numbers
+    (`tests/test_bench_model_store.py`).
 
 ### 8.3 Open — needs the DAS hardware
 
@@ -9233,8 +9249,11 @@ Owner decision (2026-09-16):
     tightest.
 48. Time `model.json` writes on the Pi's SD card.
 
-    **Tool added (2026-09-17); board run below settles the size question,
-    not the write-latency one (2026-09-18).**
+    **Done** (2026-09-18): both halves answered -- the store's real size
+    and the SD card's own write-and-`fsync` latency, not RAM's. The first
+    board run (below) measured `/tmp`, which turned out to be `tmpfs` on
+    this board; it is kept here labelled rather than deleted, and the
+    mistake it represents is what item 148 closed off in the tool itself.
     `tools/bench_model_store.py` builds one realistic snapshot -- a DAS
     closed loop of `--warm-ticks` steps against `config.example-das.yaml`
     (`--sim-preset rich` by default), so the estimator's calibration, the
@@ -9247,9 +9266,13 @@ Owner decision (2026-09-16):
     `--path` for `--repeats` repeats, reporting the size in bytes, min /
     mean / median / p99 / max write time, the spread over the repeats, and
     that p99 as a fraction of `dt` and of `mpc.model_store_interval_s`.
-    Refuses anything but a path under a scratch directory
-    (`tempfile.gettempdir()` or `/tmp`) before running anything, and
-    deletes its own scratch file afterwards unless `--keep` is given
+    Since item 148, it also resolves `--path` against `/proc/mounts`
+    before timing anything (the same source `findmnt` reads), prints and
+    records what filesystem and device actually back it, and refuses to
+    run against a RAM-backed one (`tmpfs`/`ramfs`) unless
+    `--allow-ram-backed` says the RAM numbers are wanted on purpose --
+    which is exactly how the tmpfs numbers below were produced this time,
+    labelled as such, not mistaken for the SD card's
     (`tests/test_bench_model_store.py`).
 
     Dev-machine sanity run only (not the Pi's SD card, not what this item
@@ -9266,59 +9289,78 @@ Owner decision (2026-09-16):
     on every run of this tool as well -- what's actually in the 1424
     bytes is close to the store's floor (`fingerprint`, plus four empty
     sections: `fan_curves`, `calibration`, `bays`, `ident_settle`), not
-    its steady state on a populated enclosure. The size and the write
-    time both need the Pi run to mean anything for this item: SSD-class
-    dev-machine storage says nothing about a microSD card's write and fsync latency,
-    and only a board running against the real topology (drives reporting
-    SMART, calibrations accepted, fan curves fit if enabled) reaches the
-    store's real size.
+    its steady state on a populated enclosure. Superseded below by item
+    133's warm-up fix and the board runs, which both reach a populated
+    document instead of this floor.
 
-    **Board run (2026-09-18).** The earlier no-route failure was a
-    network-reachability gap in a different work environment, not this
-    one; `ssh` reaches the board this time and `/opt/aqua-bridge` there
-    is a git-free copy of the same revision this ran from (`sha256sum`
-    of `tools/bench_model_store.py`, `tools/bench_step.py` and this file
-    all match). Writing only under `/tmp` on the board, never over the
-    daemon's own store: `PYTHONPATH=/opt/aqua-bridge/src .venv/bin/python
-    tools/bench_model_store.py --warm-ticks 1200 --sim-preset rich
-    --repeats 30 --path /tmp/model-store-bench.json` ran clean
-    (`/sys/class/thermal/thermal_zone0/temp` 46.16 → 50.46 °C across this
-    and item 95's board run together, `vcgencmd get_throttled` `0x0`
-    throughout -- not a throttled run) and reports `size_bytes` **1424**
-    -- the same floor as the dev-machine run above, even at 1200 ticks
-    and `--sim-preset rich`: item 133's caveat (the warm-up loop never
-    gets `fan_curves` or `calibration` populated) is now confirmed on the
-    board itself, not only argued from the shipped config, and no
-    sibling branch has landed that changes it -- and `min_ms` 0.243,
-    `median_ms` 0.250, `mean_ms` 0.273, `p99_ms` **0.710**, `max_ms`
-    0.710, `spread_ms` 0.467 over the 30 writes. Against `dt = 5 s` and
-    `mpc.model_store_interval_s = 600 s` that p99 gives
-    `p99_fraction_of_dt` 0.000142 (about 0.014 % of the tick) and
-    `p99_fraction_of_model_store_interval` 0.0000012 -- both computed from
-    the RAM write-and-`fsync` latency measured here, not the microSD
-    card's, so neither fraction is the item's real answer yet either.
+    **Board run, tmpfs (2026-09-18) -- what the first board run actually
+    measured, kept for the record, not deleted.** `/opt/aqua-bridge` was
+    a git-free copy of the same revision this ran from (`sha256sum` of
+    `tools/bench_model_store.py`, `tools/bench_step.py` and this file all
+    matched at the time). Writing only under `/tmp` on the board, never
+    over the daemon's own store: `--warm-ticks 1200 --sim-preset rich
+    --repeats 30 --path /tmp/model-store-bench.json` ran clean and
+    reported `size_bytes` **1424** -- the same floor as the dev-machine
+    run above, even at 1200 ticks and `--sim-preset rich`: item 133's
+    caveat (the warm-up loop never gets `fan_curves` or `calibration`
+    populated) was confirmed on the board itself, not only argued from
+    the shipped config -- and `min_ms` 0.243, `median_ms` 0.250, `mean_ms`
+    0.273, `p99_ms` **0.710**, `max_ms` 0.710, `spread_ms` 0.467 over the
+    30 writes; against `dt = 5 s` and `mpc.model_store_interval_s = 600 s`
+    that p99 gave `p99_fraction_of_dt` 0.000142 (about 0.014 % of the
+    tick) and `p99_fraction_of_model_store_interval` 0.0000012.
+    `findmnt /tmp` on this board shows `/tmp` is `tmpfs` -- RAM-backed, a
+    separate mount from the SD card the daemon's own store and `/opt`
+    both live on (`/dev/mmcblk0p2`, `ext4`) -- and `tempfile.gettempdir()`
+    there is `/tmp` itself, so the tool's scratch-root check at the time
+    accepted exactly the mount that defeated this item's purpose: a
+    sub-millisecond `p99_ms`, an order of magnitude faster than the dev
+    machine's own SSD-class 4.46 ms, was the tell, but nothing in the
+    tool said so. That run's write-scope was `/tmp` only, so a
+    disk-backed path was never attempted even though one exists on the
+    same filesystem as `/opt` -- which is what item 148 fixed and the run
+    below uses.
 
-    Those write numbers answer the size question and nothing else:
-    `findmnt /tmp` on this board shows `/tmp` is `tmpfs` -- RAM-backed,
-    and a separate mount from the SD card the daemon's own store and
-    `/opt` both live on (`/dev/mmcblk0p2`, `ext4`, confirmed with
-    `findmnt /opt`) -- and `tempfile.gettempdir()` there is `/tmp`
-    itself, so the tool's own scratch-root check (module docstring,
-    *Safety*) accepts exactly the mount that defeats this item's
-    purpose. A sub-millisecond `p99_ms` an order of magnitude faster
-    than the dev machine's own SSD-class 4.46 ms is itself the tell:
-    this measured RAM write-and-`fsync` latency, not a microSD card's,
-    and nothing in this run touched the card at all. The run this item
-    asked for was scoped to write only under `/tmp` on the board -- never
-    elsewhere, never as root, never near the daemon's own store -- so a
-    disk-backed path was not attempted even though one exists on the
-    same filesystem as `/opt` (`findmnt /var/tmp` resolves to the root
-    `ext4`, checked read-only, nothing written there). The size half of
-    this item is now settled; the write-and-`fsync`-latency half is not,
-    and still needs either a scratch path the owner points at the SD
-    card explicitly, or the tool itself flagging a resolved path that
-    turns out to be `tmpfs` so a future run cannot repeat this same
-    silent miss (PROPOSED ITEMS).
+    **Board run, disk-backed (2026-09-18) -- the SD card, the number this
+    item actually asked for.** Same board, same revision, run again after
+    item 148's fix: `tools/bench_model_store.py --warm-ticks 4320
+    --sim-preset rich --repeats 30` against a scratch path under
+    `/var/tmp` (its own subdirectory, removed afterwards) instead of
+    `/tmp`. The tool's own medium check confirms what it is about to
+    measure before timing anything: `ext4` on `/dev/mmcblk0p2`, mounted
+    at `/` -- the same device the daemon's own store and `/opt` live on,
+    not RAM. `size_bytes` **4798** (11 of 15 bays reached an accepted
+    calibration, the one fan model's curve accepted -- item 133's warm-up
+    doing what it is meant to, confirmed on the board itself this time,
+    not only the dev machine) and `min_ms` 9.67, `median_ms` 11.30,
+    `mean_ms` 20.46, `p99_ms` **182.95**, `max_ms` 182.95, `spread_ms`
+    173.29 over the 30 writes -- three of the thirty, back to back
+    (182.95 ms, 91.31 ms, 34.51 ms), well above the other twenty-seven
+    (9.67-14.14 ms) and decaying across those three rather than
+    independent, which reads as one underlying event (an ext4 journal
+    commit or the card's own housekeeping) whose effect faded over the
+    next two writes, not three unrelated spikes. Against `dt = 5 s` and
+    `mpc.model_store_interval_s = 600 s`, `p99_fraction_of_dt` **0.0366**
+    (about 3.7 % of the tick) and `p99_fraction_of_model_store_interval`
+    0.000305 -- non-negligible against a single tick if the write lands
+    on a slow one, but the store only writes once every
+    `model_store_interval_s / dt = 120` ticks, and `control/loop.py`
+    already runs the persister after that tick's PWM has gone out (module
+    docstring), so this is not a concern at the current interval.
+
+    Same `--warm-ticks`, `--sim-preset` and `--repeats` both board runs,
+    so the only variable between them is the filesystem: on this board
+    the SD card's own write-and-`fsync` is roughly 37-68x slower than
+    tmpfs's by the middle-of-distribution statistics (`min_ms` 9.67 vs
+    0.26, `median_ms` 11.30 vs 0.27, `mean_ms` 20.46 vs 0.30) and about
+    244x slower at `p99_ms` (182.95 vs 0.75) -- exactly the gap a silent
+    tmpfs measurement would hide, and did the first time. Board
+    temperature and throttling across both board runs together:
+    `/sys/class/thermal/thermal_zone0/temp` 45.08 → 51.00 °C,
+    `vcgencmd get_throttled` `0x0` before, between and after -- not a
+    throttled run. Item 48 is now closed: the size and the
+    write-and-`fsync`-latency halves are both answered, on the board,
+    against the medium the question was actually about.
 49. Digole: protocol, pages (Overview, Drives, Zones/Fans, Model, Host),
     touch, hit-test.
 75. **The kick is done; the measured duties behind it are not** (2026-09-18).
