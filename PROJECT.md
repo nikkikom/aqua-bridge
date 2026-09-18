@@ -3285,10 +3285,11 @@ refused (it would hold the schedule and every sibling channel for
 near a rail with room to say something runs. It is
 for `symmetric`, where the amplitude is cooling *given up*: since item 112 the
 solver parks the channels near `pwm_min` between runs, which is exactly where a
-symmetric pair does not fit, so `band:` refuses most of the programme (11 / 4 / 7
-of 12 starts over 12 h on the three `rich` seeds at the shipped
-`ident_amplitude: 0.15`, against 12 / 12 / 12 sized to the headroom), and the dip
-per experiment falls by 13 / 83 / 71 %. Under `above` the amplitude is cooling
+symmetric pair does not fit, so `band:` refuses most of the programme (13 / 4 / 8
+of 16 starts over 16 h on the three `rich` seeds at the shipped
+`ident_amplitude: 0.15`, against 16 / 11 / 15 sized to the headroom), and the dip
+per experiment falls by 3 / 28 / 39 % while the enclosure's own mean PWM moves by
+at most ±0.004 either way. Under `above` the amplitude is cooling
 *added* and the solver takes it straight back, so sizing down buys 0.002–0.008
 mean PWM and costs a zone — item 110's own judgement, which is why the default is
 `fixed`.
@@ -8531,28 +8532,42 @@ Owner decision (2026-09-16):
     experiment leaving its level on the fans, the solver parks the channels near
     `pwm_min` between runs — which is exactly where a symmetric pair does not fit,
     so the `band:` precondition refuses the start. On item 102's scenario at the
-    shipped `ident_amplitude: 0.15` over 12 h, `ident_levels: symmetric` takes
-    **11 / 4 / 7** of the 12 starts offered (seeds 2/3/4); sized to the headroom it
-    takes **12 / 12 / 12** and refuses none for the band. At the harness's own
-    `ident_amplitude: 0.25` the same comparison is **2 / 0 / 2** against
-    **16 / 16 / 16** — under `symmetric` at that amplitude the experiment
-    programme is effectively dead today.
+    shipped `ident_amplitude: 0.15` over 16 h, `ident_levels: symmetric` takes
+    **13 / 4 / 8** of the 16 starts offered (seeds 2/3/4); sized to the headroom it
+    takes **16 / 11 / 15**. Band refusals fall from 1858 / 8393 / 5535 to
+    175 / 3339 / 586 — not to zero, because under `headroom` the refusal is no
+    longer "a level leaves the band" but "the cut left no usable swing", and the
+    channels the solver parks *high* still have none. At the harness's own
+    `ident_amplitude: 0.25` the comparison is **2 / 0 / 2** against
+    **16 / 16 / 16**, with 9971 / 11453 / 9983 refusals against 3 / 0 / 0 — under
+    `symmetric` at that amplitude the experiment programme is effectively dead
+    today.
 
     **What the dip costs at the shipped defaults.** 16 h, `ident_amplitude: 0.15`,
     `symmetric`, mean PWM given up per tick against the solver's own command:
 
     | seed | `fixed` | `headroom` | per start |
     |---|---|---|---|
-    | 2 | 0.00668 over 13 starts | 0.00718 over 16 | 0.000514 -> 0.000449 |
-    | 3 | 0.00113 over 4 starts | 0.00077 over 16 | 0.000283 -> 0.000048 |
-    | 4 | 0.00582 over 8 starts | 0.00336 over 16 | 0.000728 -> 0.000210 |
+    | 2 | 0.00668 over 13 starts | 0.00802 over 16 | 0.000514 -> 0.000501 |
+    | 3 | 0.00113 over 4 starts | 0.00224 over 11 | 0.000284 -> 0.000204 |
+    | 4 | 0.00582 over 8 starts | 0.00664 over 15 | 0.000727 -> 0.000443 |
 
-    **13 % / 83 % / 71 % less cooling given up per experiment**, while twice to
-    four times as many experiments run. The deepest dip any single tick took falls
-    where the sizing bites: 0.1500 on all three seeds under `fixed` against
-    0.1500 / 0.1164 / 0.1496. Worst true margin 4.161 / 4.287 / 4.379 degC against
-    4.171 / 4.387 / 4.128, no limit crossed either way, against 4.065 / 4.287 /
-    4.302 with no experiment at all.
+    **3 % / 28 % / 39 % less cooling given up per experiment**, while a quarter to
+    nearly three times as many experiments run. The deepest dip any single tick
+    took falls where the sizing bites: 0.1500 on all three seeds under `fixed`
+    against 0.1500 / 0.1331 / 0.1496. The **enclosure's** own mean PWM over the run
+    — the noise the added excursion produces, not just the cooling given up —
+    reads 0.3651 / 0.2360 / 0.2789 under `fixed` against 0.3616 / 0.2397 / 0.2822:
+    within ±0.004 either way, so the whole trade is inside the noise of the
+    scenario. Worst true margin 4.161 / 4.287 / 4.379 degC against
+    4.171 / 4.316 / 4.148, no limit crossed either way.
+
+    **The cut costs some of that, and the cost is the point.** With the pair slid
+    up off `pwm_min` instead of cut, the same 16 h reads 16 / 16 / 16 starts and
+    0.000449 / 0.000048 / 0.000210 per start — better on both counts, bought with
+    up to `2 · ident_amplitude` above the solver's command. The cap is the owner's
+    and the objective is the least fan noise at the same margin, so the swing is
+    what gives way.
 
     **Under `above` the default stays `fixed`, and the measurement says why.**
     16 h at `ident_amplitude: 0.25`: `headroom` reads mean PWM 0.3563 / 0.2552 /
@@ -8743,7 +8758,11 @@ Owner decision (2026-09-16):
     passed reliably both alone and in a single-process (`--shards 1`)
     full run on the same host — a single-process run sidesteps the
     contention this item is about, at the cost of the wall-clock time
-    sharding buys. Worth deciding whether the gate should measure with
+    sharding buys. Measured again during items 119/120/123/124/125 and
+    once more on that PR's review pass, both times with three other
+    branches building on the same machine: 12.8x and 15.7x under the
+    8-way run, and 3.1 s / 5.2 s alone straight afterwards.
+    Worth deciding whether the gate should measure with
     the machine quiesced, take the median of more repeats, or report the
     ratio and fail only on a trend, so that a red CI run means a
     regression rather than a busy runner.
