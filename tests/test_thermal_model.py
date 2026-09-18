@@ -1043,11 +1043,17 @@ def test_malformed_estimator_bay_info_never_raises_out_of_step(das_example_cfg, 
 
 
 def _informed(memory: dict[str, Any], spec_keys: tuple[str, ...], block: dict[str, Any]) -> None:
-    """Make one block pass every part of the ``converged`` rule but the caller's choice."""
+    """Make one block pass every part of the ``converged`` rule but the caller's choice.
+
+    ``inf`` is the excitation half latched, which :func:`thermal._rls_window` writes at the
+    window that first satisfies it (item 119): a block that has had its excited windows
+    and its PE is informed from then on, and the EWMA decaying afterwards does not unmake
+    it."""
     block["n"] = thermal.MIN_WINDOWS
     block["w"] = thermal.MIN_WINDOWS
     block["pe"] = 1.0
     block["rel"] = [0.0] * len(spec_keys)
+    block["inf"] = True
 
 
 def _zone_ready(c: MpcConfig, zone: str, *, blind_bays: tuple[str, ...] = ()) -> dict[str, Any]:
@@ -1062,6 +1068,7 @@ def _zone_ready(c: MpcConfig, zone: str, *, blind_bays: tuple[str, ...] = ()) ->
             block["n"] = thermal.MIN_WINDOWS
             block["w"] = thermal.MIN_WINDOWS
             block["pe"] = 1.0
+            block["inf"] = True
             block["rel"] = [0.9] * len(d.st.bays[b].keys)  # far over model_converged_rel_se
         else:
             _informed(mem, d.st.bays[b].keys, block)
@@ -1176,6 +1183,104 @@ def test_model_freeze_never_freezes_a_half_informed_zone(small, monkeypatch):
     zm = _zone_state(status="learning")
     thermal._advance_status(zm, whole, c, d.st, "za", 0.05, True, params, d.zone_specs, d.bay_specs)
     assert zm["status"] == "frozen"
+
+
+def test_a_finished_model_stays_informed_after_the_fans_go_quiet(small):
+    """The question "has this block informed itself?" is **latched**, not re-asked (item
+    119). ``pe`` is an EWMA over the last ``PE_WINDOWS`` regression windows, so about an
+    hour after the last identification experiment it decays back to nothing -- which is
+    the state a finished enclosure spends nearly all of its time in. Re-reading it would
+    make every block of a converged model uninformed again as soon as the fans went quiet:
+    ``blocked`` would fill up on a healthy model, ``partial`` would never clear,
+    ``model_freeze`` could never fire, and every bay of every zone would be derated for
+    ever.
+
+    Review finding: all four of those were reproducible on the shipped default."""
+    quiet = _zone_ready(small, "za")
+    quiet["zones"]["za"]["status"] = "converged"
+    for block in (quiet["zones"]["za"]["air"], *(quiet["bays"][b] for b in ("a1", "a2"))):
+        block["pe"] = 0.0  # what the PE monitor reads an hour after the last experiment
+
+    out = thermal.summary(quiet, small)["zones"]["za"]
+    assert out["blocked"] == [] and out["uninformed"] == [] and out["partial"] is False
+    _, theta = thermal.current_model(quiet, small)
+    assert theta["k.a1"] == pytest.approx(thermal.theta_from_memory(small, quiet)["k.a1"])
+
+    # below the default fraction nothing is derated either: no bay of this zone is one
+    # the zone converged *without*
+    c = dataclasses.replace(small, model_converged_bays_frac=0.5)
+    partial = thermal.summary(quiet, c)["zones"]["za"]
+    assert partial["uninformed"] == [] and partial["partial"] is False
+    _, theta = thermal.current_model(quiet, c)
+    assert theta["k.a2"] == pytest.approx(thermal.theta_from_memory(c, quiet)["k.a2"])
+
+    # and a block that never informed itself is still uninformed, whatever ``pe`` says
+    never = _zone_ready(small, "za")
+    never["zones"]["za"]["status"] = "converged"
+    never["bays"]["a2"]["inf"] = False
+    never["bays"]["a2"]["pe"] = 0.0
+    assert thermal.summary(never, c)["zones"]["za"]["uninformed"] == ["a2"]
+
+
+def test_the_latch_is_written_by_a_window_and_cleared_by_a_reset(small):
+    """Where the latch comes from and the one thing that unmakes it (item 119): a closing
+    window that has the excited windows and the PE writes it, and a hot-swap reset starts
+    the block over at the prior *and* at ``inf: False`` -- a block that was thrown away
+    has informed nothing."""
+    d = thermal._derived(small)
+    spec = d.bay_specs["a1"]
+    block = thermal._fresh_block(spec, 1)
+    assert block["inf"] is False
+    row = np.ones(len(spec.keys))
+    for i in range(2 * thermal.MIN_WINDOWS):  # a telegraph on the one fan regressor
+        thermal._rls_window(block, spec, row, 0.0, np.array([0.2 if i % 2 else 0.8]), small)
+        if block["inf"]:
+            break
+    assert block["inf"] is True
+    assert block["n"] >= thermal.MIN_WINDOWS and block["pe"] > thermal.PE_MIN
+    # and it does not come undone when the telegraph stops and the EWMA decays
+    for _ in range(4 * thermal.PE_WINDOWS):
+        thermal._rls_window(block, spec, row, 0.0, np.array([0.5]), small)
+    assert block["pe"] <= thermal.PE_MIN and block["inf"] is True
+
+    mem = _zone_ready(small, "za")
+    assert mem["bays"]["a1"]["inf"] is True
+    thermal._reset_swapped_bays(mem, small, d.st, d.bay_specs, ["a1"], 10.0)
+    assert mem["bays"]["a1"]["inf"] is False
+    assert mem["bays"]["a1"]["rst"] == 1
+
+    # a stored block from before the latch existed derives it from what it does say, so a
+    # model store written by an older build does not restore as never informed
+    raw = dict(mem["bays"]["a2"])
+    raw.pop("inf")
+    assert thermal._parse_block(raw, d.bay_specs["a2"], 1)["inf"] is True
+    raw["pe"] = 0.0
+    assert thermal._parse_block(raw, d.bay_specs["a2"], 1)["inf"] is False
+
+
+def test_the_sigma_a_derating_spends_is_published_with_it(small):
+    """The stated guarantee is that the diagnostics cannot say one thing while the solver
+    plans another (item 119). ``k_used`` is derated by a standard error, and on a bay that
+    has closed no regression window that error is the prior's own -- which ``se`` refuses
+    to publish as a measurement (item 111). So it is published under its own name, and
+    the haircut is reproducible from what a reader can see.
+
+    Review finding: ``k_used`` was derated by a number nothing published."""
+    c = dataclasses.replace(small, model_converged_bays_frac=0.5, model_partial_k_sigmas=2.0)
+    mem = _zone_ready(c, "za", blind_bays=("a2",))
+    mem["bays"]["a2"]["rel"] = None  # a block that has closed no window: no published se
+    mem["bays"]["a2"]["se"] = None
+    mem["zones"]["za"]["status"] = "converged"
+    bays = thermal.summary(mem, c)["bays"]
+    fitted = thermal.theta_from_memory(c, mem)
+    lo = thermal.PARAMETERS["k"].lo
+    assert bays["a2"]["se"]["k.a2"] is None  # still not published as a measurement
+    sigma = bays["a2"]["k_se_used"]
+    assert sigma is not None and sigma > 0
+    assert bays["a2"]["k_used"] == pytest.approx(max(lo, fitted["k.a2"] - 2.0 * sigma))
+    # an informed bay is not derated, so it spends no sigma
+    assert bays["a1"]["k_se_used"] is None
+    assert thermal.summary(mem, small)["bays"]["a2"]["k_se_used"] is None  # nor at 1.0
 
 
 def test_model_converged_bays_frac_and_partial_k_sigmas_are_validated(small):

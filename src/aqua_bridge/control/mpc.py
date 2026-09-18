@@ -129,9 +129,13 @@ Order inside :func:`step`
    tick's gate-trusted temperatures, ``prev``, ``obs.rpm``, the zones that are
    trusted and not in fault (only their windows accumulate) and the estimator's
    occupancy, class and accepted sensor map per bay. A bay the estimator reports
-   as ``swapped`` this tick is handed over as a reset: with
+   as ``swap_reset`` this tick is handed over as a reset: with
    ``model_reset_on_swap`` its identified coefficients start over from the prior,
-   because they describe the drive that left (plan section 8 item 12). Its memory is
+   because they describe the drive that left (plan section 8 item 12). That is the
+   estimator's rate-limited *event*, not its per-tick ``swapped`` verdict -- one per
+   ``estimator.bay_settle_s`` while the bay has settling budget left, so a bay that keeps
+   tripping the rule cannot restart its zone's regression every tick (plan section 8 item
+   124, and item 109 for what happened when it could). Its memory is
    ``solver_memory["thermal"]`` and ``diagnostics["thermal"]`` its summary
    (status, prediction error, coefficients). Any exception resets the memory to
    the prior with ``status: error`` (never a raise, never a fault; the DAS MPC,

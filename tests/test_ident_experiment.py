@@ -1881,23 +1881,75 @@ def test_headroom_sizing_never_excites_less_than_the_fixed_mode():
             assert h_hi - h_lo <= 2.0 * head.ident_amplitude + 1e-9
 
 
-def test_headroom_places_a_symmetric_pair_inside_the_band_and_never_dips_deeper():
-    """ "Sized to the real headroom in both directions" (section 8 item 120). A symmetric
-    pair whose low level would fall through ``pwm_min`` slides **up**: it keeps its full
-    swing -- what the PE monitor reads -- and the dip below the base shrinks to whatever
-    room the channel had. It never slides the other way, because that would put the low
-    level further under the base than the owner's own ``ident_amplitude`` cap."""
-    cfg = ident_cfg(ident_levels="symmetric", ident_amplitude_mode="headroom")
-    for base in (cfg.pwm_min, cfg.pwm_min + 0.01, 0.3, 0.5, 0.9, cfg.pwm_max):
+@pytest.mark.parametrize("levels", ["above", "symmetric"])
+def test_headroom_never_moves_a_channel_further_than_the_amplitude_either_way(levels):
+    """ "Sized to the real headroom in both directions" (section 8 item 120), and bounded
+    in both. A level the band will not take is **cut** at the rail, never slid across the
+    base: ``ident_amplitude`` is the owner's ceiling on what one experiment may move the
+    fans by (:data:`~aqua_bridge.model.IDENT_AMPLITUDE_MAX`), so it bounds the excursion
+    *above* the solver's command exactly as it bounds the dip below it. Sliding a symmetric
+    pair up off ``pwm_min`` would keep its whole swing and buy it with up to twice that cap
+    above the command, on the channel the solver had parked low for quiet.
+
+    Review finding: the dip was pinned here and in the nightly run, the rise was not."""
+    cfg = ident_cfg(ident_levels=levels, ident_amplitude_mode="headroom")
+    bases = (cfg.pwm_min, cfg.pwm_min + 0.01, 0.3, 0.5, 0.9, cfg.pwm_max - 0.01, cfg.pwm_max)
+    for base in bases:
         lo, hi = ident._levels(cfg, "fa1", base)
         assert cfg.pwm_min - 1e-9 <= lo <= hi <= cfg.pwm_max + 1e-9, (base, lo, hi)
         assert base - lo <= cfg.ident_amplitude + 1e-9, (base, lo)  # the accepted dip
-    # right on the rail the pair sits entirely above it, with its swing intact
-    lo, hi = ident._levels(cfg, "fa1", cfg.pwm_min)
-    assert lo == pytest.approx(cfg.pwm_min)
-    assert hi > cfg.pwm_min
+        assert hi - base <= cfg.ident_amplitude + 1e-9, (base, hi)  # and the rise
+    # an amplitude the sizing cannot shrink (a channel with a flat curve asking for more
+    # swing than it can reach) is where a slide would have bitten hardest
+    steep = ident_cfg(ident_levels=levels, ident_amplitude_mode="headroom", ident_pe_aim=20.0)
+    lo, hi = ident._levels(steep, "fa1", steep.pwm_min)
+    assert lo == pytest.approx(steep.pwm_min)
+    assert hi - steep.pwm_min <= steep.ident_amplitude + 1e-9, (lo, hi)
     # and the fixed mode would have put the low level under the rail, i.e. out of band
-    assert ident._levels(ident_cfg(ident_levels="symmetric"), "fa1", cfg.pwm_min)[0] < cfg.pwm_min
+    if levels == "symmetric":
+        assert ident._levels(ident_cfg(ident_levels=levels), "fa1", cfg.pwm_min)[0] < cfg.pwm_min
+
+
+def test_headroom_still_refuses_a_start_with_no_room_left():
+    """``band:`` is "no room to run the experiment". Under ``headroom`` the levels are cut
+    into the band by construction, so nothing is left outside it to refuse and the refusal
+    is asked of what the cut left: the band ate the step *and* the stub that survived
+    cannot reach the aim. A start that could inform the model of nothing would still hold
+    the schedule and every sibling channel for ``ident_max_duration_s``.
+
+    Review finding: without this the placement removed a refusal outright, leaving only
+    ``ident_require_excitable``, which is off by default (section 8 item 120). The two
+    halves are both load-bearing: refusing every cut pair would make ``headroom`` the
+    stricter mode, and refusing on the aim alone would refuse the mid-band starts
+    ``fixed`` allows."""
+    head = ident_cfg(ident_amplitude_mode="headroom")
+    fixed = ident_cfg()
+    assert head.ident_require_excitable is False
+
+    def band(cfg, pwm):
+        reasons = ident.check_start(
+            cfg,
+            settled_tracker(cfg),
+            good_facts(cfg, pwm=pwm),
+            "channel",
+            "fa1",
+            human_control=False,
+        )
+        return [r for r in reasons if r.startswith("band:")]
+
+    # the cut left a stub: refused, as the fixed mode refuses it
+    assert band(head, head.pwm_max - 0.05) == ["band:fa1"]
+    assert band(fixed, fixed.pwm_max - 0.05) == ["band:fa1"]
+    assert ident.no_headroom(head, "fa1", head.pwm_max) is True
+    # a mid-band channel the band never touched runs in both modes, excitable or not
+    for pwm in (0.4, 0.6, 0.8):
+        assert band(head, pwm) == [] and band(fixed, pwm) == [], pwm
+    # and the start item 120 exists for: cut at pwm_min, but the stub reaches the aim
+    sym_head = ident_cfg(ident_levels="symmetric", ident_amplitude_mode="headroom")
+    sym_fixed = ident_cfg(ident_levels="symmetric")
+    parked = sym_head.pwm_min + 0.02
+    assert band(sym_fixed, parked) == ["band:fa1"]
+    assert band(sym_head, parked) == []
 
 
 def test_headroom_lets_a_channel_near_the_rail_start_where_fixed_refuses_it():
@@ -1948,7 +2000,7 @@ def test_excitation_reads_the_cap_around_the_plans_own_base():
     cfg = ident_cfg(ident_levels="symmetric", ident_amplitude_mode="headroom")
     base = cfg.pwm_min
     lo, hi = ident._levels(cfg, "fa1", base)
-    assert 0.5 * (lo + hi) != pytest.approx(base)  # the pair slid up off its midpoint
+    assert 0.5 * (lo + hi) != pytest.approx(base)  # the low half was cut off at the rail
     with_base = ident.excitation(cfg, {"fa1": (lo, hi)}, {"fa1": base})["fa1"]
     cap_lo, cap_hi = ident._placed(cfg, base, IDENT_AMPLITUDE_MAX)
     assert with_base["pe_reach_at_cap"] == pytest.approx(

@@ -151,8 +151,11 @@ mpc:
   ident_levels: above    # above: base and base + amplitude | symmetric: base +- amplitude
   ident_amplitude_mode: fixed  # fixed: every channel spends ident_amplitude | headroom: the
                          # smallest step that reaches ident_pe_aim * sqrt(PE_MIN) from where the
-                         # channel is parked, placed inside [pwm_min, pwm_max]. Worth it under
-                         # ident_levels: symmetric, where the step is cooling given up
+                         # channel is parked, cut into [pwm_min, pwm_max] and never further
+                         # than ident_amplitude from the base either way. Worth it under
+                         # ident_levels: symmetric, where the step is cooling given up.
+                         # band:<ch> then refuses a start whose remaining swing cannot
+                         # reach the model's PE bound at all
   ident_pe_aim: 2.0      # multiple of sqrt(PE_MIN) a headroom-sized telegraph aims for, > 0;
                          # below about 1.5 no zone converges (measured)
   ident_replan: true     # levels follow the live solver demand every tick (false: frozen at the start)

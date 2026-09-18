@@ -227,7 +227,10 @@ deliberately* -- an event. The model gate asks *is this bay tight enough to scor
 against* -- a level, which a bay nobody is reading fails as surely as one just swapped,
 and which the trust rule must **not** excuse, because that is the observability loss it
 exists to catch. A jump reaches the model gate through ``uncertain``: the jump is what put
-the variance there. ``zones.trust_rule: sigma`` reads ``observed``, ``settling`` and
+the variance there -- except on a bay whose swap verdict the settling budget has just
+refused, where the fit that gate is about to score is the one the estimator wanted thrown
+away, and the exemption is withheld so it is scored rather than excused (item 124,
+:func:`_mark_model_reasons`). ``zones.trust_rule: sigma`` reads ``observed``, ``settling`` and
 ``air_blind_s``; ``seeded``, ``offsets_c`` and ``proximal_map`` are diagnostics.
 
 Occupancy (``topology.bays.<b>.occupied``; runtime ``POST /api/bay``)
@@ -312,11 +315,17 @@ Exhausting the budget falls back to **keeping the fit**, not to resetting it, an
 (item 123). A bay that trips the rule oftener than the budget allows is not a drive being
 swapped three times an hour; resetting it every time is what left a zone at the prior for
 ever (item 109's pathology), while a stale fit is judged by the DAS MPC's own
-prediction-error gate and lands the solver in its PI-like fallback -- and the bay is not
-exempt from that gate once the budget is gone, so the stale fit is *scored* instead of
-excused. The record is published beside the verdict: ``swapped`` (this tick's verdict),
-``swap_reset`` (the event the reset follows), ``swap_count``, ``swap_last_s``,
-``swap_reason`` and ``swap_held`` (verdicts the rate limit refused).
+prediction-error gate and lands the solver in its PI-like fallback. For that to be the
+answer and not a hope, a bay whose verdict the budget refused has its model-gate
+``uncertain`` exemption **taken away** while the refused verdict stands: the bay-level
+widening that the verdict itself applies is what would otherwise keep refreshing that
+exemption, so the bay would be neither reset nor scored, and the fallback would rest on a
+gate that never looked. With the mark withheld the stale fit really is scored
+(:func:`_mark_model_reasons`). The record is published beside the verdict: ``swapped``
+(this tick's verdict), ``swap_reset`` (the event the reset follows), ``swap_count``,
+``swap_last_s``, ``swap_reason`` and ``swap_held`` (events the budget refused, counted at
+the cadence an accepted event would have had -- one per ``bay_settle_s``, not one per
+tick).
 
 The per-bay output shows a change in progress: ``pending_empty_s`` (seconds of
 evidence toward ``empty`` counted so far), ``pending_occupied_ticks`` (ticks of
@@ -456,8 +465,8 @@ Memory (plain JSON)::
      "bays": {bay: {"occ", "low", "rise", "blind", "rej" (failed re-checks),
                     "ver" (a re-check passed), "since", "assoc", "map", "init",
                     "disturb", "why", "spent", "clean",
-                    "swaps", "swap_ts", "swap_why", "swap_held" (the swap record,
-                     items 123, 124),
+                    "swaps", "swap_ts", "swap_why", "swap_held", "hold_ts" (the swap
+                     record, items 123, 124),
                     "unc", "calstep", "calseen" (the model gate's marks, item 100),
                     "dmap": {sensor: {"th", "P", "n"}} (item 101)}},
      "cal": {bay: {serial: {"th", "P", "n", "fresh", "rms2", "ts", "used"
@@ -952,6 +961,10 @@ def _fresh_bay() -> dict[str, Any]:
         "swap_ts": None,
         "swap_why": None,
         "swap_held": 0,
+        # item 124: when the last *refused* event was counted, so a refusal is counted at
+        # the cadence an accepted event would have had and ``swap_held`` is a count of
+        # events, not of ticks
+        "hold_ts": None,
         # item 100: the model gate's own marks, beside the trust rule's ``disturb``
         "unc": None,
         "calstep": None,
@@ -1053,6 +1066,7 @@ def _parse(memory: object, st: _Structure) -> dict[str, Any]:
             "swap_ts": _opt_num(raw.get("swap_ts")),
             "swap_why": _settle_reason(raw.get("swap_why")),
             "swap_held": held,
+            "hold_ts": _opt_num(raw.get("hold_ts")),
             "unc": _opt_num(raw.get("unc")),
             "calstep": _opt_num(raw.get("calstep")),
             "calseen": _opt_num(raw.get("calseen")),
@@ -1485,8 +1499,32 @@ def _mark_disturbed(bm: dict[str, Any], ts: float, budget: float, why: str) -> N
         bm["why"] = why
 
 
-def _swap_event(bm: dict[str, Any], ts: float, spec: Any, why: str, *, limited: bool) -> bool:
-    """Whether this tick's swap verdict is a new **event**, and record it (items 123, 124).
+def _crossed(nu: float, var: float, jump_min_c: float, jump_var: float) -> bool:
+    """The fast-swap threshold: an innovation ``nu`` of predictive variance ``var`` that is
+    both bigger than ``jump_min_c`` in degrees and further than ``jump_sigmas`` standard
+    deviations out.
+
+    **One function for both halves of the rule** (plan section 8 item 124). The per-sensor
+    half asks it of one member's own innovation and that member's own variance; the
+    bay-level half asks it of the bay's mean innovation and the variance of that mean. On
+    a bay with one proximal member the mean of one number is that number and the variance
+    of that mean is its own variance, so the two calls carry identical arguments and the
+    two halves *cannot* disagree -- which is the property item 124 exists to keep and the
+    one a test can pin without judgement (tests/test_estimator.py). Changing the threshold
+    changes it in both places; changing one caller's arithmetic away from the other's is
+    then visible as two calls with different arguments on a bay that has only one."""
+    return abs(nu) > jump_min_c and nu * nu > jump_var * var
+
+
+#: What :func:`_swap_event` made of this tick's swap verdict.
+SWAP_EVENT = "event"  #: a new event: the thermal block is reset
+SWAP_REFRACTORY = "refractory"  #: the event just before it, still visible
+SWAP_HELD = "held"  #: the budget is gone: the fit is kept, and the bay is scored for it
+
+
+def _swap_event(bm: dict[str, Any], ts: float, spec: Any, why: str, *, limited: bool) -> str:
+    """What this tick's swap verdict is -- a new **event**, the last one still standing,
+    or one the budget refused -- and the record it leaves (items 123, 124).
 
     The *statistical* half of the rule -- the bay-level step, ``why`` :data:`SETTLE_JUMP`
     -- is rate-limited, and on both halves of what a rate limit is it now agrees with the
@@ -1496,13 +1534,19 @@ def _swap_event(bm: dict[str, Any], ts: float, spec: Any, why: str, *, limited: 
       opens. A swap moves the readings for as long as it takes the filter to follow them,
       so the verdict stands for several ticks; that is one event, and one model reset;
     * *budget* -- the same ``bay_settle_max_s`` the trust exemption spends. When it is
-      gone the event is refused and counted in ``swap_held`` (only the budget's refusals:
-      a verdict inside the refractory of its own event is that event still visible, not a
-      second one held back). The thermal fit is then kept
-      (possibly stale) rather than thrown away again, and with no exemption left the bay's
-      prediction error is *scored* by the DAS MPC's validity gate instead of excused by
-      it, which is the loud half. ``bay_settle_max_s: 0`` grants neither exemption nor
-      reset, exactly as it grants no settling window.
+      gone the event is refused, and ``swap_held`` counts the refusal **at the same
+      cadence an accepted event would have had**: one per ``bay_settle_s``, not one per
+      tick the verdict happens to stand. A held event is an event that did not happen, so
+      it is counted the way events are -- otherwise the number would be a tick count in
+      disguise, its rate would depend on ``dt``, and one stuck sensor would read as
+      hundreds of refusals an hour. (A verdict inside the refractory of an *accepted*
+      event is that event still visible, not a second one held back, and is counted
+      nowhere.) The thermal fit is then kept (possibly stale) rather than thrown away
+      again, and the caller takes the bay's model-gate ``uncertain`` exemption away for as
+      long as the refused verdict stands (:func:`_mark_model_reasons`), so the stale fit
+      is *scored* by the DAS MPC's validity gate instead of excused by it, which is the
+      loud half. ``bay_settle_max_s: 0`` grants neither exemption nor reset, exactly as it
+      grants no settling window.
 
     An **occupancy crossing** (``limited=False``) is always an event. It is not a
     statistic but a declared or debounced fact -- ``empty_confirm_s`` of evidence, three
@@ -1518,13 +1562,16 @@ def _swap_event(bm: dict[str, Any], ts: float, spec: Any, why: str, *, limited: 
     if limited:
         last = bm["swap_ts"]
         if last is not None and 0.0 <= float(ts) - float(last) < spec.bay_settle_s:
-            return False
+            return SWAP_REFRACTORY
         if bm["spent"] >= spec.bay_settle_max_s:
-            bm["swap_held"] += 1
-            return False
+            held = bm["hold_ts"]
+            if held is None or not 0.0 <= float(ts) - float(held) < spec.bay_settle_s:
+                bm["swap_held"] += 1
+                bm["hold_ts"] = float(ts)
+            return SWAP_HELD
     bm["swaps"] += 1
     bm["swap_ts"], bm["swap_why"] = float(ts), why
-    return True
+    return SWAP_EVENT
 
 
 def _account_settle(
@@ -1553,7 +1600,13 @@ def _account_settle(
 
 
 def _mark_model_reasons(
-    bm: dict[str, Any], ts: float, spec: Any, sigma: float | None, sigma_cal: float | None
+    bm: dict[str, Any],
+    ts: float,
+    spec: Any,
+    sigma: float | None,
+    sigma_cal: float | None,
+    *,
+    scored: bool = False,
 ) -> None:
     """The two reasons beyond the deliberate widenings that keep a bay out of the DAS MPC's
     model checks (item 100), marked here because the estimator is the one that knows them:
@@ -1570,16 +1623,30 @@ def _mark_model_reasons(
     cannot bring an old one back. ``sigma`` is ``None`` for a bay with no estimate this
     tick: nothing is marked and the last floor is forgotten, so the bay's next estimate
     starts the comparison afresh instead of stepping against a stale one.
+
+    ``scored`` is the one case where ``uncertain`` is **withheld** (item 124): the bay's
+    swap verdict stands and the settling budget refused to act on it, so the thermal fit
+    it is about to be judged against is the one the estimator wanted thrown away. Item
+    124's fallback is to keep that fit rather than reset it for ever (item 109's
+    pathology), and the whole of what makes that fallback safe is that the stale fit is
+    then *scored* instead of excused -- which cannot happen while the widening the verdict
+    itself applied keeps refreshing the exemption that excuses it. So the mark is neither
+    refreshed nor kept, and the DAS MPC's validity gate reads that bay's prediction error
+    like any other, lands in its PI-like fallback if the fit really has gone stale, and
+    says so. The trust rule's own ``settling`` exemption is unaffected: it ran out of
+    budget by itself, which is what put the bay here.
     """
     window = spec.bay_settle_s
     for key in ("unc", "calstep"):
         mark = bm[key]
         if mark is not None and not 0.0 <= ts - float(mark) < window:
             bm[key] = None
+    if scored:
+        bm["unc"] = None
     if sigma is None or sigma_cal is None:
         bm["calseen"] = None
         return
-    if sigma * sigma - sigma_cal * sigma_cal > spec.bay_uncertain_var_c2:
+    if not scored and sigma * sigma - sigma_cal * sigma_cal > spec.bay_uncertain_var_c2:
         bm["unc"] = ts
     last = bm["calseen"]
     if last is not None and abs(sigma_cal - float(last)) > spec.bay_cal_step_c:
@@ -2181,7 +2248,7 @@ def update(
                     off = i_off + k_off
                     nu = value - x[idx] - x[off]
                     s_innov = p[idx, idx] + 2.0 * p[idx, off] + p[off, off] + r
-                big = abs(nu) > spec.jump_min_c and nu * nu > jump_var * s_innov
+                big = _crossed(nu, s_innov, spec.jump_min_c, jump_var)
                 members.append((name, value, r, nu, big, k_off, idx))
             if members and occ != EMPTY:
                 # The bay-level test (item 12), on the very innovations above and before
@@ -2203,7 +2270,7 @@ def update(
                     for row_c in rows:
                         var_bay += sum(float(p[a, c]) for a in row_a for c in row_c)
                 s_bay = var_bay / len(members) ** 2
-                if abs(nu_bay) > spec.jump_min_c and nu_bay * nu_bay > jump_var * s_bay:
+                if _crossed(nu_bay, s_bay, spec.jump_min_c, jump_var):
                     stepped[b] = True
                     step_nu = nu_bay
             jump = any(m[4] for m in members) and not (
@@ -2463,17 +2530,24 @@ def update(
     # bay has ``bay_settle_max_s`` of exemption left, the same budget the trust rule
     # spends. Only these reach ``thermal.update(reset_bays=...)``.
     resets: dict[str, bool] = {}
+    # the bays whose verdict the *budget* refused this tick. Their fit is kept, so the
+    # model gate must not go on excusing them for the very widening the verdict applied
+    # (item 124, :func:`_mark_model_reasons`).
+    held_now: set[str] = set()
     for b, was_swapped in swapped.items():
         if not was_swapped:
             continue
         occ_event = b in crossed
-        resets[b] = _swap_event(
+        verdict = _swap_event(
             mem["bays"][b],
             float(ts),
             spec,
             SETTLE_OCCUPANCY if occ_event else SETTLE_JUMP,
             limited=not occ_event,
         )
+        resets[b] = verdict == SWAP_EVENT
+        if verdict == SWAP_HELD:
+            held_now.add(b)
 
     # -- store the filter ----------------------------------------------------------------
     for z, (x, p) in arrays.items():
@@ -2668,7 +2742,9 @@ def update(
             i_d, i_s, i_q = _slots(st.zones[bay.zone], bay)
             sigma = math.sqrt(max(float(p[i_d, i_d]), 0.0) + sigma_cal * sigma_cal)
         # item 100: the estimator, not the solver, decides why a bay is not itself
-        _mark_model_reasons(bm, float(ts), spec, sigma, sigma_cal if estimated else None)
+        _mark_model_reasons(
+            bm, float(ts), spec, sigma, sigma_cal if estimated else None, scored=b in held_now
+        )
         info.update(_settle_view(bm, float(ts), spec, settling))
         bays_out[b] = info
         if not estimated:
