@@ -68,16 +68,34 @@ a genuinely empty section (nothing accepted in ``--warm-ticks``) from one this w
 never tries to populate at all.
 
 **Safety**: refuses to write anywhere but under a scratch directory
-(``tempfile.gettempdir()`` or ``/tmp``) -- never the daemon's own
-``$STATE_DIRECTORY/model.json`` or a path under ``/opt/aqua-bridge`` /
+(``tempfile.gettempdir()``, ``/tmp`` or ``/var/tmp``) -- never the daemon's
+own ``$STATE_DIRECTORY/model.json`` or a path under ``/opt/aqua-bridge`` /
 ``/etc/aqua-bridge``. The default ``--path`` is already such a scratch file
 and is removed again at the end of the run unless ``--keep`` is given.
+
+**Medium (PROJECT.md section 8 item 148).** A path under a scratch directory
+is not necessarily disk: on the owner's board ``/tmp`` is ``tmpfs``, so
+``tools/bench_model_store.py --path /tmp/...`` was writing to RAM and
+reporting RAM write-and-``fsync`` latency as if it were the SD card's --
+item 48's first board number, silently. So before timing anything,
+:func:`detect_medium` resolves ``--path`` against ``/proc/mounts`` (the same
+source ``findmnt`` reads) and the mount, filesystem type and backing device
+are printed to stderr and recorded in the report's ``medium`` key,
+regardless of what that medium turns out to be. When it is RAM-backed
+(``tmpfs`` or ``ramfs``) the tool refuses to run, the same way
+``ensure_scratch_path`` already refuses a non-scratch path, unless
+``--allow-ram-backed`` says the RAM numbers are wanted on purpose -- for a
+labelled comparison against a disk-backed run, which is exactly how this
+tool was used to settle item 148. Either way the report's
+``medium.ram_backed`` says which kind of run produced it, so a reader is
+never left to guess, and a future run cannot repeat item 48's original
+mistake without saying so loudly first.
 
 Usage::
 
     python tools/bench_model_store.py
     python tools/bench_model_store.py --config config.example-das.yaml \\
-        --warm-ticks 8640 --sim-preset rich --repeats 30 --path /tmp/model-bench.json
+        --warm-ticks 8640 --sim-preset rich --repeats 30 --path /var/tmp/model-bench.json
 """
 
 from __future__ import annotations
@@ -111,9 +129,137 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _SCRATCH_ROOTS = tuple(
     dict.fromkeys(  # de-duplicated, in order: gettempdir() usually already is /tmp
-        p.resolve() for p in (Path(tempfile.gettempdir()), Path("/tmp"))
+        p.resolve() for p in (Path(tempfile.gettempdir()), Path("/tmp"), Path("/var/tmp"))
     )
 )
+
+#: Filesystem types :func:`detect_medium` treats as RAM, not disk (module docstring,
+#: *Medium*): a write timed against one of these measures memory bandwidth and an
+#: `fsync` that has nothing to flush, not the storage device PROJECT.md item 48 asks
+#: about. ``ramfs`` has no size limit and no writeback at all, so it belongs here even
+#: though nothing in this repo mounts one.
+_RAM_BACKED_FSTYPES = frozenset({"tmpfs", "ramfs"})
+
+#: /proc/mounts escapes space, tab, newline and backslash as octal in both the device
+#: and mountpoint fields (see ``proc(5)``); undone here so a mountpoint containing one
+#: of those -- rare, but legal -- still compares equal to the real path.
+_MOUNT_ESCAPES = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
+
+
+def _unescape_mount_field(field: str) -> str:
+    out: list[str] = []
+    i = 0
+    while i < len(field):
+        ch = field[i]
+        code = field[i + 1 : i + 4]
+        if ch == "\\" and code in _MOUNT_ESCAPES:
+            out.append(_MOUNT_ESCAPES[code])
+            i += 4
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+@dataclasses.dataclass(frozen=True)
+class Medium:
+    """What actually backs a scratch path (module docstring, *Medium*): the mount
+    ``detect_medium`` matched, its filesystem type and its device/source field exactly
+    as ``/proc/mounts`` names it (``tmpfs`` for a RAM-backed mount, a block device such
+    as ``/dev/mmcblk0p2`` for a real one)."""
+
+    mountpoint: str
+    fstype: str
+    device: str
+
+    @property
+    def ram_backed(self) -> bool:
+        return self.fstype in _RAM_BACKED_FSTYPES
+
+    def asdict(self) -> dict[str, object]:
+        return {
+            "mountpoint": self.mountpoint,
+            "fstype": self.fstype,
+            "device": self.device,
+            "ram_backed": self.ram_backed,
+        }
+
+
+_UNKNOWN_MEDIUM = Medium(mountpoint="unknown", fstype="unknown", device="unknown")
+
+
+def detect_medium(path: Path, *, mounts_path: Path = Path("/proc/mounts")) -> Medium:
+    """The mount that actually backs ``path`` (module docstring, *Medium*): the
+    longest-matching-prefix entry in ``mounts_path`` (default ``/proc/mounts``, the
+    same source ``findmnt`` reads), so a scratch path under a disk-backed directory and
+    one under a RAM-backed one are told apart before anything is timed. ``path`` need
+    not exist yet -- the check walks up to the first existing ancestor, same as a
+    relative ``--path`` under a directory that is about to be created. Never raises: a
+    platform with no ``/proc/mounts`` (anything but Linux) or an unreadable one gets
+    :data:`_UNKNOWN_MEDIUM`, which is not RAM-backed by construction -- silence about
+    the medium is a reason to look closer, not a signal a tool should ever misuse to
+    also mean tmpfs."""
+    anchor = path
+    while not anchor.exists() and anchor.parent != anchor:
+        anchor = anchor.parent
+    anchor = anchor.resolve()
+
+    try:
+        lines = mounts_path.read_text().splitlines()
+    except OSError:
+        return _UNKNOWN_MEDIUM
+
+    best: Medium | None = None
+    best_len = -1
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        device, raw_mountpoint, fstype = fields[0], fields[1], fields[2]
+        mountpoint = _unescape_mount_field(raw_mountpoint)
+        mp = Path(mountpoint)
+        under_mount = anchor == mp or anchor.is_relative_to(mp)
+        if under_mount and len(mountpoint) > best_len:
+            best = Medium(mountpoint=mountpoint, fstype=fstype, device=device)
+            best_len = len(mountpoint)
+    return best if best is not None else _UNKNOWN_MEDIUM
+
+
+def report_and_check_medium(path: Path, *, allow_ram_backed: bool) -> Medium:
+    """:func:`detect_medium` for ``path``, always printed to stderr before anything is
+    timed (module docstring, *Medium*): what backs a scratch path is not obvious from
+    the path alone, and the whole point of item 148 is that it must never again be left
+    to guessing. When the medium is RAM-backed, refuses -- same shape as
+    :func:`ensure_scratch_path`'s refusal -- unless ``allow_ram_backed`` says the RAM
+    numbers are wanted on purpose, in which case it prints a loud warning instead and
+    still proceeds."""
+    medium = detect_medium(path)
+    print(
+        f"medium: {path} -> {medium.fstype} on {medium.device}, mounted at {medium.mountpoint}",
+        file=sys.stderr,
+    )
+    if not medium.ram_backed:
+        return medium
+    if not allow_ram_backed:
+        raise SystemExit(
+            f"refusing to benchmark {path}: {medium.mountpoint} ({medium.fstype} on "
+            f"{medium.device}) is RAM-backed. This is exactly what produced PROJECT.md "
+            "section 8 item 48's first board number -- RAM write-and-fsync latency reported "
+            "as if it were the SD card's (section 8 item 148). Point --path at a disk-backed "
+            "scratch directory (for example /var/tmp on the board), or pass --allow-ram-backed "
+            "to measure tmpfs on purpose, for a labelled comparison against a disk-backed run."
+        )
+    banner = "!" * 70
+    print(banner, file=sys.stderr)
+    print(
+        f"WARNING: {medium.mountpoint} ({medium.fstype} on {medium.device}) is RAM-backed -- "
+        "these write/fsync numbers are RAM latency, not disk latency. --allow-ram-backed was "
+        "given, so this run proceeds; the report's medium.ram_backed is true so it cannot be "
+        "mistaken for a disk-backed run afterwards.",
+        file=sys.stderr,
+    )
+    print(banner, file=sys.stderr)
+    return medium
 
 
 def percentile(samples: list[float], q: float) -> float:
@@ -294,6 +440,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--keep", action="store_true", help="leave the scratch file behind instead of deleting it"
     )
+    parser.add_argument(
+        "--allow-ram-backed",
+        action="store_true",
+        help="proceed even when --path resolves to a RAM-backed filesystem (tmpfs/ramfs) "
+        "instead of refusing (module docstring, Medium); use only to deliberately record RAM "
+        "numbers for a labelled comparison (PROJECT.md section 8 item 148) -- the report's "
+        "medium.ram_backed says which kind of run this was either way",
+    )
     args = parser.parse_args(argv)
 
     if args.warm_ticks <= 0:
@@ -308,10 +462,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.path is not None:
         path = ensure_scratch_path(Path(args.path))
+        created_default = False
     else:
         fd, name = tempfile.mkstemp(prefix="aqua-bridge-bench-model-store-", suffix=".json")
         os.close(fd)
         path = ensure_scratch_path(Path(name))
+        created_default = True
+
+    try:
+        medium = report_and_check_medium(path, allow_ram_backed=args.allow_ram_backed)
+    except SystemExit:
+        if created_default:
+            path.unlink(missing_ok=True)
+        raise
 
     try:
         result = bench_writes(
@@ -334,6 +497,7 @@ def main(argv: list[str] | None = None) -> int:
         "machine": platform.machine(),
         "config_path": str(config_path),
         "path": str(path),
+        "medium": medium.asdict(),
         "kept": args.keep,
         "result": result,
     }
