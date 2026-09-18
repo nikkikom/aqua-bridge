@@ -7663,8 +7663,15 @@ Owner decision (2026-09-16):
     `bookkeeping_ms` mean 30.36 ms / p99 34.36 ms / max 43.22 ms, against
     `solve_p99_ms` **94.70 ms** (`p99_ms` 91.64 ms over all 600 ticks,
     `mean_ms` 55.91 ms, `modes` auto 559 / saturated 41 / degraded 0 /
-    fallback 0, `model_active_fraction` 1.0 -- same clean MPC-only run as
-    item 73's re-measurement above). A same-session run without
+    fallback 0, `model_active_fraction` 1.0 -- a fresh run of the same kind
+    (clean, non-throttled, MPC-only) as item 73's re-measurement above, not
+    a reproduction of it: this run's numbers sit about 8-9 % above item
+    73's across the board (`solve_p99_ms` 94.70 ms vs 87.22 ms, `p99_ms`
+    91.64 ms vs 85.96 ms, `mean_ms` 55.91 ms vs 51.08 ms, `modes` auto 559 /
+    saturated 41 vs auto 562 / saturated 38), which is ordinary run-to-run
+    variance on this board, not a regression or a conflict between this
+    entry and §4's table -- read the two as separate measurements of the
+    same board, not restatements of each other). A same-session run without
     `--profile-phases` gives `solve_p99_ms` 91.69 ms, so the wrapper's
     own overhead on this board is about 3 ms (~3 %), matching the module
     docstring's own caution that `--profile-phases` "costs a little
@@ -9272,7 +9279,12 @@ Owner decision (2026-09-16):
     board itself, not only argued from the shipped config, and no
     sibling branch has landed that changes it -- and `min_ms` 0.243,
     `median_ms` 0.250, `mean_ms` 0.273, `p99_ms` **0.710**, `max_ms`
-    0.710, `spread_ms` 0.467 over the 30 writes.
+    0.710, `spread_ms` 0.467 over the 30 writes. Against `dt = 5 s` and
+    `mpc.model_store_interval_s = 600 s` that p99 gives
+    `p99_fraction_of_dt` 0.000142 (about 0.014 % of the tick) and
+    `p99_fraction_of_model_store_interval` 0.0000012 -- both computed from
+    the RAM write-and-`fsync` latency measured here, not the microSD
+    card's, so neither fraction is the item's real answer yet either.
 
     Those write numbers answer the size question and nothing else:
     `findmnt /tmp` on this board shows `/tmp` is `tmpfs` -- RAM-backed,
