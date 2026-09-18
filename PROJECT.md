@@ -7625,8 +7625,8 @@ Owner decision (2026-09-16):
     un-transcribed here. The owner decision above (regenerate the goldens
     for cheaper arithmetic) is unaffected by this and still open.
 
-    **`bench_step.py --profile-phases` added (2026-09-17), Pi run still
-    outstanding.** The bench tool now takes `--profile-phases`
+    **`bench_step.py --profile-phases` added (2026-09-17); board run
+    below (2026-09-18).** The bench tool now takes `--profile-phases`
     (`--sim-plant das`, `mpc` solver only) and adds a `phases` breakdown to
     its `mpc` result: `sqp_box_qp_ms` (`solver_das.solve_penalty_qp`, the
     SQP with its box QPs), `estimator_kalman_ms` (`estimator.update`),
@@ -7647,21 +7647,53 @@ Owner decision (2026-09-16):
     `estimator_kalman_ms` mean 0.71 ms, `gate_ms` mean 0.04 ms,
     `bookkeeping_ms` mean 0.96 ms, against a 2.6 ms solve-tick max.
 
-    Running it on the board itself -- what this item actually asks for --
-    was not done: `ssh` to the board's host had no route from the
-    environment this work ran in (`ssh: connect to host ... port 22: No
-    route to host`, every address tried, IPv4 and IPv6; concrete hostnames
-    live in `private.md`, not here). Nothing about the aquaero, the Quadro
-    or the heartbeat is implicated; this is a network-reachability gap in
-    the *work* environment, not a board problem. The command to run once
-    the board is reachable is
-    `ssh USER@PI-HOST 'cd /opt/aqua-bridge && PYTHONPATH=/opt/aqua-bridge/src
+    **Board run (2026-09-18).** The earlier no-route failure was a
+    network-reachability gap in a different work environment, not this
+    one or the board: `ssh` reaches the board this time, and `/opt/aqua-
+    bridge` there is a git-free copy of the same revision this ran
+    from (`sha256sum` of `tools/bench_step.py`, `tools/bench_model_
+    store.py` and this file all match). `PYTHONPATH=/opt/aqua-bridge/src
     .venv/bin/python tools/bench_step.py --sim-plant das --ticks 600
-    --profile-phases'`, with `vcgencmd measure_temp` and `vcgencmd
-    get_throttled` before and after (module docstring's own caution about a
-    throttled run not being a measurement). The owner decision above is
-    still open either way; this only finishes the tooling item 95 also
-    asked for.
+    --solver mpc --profile-phases` ran clean (`/sys/class/thermal/
+    thermal_zone0/temp` 42.93 → 48.31 °C, `vcgencmd get_throttled` `0x0`
+    before and after -- not a throttled run) and reports, over the 300
+    solve ticks: `sqp_box_qp_ms` mean 25.80 ms / p99 35.92 ms / max
+    38.69 ms, `estimator_kalman_ms` mean 22.37 ms / p99 24.49 ms / max
+    25.23 ms, `gate_ms` mean 1.84 ms / p99 3.02 ms / max 3.11 ms,
+    `bookkeeping_ms` mean 30.36 ms / p99 34.36 ms / max 43.22 ms, against
+    `solve_p99_ms` **94.70 ms** (`p99_ms` 91.64 ms over all 600 ticks,
+    `mean_ms` 55.91 ms, `modes` auto 559 / saturated 41 / degraded 0 /
+    fallback 0, `model_active_fraction` 1.0 -- same clean MPC-only run as
+    item 73's re-measurement above). A same-session run without
+    `--profile-phases` gives `solve_p99_ms` 91.69 ms, so the wrapper's
+    own overhead on this board is about 3 ms (~3 %), matching the module
+    docstring's own caution that `--profile-phases` "costs a little
+    overhead of its own".
+
+    The four phases add up to the whole: `bookkeeping_ms` is defined as
+    the tick's own elapsed time minus the other three (module
+    docstring), so the identity holds by construction every solve tick
+    unless that subtraction would go negative, in which case the code
+    clamps it to zero and the identity breaks. Checked directly on this
+    board (same config and seed, 300 solve ticks, phase wrappers active
+    throughout): the clamp never triggered, and the mean of the four
+    phases (49.60 ms of named phases + 30.21 ms bookkeeping = 79.80 ms)
+    matches the mean elapsed time over those same solve ticks (79.80 ms)
+    exactly; the closest any tick came to the clamp was a 24.51 ms
+    margin, nowhere near zero. The one place the numbers above do *not*
+    sum cleanly is the p99 column -- the four phase p99s add to
+    97.79 ms, about 3.1 ms over `solve_p99_ms`'s 94.70 ms -- but that gap
+    is a percentile artefact, not lost time: each phase's p99 is that
+    phase's own worst tick, taken independently, and the tick worst for
+    `bookkeeping_ms` need not be the tick worst for `sqp_box_qp_ms`, so
+    their p99s do not have to add to the p99 of the sum. Nothing is
+    unaccounted for.
+
+    This settles the tooling half of item 95: the per-phase split works
+    on the board, on real hardware, exactly as the dev-machine sanity run
+    said it would. The owner decision above (whether the remaining
+    solve-tick time is worth regenerating the goldens) is unaffected by
+    this and still open.
 98. Tune `model_max_air_dist_c_per_min` on the real enclosure (item 66).
     The shipped 8.0 °C/min is set above what the `rich` truth simulator's
     *drawn* physics produce on a healthy enclosure, where the prior's air
@@ -9182,7 +9214,8 @@ Owner decision (2026-09-16):
     tightest.
 48. Time `model.json` writes on the Pi's SD card.
 
-    **Tool added (2026-09-17), Pi run still outstanding.**
+    **Tool added (2026-09-17); board run below settles the size question,
+    not the write-latency one (2026-09-18).**
     `tools/bench_model_store.py` builds one realistic snapshot -- a DAS
     closed loop of `--warm-ticks` steps against `config.example-das.yaml`
     (`--sim-preset rich` by default), so the estimator's calibration, the
@@ -9221,18 +9254,47 @@ Owner decision (2026-09-16):
     SMART, calibrations accepted, fan curves fit if enabled) reaches the
     store's real size.
 
-    Running it on the board -- what this item actually asks for -- was not
-    done, for the same reason as item 95's tooling addendum: `ssh` to the
-    board's host had no route from the environment this work ran in
-    (concrete hostnames live in `private.md`, not here). The command to
-    run once the board is reachable, writing only under `/tmp` on the
-    board and never over its own store at `/opt/aqua-bridge`'s
-    `$STATE_DIRECTORY/model.json`, is
-    `ssh USER@PI-HOST 'cd /opt/aqua-bridge && PYTHONPATH=/opt/aqua-bridge/src
-    .venv/bin/python tools/bench_model_store.py --warm-ticks 1200
-    --sim-preset rich --repeats 30 --path /tmp/model-store-bench.json'`
-    (the tool deletes that scratch file itself when it finishes; `--keep`
-    only if the owner wants to inspect it first).
+    **Board run (2026-09-18).** The earlier no-route failure was a
+    network-reachability gap in a different work environment, not this
+    one; `ssh` reaches the board this time and `/opt/aqua-bridge` there
+    is a git-free copy of the same revision this ran from (`sha256sum`
+    of `tools/bench_model_store.py`, `tools/bench_step.py` and this file
+    all match). Writing only under `/tmp` on the board, never over the
+    daemon's own store: `PYTHONPATH=/opt/aqua-bridge/src .venv/bin/python
+    tools/bench_model_store.py --warm-ticks 1200 --sim-preset rich
+    --repeats 30 --path /tmp/model-store-bench.json` ran clean
+    (`/sys/class/thermal/thermal_zone0/temp` 46.16 → 50.46 °C across this
+    and item 95's board run together, `vcgencmd get_throttled` `0x0`
+    throughout -- not a throttled run) and reports `size_bytes` **1424**
+    -- the same floor as the dev-machine run above, even at 1200 ticks
+    and `--sim-preset rich`: item 133's caveat (the warm-up loop never
+    gets `fan_curves` or `calibration` populated) is now confirmed on the
+    board itself, not only argued from the shipped config, and no
+    sibling branch has landed that changes it -- and `min_ms` 0.243,
+    `median_ms` 0.250, `mean_ms` 0.273, `p99_ms` **0.710**, `max_ms`
+    0.710, `spread_ms` 0.467 over the 30 writes.
+
+    Those write numbers answer the size question and nothing else:
+    `findmnt /tmp` on this board shows `/tmp` is `tmpfs` -- RAM-backed,
+    and a separate mount from the SD card the daemon's own store and
+    `/opt` both live on (`/dev/mmcblk0p2`, `ext4`, confirmed with
+    `findmnt /opt`) -- and `tempfile.gettempdir()` there is `/tmp`
+    itself, so the tool's own scratch-root check (module docstring,
+    *Safety*) accepts exactly the mount that defeats this item's
+    purpose. A sub-millisecond `p99_ms` an order of magnitude faster
+    than the dev machine's own SSD-class 4.46 ms is itself the tell:
+    this measured RAM write-and-`fsync` latency, not a microSD card's,
+    and nothing in this run touched the card at all. The run this item
+    asked for was scoped to write only under `/tmp` on the board -- never
+    elsewhere, never as root, never near the daemon's own store -- so a
+    disk-backed path was not attempted even though one exists on the
+    same filesystem as `/opt` (`findmnt /var/tmp` resolves to the root
+    `ext4`, checked read-only, nothing written there). The size half of
+    this item is now settled; the write-and-`fsync`-latency half is not,
+    and still needs either a scratch path the owner points at the SD
+    card explicitly, or the tool itself flagging a resolved path that
+    turns out to be `tmpfs` so a future run cannot repeat this same
+    silent miss (PROPOSED ITEMS).
 49. Digole: protocol, pages (Overview, Drives, Zones/Fans, Model, Host),
     touch, hit-test.
 75. **The kick is done; the measured duties behind it are not** (2026-09-18).
