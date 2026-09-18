@@ -96,6 +96,10 @@ Rules (section 6 "Control", section 4.8, section 5 "Modes")
   which is why a fallback command is no longer returned untouched while one is in
   force; with no floor in force (every ordinary tick, and every tick of a legacy
   config, where the rule cannot run at all) ``compose`` behaves exactly as before.
+  A floor that raises a channel a running identification experiment drives **aborts
+  that experiment** (``spin_up:<channel>``), like any other perturbation it cannot
+  see: the experiment plans its levels from the solver's demand, so a channel the
+  floor lifts above the planned level is excitation the experiment did not ask for.
 
 Presets (section 6 ``POST /api/preset``, "MPC aggressiveness")
 --------------------------------------------------------------
@@ -430,6 +434,49 @@ def _experiment_floor(mpc_cmd: MpcCommand, plan: TickPlan, cfg: MpcConfig) -> di
         for ch, value in levels.items()
         if ch in cfg.channels and plan.overrides.get(ch) == value and ch in mpc_cmd.pwm
     }
+
+
+def _spin_floor_of(cmd: MpcCommand | None) -> dict[str, float]:
+    """The spin-up floors that were in force on the composed command of this tick.
+
+    Read back out of ``diagnostics["supervisor"]["spin_up"]``, which ``compose`` writes
+    exactly when a floor applied, so this is what reached the fans rather than what the
+    tracker thought before the tick."""
+    if cmd is None or not isinstance(cmd.diagnostics, Mapping):
+        return {}
+    diag = cmd.diagnostics.get("supervisor")
+    spin = diag.get("spin_up") if isinstance(diag, Mapping) else None
+    if not isinstance(spin, Mapping):
+        return {}
+    out: dict[str, float] = {}
+    for group in ("kick", "hold"):
+        levels = spin.get(group)
+        if not isinstance(levels, Mapping):
+            continue
+        for ch, value in levels.items():
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                continue
+            name = str(ch)
+            out[name] = max(out.get(name, float(value)), float(value))
+    return out
+
+
+def _spin_raised(exp: Mapping[str, Any], floor: Mapping[str, float] | None) -> str | None:
+    """A channel of ``exp`` that a spin-up floor put above the level it asked for.
+
+    A floor at or below the experiment's own level changed nothing on that channel, so
+    it is not a reason to throw an experiment away."""
+    if not floor:
+        return None
+    overrides = exp.get("overrides") or {}
+    for ch in exp.get("channels") or ():
+        value = floor.get(ch)
+        if value is None:
+            continue
+        want = overrides.get(ch)
+        if want is None or float(value) > float(want) + _EPS:
+            return str(ch)
+    return None
 
 
 def _fallback_channels(cmd: MpcCommand, cfg: MpcConfig) -> frozenset[str]:
@@ -1175,7 +1222,7 @@ class Supervisor:
                 ):
                     solver_cmd = None
                 tick_ts = obs.ts if ts is None and obs is not None else ts
-                self._ident_tick(solver_cmd, tick_ts, applied)
+                self._ident_tick(solver_cmd, tick_ts, applied, spin_floor=_spin_floor_of(cmd))
 
     def spin_up_status(self) -> dict[str, Any]:
         """Per channel: what the spin-up rule made of it, for the health payload.
@@ -1253,7 +1300,14 @@ class Supervisor:
         with self._lock:
             return ident.settle_snapshot(self._ident_tracker)
 
-    def _ident_tick(self, mpc_cmd: MpcCommand | None, ts: float | None, applied: bool) -> None:
+    def _ident_tick(
+        self,
+        mpc_cmd: MpcCommand | None,
+        ts: float | None,
+        applied: bool,
+        *,
+        spin_floor: Mapping[str, float] | None = None,
+    ) -> None:
         try:
             # only an experiment that re-plans reads the demand: no other tick, and no
             # tick of a frozen plan, pays for the two copies (item 52)
@@ -1266,6 +1320,15 @@ class Supervisor:
                 self._ident_tracker = ident.resume_tracker(self._ident_tracker, facts)
             self._ident_tracker = ident.track(self._ident_tracker, self._effective, facts)
             if self._experiment is None:
+                return
+            # A spin-up floor is a perturbation the experiment cannot see: its facts are
+            # the solver command, taken *before* ``compose`` applies the floor, so it
+            # would go on believing the channel sits at the level it planned while the
+            # fans carry the kick duty and then ramp back down at ``d_pwm_max``. Abort
+            # it the way every other perturbation does (section 8 item 75).
+            raised = _spin_raised(self._experiment, spin_floor)
+            if raised:
+                self._end_experiment(ident.RESULT_ABORTED, f"spin_up:{raised}")
                 return
             outcome = ident.advance(self._experiment, self._effective, facts)
             if outcome.experiment is not None:

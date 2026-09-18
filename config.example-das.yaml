@@ -704,10 +704,11 @@ spin_up:
                              # [mpc.pwm_min, mpc.pwm_max] when it is applied
   kick_s: 30.0               # how long one kick holds the channel there, seconds (> 0).
                              # It has to cover the mpc.d_pwm_max ramp up to that duty as
-                             # well as the rotor's own start time; shorter than mpc.dt is
-                             # a config error, because no kick would ever reach the fans.
-                             # Here: 0.2 -> 0.5 at d_pwm_max 0.1 is 3 ticks = 15 s of
-                             # ramp, leaving 15 s at the kick duty
+                             # well as the rotor's own start time, and a value below that
+                             # ramp plus one tick is a config error: the fan would be
+                             # kicked to a duty it never reaches and then declared failed
+                             # for a kick it never got. Here: 0.2 -> 0.5 at d_pwm_max 0.1
+                             # is 3 ticks = 15 s of ramp, leaving 15 s at the kick duty
   confirm_s: 30.0            # a channel must read at or below min_rpm under a duty at or
                              # above its stall duty for this long of live, uninterrupted
                              # readings before it is kicked, seconds (> 0). It is also
@@ -718,15 +719,29 @@ spin_up:
   min_rpm: 60.0              # a speed at or below this is "not turning", rpm (>= 0). Not
                              # zero: a tachometer reading a handful of rpm is a rotor
                              # that is not moving air either
-  retry_s: 900.0             # a failed channel is tried once more after this long,
+  retry_s: 900.0             # a failed channel gets one more sequence after this long,
                              # seconds (> 0), so a fan replaced while the daemon runs is
-                             # picked up without a restart -- and a dead one is kicked at
-                             # most once per this interval instead of for ever
+                             # picked up without a restart -- and a dead one costs at most
+                             # max_attempts kicks per this interval instead of for ever
+  clear_s: 30.0              # a declared failure is retracted only once the tachometer
+                             # has read above min_rpm for this long of live,
+                             # uninterrupted readings (> 0). Declaring one costs
+                             # confirm_s and every attempt, so retracting it -- the alarm
+                             # and the floor below -- may not cost one reading: a dead
+                             # rotor windmilled by its siblings' air reads a few rpm
   failed_channel_floor: true # while a fan is declared failed, hold every other channel
                              # of the zones it served at the duty it carried when the
                              # failure was declared, so the zone cannot lose cooling
                              # because one of its fans died. The rise above that floor
-                             # comes from the measured temperatures through the solver
+                             # comes from the measured temperatures through the solver.
+                             # A sibling whose own fan is already declared dead is never
+                             # floored: it moves no air at any duty
+  failed_channel_floor_max: 0.6
+                             # no such hold is ever recorded above this duty (0..1): a
+                             # failure declared in the middle of a hot spell would
+                             # otherwise pin the enclosure there for as long as the fan
+                             # stays dead. Above the cap the temperatures hold the
+                             # siblings up on their own, through the solver
   log_interval_s: 300.0      # one log line per channel and transition at most this
                              # often, seconds (> 0)
   # Per output: {fan, tachometer, stall_duty, kick_duty}; an absent stall_duty /

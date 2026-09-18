@@ -24,9 +24,9 @@ from typing import Any
 import pytest
 
 from aqua_bridge.control.loop import Loop, TickResult
-from aqua_bridge.control.spinup import SpinUpChannel, SpinUpConfig
+from aqua_bridge.control.spinup import SpinUpChannel, SpinUpConfig, validate_spin_up
 from aqua_bridge.control.supervisor import Supervisor
-from aqua_bridge.model import MpcCommand, MpcConfig, PlantObservation
+from aqua_bridge.model import ConfigError, MpcCommand, MpcConfig, PlantObservation
 from aqua_bridge.sim.das import DasPlant, build_das_plant, topology_from_config
 from das_fixtures import das_cfg
 
@@ -153,18 +153,21 @@ def test_a_stalled_fan_starts_on_the_first_kick_and_stays_turning() -> None:
     assert run.pwm[-1]["fa1"] == pytest.approx(run.cfg.pwm_min)
 
 
-def test_a_fan_the_first_kick_does_not_reach_is_given_a_second() -> None:
-    """``d_pwm_max`` ramps the kick, so a ``kick_s`` that only just covers the ramp can
-    expire short of the start duty. The next attempt begins from a higher command --
-    the command falls back at ``d_pwm_max`` too -- and reaches it."""
-    run = build(
-        fans={"fa1": {"start_duty": 0.55}},
-        settings=spin(kick_duty=0.6, kick_s=3.0, verify_s=1.0, max_attempts=3),
-    ).run(50)
-    # 0.15 -> 0.25, 0.35, 0.45 and the kick expires 0.1 short of the 0.55 start duty;
-    # the command falls one step to 0.35 and the second kick reaches 0.55 from there.
-    assert [round(p["fa1"], 2) for p in run.pwm[5:12]] == [0.25, 0.35, 0.45, 0.35, 0.45, 0.55, 0.6]
-    assert run.attempts("fa1") == 2
+def test_a_kick_too_short_for_the_ramp_is_refused_rather_than_condemning_the_fan() -> None:
+    """``d_pwm_max`` ramps the kick, so a ``kick_s`` that does not cover the ramp expires
+    short of the kick duty -- and the fan is then declared failed for a kick it never
+    got. ``validate_spin_up`` refuses such a config at startup; with a legal ``kick_s``
+    the ramp reaches the duty and this fan, whose rotor needs 0.55 to start, starts."""
+    cfg = das_cfg()  # dt 1, d_pwm_max 0.1, pwm_min 0.15: 0.15 -> 0.6 is 5 ticks of ramp
+    short = spin(kick_duty=0.6, kick_s=3.0, verify_s=1.0, max_attempts=3)
+    with pytest.raises(ConfigError, match="cannot deliver a kick to 0.6"):
+        validate_spin_up(cfg, short)
+    settings = spin(kick_duty=0.6, kick_s=6.0, verify_s=1.0, max_attempts=3)
+    validate_spin_up(cfg, settings)
+    run = build(fans={"fa1": {"start_duty": 0.55}}, settings=settings).run(50)
+    # one kick, ramped a d_pwm_max step per tick until the rotor breaks free at 0.55
+    assert [round(p["fa1"], 2) for p in run.pwm[5:11]] == [0.25, 0.35, 0.45, 0.55, 0.6, 0.6]
+    assert run.attempts("fa1") == 1
     assert run.states()["fa1"] == "turning" and run.rpm[-1]["fa1"] > 60.0
 
 

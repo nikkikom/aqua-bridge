@@ -23,12 +23,16 @@ It is a *supervised sequence*, not a boost:
    motion starts the next attempt, and after ``max_attempts`` the channel is a
    **failed fan**: a health problem with a clear message, and -- with
    ``failed_channel_floor`` -- a floor under every other channel of the zones it
-   served, at the duty they carried when the failure was declared, so the zone cannot
-   lose cooling because one of its fans died. A failed channel is retried once every
-   ``retry_s``, so a fan replaced while the daemon runs is picked up without a restart;
-   the retry runs *under* that floor, and the floor keeps the level recorded at the
-   first failure rather than being re-recorded, so repeated retries on a hot enclosure
-   cannot ratchet the siblings upward. Only the tachometer lifts it.
+   served, at the duty they carried when the failure was declared (never above
+   ``failed_channel_floor_max``, and never on a sibling whose own fan is already
+   declared dead), so the zone cannot lose cooling because one of its fans died. A
+   failed channel gets one more sequence every ``retry_s``, so a fan replaced while the
+   daemon runs is picked up without a restart; that retry runs *under* the floor, which
+   is recorded once at the first failure and never re-recorded, so repeated retries on
+   a hot enclosure cannot ratchet the siblings upward. The declaration -- the alarm and
+   the floor -- is retracted only by ``clear_s`` of live readings above ``min_rpm``:
+   only the tachometer lifts it, and not on one sample, because a dead rotor windmilled
+   by its siblings' airflow reads a handful of rpm.
 4. **At start too.** Every commanded channel is under the rule from the first tick;
    the same confirmation window covers the seconds a healthy fan needs to spin up.
 
@@ -77,7 +81,9 @@ is the observation's ``ts``, like everywhere else in the controller.
 A tick with no live reading (the read failed, the write failed, the channel's aquabus
 slot went away) is a **gap**: every window of that channel starts again, because wall
 time passing while nothing was measured is not evidence of anything. That is the same
-rule the fan-health monitor follows (:mod:`aqua_bridge.health`).
+rule the fan-health monitor follows (:mod:`aqua_bridge.health`). A gap is equally not
+evidence that a dead fan came back: a declared failure, and the floor under its zone,
+survives one.
 
 Every threshold and timing is a ``spin_up:`` key with one default declared once in
 :class:`SpinUpConfig`, validated there and in :func:`validate_spin_up` (which needs the
@@ -89,7 +95,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -107,6 +113,7 @@ __all__ = [
     "advance",
     "channel_kick_duty",
     "channel_stall_duty",
+    "covers_any",
     "floors",
     "new_tracker",
     "status",
@@ -264,15 +271,26 @@ class SpinUpConfig:
     #: A speed at or below this is "not turning", rpm (>= 0). Not zero: a tachometer
     #: reading a handful of rpm is a rotor that is not moving air either.
     min_rpm: float = 60.0
-    #: A failed channel is tried once more after this long, seconds (> 0), so a fan
+    #: A failed channel gets one more sequence after this long, seconds (> 0), so a fan
     #: replaced while the daemon runs is picked up without a restart -- and a truly dead
-    #: one is kicked at most once per this interval instead of for ever.
+    #: one costs at most ``max_attempts`` kicks per this interval instead of for ever.
     retry_s: float = 900.0
+    #: A declared failure is retracted only once the tachometer has read above
+    #: ``min_rpm`` for this long of live, uninterrupted readings (> 0). Declaring one
+    #: costs ``confirm_s`` and every attempt, so retracting it -- the alarm and the floor
+    #: under the zone's other fans -- may not cost one reading: a dead rotor windmilled
+    #: by its siblings' airflow reads a handful of rpm.
+    clear_s: float = 30.0
     #: While a fan is declared failed, hold every other channel of the zones it served
     #: at the duty it carried when the failure was declared, so the zone cannot lose
     #: cooling because one of its fans died. The rise above that floor comes from the
     #: measured temperatures, through the solver, like any other heat.
     failed_channel_floor: bool = True
+    #: No such hold is ever recorded above this duty (0..1). A failure declared in the
+    #: middle of a hot spell would otherwise pin the enclosure at that duty for as long
+    #: as the fan stays dead; above the cap the temperatures hold the siblings up on
+    #: their own, through the solver, exactly as they did before the failure.
+    failed_channel_floor_max: float = 0.6
     #: One log line per channel and transition at most this often, seconds (> 0).
     log_interval_s: float = 300.0
     #: Per output: what is on it and what it needs (:class:`SpinUpChannel`).
@@ -289,7 +307,13 @@ class SpinUpConfig:
                 "a kick at or below the duty a fan already fails to start at is not a kick"
             )
         _number("spin_up.min_rpm", self.min_rpm, minimum=0.0, maximum=None)
-        for name in ("kick_s", "confirm_s", "verify_s", "retry_s", "log_interval_s"):
+        _number(
+            "spin_up.failed_channel_floor_max",
+            self.failed_channel_floor_max,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        for name in ("kick_s", "confirm_s", "verify_s", "retry_s", "clear_s", "log_interval_s"):
             _number(f"spin_up.{name}", getattr(self, name), minimum=1e-9, maximum=None)
         if isinstance(self.max_attempts, bool) or not isinstance(self.max_attempts, int):
             raise ConfigError(f"spin_up.max_attempts must be an integer, got {self.max_attempts!r}")
@@ -359,13 +383,47 @@ def validate_spin_up(cfg: MpcConfig, settings: SpinUpConfig) -> None:
         raise ConfigError(
             f"spin_up.channels names {unknown}, which are not in mpc.channels {list(cfg.channels)}"
         )
-    ramp_s = math.ceil(max(0.0, cfg.pwm_max - cfg.pwm_min) / cfg.d_pwm_max) * cfg.dt
-    if settings.enabled and settings.kick_s < cfg.dt:
+    if not settings.enabled:
+        return
+    # The worst case a kick has to deliver: the highest kick duty of any channel,
+    # reached from pwm_min one d_pwm_max step per tick, plus the one tick that actually
+    # holds the fan there. A kick_s shorter than that is not a rule that silently never
+    # fires -- the channel is kicked to a duty it never reaches, and after max_attempts
+    # the fan is declared failed, alarmed and its siblings floored for a kick it never
+    # got. So it is a configuration error, refused before anything is opened.
+    top = max(
+        [channel_kick_duty(cfg, settings, ch) for ch in cfg.channels]
+        or [min(cfg.pwm_max, max(cfg.pwm_min, float(settings.kick_duty)))]
+    )
+    ramp_s = math.ceil(max(0.0, top - cfg.pwm_min) / cfg.d_pwm_max) * cfg.dt
+    if settings.kick_s < cfg.dt:
         raise ConfigError(
             f"spin_up.kick_s ({settings.kick_s:g} s) is shorter than one tick "
             f"(mpc.dt = {cfg.dt:g} s), so no kick would ever reach the fans; it also has to "
-            f"cover the mpc.d_pwm_max ramp up to the kick duty (at most {ramp_s:g} s here)"
+            f"cover the mpc.d_pwm_max ramp up to the kick duty ({ramp_s:g} s here)"
         )
+    if settings.kick_s < ramp_s + cfg.dt:
+        raise ConfigError(
+            f"spin_up.kick_s ({settings.kick_s:g} s) cannot deliver a kick to {top:g}: the "
+            f"mpc.d_pwm_max ({cfg.d_pwm_max:g} per tick) ramp from mpc.pwm_min "
+            f"({cfg.pwm_min:g}) up to it takes {ramp_s:g} s, so the kick must last at least "
+            f"{ramp_s + cfg.dt:g} s (that ramp plus one tick at the duty). As it stands the "
+            "fan would be declared failed for a kick it never got"
+        )
+
+
+def covers_any(cfg: MpcConfig, settings: SpinUpConfig) -> bool:
+    """True when the rule can produce a verdict other than "off" on some channel.
+
+    A legacy config (no fitted curve on any output), a section that is switched off, or
+    one that declares every output fan-less or tach-less can never kick anything and can
+    never say anything but "off" -- so ``aqua_bridge.__main__.build_health_monitor``
+    does not build an observer for this rule alone in that case, and an operator who
+    turned the health sections off keeps them off.
+    """
+    return settings.enabled and any(
+        _coverage(cfg, settings, channel) is None for channel in cfg.channels
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +484,16 @@ def _record(state: str, **kw: Any) -> dict[str, Any]:
         "reason": None,
         "rpm": None,
         "duty": None,
+        #: The fan is declared failed: the alarm and the sibling floor stand. It
+        #: survives a gap and the whole of a ``retry_s`` retry, and only ``clear_s`` of
+        #: live readings above ``min_rpm`` retracts it.
+        "declared": False,
+        #: When that declaration was first made (never re-recorded while it stands).
         "failed_since": None,
+        #: When the wait for the next retry started (the declaration, or the last retry).
+        "retry_since": None,
+        #: Since when a declared channel's tachometer has been reading above ``min_rpm``.
+        "turning_since": None,
     }
     out.update(kw)
     return out
@@ -461,23 +528,32 @@ def advance(
         idle -> confirming --confirm_s--> kicking --kick_s--> verifying --verify_s-->
                 the next kick, or failed once max_attempts kicks have gone out
 
-    A tachometer above ``min_rpm`` ends the sequence at any point and clears everything.
-    A gap (no live reading) drops every timer and ends any kick in force, but keeps the
-    attempt count: a kick that went out counts whether or not it could be verified. A
-    duty that falls below the channel's stall duty ends the sequence instead -- the fan
-    is no longer expected to turn -- and the next judged tick starts a fresh one.
+    A tachometer above ``min_rpm`` ends a sequence that has declared nothing. A
+    *declared* failure is retracted only by ``clear_s`` of live readings above
+    ``min_rpm``: declaring one costs a confirmation window and every attempt, so
+    retracting it -- the alarm and the floor under the zone's remaining fans -- may not
+    cost one sample, because a dead rotor windmilled by its siblings' airflow reads a
+    handful of rpm. A gap (no live reading) drops every timer and ends any kick in
+    force, but keeps the attempt count and the declaration: a tick that measured nothing
+    is not evidence that a fan came back. A duty that falls below the channel's stall
+    duty ends an undeclared sequence instead -- the fan is no longer expected to turn --
+    and the next judged tick starts a fresh one.
     """
     old = tracker.get("channels") or {}
     old_failed = tracker.get("failed") or {}
     ts = facts.ts if _finite(facts.ts) else None
     channels: dict[str, Any] = {}
     failed: dict[str, Any] = {}
+    # Channels whose own fan the daemon has already declared dead. A sibling's failure
+    # does not floor them: a rotor that does not turn moves no air at any duty, so
+    # pinning it high is noise and nothing else.
+    dead = {ch for ch, record in old.items() if record.get("declared")}
     for channel in cfg.channels:
         prev = old.get(channel)
-        # The floor a failed fan left under its siblings survives until that fan is seen
-        # turning again: a retry sequence (``retry_s``) runs *under* it, and the level is
-        # the one recorded at the first failure and never re-recorded, so repeated
-        # retries on a hot enclosure cannot ratchet the siblings upward.
+        # The floor a failed fan left under its siblings, carried for as long as the
+        # declaration stands -- through a gap, and through the whole of a ``retry_s``
+        # retry, which runs *under* it. It is recorded once, at the first failure, and
+        # only the tachometer lifts it (``clear_s`` of it).
         held = old_failed.get(channel)
         reason = _coverage(cfg, settings, channel)
         if reason is not None:
@@ -499,15 +575,16 @@ def advance(
         rpm = facts.rpm.get(channel)
         live = measured and not unbound and _finite(duty) and _finite(rpm)
         attempts = int(prev["attempts"]) if prev else 0
-        was_failed = prev is not None and prev["state"] == FAILED
+        declared = bool(prev and prev["declared"])
+        if declared and held is not None:
+            failed[channel] = held
 
         if not live:
-            # Nothing was measured, so nothing here was established by live data.
-            if was_failed:
+            # Nothing was measured, so nothing here was established by live data --
+            # including that a declared fan came back.
+            if declared:
                 assert prev is not None
                 channels[channel] = _keep_failed(prev)
-                if held is not None:
-                    failed[channel] = held
             else:
                 channels[channel] = _record(
                     IDLE,
@@ -519,8 +596,22 @@ def advance(
         assert ts is not None
         duty, rpm = float(duty), float(rpm)  # type: ignore[arg-type]
         common: dict[str, Any] = {"rpm": rpm, "duty": duty}
-        if rpm > settings.min_rpm:  # it turns: the sequence is over, whatever it was
-            channels[channel] = _record(TURNING, since=ts, **common)
+        if rpm > settings.min_rpm:
+            if not declared:  # it turns: the sequence is over, whatever it was
+                channels[channel] = _record(TURNING, since=ts, **common)
+                continue
+            assert prev is not None
+            started = float(prev["turning_since"]) if _finite(prev["turning_since"]) else ts
+            if ts - started >= settings.clear_s:
+                channels[channel] = _record(TURNING, since=ts, **common)
+                failed.pop(channel, None)  # the tachometer, and only it, lifts the floor
+            else:
+                channels[channel] = _keep_failed(
+                    prev,
+                    turning_since=started,
+                    reason=_recovering(channel, settings, rpm),
+                    **common,
+                )
             continue
 
         stall = channel_stall_duty(settings, channel)
@@ -529,25 +620,36 @@ def advance(
         # just above a dead band a standing rotor is normal and a kick would be noise.
         judged = duty >= stall and (target is None or target > settings.min_rpm)
 
-        if was_failed:
+        if declared:
             assert prev is not None
-            since_failed = prev["failed_since"]
-            elapsed = _finite(since_failed) and ts - float(since_failed) >= settings.retry_s
-            retry = judged and elapsed
-            if not retry:
-                channels[channel] = _keep_failed(prev, **common)
-                if held is not None:
-                    failed[channel] = held
+            if prev["state"] not in (CONFIRMING, KICKING, VERIFYING):
+                # Waiting out ``retry_s``: a fan may have been replaced while the daemon
+                # ran, so it gets one more sequence -- under the floor its failure left.
+                since_retry = prev["retry_since"]
+                due = _finite(since_retry) and ts - float(since_retry) >= settings.retry_s
+                if judged and due:
+                    channels[channel] = _record(
+                        CONFIRMING,
+                        since=ts,
+                        declared=True,
+                        failed_since=prev["failed_since"],
+                        retry_since=ts,
+                        **common,
+                    )
+                else:
+                    channels[channel] = _keep_failed(prev, **common)
                 continue
-            # A fan may have been replaced while the daemon ran: one more sequence, run
-            # under the floor its failure left -- only the tachometer lifts that.
-            channels[channel] = _record(CONFIRMING, since=ts, **common)
-            if held is not None:
-                failed[channel] = held
-            continue
+            if not judged:  # a retry cannot run under this duty: back to waiting
+                channels[channel] = _keep_failed(prev, **common)
+                continue
 
-        if held is not None:
-            failed[channel] = held  # a retry sequence runs under the floor, whatever it does
+        # What a declared failure carries through the sequence of its own retry: the
+        # declaration itself, the moment it was first made, and the retry clock.
+        carry: dict[str, Any] = {
+            "declared": declared,
+            "failed_since": prev["failed_since"] if declared else None,
+            "retry_since": prev["retry_since"] if declared else None,
+        }
 
         if not judged:
             channels[channel] = _record(IDLE, **common)
@@ -564,44 +666,84 @@ def advance(
                     attempts=attempts,
                     kick_until=prev["kick_until"],  # type: ignore[index]
                     reason=prev["reason"],  # type: ignore[index]
+                    **carry,
                     **common,
                 )
             else:
-                channels[channel] = _record(VERIFYING, since=ts, attempts=attempts, **common)
+                channels[channel] = _record(
+                    VERIFYING, since=ts, attempts=attempts, **carry, **common
+                )
             continue
 
         if state == VERIFYING:
             if ts - since < settings.verify_s:
-                channels[channel] = _record(VERIFYING, since=since, attempts=attempts, **common)
+                channels[channel] = _record(
+                    VERIFYING, since=since, attempts=attempts, **carry, **common
+                )
             elif attempts >= settings.max_attempts:
-                channels[channel] = _fail(channel, ts, attempts, **common)
-                failed[channel] = held if held is not None else _hold(cfg, settings, channel, facts)
+                channels[channel] = _fail(channel, ts, attempts, carry=carry, **common)
+                failed[channel] = (
+                    held if held is not None else _hold(cfg, settings, channel, facts, dead=dead)
+                )
+                dead.add(channel)
             else:
-                channels[channel] = _kick(cfg, settings, channel, ts, attempts, **common)
+                channels[channel] = _kick(
+                    cfg, settings, channel, ts, attempts, carry=carry, **common
+                )
             continue
 
         # idle / turning / confirming: the confirmation window
         if state != CONFIRMING:
             since = ts
         if ts - since < settings.confirm_s:
-            channels[channel] = _record(CONFIRMING, since=since, attempts=attempts, **common)
+            channels[channel] = _record(
+                CONFIRMING, since=since, attempts=attempts, **carry, **common
+            )
         elif attempts >= settings.max_attempts:
-            channels[channel] = _fail(channel, ts, attempts, **common)
-            failed[channel] = held if held is not None else _hold(cfg, settings, channel, facts)
+            channels[channel] = _fail(channel, ts, attempts, carry=carry, **common)
+            failed[channel] = (
+                held if held is not None else _hold(cfg, settings, channel, facts, dead=dead)
+            )
+            dead.add(channel)
         else:
-            channels[channel] = _kick(cfg, settings, channel, ts, attempts, **common)
+            channels[channel] = _kick(cfg, settings, channel, ts, attempts, carry=carry, **common)
     return {"channels": channels, "failed": failed}
 
 
-def _keep_failed(prev: Mapping[str, Any], **common: Any) -> dict[str, Any]:
-    """A channel already declared failed stays failed, with its message."""
+def _keep_failed(
+    prev: Mapping[str, Any],
+    *,
+    turning_since: float | None = None,
+    reason: str | None = None,
+    **common: Any,
+) -> dict[str, Any]:
+    """A channel whose fan is declared failed stays declared, with its message.
+
+    The state falls back to ``failed`` whatever the sequence was doing -- a gap or a
+    duty below the stall duty ends a retry -- because the declaration, the alarm and the
+    floor under the zone's other fans stand until ``clear_s`` of the tachometer retracts
+    them."""
     return _record(
         FAILED,
         since=prev["since"],
         attempts=prev["attempts"],
+        declared=True,
         failed_since=prev["failed_since"],
-        reason=prev["reason"],
+        retry_since=prev["retry_since"],
+        turning_since=turning_since,
+        reason=prev["reason"] if reason is None else reason,
         **common,
+    )
+
+
+def _recovering(channel: str, settings: SpinUpConfig, rpm: float) -> str:
+    """The message of a declared fan whose tachometer has started reading again."""
+    return (
+        f"{channel}: the tachometer reads {rpm:.0f} rpm again, but the fan stays declared "
+        f"failed -- and its siblings floored -- until it has kept turning for "
+        f"spin_up.clear_s ({settings.clear_s:g} s). Declaring a fan dead costs a "
+        "confirmation window and every attempt, so retracting it may not cost one reading: "
+        "a dead rotor windmilled by the air of its siblings reads a handful of rpm"
     )
 
 
@@ -612,7 +754,14 @@ def _since(prev: Mapping[str, Any] | None, state: str, ts: float) -> float:
 
 
 def _kick(
-    cfg: MpcConfig, settings: SpinUpConfig, channel: str, ts: float, attempts: int, **common: Any
+    cfg: MpcConfig,
+    settings: SpinUpConfig,
+    channel: str,
+    ts: float,
+    attempts: int,
+    *,
+    carry: Mapping[str, Any] | None = None,
+    **common: Any,
 ) -> dict[str, Any]:
     duty = channel_kick_duty(cfg, settings, channel)
     return _record(
@@ -620,6 +769,7 @@ def _kick(
         since=ts,
         attempts=attempts + 1,
         kick_until=ts + settings.kick_s,
+        **(dict(carry) if carry else {}),
         reason=(
             f"{channel}: commanded above its stall duty with the tachometer at or below "
             f"{settings.min_rpm:g} rpm; kicking to {duty * 100:.0f} % for "
@@ -629,13 +779,25 @@ def _kick(
     )
 
 
-def _fail(channel: str, ts: float, attempts: int, **common: Any) -> dict[str, Any]:
+def _fail(
+    channel: str,
+    ts: float,
+    attempts: int,
+    *,
+    carry: Mapping[str, Any] | None = None,
+    **common: Any,
+) -> dict[str, Any]:
+    """The declaration. A retry that fails again keeps the *first* failure's moment, so
+    the floor it recorded is never re-recorded and the message keeps its age."""
     duty = common.get("duty")
+    first = carry.get("failed_since") if carry else None
     return _record(
         FAILED,
         since=ts,
         attempts=attempts,
-        failed_since=ts,
+        declared=True,
+        failed_since=float(first) if _finite(first) else ts,
+        retry_since=ts,
         reason=(
             f"{channel}: the fan does not turn. {attempts} spin-up kick(s) went out and the "
             f"tachometer still reads {common.get('rpm', 0.0):.0f} rpm at "
@@ -647,22 +809,38 @@ def _fail(channel: str, ts: float, attempts: int, **common: Any) -> dict[str, An
 
 
 def _hold(
-    cfg: MpcConfig, settings: SpinUpConfig, channel: str, facts: TickFacts
+    cfg: MpcConfig,
+    settings: SpinUpConfig,
+    channel: str,
+    facts: TickFacts,
+    *,
+    dead: Collection[str] = (),
 ) -> dict[str, float]:
     """The floor a failed channel leaves under its siblings: what they carried now.
 
     Empty with ``failed_channel_floor: false``. The floor never rises by itself and is
-    gone the moment the failed fan turns again; the *rise* above it comes from the
-    measured temperatures through the solver, which is the only thing that knows how
-    much more air the zone needs.
+    gone once the failed fan has turned again for ``clear_s``; the *rise* above it comes
+    from the measured temperatures through the solver, which is the only thing that
+    knows how much more air the zone needs.
+
+    Two bounds keep a hold from outliving its reason. A sibling whose own fan is already
+    declared dead (``dead``) is not floored at all -- a rotor that does not turn moves no
+    air at any duty, so pinning it high is noise and nothing else -- and no level is
+    recorded above ``failed_channel_floor_max``, because a failure declared in the middle
+    of a hot spell would otherwise pin the enclosure at that duty for as long as the fan
+    stays dead. Above the cap the temperatures hold the siblings up on their own, through
+    the solver, exactly as they did before the failure.
     """
     if not settings.failed_channel_floor:
         return {}
     out: dict[str, float] = {}
+    cap = float(settings.failed_channel_floor_max)
     for sib in _siblings(cfg, channel):
+        if sib in dead:
+            continue
         value = facts.duty.get(sib)
         if _finite(value):
-            out[sib] = float(value)  # type: ignore[arg-type]
+            out[sib] = min(float(value), cap)  # type: ignore[arg-type]
     return out
 
 
@@ -689,15 +867,23 @@ class Floors:
 
 
 def floors(tracker: Mapping[str, Any], cfg: MpcConfig, settings: SpinUpConfig) -> Floors:
-    """What the supervisor must not let any channel fall below this tick."""
+    """What the supervisor must not let any channel fall below this tick.
+
+    A channel whose own fan is declared failed carries no *hold*, whoever recorded it:
+    a rotor that does not turn moves no air at any duty, so holding it high is noise and
+    nothing else. Its own retry's *kick* still raises it -- that is what tests whether
+    the fan came back."""
     kick: dict[str, float] = {}
+    dead: set[str] = set()
     for channel, record in (tracker.get("channels") or {}).items():
         if record["state"] == KICKING and channel in cfg.channels:
             kick[channel] = channel_kick_duty(cfg, settings, channel)
+        if record["declared"]:
+            dead.add(channel)
     hold: dict[str, float] = {}
     for levels in (tracker.get("failed") or {}).values():
         for ch, value in levels.items():
-            if ch in cfg.channels:
+            if ch in cfg.channels and ch not in dead:
                 hold[ch] = max(hold.get(ch, value), float(value))
     return Floors(kick=kick, hold=hold)
 
@@ -709,6 +895,11 @@ def status(tracker: Mapping[str, Any]) -> dict[str, Any]:
     ``monitored`` is the same promise the fan-health verdict makes (PROJECT.md section 8
     item 117): true only where the rule actually ran on this channel, so a channel
     nothing watches can never read as a fan found healthy.
+
+    ``failed`` is the *declaration*, not the state string: it stands through the ticks
+    of a ``retry_s`` retry and through a gap, and goes away only when ``clear_s`` of the
+    tachometer has retracted it -- so the operator's alarm is not withdrawn by one
+    reading, or by the daemon merely trying again.
     """
     out: dict[str, Any] = {}
     for channel, record in (tracker.get("channels") or {}).items():
@@ -717,7 +908,7 @@ def status(tracker: Mapping[str, Any]) -> dict[str, Any]:
             "monitored": record["state"] != OFF,
             # A flag, not a state string to compare: :mod:`aqua_bridge.health` publishes
             # this verdict and must not import this module (it is the other way round).
-            "failed": record["state"] == FAILED,
+            "failed": bool(record["declared"]),
             "attempts": record["attempts"],
             "rpm": record["rpm"],
             "duty": record["duty"],

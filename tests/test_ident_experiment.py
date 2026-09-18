@@ -1072,7 +1072,7 @@ def test_parse_ident_rejects_malformed_bodies(body):
 class Rig:
     """A Loop on the DAS fixture with a plant that holds the commanded PWM."""
 
-    def __init__(self, cfg: MpcConfig, **temps: float) -> None:
+    def __init__(self, cfg: MpcConfig, *, spin_up: Any = None, **temps: float) -> None:
         self.cfg = cfg
         self.t = 0.0
         self.temps: dict[str, float | None] = {name: 37.5 for name in PROX}
@@ -1080,8 +1080,10 @@ class Rig:
         self.wiggle: dict[str, float] = {}
         self.drop: tuple[str, ...] = ()
         self.pwm = dict.fromkeys(cfg.channels, 0.5)
+        #: What the tachometers report; ``None`` is ``das_obs``'s healthy default.
+        self.rpm: dict[str, float | None] | None = None
         self.fail = 0
-        self.sup = Supervisor(cfg)
+        self.sup = Supervisor(cfg, spin_up=spin_up)
         self.loop = Loop(self, self, cfg, self.sup)
         self.results: list[Any] = []
 
@@ -1092,7 +1094,7 @@ class Rig:
         for name, amp in self.wiggle.items():
             base = temps.get(name)
             temps[name] = (35.0 if base is None else base) + sign * amp
-        return das_obs(self.cfg, self.t, pwm=self.pwm, drop=self.drop, **temps)
+        return das_obs(self.cfg, self.t, pwm=self.pwm, rpm=self.rpm, drop=self.drop, **temps)
 
     def apply(self, cmd: MpcCommand) -> None:
         if self.fail:
@@ -1630,6 +1632,53 @@ def test_fallback_beats_the_experiment_and_aborts_it():
     assert not rig.status["running"] and rig.status["last_abort_reason"] == "degraded"
     for r in rig.ticks(10):
         assert "experiment" not in r.cmd.diagnostics["supervisor"]
+
+
+def test_a_spin_up_kick_aborts_a_running_experiment():
+    """Section 8 item 75. A kick is a floor applied in ``compose``; the experiment's own
+    facts are the solver command taken *before* that, so it would go on believing the
+    channel sits at the level it planned while the fans carry the kick duty and then ramp
+    back down. Abort it, the way every other perturbation it cannot see does."""
+    from aqua_bridge.control.spinup import SpinUpConfig
+
+    cfg = ident_cfg()
+    settings = SpinUpConfig(
+        confirm_s=2.0 * cfg.dt, kick_s=20.0 * cfg.dt, verify_s=cfg.dt, kick_duty=1.0
+    )
+    rig = Rig(cfg, spin_up=settings)
+    rig.ticks(8)
+    rig.sup.submit(Ident("start", group="front"))
+    assert rig.status["running"]
+    rig.rpm = {**dict.fromkeys(cfg.channels, 1000.0), "fa1": 0.0}  # fa1 stands still
+    for _ in range(8):
+        rig.ticks(1)
+        if not rig.status["running"]:
+            break
+    assert not rig.status["running"]
+    assert rig.status["last_abort_reason"] == "spin_up:fa1"
+    # ... and the kick itself still reaches the fans: an abort drops the overrides, it
+    # does not drop the floor.
+    (r,) = rig.ticks(1)
+    assert r.cmd.diagnostics["supervisor"]["spin_up"]["kick"]["fa1"] == pytest.approx(cfg.pwm_max)
+
+
+def test_a_spin_up_floor_below_the_experiments_own_level_changes_nothing():
+    """The floor only raises, so one at or below the level the experiment commands
+    changed nothing on that channel and is no reason to throw the experiment away."""
+    from aqua_bridge.control.spinup import SpinUpConfig
+
+    cfg = ident_cfg()
+    settings = SpinUpConfig(
+        confirm_s=2.0 * cfg.dt, kick_s=20.0 * cfg.dt, verify_s=cfg.dt, kick_duty=0.2
+    )
+    rig = Rig(cfg, spin_up=settings)
+    rig.ticks(8)
+    rig.sup.submit(Ident("start", group="front"))
+    rig.rpm = {**dict.fromkeys(cfg.channels, 1000.0), "fa1": 0.0}
+    rig.ticks(8)
+    kicked = [r for r in rig.results if "spin_up" in r.cmd.diagnostics["supervisor"]]
+    assert kicked, "the rule did fire"
+    assert rig.status["running"], "and the experiment survived it"
 
 
 def test_every_zone_in_fault_aborts_with_fallback():

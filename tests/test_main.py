@@ -302,10 +302,29 @@ def test_build_health_monitor_is_none_when_disabled_with_a_source_that_has_none(
     # ... but a composite still gets one: its device health is published either way
     composite, _s, _r = main_mod.build_io(app, "composite")
     assert main_mod.build_health_monitor(app, sup, composite) is not None
-    # ... and so does a source with none while the spin-up rule is on: that verdict is
-    # published through this monitor and nothing else (section 8 item 75).
+    # ... and the spin-up rule does not resurrect one behind the operator's back: this
+    # is the legacy example, where the rule can cover no channel for want of a fitted
+    # curve, so switching it on changes nothing (section 8 item 75).
     with_spin = dataclasses.replace(app, spin_up={"enabled": True})
-    assert main_mod.build_health_monitor(with_spin, sup, sim_src) is not None
+    assert main_mod.build_health_monitor(with_spin, sup, sim_src) is None
+
+
+def test_build_health_monitor_is_built_for_the_spin_up_rule_where_it_can_run(
+    example_das_config_path,
+):
+    """A source with no device health of its own and both health sections off still gets
+    a monitor where the spin-up rule *can* run: its verdict is published through this
+    monitor and nothing else (section 8 item 75)."""
+    from aqua_bridge.control.supervisor import Supervisor
+
+    app = load_config(example_das_config_path)
+    off = {"enabled": False}
+    app = dataclasses.replace(app, fan_health=off, host_health=off)
+    sup = Supervisor(app.mpc)
+    plain = object()  # a source with no device health of its own, like the simulator's
+    assert main_mod.build_health_monitor(app, sup, plain) is not None
+    with_off = dataclasses.replace(app, spin_up={"enabled": False})
+    assert main_mod.build_health_monitor(with_off, sup, plain) is None
 
 
 def test_a_bad_fan_health_key_exits_2_before_anything_opens(tmp_path, example_config_path, caplog):

@@ -182,8 +182,9 @@ function renderDevices(health) {
     // The spin-up kick (section 8 item 75): a channel commanded but not turning. The
     // failed fan's own line is in h.problems below; here it is the channel's state, and
     // a channel the rule does not watch says so rather than showing nothing.
+    // `failed` is the declaration, not the state: it stands while a retry runs.
     const s = f.spin_up;
-    if (s && s.state === "failed") parts.push("FAN DOES NOT TURN");
+    if (s && s.failed) parts.push("FAN DOES NOT TURN" + (s.state === "failed" ? "" : ", retrying"));
     else if (s && (s.state === "kicking" || s.state === "confirming" || s.state === "verifying"))
       parts.push("spin-up " + s.state + " (" + s.attempts + ")");
     else if (s && s.monitored === false) parts.push("spin-up not monitored");
