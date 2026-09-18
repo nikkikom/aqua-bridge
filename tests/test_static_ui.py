@@ -125,6 +125,16 @@ _DEVICE_HEALTH: dict[str, Any] = {
             "rail_monitored": True,
             "power_monitored": False,
             "unmonitored": {"power": "pwm1 reports no current or power this daemon may judge"},
+            # the spin-up kick's verdict for this output (PROJECT.md section 8 item 75)
+            "spin_up": {
+                "state": "turning",
+                "monitored": True,
+                "failed": False,
+                "attempts": 0,
+                "rpm": 700.0,
+                "duty": 0.5,
+                "reason": None,
+            },
             "problems": [],
         }
     },

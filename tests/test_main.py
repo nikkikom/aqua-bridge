@@ -294,13 +294,18 @@ def test_build_health_monitor_is_none_when_disabled_with_a_source_that_has_none(
     from aqua_bridge.control.supervisor import Supervisor
 
     app = load_config(example_config_path)
-    app = dataclasses.replace(app, fan_health={"enabled": False}, host_health={"enabled": False})
+    off = {"enabled": False}
+    app = dataclasses.replace(app, fan_health=off, host_health=off, spin_up=off)
     sup = Supervisor(app.mpc)
     sim_src, _sink, _release = main_mod.build_io(app, "sim")
     assert main_mod.build_health_monitor(app, sup, sim_src) is None
     # ... but a composite still gets one: its device health is published either way
     composite, _s, _r = main_mod.build_io(app, "composite")
     assert main_mod.build_health_monitor(app, sup, composite) is not None
+    # ... and so does a source with none while the spin-up rule is on: that verdict is
+    # published through this monitor and nothing else (section 8 item 75).
+    with_spin = dataclasses.replace(app, spin_up={"enabled": True})
+    assert main_mod.build_health_monitor(with_spin, sup, sim_src) is not None
 
 
 def test_a_bad_fan_health_key_exits_2_before_anything_opens(tmp_path, example_config_path, caplog):
