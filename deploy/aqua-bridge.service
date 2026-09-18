@@ -1,7 +1,28 @@
 [Unit]
 Description=aqua-bridge MPC fan controller (aquaero 6 XT + Quadro)
-Wants=network-online.target
-After=network-online.target
+Documentation=file:///opt/aqua-bridge/PROJECT.md
+# Deliberately NO Wants=/After=network-online.target (it was here until the
+# watchdog work; PROJECT.md §2 "the network is outside the cooling path").
+# The daemon controls the fans over USB and needs no network at all: MQTT
+# connects asynchronously with automatic reconnects, the HTTPS API binds
+# 0.0.0.0 and a bind failure only turns the API off, and Home Assistant
+# discovery is a publish like any other. Ordering after that target would
+# instead hold the fans hostage to the router: NetworkManager-wait-online waits
+# its full 30 s default when nothing associates, and this board takes 28 s from
+# power to its first controller write as it is -- two windows the aquaero's own
+# 30 s software-sensor timeout would spend on a boot with the router switched
+# off. After=network.target is not needed either: it orders nothing that
+# matters here and would only add a second name to keep true.
+#
+# No start rate limiting ([Unit], not [Service], since systemd 229). systemd's
+# default -- 5 starts in 10 s, then the unit is parked in "failed" -- is the one
+# way this unit can go silent: parked means nothing writes the controllers and
+# nothing writes the aquaero's software sensor ever again, and only the
+# controller's own watchdog saves the drives. A daemon that keeps trying is
+# always better than one systemd has given up on (PROJECT.md §2: a failure never
+# reduces cooling). With RestartSec=5 below, "keeps trying" costs one start
+# every five seconds.
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify
@@ -24,6 +45,28 @@ ExecStart=/opt/aqua-bridge/.venv/bin/python -m aqua_bridge --config /etc/aqua-br
 # it. Delete model.json for a clean prior (the calibrations go with it).
 StateDirectory=aqua-bridge
 Restart=always
+# 5 s, not systemd's 100 ms default: it keeps a daemon that exits immediately
+# (a config error) from spinning the CPU and the journal, and it is far inside
+# the aquaero's 30 s software-sensor timeout, so a restart never costs a fan
+# alarm on its own.
+RestartSec=5
+# Two WATCHDOG=1 pings further apart than this and systemd kills the daemon.
+# The bound the daemon checks itself at startup against $WATCHDOG_USEC
+# (hw/aquacomputer_adapter.py::check_watchdog) is mpc.dt + mpc.budget_alarm_ms
+# + the controllers' worst-case I/O: 19 s for config.example-das.yaml as it
+# ships, 32 s with the Quadro on its own USB port. The rest of the 45 s is the
+# margin for what that bound does not count -- the publishers and the recorder,
+# whose largest single item is one vcgencmd at host_health.vcgencmd_timeout_s
+# (2 s, at most once a minute).
+# WatchdogSignal is left at SIGABRT on purpose. SIGTERM would run the daemon's
+# stop path, which writes fallback_pwm through the very sink whose slowness
+# tripped the watchdog: it would block until TimeoutStopSec and be SIGKILLed
+# anyway, only later. So: the process dies at once, the fans hold their last
+# commanded PWM (they are never turned down by a watchdog kill), Restart=always
+# brings the daemon back within RestartSec, and its first tick resumes the ramp
+# from the duty it reads off the device. Nothing writes the aquaero's software
+# sensor during that gap; if the gap outlasts the sensor's own timeout the
+# aquaero drives every output to 100 % -- loud, and the safe direction.
 WatchdogSec=45
 # READY=1 is sent after the first tick whose command reached the device, so
 # a device that is absent at boot (USB not yet enumerated, hidraw permissions

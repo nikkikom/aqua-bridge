@@ -233,5 +233,11 @@ $DAS_NOTE
          --config $CONFIG_DIR/config.yaml --group $USER_ACCOUNT <name>
      A certificate this script created is self-signed: browsers warn
      until you trust $TLS_CERT.
-  4. Then: sudo systemctl enable --now aqua-bridge
+  4. Board hardening, once per card and independent of the steps above:
+       $SCRIPT_DIR/install-board-watchdogs.sh --check        # reports, writes nothing
+       sudo $SCRIPT_DIR/install-board-watchdogs.sh
+     SoC hardware watchdog, journald caps, Wi-Fi power save off and the
+     Wi-Fi re-association timer (PROJECT.md §2, §9). It does not touch
+     this unit, the controllers or $CONFIG_DIR/config.yaml.
+  5. Then: sudo systemctl enable --now aqua-bridge
 EOF
