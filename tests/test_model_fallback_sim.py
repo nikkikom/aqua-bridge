@@ -127,8 +127,11 @@ def load_step_run(
     clock = {"ts": 0.0}
     current_model = thermal.current_model
 
-    def model_at_ts(memory: object, c: MpcConfig) -> tuple[str, dict[str, float]]:
-        status, theta = current_model(memory, c)
+    def model_at_ts(memory: object, c: MpcConfig, **kw: Any) -> tuple[str, dict[str, float]]:
+        # ``**kw`` forwards whatever the caller passes (``occupancy`` since section 8
+        # item 119): a stub that swallowed a new keyword instead of forwarding it would
+        # go on passing while testing the wrong function.
+        status, theta = current_model(memory, c, **kw)
         if clock["ts"] < T_STEP:
             return status, theta
         if gain is None:
