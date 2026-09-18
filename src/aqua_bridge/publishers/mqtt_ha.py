@@ -95,14 +95,19 @@ the card the daemon runs from has been below ``disk_free_min_gb`` free for
 attributes are the host half of the same blob: the board's temperature, the air
 reference, the load average, the decoded ``get_throttled`` word, and the disk
 free space and read-only state (``disk_free_gb``, ``disk_used_pct``,
-``read_only``). The board -- and the card it runs from -- are a health signal
+``read_only`` -- ``disk_free_gb`` also has its own sensor, ``host_disk_free_gb``,
+so it can be charted and alerted on directly rather than read only from these
+attributes). The board -- and the card it runs from -- are a health signal
 only -- never a solver input, never a zone air sensor -- so they get a sensor of
 their own rather than being read as a controller fault. Only the *facts* -- the
-board is hot, it is throttling now, the card is low on space, the filesystem is
-read-only -- also join the daemon-wide ``health.device_health.problems`` list
-behind ``device_problem``; the divergence rule is a hint about where to look, not
-a verdict, so it turns on ``host_problem`` alone and leaves ``device_problem`` for
-something that is actually broken.
+board is hot, it is throttling now, the filesystem is read-only -- also join the
+daemon-wide ``health.device_health.problems`` list behind ``device_problem``;
+the divergence rule and the free-space rule are *hints*, not verdicts, so each
+turns on ``host_problem`` alone and leaves ``device_problem`` for something that
+is actually broken. The free-space rule is a hint for the same reason
+divergence is: a filling card can sit below its threshold for days, and a
+daemon-wide flag latched that long would read exactly like a missing aquabus
+device.
 
 DAS mode (``mpc.topology``) subscribes to the limit and bay topics and adds one
 ``limit_<class>`` number entity per drive class (state from
@@ -398,6 +403,7 @@ def host_sensor_specs() -> tuple[tuple[str, str, str | None, str | None], ...]:
         ("load1", "Load average (1m)", None, None),
         ("mem_used_pct", "RAM used", "%", None),
         ("disk_used_pct", "Disk used", "%", None),
+        ("disk_free_gb", "Disk free", "GB", None),
         ("wifi_rssi_dbm", "Wi-Fi signal", "dBm", "signal_strength"),
         ("uptime_s", "Uptime", "s", "duration"),
     )

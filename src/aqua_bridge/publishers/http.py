@@ -24,12 +24,15 @@ load average, the decoded ``get_throttled`` word, the free space and read-only
 state of the card the daemon runs from (``disk_free_gb``, ``disk_used_pct``,
 ``read_only``), and this board's own ``faults``, ``hints``, ``problems`` and
 ``ok``. Only its *faults* -- the board is hot, the board is throttling now, the
-card is low on space, the filesystem has gone read-only -- join the top-level
-``problems`` list that ``/api/health`` shows; the divergence rule is a hint about
-where to look, not a verdict, so it stays in ``device_health.host`` and does not
-make the daemon not-ok. The board -- and the card it runs from -- are a health
-signal and nothing else: neither is in ``PlantObservation``, in the
-``diagnostics`` the solver reads, and no rule here can change a duty.
+filesystem has gone read-only -- join the top-level ``problems`` list that
+``/api/health`` shows; the divergence rule and the free-space rule are hints,
+not verdicts (the free-space rule for the same reason: a filling card can sit
+below its threshold for days, and a daemon-wide flag latched that long would
+read exactly like a missing aquabus device), so each stays in
+``device_health.host`` and does not make the daemon not-ok. The board -- and the
+card it runs from -- are a health signal and nothing else: neither is in
+``PlantObservation``, in the ``diagnostics`` the solver reads, and no rule here
+can change a duty.
 
 ``GET /api/state`` also carries a top-level ``host`` key (host machine metrics,
 :mod:`aqua_bridge.hostinfo`): the same numbers as the MQTT state blob's ``host``

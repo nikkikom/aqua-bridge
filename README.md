@@ -374,6 +374,17 @@ is not yet confirmed on real hardware, on either board.
     20–25 °C above the air around it — so narrow it only from a measured
     board-vs-air delta on the board in its finished place.
 
+    The same section also watches the card the daemon runs from ("the disk
+    nobody watches"): the page's **Host** section and `device_health.host`
+    show its free space (`disk_free_gb`, below `disk_free_min_gb` for
+    `disk_free_fault_s` is a warning) and whether its filesystem has gone
+    read-only (`read_only`, the kernel's own `/proc/mounts` report — the
+    first sign of a dying SD card). `host_health.disk_path` (default `"/"`)
+    names which filesystem both rules judge; point it at `record_path`'s
+    mount when that is not `/`. The read-only rule is a fact like a hot or
+    throttling board; the free-space rule is a hint like the divergence
+    rule, since a filling card can sit below its threshold for days.
+
 12. **Optional SMART agent**, on the PC with the drives attached (not
     the Pi): `python tools/smart_agent.py --mqtt <broker-host>
     --node-id aqua-bridge --interval 60`, or install

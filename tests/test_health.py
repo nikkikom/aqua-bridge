@@ -28,6 +28,7 @@ from aqua_bridge.health import (
     HostHealthConfig,
     default_air_temps,
     expected_rpm,
+    host_metrics_reader,
 )
 from aqua_bridge.hostinfo import decode_throttled, read_rpi_volt_hwmon
 from aqua_bridge.hw.aquacomputer import AQUAERO, QUADRO, decode_status
@@ -695,37 +696,63 @@ def test_every_host_threshold_is_a_key_with_one_default() -> None:
         "log_interval_s",
         "vcgencmd_interval_s",
         "vcgencmd_timeout_s",
+        "disk_path",
         "disk_free_min_gb",
         "disk_free_fault_s",
     }
     assert defaults.enabled is True and defaults.air_temps == ()
     assert defaults.temp_limit_c == 75.0 and defaults.divergence_c == 40.0
     assert defaults.vcgencmd_timeout_s == 2.0 and defaults.vcgencmd_interval_s == 60.0
+    assert defaults.disk_path == "/"
     assert defaults.disk_free_min_gb == 2.0 and defaults.disk_free_fault_s == 60.0
     assert HostHealthConfig.from_section(None) == defaults
     assert HostHealthConfig.from_section({}) == defaults
 
 
 def test_disk_free_min_gb_default_clears_the_bounded_writers_with_room_to_spare() -> None:
-    """The default is argued from what actually writes to the card, not a round
-    number: the recorder's own worst case (its file plus every rotated backup),
-    the model store's measured floor, and the journal cap
-    deploy/install-board-watchdogs.sh sets -- together well under the default,
-    with margin to still act."""
+    """The default is argued from what actually writes to the default disk_path
+    ("/"), not a round number: the recorder's own worst case (its file plus every
+    rotated backup) and the model store's measured floor, unconditionally -- the
+    journal cap deploy/install-board-watchdogs.sh sets is margin *on top* of
+    this, not a term the arithmetic depends on, since it only lands on the card
+    when the board keeps a persistent journal
+    (health.HostHealthConfig.disk_free_min_gb's docstring says why)."""
     from aqua_bridge.recorder import DEFAULT_BACKUP_COUNT, DEFAULT_MAX_BYTES
 
     recorder_worst_case_mb = DEFAULT_MAX_BYTES * (DEFAULT_BACKUP_COUNT + 1) / 1_000_000
-    journal_cap_mb = 200  # deploy/install-board-watchdogs.sh JOURNAL_MAX_USE
     model_store_mb = 1  # generous: item 48 measured a 1424-byte floor
-    bounded_mb = recorder_worst_case_mb + journal_cap_mb + model_store_mb
-    assert bounded_mb == pytest.approx(321.0)
-    assert HostHealthConfig().disk_free_min_gb * 1000 > bounded_mb * 2
+    bounded_mb = recorder_worst_case_mb + model_store_mb
+    assert bounded_mb == pytest.approx(121.0)
+    # Room to act even without counting the conditional journal cap at all.
+    assert HostHealthConfig().disk_free_min_gb * 1000 > bounded_mb * 10
+    journal_cap_mb = 200  # deploy/install-board-watchdogs.sh JOURNAL_MAX_USE, the persistent case
+    assert HostHealthConfig().disk_free_min_gb * 1000 > (bounded_mb + journal_cap_mb) * 2
 
 
 def test_host_from_section_overrides_and_keeps_the_other_defaults() -> None:
     settings = HostHealthConfig.from_section({"temp_limit_c": 70.0, "air_temps": ["inlet_a"]})
     assert settings.temp_limit_c == 70.0 and settings.air_temps == ("inlet_a",)
     assert settings.divergence_c == HostHealthConfig().divergence_c
+
+
+def test_host_metrics_reader_threads_disk_path_into_collect_hostinfo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """disk_path must reach hostinfo.collect_hostinfo, not just live in the config:
+    otherwise the disk rules always judge "/" however the operator points
+    record_path or --model-store elsewhere."""
+    seen: dict[str, Any] = {}
+
+    def fake_collect_hostinfo(**kwargs: Any) -> dict[str, Any]:
+        seen.update(kwargs)
+        return {}
+
+    import aqua_bridge.health as health_mod
+
+    monkeypatch.setattr(health_mod, "collect_hostinfo", fake_collect_hostinfo)
+    reader = host_metrics_reader(HostHealthConfig(disk_path="/mnt/recordings"))
+    reader()
+    assert seen["disk_path"] == "/mnt/recordings"
 
 
 @pytest.mark.parametrize(
@@ -744,6 +771,9 @@ def test_host_from_section_overrides_and_keeps_the_other_defaults() -> None:
         ({"air_temps": "inlet_a"}, "host_health.air_temps must be a list"),
         ({"air_temps": [""]}, "air_temps entries must be non-empty strings"),
         ({"air_temps": [3]}, "air_temps entries must be non-empty strings"),
+        ({"disk_path": ""}, "host_health.disk_path must be a non-empty string"),
+        ({"disk_path": None}, "host_health.disk_path must be a non-empty string"),
+        ({"disk_path": 5}, "host_health.disk_path must be a non-empty string"),
         ({"disk_free_min_gb": -1.0}, "host_health.disk_free_min_gb must be >="),
         ({"disk_free_min_gb": "2"}, "host_health.disk_free_min_gb must be a number"),
         ({"disk_free_fault_s": 0}, "host_health.disk_free_fault_s must be >="),
@@ -989,13 +1019,18 @@ def test_without_an_air_reading_the_divergence_rule_is_off() -> None:
 
 
 def test_low_free_space_is_reported_only_after_disk_free_fault_s_and_clears() -> None:
+    """A hint, not a fact (like the divergence rule): a filling card can sit below
+    the threshold for days, and a fact that latched that long would be
+    indistinguishable from a missing aquabus device."""
     board = _board(HostHealthConfig(disk_free_min_gb=2.0, disk_free_fault_s=60.0))
     low = _host_info(disk_free_gb=1.5)
     assert board.check(low, {}, 0.0)["problems"] == []
     assert board.check(low, {}, 59.0)["problems"] == []
-    problems = board.check(low, {}, 60.0)["problems"]
+    verdict = board.check(low, {}, 60.0)
+    problems = verdict["problems"]
     assert len(problems) == 1 and "1.50 GB free" in problems[0] and "below the 2 GB" in problems[0]
-    assert board.check(low, {}, 60.0)["ok"] is False
+    assert verdict["faults"] == [] and verdict["hints"] == problems
+    assert verdict["ok"] is False
     # back above the limit: the window is forgotten, not merely paused
     assert board.check(_host_info(disk_free_gb=5.0), {}, 61.0)["problems"] == []
     assert board.check(low, {}, 120.0)["problems"] == []
@@ -1024,6 +1059,10 @@ def test_read_only_is_reported_the_tick_it_is_seen_and_clears() -> None:
     verdict = board.check(_host_info(read_only=True), {}, 0.0)
     assert len(verdict["problems"]) == 1
     assert "read-only" in verdict["problems"][0]
+    # The recorder and the model store log every failed write; the message must
+    # not claim they fail silently.
+    assert "silently" not in verdict["problems"][0]
+    assert "loudly" in verdict["problems"][0]
     assert verdict["ok"] is False
     assert board.check(_host_info(read_only=False), {}, 1.0)["problems"] == []
 
@@ -1044,14 +1083,28 @@ def test_a_non_boolean_read_only_value_degrades_to_unknown_not_raised() -> None:
 
 
 def test_both_disk_rules_can_fire_together() -> None:
+    """The read-only rule is a fact, the free-space rule a hint: both still show in
+    the combined problems list, but only the read-only one is a "fault"."""
     board = _board(HostHealthConfig(disk_free_min_gb=2.0, disk_free_fault_s=0.001))
     low_and_ro = _host_info(disk_free_gb=0.5, read_only=True)
     board.check(low_and_ro, {}, 0.0)
     verdict = board.check(low_and_ro, {}, 1.0)
-    assert len(verdict["faults"]) == 2
-    assert any("free" in p for p in verdict["faults"])
-    assert any("read-only" in p for p in verdict["faults"])
-    assert verdict["problems"] == verdict["faults"]
+    assert len(verdict["faults"]) == 1 and "read-only" in verdict["faults"][0]
+    assert len(verdict["hints"]) == 1 and "free" in verdict["hints"][0]
+    assert verdict["problems"] == [*verdict["faults"], *verdict["hints"]]
+
+
+def test_disk_path_names_the_judged_filesystem_in_both_disk_messages() -> None:
+    """A confident number about the wrong filesystem is worse than none: the
+    message must say which path was actually judged."""
+    board = _board(
+        HostHealthConfig(disk_path="/mnt/recordings", disk_free_min_gb=2.0, disk_free_fault_s=0.001)
+    )
+    info = _host_info(disk_free_gb=0.5, read_only=True)
+    board.check(info, {}, 0.0)
+    verdict = board.check(info, {}, 1.0)
+    assert "/mnt/recordings" in verdict["faults"][0]
+    assert "/mnt/recordings" in verdict["hints"][0]
 
 
 def test_air_temps_from_the_config_override_the_default_reference() -> None:
@@ -1151,9 +1204,12 @@ def test_a_hot_board_is_a_daemon_problem_and_the_hint_rides_along() -> None:
     assert verdict["problems"] == [*verdict["faults"], *verdict["hints"]]
 
 
-def test_on_tick_publishes_the_disk_rules_and_they_join_the_daemon_problems() -> None:
-    """Published the same way item 103 publishes the board's temperature: in the
-    health payload, and its facts in the one daemon-wide problems list."""
+def test_on_tick_publishes_the_disk_rules_and_the_fact_joins_the_daemon_problems() -> None:
+    """Published the same way item 103 publishes the board's temperature: both in
+    the health payload, but only the read-only *fact* in the one daemon-wide
+    problems list -- the free-space rule is a hint, like divergence, and must not
+    flip /api/health or Home Assistant's device_problem for as long as a filling
+    card can sit below its threshold."""
     published: list[dict[str, Any]] = []
     mon = HealthMonitor(
         _cfg(),
@@ -1168,9 +1224,10 @@ def test_on_tick_publishes_the_disk_rules_and_they_join_the_daemon_problems() ->
     assert payload["host"]["disk_free_gb"] == pytest.approx(0.5)
     assert payload["host"]["disk_used_pct"] == pytest.approx(97.0)
     assert payload["host"]["read_only"] is True
-    assert len(payload["host"]["faults"]) == 2
+    assert len(payload["host"]["faults"]) == 1 and "read-only" in payload["host"]["faults"][0]
+    assert len(payload["host"]["hints"]) == 1 and "free" in payload["host"]["hints"][0]
     assert payload["host"]["ok"] is False
-    assert payload["problems"] == payload["host"]["problems"]
+    assert payload["problems"] == payload["host"]["faults"]
     assert payload["ok"] is False
 
 
