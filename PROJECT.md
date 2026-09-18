@@ -9203,6 +9203,63 @@ Owner decision (2026-09-16):
     own, so at most a quarter of the owner's enclosure, and would have
     to declare that in its `monitored` flag like every other rule that
     does not cover what it looks at.
+136. The capture that decodes the aquaero's start boost (owner action;
+    §2 "The controller's own start boost"). The firmware's per-output
+    start boost is in the control report and cannot be picked out
+    read-only: four of a controller block's six undecoded `u16`
+    (`+0x08`, `+0x0A`, `+0x0C`, `+0x12`) hold one value across all
+    eight of the owner's outputs, so there is no difference between
+    outputs to read there, and the two that differ (`+0x00`, `+0x02`)
+    differ in a way nothing connects to a boost, with no capture saying
+    what was set to make them differ. What settles it is one capture
+    only the owner can produce: set the start boost to two clearly
+    different values on two outputs in the aquaero's own menu — say
+    output 1 at 100 % for 5 s and output 2 at 40 % for 1 s — and
+    capture a control report; a before/after capture on one output does
+    as well. The words that differ, and how, are the decode. The
+    groundwork is done: the six words are read into
+    `ChannelState.undecoded` and printed by `tools/aquacomputer_probe.py`
+    under each output, and the firmware's default for an unassigned
+    output is pinned from blocks 9-12 as the third reference point.
+    Once decoded: name the fields, publish them next to the power
+    limits in the probe and the device health, and keep them read-only
+    — writing a boost needs the save report, which persists the whole
+    control report over the owner's own configuration, and that
+    decision is separate (§2, "The controller's own start boost").
+137. Current as evidence that a tach-less rotor turns, bounded to a
+    spin-up kick only (item 75, item 135). The current field of an
+    output behind a bus device is a PWM-cycle sample, so it is useless
+    at a low duty — but at a high one it reads in nearly every report
+    (16 of 16 at 60 %, 18 of 20 at 100 %), and a spin-up kick drives the
+    channel high by definition. So during a kick, and only then, a
+    non-zero current is evidence that the rotor turns: the only such
+    evidence this installation has for an output whose tachometer is
+    missing, unbound or on a splitter's second fan. Bounded by the same
+    measurement item 135 is bounded by: it can only ever apply to an
+    output behind a bus device, since the aquaero's own outputs report
+    0 mA in every report at every duty, so the rule must be off for
+    those rather than silently passing. Shape: after a kick of a
+    tach-less output, if every report during the kick read 0 mA, report
+    it as a channel whose rotor cannot be confirmed — never as a fault
+    that changes a duty, and never outside the kick window. Needs one
+    bench run to size it (how many reports of the kick, what a stalled
+    rotor's current actually reads) before any threshold is written
+    down, and every number it uses is a config key with one documented
+    default.
+138. Does a fan actually fail to start from the preset the controller
+    holds (owner action)? The whole case for a start boost rests on it,
+    and nothing has measured it. The hint is there: the 2026-09-15
+    sweep found both test fans starting only at 25 % while holding
+    355-375 rpm all the way down to 14 %, and on 2026-09-18 three fans
+    were turning at a 20 % duty only because something had already spun
+    them up. The observation is one bench test, and it needs the owner
+    because stopping a fan by hand is not something a daemon can do:
+    hold an output at the duty the controller would come back with,
+    stop the fan, and see whether it starts again. If it does, the
+    firmware boost is not worth a write on this hardware and item 136
+    can close; if it does not, the saved preset is a cold-start hazard
+    on every power return and item 136's decode becomes worth the
+    owner's time.
 
 ### 8.4 Open — Zero 2 W upgrade
 
