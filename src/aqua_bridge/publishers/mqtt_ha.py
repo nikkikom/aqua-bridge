@@ -88,16 +88,21 @@ is one tap away in Home Assistant without a second entity per output.
 The Raspberry Pi the daemon runs on has its own binary sensor, ``host_problem``
 (PROJECT.md section 8 item 103): on whenever ``value_json.device_health.host.ok``
 is false, that is whenever the board has been above ``host_health.temp_limit_c``
-for ``temp_fault_s``, is throttling now, or (only while its CPU is idle) has sat
-further than ``divergence_c`` from the enclosure air for ``divergence_fault_s``.
-Its attributes are the host half of the same blob: the board's temperature, the
-air reference, the load average and the decoded ``get_throttled`` word. The board
-is a health signal only -- never a solver input, never a zone air sensor -- so it
-gets a sensor of its own rather than being read as a controller fault. Only the
-board's *facts* -- it is hot, it is throttling now -- also join the daemon-wide
-``health.device_health.problems`` list behind ``device_problem``; the divergence
-rule is a hint about where to look, not a verdict, so it turns on ``host_problem``
-alone and leaves ``device_problem`` for something that is actually broken.
+for ``temp_fault_s``, is throttling now, has sat further than ``divergence_c``
+from the enclosure air for ``divergence_fault_s`` (only while its CPU is idle),
+the card the daemon runs from has been below ``disk_free_min_gb`` free for
+``disk_free_fault_s``, or that card's filesystem has gone read-only. Its
+attributes are the host half of the same blob: the board's temperature, the air
+reference, the load average, the decoded ``get_throttled`` word, and the disk
+free space and read-only state (``disk_free_gb``, ``disk_used_pct``,
+``read_only``). The board -- and the card it runs from -- are a health signal
+only -- never a solver input, never a zone air sensor -- so they get a sensor of
+their own rather than being read as a controller fault. Only the *facts* -- the
+board is hot, it is throttling now, the card is low on space, the filesystem is
+read-only -- also join the daemon-wide ``health.device_health.problems`` list
+behind ``device_problem``; the divergence rule is a hint about where to look, not
+a verdict, so it turns on ``host_problem`` alone and leaves ``device_problem`` for
+something that is actually broken.
 
 DAS mode (``mpc.topology``) subscribes to the limit and bay topics and adds one
 ``limit_<class>`` number entity per drive class (state from

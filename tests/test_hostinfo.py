@@ -26,6 +26,7 @@ from aqua_bridge.hostinfo import (
     read_disk,
     read_loadavg,
     read_memory,
+    read_mount_ro,
     read_rpi_volt_hwmon,
     read_throttled,
     read_uptime_s,
@@ -140,6 +141,87 @@ def test_disk_parses_real_root() -> None:
 
 def test_disk_missing_path_is_none(tmp_path: Path) -> None:
     assert read_disk(tmp_path / "does" / "not" / "exist") is None
+
+
+# --- read_mount_ro (the disk nobody watches: the read-only rule) ------------
+
+
+def test_mount_ro_reads_the_kernel_s_own_report(tmp_path: Path) -> None:
+    mounts = tmp_path / "mounts"
+    target = tmp_path / "root"
+    target.mkdir()
+    _write(
+        mounts,
+        f"/dev/mmcblk0p2 {target} ext4 ro,noatime,errors=remount-ro 0 0\n",
+    )
+    assert read_mount_ro(target, mounts) is True
+
+
+def test_mount_rw_is_false_not_none(tmp_path: Path) -> None:
+    """A confirmed read-write mount is a fact too, not merely "not read-only"."""
+    mounts = tmp_path / "mounts"
+    target = tmp_path / "root"
+    target.mkdir()
+    _write(mounts, f"/dev/mmcblk0p2 {target} ext4 rw,noatime 0 0\n")
+    assert read_mount_ro(target, mounts) is False
+
+
+def test_mount_ro_picks_the_longest_matching_prefix(tmp_path: Path) -> None:
+    """A path on a sub-mount is judged by its own entry, not the root's."""
+    mounts = tmp_path / "mounts"
+    root = tmp_path / "root"
+    sub = root / "var" / "lib" / "aqua-bridge"
+    sub.mkdir(parents=True)
+    _write(
+        mounts,
+        f"/dev/mmcblk0p2 {root} ext4 rw,noatime 0 0\n"
+        f"tmpfs {root / 'var' / 'lib' / 'aqua-bridge'} tmpfs ro 0 0\n",
+    )
+    assert read_mount_ro(sub, mounts) is True
+    assert read_mount_ro(root, mounts) is False
+
+
+def test_mount_ro_a_later_entry_for_the_same_point_wins(tmp_path: Path) -> None:
+    """A remount appends a new line rather than rewriting the old one."""
+    mounts = tmp_path / "mounts"
+    target = tmp_path / "root"
+    target.mkdir()
+    _write(
+        mounts,
+        f"/dev/mmcblk0p2 {target} ext4 rw,noatime 0 0\n"
+        f"/dev/mmcblk0p2 {target} ext4 ro,noatime,errors=remount-ro 0 0\n",
+    )
+    assert read_mount_ro(target, mounts) is True
+
+
+def test_mount_ro_no_matching_entry_is_none(tmp_path: Path) -> None:
+    mounts = tmp_path / "mounts"
+    _write(mounts, "tmpfs /run tmpfs rw 0 0\n")
+    assert read_mount_ro(tmp_path / "elsewhere", mounts) is None
+
+
+def test_mount_ro_unreadable_mounts_file_is_none(tmp_path: Path) -> None:
+    assert read_mount_ro("/", tmp_path / "no" / "such" / "mounts") is None
+
+
+def test_mount_ro_a_short_or_garbage_line_is_skipped_not_raised(tmp_path: Path) -> None:
+    mounts = tmp_path / "mounts"
+    target = tmp_path / "root"
+    target.mkdir()
+    _write(mounts, f"garbage line\n\n/dev/mmcblk0p2 {target} ext4 rw 0 0\n")
+    assert read_mount_ro(target, mounts) is False
+
+
+def test_mount_ro_never_raises_on_an_unresolvable_path(tmp_path: Path, monkeypatch: Any) -> None:
+    """A path this process cannot resolve (e.g. a permission error walking up to
+    it) degrades to unknown rather than raising on the tick path."""
+
+    def boom(_path: object) -> str:
+        raise OSError("denied")
+
+    monkeypatch.setattr(hostinfo.os.path, "realpath", boom)
+    _write(tmp_path / "mounts", "/dev/mmcblk0p2 / ext4 rw 0 0\n")
+    assert read_mount_ro("/", tmp_path / "mounts") is None
 
 
 # --- read_wifi_rssi ----------------------------------------------------------
@@ -485,6 +567,7 @@ def test_collect_hostinfo_all_missing_is_all_none(tmp_path: Path) -> None:
         meminfo_path=tmp_path / "meminfo",
         uptime_path=tmp_path / "uptime",
         disk_path=tmp_path / "no" / "such" / "path",
+        mounts_path=tmp_path / "mounts",
         wireless_path=tmp_path / "wireless",
         throttled_path=tmp_path / "get_throttled",
         hwmon_root=tmp_path / "hwmon",
@@ -501,6 +584,7 @@ def test_collect_hostinfo_all_missing_is_all_none(tmp_path: Path) -> None:
         "wifi_rssi_dbm": None,
         "uptime_s": None,
         "throttled": None,
+        "read_only": None,
     }
 
 
@@ -515,6 +599,7 @@ def test_collect_hostinfo_all_present(tmp_path: Path) -> None:
     _write(tmp_path / "uptime", "100.0 0.0\n")
     _write(tmp_path / "wireless", _WIRELESS_SAMPLE)
     _write(tmp_path / "get_throttled", "0x50005\n")
+    _write(tmp_path / "mounts", "/dev/mmcblk0p2 / ext4 rw,noatime 0 0\n")
 
     info = collect_hostinfo(
         thermal_root=tmp_path / "thermal",
@@ -522,6 +607,7 @@ def test_collect_hostinfo_all_present(tmp_path: Path) -> None:
         meminfo_path=tmp_path / "meminfo",
         uptime_path=tmp_path / "uptime",
         disk_path="/",
+        mounts_path=tmp_path / "mounts",
         wireless_path=tmp_path / "wireless",
         throttled_path=tmp_path / "get_throttled",
         hwmon_root=tmp_path / "hwmon",
@@ -536,6 +622,7 @@ def test_collect_hostinfo_all_present(tmp_path: Path) -> None:
     assert info["disk_used_pct"] is not None
     assert info["throttled"]["hex"] == "0x50005"
     assert info["throttled"]["under_voltage_now"] is True
+    assert info["read_only"] is False
 
 
 # --- CachedHostInfo ----------------------------------------------------------

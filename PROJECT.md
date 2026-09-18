@@ -4242,7 +4242,7 @@ a model converges only with them.
   throttling rule but never silence it. A board with none of the three
   degrades to `null` and warns about nothing.
 
-  `health.HostHealth` then applies three
+  `health.HostHealth` then applies five
   rules on the same `on_tick` observer as the fans', and the verdict rides
   the same payload as `device_health.host` (§6, §7):
 
@@ -4282,13 +4282,54 @@ a model converges only with them.
     about the CPU than about the air. **This rule is a hint, not a
     verdict**: it says that either the air sensors or the board's placement
     deserve a look, never which of the two is wrong.
+  - **the card is low on space** — free space below `disk_free_min_gb` for
+    `disk_free_fault_s` ("the disk nobody watches", §8 proposed items).
+    `hostinfo` has always collected `disk_used_pct`/`disk_free_gb` and both
+    were always published — an MQTT sensor, a row on the page — but nothing
+    watched them: the card fills silently and the recorder, the model store
+    and the journal all start failing at once. On the owner's board that
+    card is a 15 GB SD (11 GB free today), and it is also the failure mode
+    of a worn-out card. The rule is meant to warn **while there is still
+    room to act**, not once a write has already failed, so the default is
+    argued from what actually writes to the card rather than a round
+    number: the recorder's own worst case is its file plus every rotated
+    backup, each up to `record_max_bytes` — 20 MB × 6 files = 120 MB at the
+    recorder's own defaults (item 79); the model store's measured floor is
+    1.4 KB and stays well under a megabyte even richer (item 48); and
+    `deploy/install-board-watchdogs.sh` caps the journal at
+    `JOURNAL_MAX_USE` (200 MB, §9 "Board hardening") — the one other thing
+    this project makes write to the card without an existing limit. Under
+    350 MB of *intentional*, bounded
+    growth altogether; the default `disk_free_min_gb` (2 GB) leaves several
+    times that as room to act. Default `disk_free_fault_s` (60 s) is a short
+    debounce against one noisy `statvfs` sample, not a filter for anything
+    transient — a filling card is a slow, roughly monotonic trend, not a
+    spike the way a rail sag is.
+  - **the filesystem is read-only** — `hostinfo.read_mount_ro()` said so:
+    the kernel's own `/proc/mounts`, not a write probe. On an SD card this
+    is usually the first visible sign of a dying card — an I/O error trips
+    the filesystem's `errors=remount-ro` and every write after that fails
+    silently as far as this daemon is concerned, the recorder's `OSError`
+    catch included. Chosen over a write probe because the failure this
+    rule exists to catch is already a fact in `/proc/mounts` the instant it
+    happens — the kernel updates that table synchronously on every mount
+    change, so there is no staleness a poll interval would need to cover —
+    and a write probe would add both a write and an `fsync`, on every
+    check, to the very card this rule is protecting. Reported the tick it
+    is seen, like throttling now: no window, since the kernel has already
+    remounted the filesystem and a sustained rule would only delay a fact
+    everyone downstream needs immediately. An unknown reading (the mount
+    table unreadable, no matching entry) never fires this rule — only a
+    confirmed `True` does; never guessed either way, the same rule the
+    throttling word follows.
 
-  The first two rules report a *fact*, and their problems join the daemon's
-  one `problems` list (so `/api/health` goes not-ok and Home Assistant's
-  `Controller problem` turns on); the divergence *hint* does not — it shows
-  on `device_health.host` and on the board's own `Board problem` sensor
-  alone, because a hint that flips the daemon-wide flag is indistinguishable
-  from an aquabus device that has gone missing.
+  The first two rules and the two disk rules report a *fact*, and their
+  problems join the daemon's one `problems` list (so `/api/health` goes
+  not-ok and Home Assistant's `Controller problem` turns on); the
+  divergence *hint* does not — it shows on `device_health.host` and on the
+  board's own `Board problem` sensor alone, because a hint that flips the
+  daemon-wide flag is indistinguishable from an aquabus device that has
+  gone missing.
 
   The air reference is `air_temps`, empty by default, which means every
   `zone_air` sensor, else every `inlet` sensor, else every configured
@@ -5604,12 +5645,15 @@ Config `http:` (parsed and validated by `HttpSettings` in
   `verifying` | `failed` — with `monitored`, `failed`, `attempts`, the last
   `rpm` and `duty`, and, where the rule is off for that output, the
   `reason`; a failed fan's line is in the top-level `problems` too), and
-  `problems`), `host` (§8 item 103: the board's own
+  `problems`), `host` (§8 item 103, extended for "the disk nobody
+  watches": the board's own
   `cpu_temp_c`, the `air_c` reference it is compared against with the
   `air_temps` it was averaged from, the signed `divergence_c`, `load1`,
-  `idle`, the `throttled` reading and this board's own `faults`,
-  `hints`, `problems` and `ok`), `problems` and `ok`. Only the board's
-  *faults* — it is hot, it is throttling now — are in the top-level
+  `idle`, the `throttled` reading, the card's own
+  `disk_free_gb`/`disk_used_pct` and `read_only`, and this board's own
+  `faults`, `hints`, `problems` and `ok`), `problems` and `ok`. Only the
+  board's *facts* — it is hot, it is throttling now, the card is low on
+  space, the filesystem is read-only — are in the top-level
   `problems` list `/api/health` shows; the divergence *hint* stays in
   `device_health.host` (§3 "The board itself"). Empty with `ok`
   true before the first tick and with a source that has none (the
@@ -5620,11 +5664,14 @@ Config `http:` (parsed and validated by `HttpSettings` in
   its shape.
 - `host` — host machine metrics (`aqua_bridge.hostinfo.collect_hostinfo`:
   `cpu_temp_c`, `load1`, `load5`, `load15`, `mem_used_pct`, `mem_total_kb`,
-  `disk_used_pct`, `disk_free_gb`, `wifi_rssi_dbm`, `uptime_s`, and
+  `disk_used_pct`, `disk_free_gb`, `wifi_rssi_dbm`, `uptime_s`,
   `throttled` — the board's throttling state, §8 item 103, the one nested
   value: the decoded word with its `source` and, for a cached `vcgencmd`
   word, its `age_s`, or a `partial` reading whose `unknown` conditions are
-  `null`; `null` per key when unreadable), refreshed at most every `host.interval_s` seconds
+  `null`; and `read_only` — whether the filesystem `disk_used_pct` and
+  `disk_free_gb` describe is mounted read-only, from `/proc/mounts`
+  (`hostinfo.read_mount_ro`), `null` when that cannot be determined;
+  `null` per key when unreadable), refreshed at most every `host.interval_s` seconds
   through a cache the HTTP app owns (`publishers/http.py`, item 25); present
   in both modes
 
@@ -5938,15 +5985,20 @@ availability topic and one device block. Entities:
 - binary sensor `host_problem` (`device_class: problem`, diagnostic,
   §8 item 103): on whenever `device_health.host.ok` is false, that is
   whenever the board has been above `host_health.temp_limit_c` for
-  `temp_fault_s`, is throttling now, or — only while its CPU is idle — has
-  sat further than `divergence_c` from the enclosure air for
-  `divergence_fault_s`. Its `json_attributes` are the `device_health.host`
-  blob: the board's temperature, the air reference, the load average and
-  the decoded `get_throttled` word. The board gets an entity of its own so
-  a hot Pi is not read as a controller fault. Only the board's *facts* —
-  hot, throttling now — also join the one `health.device_health.problems`
-  list behind `device_problem`; the divergence hint turns on `host_problem`
-  alone, so `device_problem` keeps meaning "something is broken".
+  `temp_fault_s`, is throttling now, has sat further than `divergence_c`
+  from the enclosure air for `divergence_fault_s` (only while its CPU is
+  idle), the card the daemon runs from has been below
+  `disk_free_min_gb` free for `disk_free_fault_s`, or that card's
+  filesystem has gone read-only. Its `json_attributes` are the
+  `device_health.host` blob: the board's temperature, the air reference,
+  the load average, the decoded `get_throttled` word, and the card's own
+  `disk_free_gb`/`disk_used_pct`/`read_only`. The board — and the card it
+  runs from — get an entity of their own so a hot Pi or a filling SD card
+  is not read as a controller fault. Only the *facts* — hot, throttling
+  now, low on space, read-only — also join the one
+  `health.device_health.problems` list behind `device_problem`; the
+  divergence hint turns on `host_problem` alone, so `device_problem` keeps
+  meaning "something is broken".
 - number `setpoint_<temp>` per setpoint (range `temp_min_c..temp_max_c`,
   step 0.5); a DAS config without setpoints publishes none
 - number `pwm_cmd_<channel>` per channel (range `pwm_min..pwm_max`, step
@@ -9992,6 +10044,18 @@ times, pings without a gateway, or touches a disconnected interface that
 NetworkManager is already retrying. The stubs cover the failing branches too,
 which are the ones the guards exist for: an `nmcli` that exits non-zero, one
 slow enough to be killed mid-run, and the silence after the give-up.
+
+**The free-space rule's journal cap is this script's, not a second one.**
+`health.HostHealthConfig.disk_free_min_gb`'s default (§3, "the card is low
+on space") is argued in part from a journal cap, and the cap it means is
+this one — `JOURNAL_MAX_USE` above, installed by this script. An earlier
+version of the disk-free-rule change installed its own second drop-in from
+`install-pi.sh` (`/etc/systemd/journald.conf.d/aqua-bridge.conf`,
+`SystemMaxUse` only); resolved in favor of this script's, since it already
+covers the same setting plus `SystemMaxFileSize`, `MaxRetentionSec` and
+`SyncIntervalSec` from one set of knobs, and a board running both scripts
+must not end up with two drop-ins governing one journal from two different
+defaults. `install-pi.sh` does not touch the journal.
 
 ### udev
 
