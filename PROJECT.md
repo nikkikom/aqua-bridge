@@ -4282,54 +4282,71 @@ a model converges only with them.
     about the CPU than about the air. **This rule is a hint, not a
     verdict**: it says that either the air sensors or the board's placement
     deserve a look, never which of the two is wrong.
-  - **the card is low on space** — free space below `disk_free_min_gb` for
-    `disk_free_fault_s` ("the disk nobody watches", §8 proposed items).
-    `hostinfo` has always collected `disk_used_pct`/`disk_free_gb` and both
-    were always published — an MQTT sensor, a row on the page — but nothing
-    watched them: the card fills silently and the recorder, the model store
-    and the journal all start failing at once. On the owner's board that
-    card is a 15 GB SD (11 GB free today), and it is also the failure mode
-    of a worn-out card. The rule is meant to warn **while there is still
-    room to act**, not once a write has already failed, so the default is
-    argued from what actually writes to the card rather than a round
-    number: the recorder's own worst case is its file plus every rotated
-    backup, each up to `record_max_bytes` — 20 MB × 6 files = 120 MB at the
-    recorder's own defaults (item 79); the model store's measured floor is
-    1.4 KB and stays well under a megabyte even richer (item 48); and
-    `deploy/install-board-watchdogs.sh` caps the journal at
-    `JOURNAL_MAX_USE` (200 MB, §9 "Board hardening") — the one other thing
-    this project makes write to the card without an existing limit. Under
-    350 MB of *intentional*, bounded
-    growth altogether; the default `disk_free_min_gb` (2 GB) leaves several
-    times that as room to act. Default `disk_free_fault_s` (60 s) is a short
+  - **the card is low on space** — free space on `host_health.disk_path`
+    (default `"/"`) below `disk_free_min_gb` for `disk_free_fault_s` ("the
+    disk nobody watches", §8 proposed items). `hostinfo` has always
+    collected `disk_used_pct`/`disk_free_gb` and both were always
+    published — an MQTT sensor, a row on the page — but nothing watched
+    them: the card fills silently and the recorder, the model store and
+    the journal all start failing at once. On the owner's board that card
+    is a 15 GB SD (11 GB free today), and it is also the failure mode of a
+    worn-out card. `record_path` and `--model-store` are not pinned to
+    `/`, so an operator who puts either on a different mount must point
+    `disk_path` there too, or this rule (and the read-only one) watches a
+    filesystem nobody writes to while the one that matters fills or dies
+    unwatched. The rule is meant to warn **while there is still room to
+    act**, not once a write has already failed, so the default is argued
+    from what actually writes to the default `disk_path` rather than a
+    round number: the recorder's own worst case is its file plus every
+    rotated backup, each up to `record_max_bytes` — 20 MB × 6 files =
+    120 MB at the recorder's own defaults (item 79); the model store's
+    measured floor is 1.4 KB and stays well under a megabyte even richer
+    (item 48) — under 125 MB together, unconditionally.
+    `deploy/install-board-watchdogs.sh` also caps the journal at
+    `JOURNAL_MAX_USE` (200 MB), but only in the persistent-journal case
+    (§9 "Board hardening" above has why that is not guaranteed on a stock
+    image — that script assumes the journal is already persistent and
+    does not itself create `/var/log/journal`); that cap is margin on top
+    of the 125 MB figure, not a term the default depends on.
+    `disk_free_min_gb` (2 GB) leaves more than ten times the unconditional
+    figure as room to act. Default `disk_free_fault_s` (60 s) is a short
     debounce against one noisy `statvfs` sample, not a filter for anything
     transient — a filling card is a slow, roughly monotonic trend, not a
-    spike the way a rail sag is.
-  - **the filesystem is read-only** — `hostinfo.read_mount_ro()` said so:
-    the kernel's own `/proc/mounts`, not a write probe. On an SD card this
-    is usually the first visible sign of a dying card — an I/O error trips
-    the filesystem's `errors=remount-ro` and every write after that fails
-    silently as far as this daemon is concerned, the recorder's `OSError`
-    catch included. Chosen over a write probe because the failure this
-    rule exists to catch is already a fact in `/proc/mounts` the instant it
-    happens — the kernel updates that table synchronously on every mount
-    change, so there is no staleness a poll interval would need to cover —
-    and a write probe would add both a write and an `fsync`, on every
-    check, to the very card this rule is protecting. Reported the tick it
-    is seen, like throttling now: no window, since the kernel has already
+    spike the way a rail sag is. **This rule is a hint, not a verdict**,
+    for the same reason the divergence rule is (below): once it starts, a
+    filling card can sit below the threshold for days or weeks, and a
+    daemon-wide flag latched for that whole span would be
+    indistinguishable from an aquabus device that went missing sometime
+    during it.
+  - **the filesystem is read-only** — `hostinfo.read_mount_ro()` said so
+    for `disk_path`: the kernel's own `/proc/mounts`, not a write probe.
+    On an SD card this is usually the first visible sign of a dying
+    card — an I/O error trips the filesystem's `errors=remount-ro` and
+    every write after that fails — loudly, not silently: `Recorder.on_tick`
+    logs an exception on every failed write it catches, and the model
+    store's atomic write logs a warning on every failed attempt too, once
+    per `model_store_interval_s` for as long as the condition lasts.
+    Chosen over a write probe because the failure this rule exists to
+    catch is already a fact in `/proc/mounts` the instant it happens — the
+    kernel updates that table synchronously on every mount change, so
+    there is no staleness a poll interval would need to cover — and a
+    write probe would add both a write and an `fsync`, on every check, to
+    the very card this rule is protecting. Reported the tick it is seen,
+    like throttling now: no window, since the kernel has already
     remounted the filesystem and a sustained rule would only delay a fact
     everyone downstream needs immediately. An unknown reading (the mount
     table unreadable, no matching entry) never fires this rule — only a
     confirmed `True` does; never guessed either way, the same rule the
-    throttling word follows.
+    throttling word follows. Unlike the free-space rule this clears the
+    moment the mount is writable again, so it stays a *fact*.
 
-  The first two rules and the two disk rules report a *fact*, and their
+  The first two rules and the read-only rule report a *fact*, and their
   problems join the daemon's one `problems` list (so `/api/health` goes
   not-ok and Home Assistant's `Controller problem` turns on); the
-  divergence *hint* does not — it shows on `device_health.host` and on the
-  board's own `Board problem` sensor alone, because a hint that flips the
-  daemon-wide flag is indistinguishable from an aquabus device that has
-  gone missing.
+  divergence *hint* and the free-space *hint* do not — each shows on
+  `device_health.host` and on the board's own `Board problem` sensor
+  alone, because a hint that flips the daemon-wide flag is
+  indistinguishable from an aquabus device that has gone missing.
 
   The air reference is `air_temps`, empty by default, which means every
   `zone_air` sensor, else every `inlet` sensor, else every configured
@@ -5157,7 +5174,23 @@ the board.
   payload's `ok` true while the board's own goes false, and a hot board
   joining the daemon's problem list; `on_tick` publishing the board's
   verdict next to the fans', surviving a host reader that raises, and
-  leaving the observation untouched.
+  leaving the observation untouched. The disk rules ("the disk nobody
+  watches", §8 proposed items): `disk_path`'s validation and the free-space
+  default's arithmetic cross-checked against the recorder's and the
+  journal's real bounds; the free-space rule firing only after
+  `disk_free_fault_s` and clearing, and staying a *hint* (`faults == []`,
+  `hints` carries it) so it never joins the daemon-wide list even while
+  it fires; a missing or unreadable `disk_free_gb` never firing, degrading
+  to unknown; `disk_used_pct` riding along in the verdict; the read-only
+  rule firing the tick it is seen and clearing, as a *fact*; an
+  unknown or non-boolean `read_only` value never firing; both rules
+  naming `disk_path` in their messages, and the read-only message saying
+  the recorder and the model store fail loudly, not silently; both disk
+  rules firing together with the right one in each list; both still
+  publishing their numbers with `host_health.enabled: false`; `on_tick`
+  publishing both and only the read-only fact joining the daemon-wide
+  `problems`; `host_metrics_reader` threading `disk_path` into
+  `collect_hostinfo`.
 - `tests/test_hw_sources.py` — `CompositeSource` over two fake
   controllers and a fake 1-Wire source: merged reads, each channel
   written to its own device with one SET each, a failing device (first or
@@ -5359,7 +5392,20 @@ runners allow it.
   reused between polls with its age, and a failed poll dropping the word,
   falling through to the hwmon bit and not being retried before the interval
   is out. The runner is always a callable the test owns — no test starts a
-  `vcgencmd` process.
+  `vcgencmd` process. `read_mount_ro` ("the disk nobody watches", §8
+  proposed items): the kernel's own
+  read-only report against a fake `/proc/mounts`; a confirmed read-write
+  mount is `False`, not `None`; the longest matching prefix wins so a
+  sub-mount is judged by its own entry; two entries for one mount point
+  (a stacked mount, not a remount — `/proc/mounts` is generated fresh
+  from the live table, so a remount never adds a line) and the later one
+  wins; no matching entry, or an unreadable mounts file, is `None`; a
+  short or garbage line is skipped, not raised; an escaped mount point
+  (`\040` etc.) still matches the real path instead of silently falling
+  back to the root entry; an embedded NUL byte in the path (the
+  reachable failure of `os.path.realpath`, not an `OSError` — that one is
+  swallowed by `realpath(strict=False)` on POSIX) degrades to unknown,
+  not raised.
 - `tests/test_deploy.py` — unit file (`Type=notify`, `NotifyAccess=main`,
   `Restart=always`, watchdog, no `ExecStop=`, venv `ExecStart`,
   `TimeoutStartSec >= WatchdogSec`), udev rules against the unit’s
@@ -5370,8 +5416,11 @@ runners allow it.
   script creates the self-signed certificate at the
   `http:` default paths only when absent and creates no users, `bash -n` and `shellcheck` on both scripts (shellcheck skipped
   when not installed; GitHub runners have it), `StateDirectory=` for the
-  model store, and the SMART agent unit being a user unit that
-  `install-pi.sh` does not install.
+  model store, the SMART agent unit being a user unit that
+  `install-pi.sh` does not install, and the journald cap ("the disk
+  nobody watches", §8 proposed items): `JOURNAL_MAX_USE` a documented
+  variable at the top of the script, actually installed as both
+  `SystemMaxUse=` and `RuntimeMaxUse=` in the drop-in.
 
 ### 4.10 DAS suites (estimator, model, solver, experiments)
 
@@ -5652,9 +5701,9 @@ Config `http:` (parsed and validated by `HttpSettings` in
   `idle`, the `throttled` reading, the card's own
   `disk_free_gb`/`disk_used_pct` and `read_only`, and this board's own
   `faults`, `hints`, `problems` and `ok`), `problems` and `ok`. Only the
-  board's *facts* — it is hot, it is throttling now, the card is low on
-  space, the filesystem is read-only — are in the top-level
-  `problems` list `/api/health` shows; the divergence *hint* stays in
+  board's *facts* — it is hot, it is throttling now, the filesystem is
+  read-only — are in the top-level `problems` list `/api/health` shows;
+  the divergence *hint* and the free-space *hint* stay in
   `device_health.host` (§3 "The board itself"). Empty with `ok`
   true before the first tick and with a source that has none (the
   simulator)
@@ -5970,7 +6019,8 @@ qos 1; `unique_id` is `{node_id}_{object_id}`; every entity carries the
 availability topic and one device block. Entities:
 
 - sensors `host_cpu_temp_c`, `host_load1`, `host_mem_used_pct`,
-  `host_disk_used_pct`, `host_wifi_rssi_dbm`, `host_uptime_s`
+  `host_disk_used_pct`, `host_disk_free_gb`, `host_wifi_rssi_dbm`,
+  `host_uptime_s`
 - sensor `temp_<temp>` per `mpc.temps`; `rpm_<channel>` and
   `pwm_<channel>` (commanded PWM in %) per channel
 - binary sensor `device_problem` (`device_class: problem`, diagnostic,
@@ -5987,18 +6037,22 @@ availability topic and one device block. Entities:
   whenever the board has been above `host_health.temp_limit_c` for
   `temp_fault_s`, is throttling now, has sat further than `divergence_c`
   from the enclosure air for `divergence_fault_s` (only while its CPU is
-  idle), the card the daemon runs from has been below
+  idle), the card at `host_health.disk_path` has been below
   `disk_free_min_gb` free for `disk_free_fault_s`, or that card's
   filesystem has gone read-only. Its `json_attributes` are the
   `device_health.host` blob: the board's temperature, the air reference,
   the load average, the decoded `get_throttled` word, and the card's own
-  `disk_free_gb`/`disk_used_pct`/`read_only`. The board — and the card it
+  `disk_free_gb`/`disk_used_pct`/`read_only` (`disk_free_gb` also has its
+  own sensor, `host_disk_free_gb`, above). The board — and the card it
   runs from — get an entity of their own so a hot Pi or a filling SD card
   is not read as a controller fault. Only the *facts* — hot, throttling
-  now, low on space, read-only — also join the one
-  `health.device_health.problems` list behind `device_problem`; the
-  divergence hint turns on `host_problem` alone, so `device_problem` keeps
-  meaning "something is broken".
+  now, read-only — also join the one `health.device_health.problems` list
+  behind `device_problem`; the divergence hint and the free-space hint
+  turn on `host_problem` alone, so `device_problem` keeps meaning
+  "something is broken" — the free-space rule is a hint rather than a
+  fact for the same reason divergence is: it can sit true for days once a
+  card starts filling, and latching the daemon-wide flag for that long
+  would be indistinguishable from a missing aquabus device.
 - number `setpoint_<temp>` per setpoint (range `temp_min_c..temp_max_c`,
   step 0.5); a DAS config without setpoints publishes none
 - number `pwm_cmd_<channel>` per channel (range `pwm_min..pwm_max`, step
@@ -10055,7 +10109,17 @@ version of the disk-free-rule change installed its own second drop-in from
 covers the same setting plus `SystemMaxFileSize`, `MaxRetentionSec` and
 `SyncIntervalSec` from one set of knobs, and a board running both scripts
 must not end up with two drop-ins governing one journal from two different
-defaults. `install-pi.sh` does not touch the journal.
+defaults. `install-pi.sh` does not touch the journal. Whether this
+script's own drop-in ever lands on the card is itself conditional:
+journald's `Storage=auto` (the Raspberry Pi OS default) keeps the
+journal *persistent* under `/var/log/journal` only when that directory
+exists, and neither this script nor `install-pi.sh` creates it, so on a
+stock image the journal lives *volatile* under `/run/log/journal`
+(tmpfs) and `SystemMaxUse=` bounds nothing on the SD card until an
+operator or a later image makes the journal persistent — which is
+exactly why `health.HostHealthConfig.disk_free_min_gb`'s default treats
+this cap as margin on top of the recorder-plus-model-store arithmetic,
+never a term it depends on.
 
 ### udev
 

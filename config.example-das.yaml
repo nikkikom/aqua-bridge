@@ -686,18 +686,26 @@ host_health:
                              # (> 0); it guards against a VideoCore mailbox that never
                              # answers. A timeout is simply unknown, and the chain
                              # falls through to the rpi_volt hwmon under-voltage bit
-  disk_free_min_gb: 2.0      # the card is a deviation below this many GB free (>= 0).
-                             # Argued from what actually writes to it: the recorder's
-                             # own worst case is 20 MB x 6 files = 120 MB at its
-                             # defaults, the model store's measured floor is 1.4 KB,
-                             # and deploy/install-board-watchdogs.sh caps the
-                             # journal at JOURNAL_MAX_USE (200 MB) -- under 350 MB of bounded
-                             # growth, so 2 GB leaves several times that as room to
-                             # act before a write could actually fail
+  disk_path: "/"             # the filesystem the disk-free and read-only rules judge.
+                             # Point this at record_path's mount when it is not "/" --
+                             # record_path and --model-store are not pinned to "/",
+                             # so these rules judge the wrong card if it moves and
+                             # this key does not move with it
+  disk_free_min_gb: 2.0      # free space on disk_path below this many GB is a
+                             # deviation (>= 0). Argued from what actually writes to
+                             # the default disk_path: the recorder's own worst case
+                             # is 20 MB x 6 files = 120 MB at its defaults, the model
+                             # store's measured floor is 1.4 KB -- under 125 MB
+                             # together, unconditionally. deploy/install-board-watchdogs.sh
+                             # also caps the journal at JOURNAL_MAX_USE (200 MB), but
+                             # only when the image keeps a persistent journal; 2 GB
+                             # leaves room to act well beyond either figure
   disk_free_fault_s: 60.0    # a free-space deviation held this long is reported,
                              # seconds (> 0); a short debounce against one noisy
                              # statvfs sample, not a filter for anything transient --
-                             # a filling card is a slow, roughly monotonic trend
+                             # a filling card is a slow, roughly monotonic trend, and
+                             # this rule is a hint (like the divergence rule): it can
+                             # sit true for days, and must not latch device_problem
 
 # The spin-up kick: a fan that is commanded but does not turn (PROJECT.md section 3
 # "Spin-up kick", section 8 item 75). A fan's STARTING duty is higher than its running

@@ -181,8 +181,12 @@ def test_mount_ro_picks_the_longest_matching_prefix(tmp_path: Path) -> None:
     assert read_mount_ro(root, mounts) is False
 
 
-def test_mount_ro_a_later_entry_for_the_same_point_wins(tmp_path: Path) -> None:
-    """A remount appends a new line rather than rewriting the old one."""
+def test_mount_ro_a_later_entry_for_a_stacked_mount_wins(tmp_path: Path) -> None:
+    """Two entries for the same mount point come from one mount stacked on top of
+    another there (a bind mount, say), not from a remount: a remount updates the
+    existing mount's flags in place and adds no line to /proc/mounts, which is
+    generated fresh from the live mount table on every read. The topmost mount is
+    the one actually in effect, so the later entry must win."""
     mounts = tmp_path / "mounts"
     target = tmp_path / "root"
     target.mkdir()
@@ -192,6 +196,28 @@ def test_mount_ro_a_later_entry_for_the_same_point_wins(tmp_path: Path) -> None:
         f"/dev/mmcblk0p2 {target} ext4 ro,noatime,errors=remount-ro 0 0\n",
     )
     assert read_mount_ro(target, mounts) is True
+
+
+def test_mount_ro_matches_an_escaped_mount_point(tmp_path: Path) -> None:
+    """/proc/mounts octal-escapes whitespace and backslashes in the mount point
+    (\\040 space, \\011 tab, \\012 newline, \\134 backslash); a mount point
+    containing a space must still match the real path, not silently fall back to
+    the root entry's state the way an unmatched path used to."""
+    mounts = tmp_path / "mounts"
+    root = tmp_path / "root"
+    target = root / "media" / "pi" / "MY DRIVE"
+    target.mkdir(parents=True)
+    _write(
+        mounts,
+        f"/dev/mmcblk0p2 {root} ext4 rw,noatime 0 0\n"
+        f"/dev/sda1 {root}/media/pi/MY\\040DRIVE vfat ro 0 0\n",
+    )
+    assert read_mount_ro(target, mounts) is True
+    # Without the escaped sibling entry the same path would fall back to the
+    # (read-write) root -- confirming the match is on the escaped sub-mount, not
+    # a coincidence of the root always matching.
+    _write(mounts, f"/dev/mmcblk0p2 {root} ext4 rw,noatime 0 0\n")
+    assert read_mount_ro(target, mounts) is False
 
 
 def test_mount_ro_no_matching_entry_is_none(tmp_path: Path) -> None:
@@ -212,16 +238,17 @@ def test_mount_ro_a_short_or_garbage_line_is_skipped_not_raised(tmp_path: Path) 
     assert read_mount_ro(target, mounts) is False
 
 
-def test_mount_ro_never_raises_on_an_unresolvable_path(tmp_path: Path, monkeypatch: Any) -> None:
-    """A path this process cannot resolve (e.g. a permission error walking up to
-    it) degrades to unknown rather than raising on the tick path."""
+def test_mount_ro_never_raises_on_an_unresolvable_path(tmp_path: Path) -> None:
+    """A path os.path.realpath cannot resolve degrades to unknown rather than
+    raising on the tick path.
 
-    def boom(_path: object) -> str:
-        raise OSError("denied")
-
-    monkeypatch.setattr(hostinfo.os.path, "realpath", boom)
+    ``realpath(strict=False)`` is total over any ordinary string on POSIX -- a
+    permission error or a missing component is swallowed and a best-effort path
+    returned, not an ``OSError`` -- so the reachable failure is an embedded NUL
+    byte, which raises ``ValueError``, not the ``OSError`` an earlier version of
+    this test reached only by monkeypatching realpath itself."""
     _write(tmp_path / "mounts", "/dev/mmcblk0p2 / ext4 rw 0 0\n")
-    assert read_mount_ro("/", tmp_path / "mounts") is None
+    assert read_mount_ro("/tmp/bad\x00path", tmp_path / "mounts") is None
 
 
 # --- read_wifi_rssi ----------------------------------------------------------

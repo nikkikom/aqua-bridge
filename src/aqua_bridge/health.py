@@ -142,8 +142,10 @@ board is hot, the board is throttling now, -- only while the CPU is idle -- the
 board's temperature diverges from the enclosure air, the card the daemon runs
 from is low on free space, and that card's filesystem has gone read-only. Its
 inputs are :func:`aqua_bridge.hostinfo.collect_hostinfo`'s ``cpu_temp_c``,
-``load1``, ``throttled``, ``disk_free_gb``/``disk_used_pct`` and ``read_only``,
-plus the observation's own temperatures as the air reference.
+``load1``, ``throttled``, ``disk_free_gb``/``disk_used_pct`` and ``read_only``
+-- the last three all describing whichever filesystem ``host_health.disk_path``
+names (default ``"/"``) -- plus the observation's own temperatures as the air
+reference.
 
 The board is **not** part of the thermal model: about a watt against the drives'
 tens of watts, and its reading is dominated by its own self-heating, which moves
@@ -156,11 +158,15 @@ The card the daemon runs from is a health signal in exactly the same sense: abou
 a stopped recording and a stopped model store, never a plant measurement, and it
 never reaches ``PlantObservation`` or the solver's ``diagnostics`` either.
 
-The four rules that report a fact -- the board is hot, the board is throttling,
-the card is low on space, the filesystem is read-only -- join the payload's
-daemon-wide ``problems``; the divergence rule, which is a hint about where to
-look, does not, and shows only on the board's own published verdict and its Home
-Assistant ``host_problem`` sensor.
+The three rules that report a fact -- the board is hot, the board is throttling,
+the filesystem is read-only -- join the payload's daemon-wide ``problems``; the
+divergence rule and the free-space rule, both hints rather than verdicts, do
+not, and show only on the board's own published verdict and its Home Assistant
+``host_problem`` sensor. The free-space rule is a hint for the same reason the
+divergence rule is: a filling card can sit below its threshold for days or
+weeks once it starts, and a daemon-wide flag latched for that whole span would
+be indistinguishable from an aquabus device that went missing sometime during
+it -- unlike the other three, which clear as soon as the condition does.
 
 The throttling rule needs a source, and on the board this daemon runs on the
 cheapest one is not there: kernel 6.18 exposes no ``get_throttled`` sysfs
@@ -454,21 +460,36 @@ class HostHealthConfig:
     #: chain falls through to the hwmon under-voltage bit. A board where the call
     #: times out pays that once per ``vcgencmd_interval_s``, not once per tick.
     vcgencmd_timeout_s: float = 2.0
+    #: The filesystem the disk-free and read-only rules judge -- passed straight
+    #: through to :func:`aqua_bridge.hostinfo.read_disk` and
+    #: :func:`~aqua_bridge.hostinfo.read_mount_ro`, which match it to the mount that
+    #: actually carries it, not necessarily this literal string. Default ``"/"``,
+    #: the root filesystem: what ``disk_used_pct``/``disk_free_gb`` have always
+    #: described and what the daemon's own paths sit on unless an operator points
+    #: them elsewhere. ``record_path`` (a top-level config key) and ``--model-store``
+    #: are **not** pinned to ``/`` -- an operator who puts either on a different
+    #: mount must point this key at it too, or these rules judge a filesystem
+    #: nobody writes to while the one that matters fills or dies unwatched.
+    disk_path: str = "/"
     #: The card this daemon runs from is a deviation below this many GB free
-    #: (>= 0; ``hostinfo.read_disk``'s GB, 1024**3 bytes). Argued from what
-    #: actually writes to it, not a round number: the
-    #: recorder's own worst case is its rotated file plus every backup, each up to
-    #: ``record_max_bytes`` -- 20 MB x 6 files = 120 MB at the recorder's own
-    #: defaults (:mod:`aqua_bridge.recorder`, item 79); the model store's measured
-    #: floor is 1.4 KB and stays well under a megabyte even richer (item 48); and
-    #: on the Pi, ``deploy/install-board-watchdogs.sh``'s ``JOURNAL_MAX_USE``
-    #: (200 MB by default) bounds the one other thing this project makes write
-    #: there without limit.
-    #: Together that is under 350 MB of *intentional*, bounded growth; 2 GB leaves
-    #: several times that as room to act -- clear old recordings, shrink the journal
-    #: -- before a single rotation or write could still fail for want of space. On
-    #: the owner's 15 GB SD card (11 GB free) this default sits nowhere near a false
-    #: alarm.
+    #: (>= 0; ``hostinfo.read_disk``'s GB, 1024**3 bytes, on ``disk_path``). Argued
+    #: from what actually writes to the default ``disk_path`` ("/"), not a round
+    #: number: the recorder's own worst case is its rotated file plus every backup,
+    #: each up to ``record_max_bytes`` -- 20 MB x 6 files = 120 MB at the recorder's
+    #: own defaults (:mod:`aqua_bridge.recorder`, item 79); the model store's
+    #: measured floor is 1.4 KB and stays well under a megabyte even richer (item
+    #: 48) -- under 125 MB together. On the Pi,
+    #: ``deploy/install-board-watchdogs.sh``'s ``JOURNAL_MAX_USE`` (200 MB by
+    #: default) also caps the journal, but only when the board keeps a
+    #: *persistent* journal (that script assumes it is, and does not itself
+    #: create ``/var/log/journal``; on a stock image with the default
+    #: ``Storage=auto`` the journal stays volatile and that cap bounds RAM, not
+    #: the card) -- so it is margin on top of this arithmetic, never a term it
+    #: depends on. Even without it, 2 GB leaves more than ten times the
+    #: recorder-plus-model-store figure as room to act -- clear old recordings,
+    #: shrink the journal -- before a single rotation or write could still fail
+    #: for want of space. On the owner's 15 GB SD card (11 GB free) this default
+    #: sits nowhere near a false alarm.
     disk_free_min_gb: float = 2.0
     #: A free-space deviation held this long is reported, seconds (> 0). A card
     #: filling up is a slow, roughly monotonic trend, not a spike -- unlike the rail
@@ -483,6 +504,10 @@ class HostHealthConfig:
         _number("host_health.temp_limit_c", self.temp_limit_c, minimum=0.0, maximum=None)
         _number("host_health.divergence_c", self.divergence_c, minimum=1e-9, maximum=None)
         _number("host_health.idle_load1_max", self.idle_load1_max, minimum=0.0, maximum=None)
+        if not isinstance(self.disk_path, str) or not self.disk_path:
+            raise ConfigError(
+                f"host_health.disk_path must be a non-empty string, got {self.disk_path!r}"
+            )
         _number("host_health.disk_free_min_gb", self.disk_free_min_gb, minimum=0.0, maximum=None)
         for name in (
             "temp_fault_s",
@@ -566,7 +591,8 @@ def host_metrics_reader(
     clock: Callable[[], float] = time.monotonic,
 ) -> Callable[[], dict[str, Any]]:
     """:func:`~aqua_bridge.hostinfo.collect_hostinfo` with this config's throttling
-    source chain: one :class:`~aqua_bridge.hostinfo.ThrottledReader` per caller.
+    source chain and ``disk_path`` (default ``"/"``): one
+    :class:`~aqua_bridge.hostinfo.ThrottledReader` per caller.
 
     Every caller gets the same chain, the control loop's reader included, because the
     board this daemon runs on has no cheaper complete source: on a Raspberry Pi Zero 2
@@ -593,7 +619,7 @@ def host_metrics_reader(
         else None
     )
     throttled = ThrottledReader(vcgencmd=runner, poll_interval_s=s.vcgencmd_interval_s, clock=clock)
-    return functools.partial(collect_hostinfo, throttled=throttled)
+    return functools.partial(collect_hostinfo, throttled=throttled, disk_path=s.disk_path)
 
 
 def _throttled_detail(throttled: Mapping[str, Any]) -> str:
@@ -650,30 +676,39 @@ class HostHealth:
         that either the air sensors or the board's placement deserve a look, never
         which.
     ``the card is low on space`` (the disk nobody watches)
-        Free space below ``disk_free_min_gb`` for ``disk_free_fault_s``. ``hostinfo``
-        has always collected ``disk_used_pct``/``disk_free_gb`` and both were always
-        published -- an MQTT sensor, a row on the page -- but nothing watched them:
-        the card fills silently and the recorder, the model store and the journal
-        all start failing at once, together, on the SD card most of this daemon's
+        Free space on ``disk_path`` below ``disk_free_min_gb`` for
+        ``disk_free_fault_s``. ``hostinfo`` has always collected
+        ``disk_used_pct``/``disk_free_gb`` and both were always published -- an
+        MQTT sensor, a row on the page -- but nothing watched them: the card fills
+        silently and the recorder, the model store and the journal all start
+        failing at once, together, on the SD card most of this daemon's
         deployments boot from. This rule is meant to warn **while there is still
         room to act** -- delete old recordings, shrink the journal -- not once a
         write has already failed; ``disk_free_min_gb``'s default is sized from what
-        actually writes to the card, not a round number (its own docstring has the
-        arithmetic).
+        actually writes to the default ``disk_path``, not a round number (its own
+        docstring has the arithmetic). **This rule is a hint, not a verdict**, for
+        the same reason the divergence rule is: a filling card is a slow,
+        roughly monotonic trend that can sit below the threshold for days or
+        weeks once it starts, and a hint that latched the daemon-wide problem flag
+        for that long would be indistinguishable from an aquabus device that has
+        gone missing for the same span -- exactly what a fact must not do.
     ``the filesystem is read-only``
-        :func:`aqua_bridge.hostinfo.read_mount_ro` said so -- the kernel's own
-        ``/proc/mounts``, not a write probe (that function's docstring says why).
-        On an SD card this is usually the first visible sign of a dying card: an I/O
-        error trips the filesystem's ``errors=remount-ro`` and every write after
-        that fails silently as far as this daemon is concerned -- the recorder logs
-        nothing because ``Recorder.on_tick`` catches exactly the ``OSError`` a
-        remount produces, and the model store's atomic write likewise fails and is
-        logged, at most, once. Reported the tick it is seen, like throttling: the
-        kernel has already remounted the filesystem, so a sustained window would
-        only delay a fact everyone downstream needs immediately.
+        :func:`aqua_bridge.hostinfo.read_mount_ro` said so for ``disk_path`` -- the
+        kernel's own ``/proc/mounts``, not a write probe (that function's docstring
+        says why). On an SD card this is usually the first visible sign of a dying
+        card: an I/O error trips the filesystem's ``errors=remount-ro`` and every
+        write after that fails -- loudly, not silently: ``Recorder.on_tick`` logs
+        an exception on every failed write it catches, and the model store's
+        atomic write logs a warning on every failed attempt too, once per
+        ``model_store_interval_s`` for as long as the condition lasts. Reported the
+        tick it is seen, like throttling: the kernel has already remounted the
+        filesystem, so a sustained window would only delay a fact everyone
+        downstream needs immediately. Unlike the free-space rule this clears the
+        moment the mount is writable again, so it is a fact: it cannot latch the
+        daemon-wide flag for longer than the condition itself lasts.
 
-    :meth:`check` reports the first two, the disk-space rule and the read-only rule
-    as ``faults`` and the divergence hint as ``hints``, with ``problems`` their
+    :meth:`check` reports the first two rules and the read-only rule as ``faults``
+    and the divergence and disk-space rules as ``hints``, with ``problems`` their
     concatenation and ``ok`` false for either. Only the ``faults`` join the
     daemon-wide problem list (:meth:`HealthMonitor.update`): a hint must not make
     ``/api/health`` not-ok or turn on the controller-fault sensor in Home Assistant,
@@ -782,29 +817,19 @@ class HostHealth:
         if throttled is not None and throttled.get("now") is True:
             faults.append(f"host: the board is throttling now ({_throttled_detail(throttled)})")
 
-        # The disk nobody watches: disk_free_gb was always collected and published,
-        # but nothing judged it before this. Warn while there is still room to act,
-        # not once a write has already failed (disk_free_min_gb's docstring has the
-        # arithmetic this default is argued from).
-        held = self._sustained(
-            "disk_free", disk_free_gb is not None and disk_free_gb < s.disk_free_min_gb, now
-        )
-        if held is not None and disk_free_gb is not None:
-            faults.append(
-                f"host: {disk_free_gb:.2f} GB free on disk, below the "
-                f"{s.disk_free_min_gb:g} GB warning, for {held:.0f} s -- the recorder, "
-                "the model store and the journal all write to this card"
-            )
-
         # No window, like throttling now: the kernel has already remounted the
         # filesystem by the time read_mount_ro sees it, so a sustained rule would
         # only delay a fact everyone downstream (the recorder, the model store)
         # needs immediately. An unknown reading (mount table unreadable, no
-        # matching entry) never fires this -- only a confirmed True does.
+        # matching entry) never fires this -- only a confirmed True does. Unlike
+        # the free-space rule below, this clears itself the moment the mount is
+        # writable again, so it cannot latch the daemon-wide flag indefinitely and
+        # stays a fact.
         if read_only is True:
             faults.append(
-                "host: the filesystem is mounted read-only -- the recorder and the "
-                "model store are failing silently"
+                f"host: {s.disk_path} is mounted read-only -- writes to it fail "
+                "now, loudly (the recorder and the model store each log every "
+                "failed write), but nothing lands on disk"
             )
 
         hints: list[str] = []
@@ -815,6 +840,24 @@ class HostHealth:
                 f"host: the board is {divergence:+.1f} degC from the enclosure air "
                 f"({air:.1f} degC) at idle, beyond {s.divergence_c:g} degC, for {held:.0f} s "
                 f"-- a hint about the air sensors or the board's placement, not a verdict"
+            )
+
+        # The disk nobody watches: disk_free_gb was always collected and published,
+        # but nothing judged it before this. Warn while there is still room to act,
+        # not once a write has already failed (disk_free_min_gb's docstring has the
+        # arithmetic this default is argued from). A hint, not a fact, like the
+        # divergence rule and for the same reason: a filling card can sit below the
+        # threshold for days or weeks once it starts, and a fact that latches the
+        # daemon-wide problem flag for that whole span would be indistinguishable
+        # from an aquabus device that has gone missing at some point during it.
+        held = self._sustained(
+            "disk_free", disk_free_gb is not None and disk_free_gb < s.disk_free_min_gb, now
+        )
+        if held is not None and disk_free_gb is not None:
+            hints.append(
+                f"host: {disk_free_gb:.2f} GB free on {s.disk_path}, below the "
+                f"{s.disk_free_min_gb:g} GB warning, for {held:.0f} s -- act before a "
+                "write to it actually fails"
             )
 
         out["faults"] = faults
@@ -1236,10 +1279,11 @@ class HealthMonitor:
             "devices": devices["devices"],
             "fans": fans,
             "host": board,
-            # Only the board's *faults* (hot, throttling now) are daemon problems.
-            # The divergence rule is a hint about where to look, not a verdict, and
-            # must not flip /api/health or the controller-fault sensor; it is in
-            # host["problems"] and on the board's own host_problem sensor instead.
+            # Only the board's *faults* (hot, throttling now, filesystem read-only)
+            # are daemon problems. The divergence and free-space rules are hints,
+            # not verdicts, and must not flip /api/health or the controller-fault
+            # sensor; they are in host["problems"] and on the board's own
+            # host_problem sensor instead.
             "problems": [
                 *devices["problems"],
                 *problems,

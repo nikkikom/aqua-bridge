@@ -188,9 +188,30 @@ def read_disk(path: str | os.PathLike[str] = "/") -> dict[str, float] | None:
 #: Where the kernel lists every mount, its point and its current options --
 #: including ``ro``, which a filesystem gains on its own when the kernel remounts it
 #: read-only after an I/O error (``errors=remount-ro``, the usual ``ext4`` default).
-#: A plain file, refreshed by the kernel on every mount change; reading it costs
-#: nothing and writes nothing to the card :func:`read_mount_ro` is asking about.
+#: A plain file, refreshed by the kernel on every mount change: one small read, no
+#: process started, and it writes nothing to the card :func:`read_mount_ro` is
+#: asking about.
 MOUNTS_PATH = Path("/proc/mounts")
+
+#: ``/proc/mounts``' own octal escapes for the characters a mount point cannot
+#: carry unescaped (a field separator, or the escape character itself), applied in
+#: this order so an escaped backslash is never re-interpreted as the start of
+#: another escape. Unescaping before comparison is what keeps a mount point with a
+#: space in it (``/media/pi/MY DRIVE``, ``\040``-escaped in the file) from missing
+#: its own entry and silently falling back to the root filesystem's state.
+_MOUNT_POINT_ESCAPES: tuple[tuple[str, str], ...] = (
+    ("\\040", " "),
+    ("\\011", "\t"),
+    ("\\012", "\n"),
+    ("\\134", "\\"),
+)
+
+
+def _unescape_mount_point(raw: str) -> str:
+    """A ``/proc/mounts`` mount-point field with its octal escapes undone."""
+    for escaped, char in _MOUNT_POINT_ESCAPES:
+        raw = raw.replace(escaped, char)
+    return raw
 
 
 def read_mount_ro(
@@ -212,18 +233,26 @@ def read_mount_ro(
     ``path`` is matched to the mount whose mount point is the longest prefix of it
     (the same rule the kernel itself uses to answer a lookup), so a path on a
     sub-mount is judged by its own entry and not the root filesystem's; on two
-    entries for the same mount point (a remount, which appends a new line rather
-    than rewriting the old one) the later entry wins, since that is the one in
-    effect. Returns ``None`` -- never guessed as read-only or as read-write --
-    when ``mounts_path`` does not read, is empty, or names no mount point that is a
-    prefix of ``path``; never raises.
+    entries for the same mount point (one mount stacked on top of another at the
+    same path -- a bind mount, say -- rather than a remount, which updates the
+    existing mount's flags in place and adds no line) the later entry wins, since
+    the topmost mount is the one actually in effect. Returns ``None`` -- never
+    guessed as read-only or as read-write -- when ``mounts_path`` does not read, is
+    empty, or names no mount point that is a prefix of ``path``; never raises.
     """
     text = _read_text(mounts_path)
     if text is None:
         return None
     try:
         resolved = os.path.realpath(path)
-    except OSError:
+    except (OSError, ValueError, TypeError):
+        # realpath(strict=False) is total over any str/PathLike on POSIX -- it
+        # swallows a permission error or a missing component and returns its
+        # best-effort path rather than raising -- so OSError is unreachable in
+        # practice; ValueError (an embedded NUL byte) and TypeError (not a
+        # str/PathLike) are the failures that can actually happen, and this must
+        # degrade to unknown for those too rather than let one escape to a caller
+        # that promises never to raise on the tick path.
         return None
     best_point: str | None = None
     best_ro: bool | None = None
@@ -231,7 +260,7 @@ def read_mount_ro(
         fields = line.split()
         if len(fields) < 4:
             continue
-        mount_point, options = fields[1], fields[3]
+        mount_point, options = _unescape_mount_point(fields[1]), fields[3]
         if mount_point == "/":
             matches = True
         else:
