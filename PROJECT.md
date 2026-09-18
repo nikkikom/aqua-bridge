@@ -7226,17 +7226,20 @@ Owner decision (2026-09-16):
 119. A zone that converges on its air block plus the bays that have
     informed themselves, rather than all-or-nothing (item 111's own
     question, left to the owner because it is a policy call about acting
-    on a partly identified model, not an identification problem). At 36 h
-    it would add z2 on seeds 2 and 3 and z0 on seed 4, but 4 of those 5
-    blockers are item 109's swap-damaged bays, so a partial rule would
-    mostly paper over item 109 rather than buy a better model. The safety
-    asymmetry to weigh: an *under*-estimated `k` makes the DAS MPC believe
-    airflow helps that bay less than it does, so it runs the fans higher —
-    safe; an over-estimated one runs them lower. `pred_err_c` still gates
-    zone-wide and the bay blocks' residuals feed it, the empirical check
-    `rel_se` is the parametric version of. A candidate key:
-    `model_converged_bays_frac` (default 1.0, today's rule) or a bound on
-    `se(k)` rather than on `rel_se(k)`.
+    on a partly identified model, not an identification problem). Measured
+    when this was written, 4 of the 5 zones still short at 36 h were item
+    109's swap-damaged bays (b03, b10); item 109's fix (§8, this section)
+    resolved that estimator defect directly, and the 36 h picture is now
+    11 of 12 zones converged, with a single zone (z3, seed 3) blocked by
+    one bay (b15) whose fitted `k` is genuinely small, not swap-damaged.
+    The policy question survives on that narrower case: the safety
+    asymmetry to weigh is that an *under*-estimated `k` makes the DAS MPC
+    believe airflow helps that bay less than it does, so it runs the fans
+    higher — safe; an over-estimated one runs them lower. `pred_err_c`
+    still gates zone-wide and the bay blocks' residuals feed it, the
+    empirical check `rel_se` is the parametric version of. A candidate
+    key: `model_converged_bays_frac` (default 1.0, today's rule) or a
+    bound on `se(k)` rather than on `rel_se(k)`.
 120. Size the telegraph to the headroom under `ident_levels: symmetric`
     (item 110). Under `above` the amplitude is cooling *added* and the
     solver gives it straight back, which is why sizing it down buys only
@@ -7256,11 +7259,59 @@ Owner decision (2026-09-16):
     would put items 110 and 111's answer where it is read.
 122. The nightly cost and the third seed. `test_ident_converge_sim.py` is
     now 9 cases at ~12.5 min: the 36 h item-111 case is ~60 s per seed and
-    the 16 h A/B two runs per seed. Since item 112, seed 3 converges
-    nothing in either arm at 16 h, so it no longer separates the two arms
-    — only seeds 2 and 4 do. Worth deciding together whether to drop the
-    36 h case to one seed, and whether to add a fourth seed so the A/B
-    keeps three separating ones.
+    the 16 h A/B two runs per seed. (Re-measured after item 109's fix:
+    with b03 no longer reported swapped, seed 3's zone-wide arm now
+    converges z0 and z2 too, so all three seeds separate the two arms at
+    16 h, not just two of three as first measured — this line was written
+    against the pre-item-109 numbers.) Still worth deciding together
+    whether the 36 h case needs all three seeds or would lose little at
+    one, given the same fix takes it to 11 of 12 zones converged rather
+    than 7.
+123. A bay whose thermal block is reset should say so (item 109).
+    `swapped` is a per-tick flag with no memory: `model_reset_on_swap`
+    throws away a bay's `g0`, `k`, `q_s`, its covariance, its counters,
+    its PE monitor and its window in progress, plus its zone's air
+    window, and nothing counts how often that happens. Item 109 was
+    found only because item 102 noticed a zone that closed no regression
+    window; a bay resetting once an hour would leave a zone permanently
+    behind without ever being visible. Worth deciding whether `/api/model`
+    should carry a per-bay reset count and last-reset time, and whether a
+    rate above some threshold should be a health finding rather than a
+    diagnostic.
+124. The bay-level swap test and the per-sensor fast-swap rule disagree
+    about what an event is, and only one of them is rate-limited (item
+    109). `jumped` grants the `sigma` trust exemption under
+    `bay_settle_s` per window and `bay_settle_max_s` in total, exactly so
+    a flapping sensor cannot stay exempt for ever; `stepped` resets the
+    thermal model with no budget at all. The two fire on the same kind of
+    evidence at almost the same thresholds. Worth deciding whether the
+    model reset should spend a budget of its own, and if so whether
+    exhausting it should fall back to *not* resetting (keeping a possibly
+    stale fit) or to something louder.
+125. A redundant pair identifies its own placement difference, and on
+    the fused layout that difference is the only thing the offset state
+    carries (item 109) — so the filter already holds the number that
+    says whether the two sensors still sit where they did. A pair whose
+    learned gap walks away from the `ds*rise + db` shape it should have
+    is a sensor coming loose or fouling, which nothing currently reports.
+    Worth deciding whether the offset (or, on the per-sensor layout, the
+    learned map) should be checked against its own prior box and
+    published as a per-sensor health signal.
+126. The relative step-budget gate loses its margin on a shared machine
+    (item 109). `test_das_mpc_step_p99_within_the_relative_budget`
+    divides the DAS MPC's p99 by the legacy MPC's, measured back to back
+    in one process, and asks for at most 12x; the method notes were
+    written against "a runner hiccup during one repeat", which the
+    warm-up and the 75th percentile do handle. Sustained contention is a
+    different failure: it loads the DAS side harder than the legacy one.
+    Measured independently on items 109 and 110/111/112's own PRs (and
+    again during this merge): the gate fails intermittently under an
+    8-way parallel `ci_pytest_shards.py` run and passes alone every time,
+    while the ratio's own distribution does not move (10.4–10.6 on one
+    measurement, 10.57–10.62 on another). Worth deciding whether the gate
+    should measure with the machine quiesced, take the median of more
+    repeats, or report the ratio and fail only on a trend, so that a red
+    CI run means a regression rather than a busy runner.
 
 ### 8.3 Open — needs the DAS hardware
 
