@@ -8871,6 +8871,60 @@ Owner decision (2026-09-16):
     and `SyncIntervalSec` from one set of knobs — a board running both
     scripts must not end up with two drop-ins governing one journal
     from two different defaults.
+140. **The DAS MPC is the louder of the two solvers on the shipped example**
+    (item 119). Measured while item 119's cost was being separated: over 36 h
+    on `rich` seeds 2/3/4 the enclosure's mean PWM is 0.3656 / 0.2904 / 0.3566
+    with the MPC acting for 11146 / 6754 / 20074 of 25920 ticks, against
+    0.3165 / 0.2553 / 0.2976 with it acting for 370 / 0 / 5266 — and the worst
+    true margin is identical to the digit (4.133 / 4.510 / 4.026 degC) either
+    way. So on this simulated enclosure the model-based solver buys no margin
+    for about +0.05 mean PWM. Worth deciding whether that is the example's own
+    weights (`weight_dpwm`, `rho_soft`), the prediction horizon, or the model,
+    because it is the objective of the whole milestone that the MPC be
+    *quieter* at the same margin.
+141. **A health finding on the reset rate** (items 123, 124). Item 123 left it
+    open and item 124 made it non-urgent, but the numbers are now there to
+    write a rule on: a bay whose `swap_held` is climbing is one the estimator
+    keeps calling swapped and the budget keeps refusing, which is a sensor or
+    a placement problem and not a drive. The counter is now one per
+    `bay_settle_s` of a standing verdict, so a threshold set against it does
+    not depend on `dt`. Worth deciding a threshold (per hour? per
+    `bay_settle_max_s` of clean time?) and whether it belongs in `health.py`
+    beside the fan and board rules or in the estimator's own diagnostics.
+142. **Acting on item 125's `placement` verdict** (item 125). The signal
+    ships as a diagnostic. On the per-sensor layout an `over` is a placement
+    the config does not allow, and a sensor coming loose is exactly the
+    failure that biases a whole bay's estimate toward safety or away from it
+    depending on the sign. Turning it into a gate input (drop the member,
+    keep the anchor) or a health finding needs the per-sensor layout on,
+    which is item 99's golden decision.
+143. **The replay path never reconstructs `reset_bays`** (item 123).
+    `recorder.thermal_inputs` builds `occupancy`, `classes` and `maps` from a
+    record's `bays` block but not the swap verdict, so `tools/replay.py` and
+    `tools/fit_model.py` re-learn a bay the live run reset — the fit they
+    produce is not the fit the daemon had. The record now carries
+    `swap_reset` per bay (item 123), so the gap is one line to close; worth
+    deciding whether a replay *should* reproduce the resets or deliberately
+    fit across them, since the second is what a hold-out pass wants.
+144. **A monkeypatched stub that no longer matches its function is
+    invisible.** `test_model_fallback_sim` replaced `thermal.current_model`
+    with a two-positional-arg stub; adding a keyword argument turned every
+    call into a `TypeError` that `solver_das` catches as "a thermal memory
+    that cannot be read", and the whole suite went on passing while testing
+    the fallback path instead of the fallback *decision*. Only the
+    assertions about *which* tick switched caught it. Worth deciding whether
+    the repo wants a small conftest helper that monkeypatches through
+    `inspect.signature`, so a stub that has drifted fails loudly instead of
+    silently widening an `except Exception`.
+145. **`bay_settle_max_s` is one key with two meanings** (items 123, 124). It
+    bounds the `sigma` trust exemption and, since item 124, the statistical
+    half of `model_reset_on_swap` — so `bay_settle_max_s: 0`, a documented and
+    supported way to switch the trust exemption off, now also stops a drive
+    replaced in place from ever having its coefficients thrown away. The
+    review pass documented the coupling in all three places an owner would
+    look. Worth deciding whether the two budgets should be one key at all, or
+    whether the reset wants its own, since a key named for one rule quietly
+    gating another is what makes that setting a trap.
 
 ### 8.3 Open — needs the DAS hardware
 
