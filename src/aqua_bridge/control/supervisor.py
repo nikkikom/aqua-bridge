@@ -87,6 +87,15 @@ Rules (section 6 "Control", section 4.8, section 5 "Modes")
   value. The mode of the composed command is the solver's mode (there is
   no ``manual`` mode in :class:`~aqua_bridge.model.Mode`); the control mode
   and the overrides are recorded in ``diagnostics["supervisor"]``.
+* **The spin-up floor** (:mod:`aqua_bridge.control.spinup`, PROJECT.md section 8
+  item 75) is applied last, to every channel and in every mode, because it only
+  ever *raises*: ``max(what was composed above, the floor)``, then the same rate
+  limit and clamp. Two things put a channel there -- a kick on a channel that is
+  commanded above its stall duty while its tachometer reads nothing, and the hold
+  under the siblings of a fan declared failed. Neither can reduce cooling anywhere,
+  which is why a fallback command is no longer returned untouched while one is in
+  force; with no floor in force (every ordinary tick, and every tick of a legacy
+  config, where the rule cannot run at all) ``compose`` behaves exactly as before.
 
 Presets (section 6 ``POST /api/preset``, "MPC aggressiveness")
 --------------------------------------------------------------
@@ -193,7 +202,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from aqua_bridge.control import ident
+from aqua_bridge.control import ident, spinup
 from aqua_bridge.control.intents import (
     INTENT_KINDS,
     Calibrate,
@@ -386,6 +395,14 @@ class TickPlan:
     #: ``{bay: {"temp_c": float, "age_s": float}}``, the shape
     #: ``PlantObservation.inputs["calibration"]`` carries. Empty in legacy mode.
     calibrations: dict[str, dict[str, float]] = field(default_factory=dict)
+    #: Spin-up floors in force this tick (:mod:`aqua_bridge.control.spinup`): the
+    #: minimum PWM ``compose`` raises each named channel to -- a kick on a channel that
+    #: is commanded but not turning, and the hold under the siblings of a failed fan.
+    #: Empty on every ordinary tick, which is why the legacy command path is unchanged.
+    spin_up_floor: dict[str, float] = field(default_factory=dict)
+    #: ``{"kick": {ch: duty}, "hold": {ch: pwm}}`` behind those floors, for
+    #: ``diagnostics["supervisor"]["spin_up"]``; ``None`` while nothing is in force.
+    spin_up: dict[str, Any] | None = None
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -442,6 +459,7 @@ class Supervisor:
         clock: Callable[[], float] | None = None,
         version: str = "",
         preset: Preset = Preset.NORMAL,
+        spin_up: spinup.SpinUpConfig | None = None,
     ) -> None:
         if not isinstance(cfg, MpcConfig):
             raise TypeError(f"cfg must be an MpcConfig, got {type(cfg).__name__}")
@@ -491,6 +509,15 @@ class Supervisor:
         #: Last published device / fan health (:mod:`aqua_bridge.health`), empty
         #: until a monitor reports one.
         self._device_health: dict[str, Any] = {}
+
+        # The spin-up kick (:mod:`aqua_bridge.control.spinup`, section 8 item 75). The
+        # tracker is advanced from the loop's own report in ``record_tick`` and read in
+        # ``plan_tick``; it is in memory only, like every other runtime state, because a
+        # fan that does not turn is re-detected within ``confirm_s`` of the next start.
+        self._spin_settings = spinup.SpinUpConfig() if spin_up is None else spin_up
+        self._spin_tracker: dict[str, Any] = spinup.new_tracker()
+        #: ``(channel, state) -> monotonic clock of the last line``, for the rate limit.
+        self._spin_logged: dict[tuple[str, str], float] = {}
 
     # -- read side --------------------------------------------------------
 
@@ -1022,6 +1049,7 @@ class Supervisor:
             if self._experiment is not None:
                 overrides = {**self._experiment["overrides"], **overrides}
                 experiment = ident.status(self._experiment, self._ident_last, self._effective)
+            spin = spinup.floors(self._spin_tracker, self._effective, self._spin_settings)
             return TickPlan(
                 cfg=self._effective,
                 control_mode=self._control_mode,
@@ -1030,6 +1058,8 @@ class Supervisor:
                 preset=self._preset,
                 experiment=experiment,
                 calibrations=self._fresh_calibrations(),
+                spin_up_floor=spin.combined(),
+                spin_up=spin.to_dict() if spin else None,
             )
 
     def compose(
@@ -1053,8 +1083,12 @@ class Supervisor:
         }
         if plan.experiment is not None:
             supervisor_diag["experiment"] = plan.experiment
+        spin_floor = plan.spin_up_floor
+        if spin_floor and plan.spin_up is not None:
+            supervisor_diag["spin_up"] = plan.spin_up
         diagnostics = dict(mpc_cmd.diagnostics)
-        if mpc_cmd.mode is Mode.FALLBACK or not plan.overrides:
+        overrides_apply = mpc_cmd.mode is not Mode.FALLBACK and bool(plan.overrides)
+        if not overrides_apply and not spin_floor:
             # Fallback wins over manual: the controller is blind and must not
             # let a human-pinned low duty reduce cooling. No override -> solver.
             diagnostics["supervisor"] = supervisor_diag
@@ -1066,20 +1100,30 @@ class Supervisor:
         limited: dict[str, bool] = {}
         applied_any = False
         for ch in cfg.channels:
-            if ch in plan.overrides and ch not in blocked:
+            overridden = overrides_apply and ch in plan.overrides and ch not in blocked
+            if overridden:
                 applied_any = True
                 want = float(plan.overrides[ch])
                 if ch in floor:
                     want = max(want, floor[ch])
-                prev = float(prev_pwm[ch])
-                moved = _clamp(want, prev - cfg.d_pwm_max, prev + cfg.d_pwm_max)
-                limited[ch] = abs(moved - want) > _EPS
-                pwm[ch] = _clamp(moved, cfg.pwm_min, cfg.pwm_max)
             else:
-                pwm[ch] = float(mpc_cmd.pwm[ch])
+                want = float(mpc_cmd.pwm[ch])
+            if ch in spin_floor:
+                # The spin-up floor is last and applies in every mode: it only raises
+                # (:mod:`aqua_bridge.control.spinup`), so it can reduce cooling nowhere.
+                want = max(want, spin_floor[ch])
+            elif not overridden:
+                pwm[ch] = want  # the solver's own value, already rate limited and clamped
+                continue
+            prev = float(prev_pwm[ch])
+            moved = _clamp(want, prev - cfg.d_pwm_max, prev + cfg.d_pwm_max)
+            if overridden:
+                limited[ch] = abs(moved - want) > _EPS
+            pwm[ch] = _clamp(moved, cfg.pwm_min, cfg.pwm_max)
         supervisor_diag["overrides_applied"] = applied_any
-        supervisor_diag["override_rate_limited"] = limited
-        if mpc_cmd.mode is Mode.DEGRADED:
+        if overrides_apply:
+            supervisor_diag["override_rate_limited"] = limited
+        if overrides_apply and mpc_cmd.mode is Mode.DEGRADED:
             supervisor_diag["overrides_blocked"] = [
                 ch for ch in cfg.channels if ch in plan.overrides and ch in blocked
             ]
@@ -1118,6 +1162,7 @@ class Supervisor:
             self._usb_present = bool(usb_present)
             if extra:
                 self._extra.update(extra)
+            self._spin_tick(obs, cmd, applied=applied, ts=ts)
             if self._base_cfg.is_das:
                 # The loop's emergency path (compose or a later stage raised after step)
                 # applies a fallback command while mpc_cmd still says what the solver
@@ -1131,6 +1176,73 @@ class Supervisor:
                     solver_cmd = None
                 tick_ts = obs.ts if ts is None and obs is not None else ts
                 self._ident_tick(solver_cmd, tick_ts, applied)
+
+    def spin_up_status(self) -> dict[str, Any]:
+        """Per channel: what the spin-up rule made of it, for the health payload.
+
+        The shape of :func:`aqua_bridge.control.spinup.status` -- state, attempts, the
+        last reading, ``monitored`` and, where the rule is off for a channel, why. A
+        purely read side: :class:`aqua_bridge.health.HealthMonitor` publishes it and the
+        failed fans among them join the payload's ``problems``."""
+        with self._lock:
+            return spinup.status(self._spin_tracker)
+
+    def _spin_tick(
+        self,
+        obs: PlantObservation | None,
+        cmd: MpcCommand | None,
+        *,
+        applied: bool,
+        ts: float | None,
+    ) -> None:
+        """Advance the spin-up tracker on this tick's facts (section 8 item 75).
+
+        ``obs`` is ``None`` on a tick whose read failed and ``applied`` false when the
+        write did, and either makes the tick a gap: what the fans did between two
+        measurements is not evidence about the rotor. Never raises -- like the
+        experiment bookkeeping, a diagnosis must not cost a tick; on an error the
+        tracker starts over, which at worst re-runs one confirmation window."""
+        try:
+            live = obs is not None and cmd is not None and applied
+            tick_ts = ts if ts is not None else (obs.ts if obs is not None else None)
+            facts = spinup.TickFacts(
+                ts=tick_ts,
+                duty={} if cmd is None else cmd.pwm,
+                rpm={} if obs is None else obs.rpm,
+                live=live,
+            )
+            before = self._spin_tracker
+            self._spin_tracker = spinup.advance(before, self._effective, self._spin_settings, facts)
+            self._log_spin(before, self._spin_tracker)
+        except Exception:  # a diagnosis must never fail the tick
+            _LOG.exception("spin-up bookkeeping failed")
+            self._spin_tracker = spinup.new_tracker()
+
+    def _log_spin(self, before: Mapping[str, Any], after: Mapping[str, Any]) -> None:
+        """One line per channel when it enters a kick or is declared failed.
+
+        Rate limited to ``spin_up.log_interval_s`` per channel and state, on the same
+        grounds as the fan-health lines: a warning repeated on every tick of a condition
+        the owner already knows about is a warning the owner learns to skip."""
+        now = self._clock()
+        old = before.get("channels") or {}
+        for channel, record in (after.get("channels") or {}).items():
+            state = record["state"]
+            if state not in (spinup.KICKING, spinup.FAILED):
+                continue
+            was = old.get(channel)
+            if was is not None and was["state"] == state and state != spinup.KICKING:
+                continue
+            if was is not None and was["state"] == state and was["attempts"] == record["attempts"]:
+                continue
+            last = self._spin_logged.get((channel, state))
+            if last is not None and now - last < self._spin_settings.log_interval_s:
+                continue
+            self._spin_logged[(channel, state)] = now
+            if state == spinup.FAILED:
+                _LOG.error("spin-up: %s (PROJECT.md section 8 item 75)", record["reason"])
+            else:
+                _LOG.warning("spin-up: %s (PROJECT.md section 8 item 75)", record["reason"])
 
     def ident_settle_snapshot(self) -> dict[str, float]:
         """The experiments' settle timers for the model store: ``{zone: seconds settled}``.

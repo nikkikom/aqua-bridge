@@ -114,9 +114,24 @@ power against the duty
     ``unmonitored`` otherwise -- a seized fan drawing 0 mA at full duty must never
     publish as a power rule that ran and passed.
 
+the spin-up rule
+    Not a rule of this module: the kick that starts a fan which is commanded but not
+    turning lives in :mod:`aqua_bridge.control.spinup`, because it has to change a
+    command and this module only reads. What arrives here is its verdict, through the
+    ``spin_up`` callable the daemon binds to
+    :meth:`~aqua_bridge.control.supervisor.Supervisor.spin_up_status`: each channel's
+    state goes into that channel's ``spin_up`` key beside the three rules above, and a
+    fan it has declared **failed** joins the payload's daemon-wide ``problems``. It
+    declares its own coverage the same way the rules above do -- ``monitored`` false
+    with a reason for an output with no fan, a fan with no tachometer, a channel with
+    no tachometer bound and a channel with no fitted curve -- so a channel nothing
+    watches can never read as a fan found healthy.
+
 Every threshold above is a ``fan_health:`` key with one default declared once in
 :class:`FanHealthConfig`, validated there, shown in both example configs and
-described in PROJECT.md section 3.
+described in PROJECT.md section 3. The kick's own thresholds are ``spin_up:`` keys
+under the same rules, declared once in
+:class:`~aqua_bridge.control.spinup.SpinUpConfig`.
 
 The board itself
 ----------------
@@ -718,6 +733,21 @@ class HostHealth:
             _LOG.warning("host health: %s (PROJECT.md section 8 item 103)", text)
 
 
+def _spin_problems(verdicts: Mapping[str, Any]) -> list[str]:
+    """One line per fan the spin-up rule has declared failed, channel order.
+
+    The verdict carries a ``failed`` flag rather than a state string to compare against:
+    :mod:`aqua_bridge.control.spinup` imports this module (for ``expected_rpm``), so this
+    module must not import it back.
+    """
+    out: list[str] = []
+    for channel in sorted(verdicts):
+        verdict = verdicts[channel]
+        if verdict.get("failed") and verdict.get("reason"):
+            out.append(str(verdict["reason"]))
+    return out
+
+
 @dataclass
 class _ChannelState:
     """What one channel's rules need to remember between ticks."""
@@ -777,6 +807,7 @@ class HealthMonitor:
         clock: Callable[[], float] | None = None,
         host_settings: HostHealthConfig | None = None,
         hostinfo: Callable[[], Mapping[str, Any]] | None = None,
+        spin_up: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self.cfg = cfg
         self.settings = settings
@@ -791,6 +822,10 @@ class HealthMonitor:
         air_temps = validate_host_health(cfg, self.host_settings)
         self.host = HostHealth(self.host_settings, air_temps=air_temps)
         self._hostinfo = hostinfo
+        #: The spin-up rule's per-channel verdict
+        #: (:meth:`~aqua_bridge.control.supervisor.Supervisor.spin_up_status` in the
+        #: daemon), ``None`` in a run that has no supervisor to ask.
+        self._spin_up = spin_up
         self.last: dict[str, Any] = {
             "devices": [],
             "fans": {},
@@ -1049,6 +1084,7 @@ class HealthMonitor:
         *,
         host: Mapping[str, Any] | None = None,
         temps: Mapping[str, Any] | None = None,
+        spin_up: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Run the rules over one tick's readings and merge in the device health.
 
@@ -1062,6 +1098,13 @@ class HealthMonitor:
         and ``temps`` the observation's temperatures, the two the board's own rules
         need (item 103). They are judged and published here and nowhere else: neither
         reaches ``PlantObservation`` or the solver's ``diagnostics``.
+
+        ``spin_up`` is the spin-up rule's verdict per channel
+        (:func:`aqua_bridge.control.spinup.status`), merged into each channel's verdict
+        and, for a fan it has declared failed, into the payload's ``problems``. A
+        channel that has a spin-up verdict but no reading this tick still gets an entry,
+        because "this fan does not turn" is worth publishing on a tick whose electrical
+        readings did not arrive.
         """
         self._tick += 1
         fans: dict[str, Any] = {}
@@ -1079,6 +1122,12 @@ class HealthMonitor:
                 fans[channel] = verdict
                 problems.extend(verdict["problems"])
                 self._log(channel, verdict["problems"], now)
+        spin = self._spin_verdicts(spin_up)
+        for channel, verdict in spin.items():
+            entry = fans.get(channel)
+            if entry is None:
+                entry = fans[channel] = {"problems": []}
+            entry["spin_up"] = verdict
         devices = self.device_health()
         board = self.host.check(host, temps, now)
         payload = {
@@ -1089,11 +1138,38 @@ class HealthMonitor:
             # The divergence rule is a hint about where to look, not a verdict, and
             # must not flip /api/health or the controller-fault sensor; it is in
             # host["problems"] and on the board's own host_problem sensor instead.
-            "problems": [*devices["problems"], *problems, *board["faults"]],
+            "problems": [
+                *devices["problems"],
+                *problems,
+                *_spin_problems(spin),
+                *board["faults"],
+            ],
         }
         payload["ok"] = not payload["problems"]
         self.last = payload
         return payload
+
+    def _spin_verdicts(self, spin_up: Mapping[str, Any] | None) -> dict[str, Any]:
+        """This tick's spin-up verdict per channel, as a plain dict of mappings.
+
+        The caller may hand one in (a test, a replay); otherwise the bound callable is
+        asked. It is the supervisor's, so it never raises, but a diagnostics path takes
+        nothing on trust: a failure here costs the verdict, never the tick."""
+        if spin_up is None:
+            if self._spin_up is None:
+                return {}
+            try:
+                spin_up = self._spin_up()
+            except Exception:  # a diagnostics path must never break a tick
+                _LOG.exception("spin-up status failed")
+                return {}
+        if not isinstance(spin_up, Mapping):
+            return {}
+        return {
+            str(ch): dict(verdict)
+            for ch, verdict in spin_up.items()
+            if isinstance(verdict, Mapping)
+        }
 
     def device_health(self) -> dict[str, Any]:
         """``{devices, problems}`` from the source, or empty lists without such a source.

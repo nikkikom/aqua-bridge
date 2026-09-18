@@ -282,6 +282,63 @@ host_health:
                              # answers. A timeout is simply unknown, and the chain
                              # falls through to the rpi_volt hwmon under-voltage bit
 
+# The spin-up kick: a fan that is commanded but does not turn (PROJECT.md section 3
+# "Spin-up kick", section 8 item 75). A fan's STARTING duty is higher than its running
+# duty -- the owner's aquaero test fan stops at 13 % and starts at 25 % -- so a channel
+# can read a healthy duty on a healthy rail while the rotor stands still and the
+# enclosure is silently uncooled there. Defaults shown.
+#
+# THIS SECTION HAS NO EFFECT ON THIS CONFIG. The rule needs the channel's fitted curve
+# (mpc.fans / mpc.fan_models, which need mpc.topology) to say what speed an output
+# should reach, so without a zoned config every channel reports the rule as off, with
+# that as the reason, and no command ever changes. See config.example-das.yaml for the
+# per-output kick duties measured on the owner's hardware.
+spin_up:
+  enabled: true              # false: nothing is detected, nothing is kicked, and every
+                             # channel's verdict says the rule is off
+  stall_duty: 0.15           # a channel commanded below this output duty may
+                             # legitimately stand still and is not judged (0..1); above
+                             # the 13 % at which the owner's test fan stops. Per output:
+                             # channels.<ch>.stall_duty
+  kick_duty: 0.5             # the duty a kick raises a channel to (0..1) when that
+                             # channel has no kick_duty of its own: twice the 25 % start
+                             # duty measured on the owner's aquaero output, the margin an
+                             # uncharacterised output gets. Clamped into
+                             # [mpc.pwm_min, mpc.pwm_max] when it is applied
+  kick_s: 30.0               # how long one kick holds the channel there, seconds (> 0).
+                             # It has to cover the mpc.d_pwm_max ramp up to that duty as
+                             # well as the rotor's own start time; shorter than mpc.dt is
+                             # a config error, because no kick would ever reach the fans
+  confirm_s: 30.0            # a channel must read at or below min_rpm under a duty at or
+                             # above its stall duty for this long of live, uninterrupted
+                             # readings before it is kicked, seconds (> 0). It is also
+                             # what covers the seconds a healthy fan needs to spin up
+  verify_s: 30.0             # after a kick, how long the tachometer is watched before
+                             # the next attempt, seconds (> 0)
+  max_attempts: 3            # kicks one channel gets before it is a failed fan (>= 1)
+  min_rpm: 60.0              # a speed at or below this is "not turning", rpm (>= 0). Not
+                             # zero: a tachometer reading a handful of rpm is a rotor
+                             # that is not moving air either
+  retry_s: 900.0             # a failed channel is tried once more after this long,
+                             # seconds (> 0), so a fan replaced while the daemon runs is
+                             # picked up without a restart -- and a dead one is kicked at
+                             # most once per this interval instead of for ever
+  failed_channel_floor: true # while a fan is declared failed, hold every other channel
+                             # of the zones it served at the duty it carried when the
+                             # failure was declared, so the zone cannot lose cooling
+                             # because one of its fans died. The rise above that floor
+                             # comes from the measured temperatures through the solver
+  log_interval_s: 300.0      # one log line per channel and transition at most this
+                             # often, seconds (> 0)
+  channels: {}               # per output: what is on it and what it needs --
+                             #   <ch>: {fan: true, tachometer: true,
+                             #          stall_duty: null, kick_duty: null}
+                             # fan: false  -> nothing hangs on this output
+                             # tachometer: false -> this fan drives no tach wire
+                             # Either one turns the rule off for that output: it is never
+                             # kicked and never alarmed, and the verdict says which. A
+                             # null stall_duty / kick_duty means the section's value
+
 http:
   # HTTPS with basic auth only; there is no plain-HTTP listener (PROJECT.md section 6).
   # With enabled: true but a missing or invalid certificate, key or credentials
