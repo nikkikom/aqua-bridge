@@ -624,12 +624,16 @@ def _aquabus_loop(cfg, device: FakeController, temp_map=None):
 
 
 def _bus_gone(template: bytes) -> bytes:
-    """The Quadro off aquabus: every aquabus fan block reads rpm 0xFFFF, while the
-    aquabus temperature slots keep the value they last read (PROJECT.md item 92)."""
+    """The Quadro off aquabus: every aquabus fan block reads rpm 0xFFFF and the aquabus
+    flow slot reads "no data" (PROJECT.md items 92, 130), while the aquabus temperature
+    slots keep the value they last read (item 92)."""
     status = bytearray(template)
     for number in AQUAERO.aquabus_outputs:
         speed = AQUAERO.fan_blocks[number - 1] + AQUAERO.fan_layout.speed
         status[speed : speed + 2] = b"\xff\xff"
+    if AQUAERO.aquabus_flow_index is not None:
+        flow = AQUAERO.flow_offsets[AQUAERO.aquabus_flow_index - 1]
+        status[flow : flow + 2] = b"\x7f\xff"
     return bytes(status)
 
 

@@ -15,6 +15,41 @@ is timed, not an empty cold-start document -- then serialises it exactly as
 ``os.replace``, ``fsync`` of the directory, the same call the daemon makes --
 against ``--path`` for ``--repeats`` repeats.
 
+**The warm-up is forced to actually reach that state (PROJECT.md section 8 item
+133).** Three things the closed loop alone does not produce against the shipped
+example, however many ``--warm-ticks``, and each was checked against
+``config.example-das.yaml`` before this was written, not assumed:
+
+* ``calibration`` needs SMART samples, and none of the shipped examples declare a
+  bay's serial (PROJECT.md section 3, "no SES backplane" -- the estimator finds the
+  mapping by correlation instead). :func:`aqua_bridge.sim.das.DriveSpec` reads
+  ``serial`` straight from the topology dict, so an occupied bay with none never
+  schedules a SMART sample at all (:meth:`~aqua_bridge.sim.das.DasPlant._schedule_smart`):
+  zero SMART traffic however long the loop runs. This tool's warm-up gives the *truth*
+  plant (never ``cfg.topology``, which stays exactly as loaded) a synthetic serial per
+  occupied bay with none (``tools/bench_step.py``'s ``das_plant(..., inject_smart_serials=True)``),
+  so the estimator has something to correlate and calibrate against, the same way a
+  real enclosure's unlabelled drives do.
+* ``fan_curves`` needs ``mpc.fan_curve_online: true``, which the shipped examples leave
+  off (a config decision, not a bug); the warm-up runs against
+  ``dataclasses.replace(cfg, fan_curve_online=True)`` instead of the loaded config, and
+  the written document is built and timed against that same forced config, reported as
+  ``result.fan_curve_online_forced``.
+* Forcing the flag alone is not enough: measured directly (2026-09-18), a closed loop
+  that is *always actively regulating* practically never holds a duty within
+  :data:`aqua_bridge.control.fancurve.SETTLE_TOL` (1e-6) for
+  ``mpc.fan_curve_settle_s`` straight -- sensor noise alone moves the MPC/PI output by
+  more than that most ticks. Six simulated hours of the ordinary closed loop left the
+  fit's bin accumulator with exactly one usable bin (the ``pwm_max`` clamp, the one
+  duty that ever holds bit-for-bit), never the four bins across a 0.25 span
+  :data:`aqua_bridge.control.fancurve.MIN_BINS` / ``MIN_SPAN`` need -- not a "modest
+  number of ticks" problem, a structural one. So the warm-up appends a short, separate
+  dwell scan after the closed loop (:func:`_fan_curve_dwell_scan`): it holds every
+  channel at a few fixed duties spanning ``[mpc.pwm_min, mpc.pwm_max]`` long enough to
+  settle, feeding the *same* :func:`aqua_bridge.control.fancurve.update` the daemon's
+  own ``step()`` calls -- a commissioning-style sweep through the real online-fit code,
+  not a fabricated curve.
+
 Reports the size in bytes, the min / mean / median / p99 / max write time in
 milliseconds, the spread (max - min) over the repeats, and that p99 as a
 fraction of ``dt`` (the tick period) and of ``mpc.model_store_interval_s``
@@ -25,7 +60,12 @@ model.json's persister included, only after ``apply()`` has already sent that
 tick's PWM and after the step-budget gate has already been measured and
 recorded on ``step()`` alone -- but a slow write still runs inside ``tick()``
 and so delays the *next* tick's read, which is what the fraction of
-``dt`` is checking).
+``dt`` is checking). Also reports whether ``fan_curve_online`` was forced on for this
+run (``fan_curve_online_forced``, true whenever ``--config`` itself leaves it off),
+how many bays reached an accepted calibration (``calibrated_bays``) and which fan
+models reached an accepted curve (``fan_curve_fit_accepted``) -- so a reader can tell
+a genuinely empty section (nothing accepted in ``--warm-ticks``) from one this warm-up
+never tries to populate at all.
 
 **Safety**: refuses to write anywhere but under a scratch directory
 (``tempfile.gettempdir()`` or ``/tmp``) -- never the daemon's own
@@ -37,7 +77,7 @@ Usage::
 
     python tools/bench_model_store.py
     python tools/bench_model_store.py --config config.example-das.yaml \\
-        --warm-ticks 1200 --sim-preset rich --repeats 30 --path /tmp/model-bench.json
+        --warm-ticks 8640 --sim-preset rich --repeats 30 --path /tmp/model-bench.json
 """
 
 from __future__ import annotations
@@ -55,10 +95,17 @@ import time
 from pathlib import Path
 
 from aqua_bridge.config import load_config
+from aqua_bridge.control import fancurve
 from aqua_bridge.control.loop import TickResult
 from aqua_bridge.control.mpc import step
-from aqua_bridge.model import MpcState
+from aqua_bridge.model import MpcConfig, MpcState
 from aqua_bridge.modelstore import build_document, write_atomic
+
+#: Duty levels the fan-curve dwell scan holds (module docstring): evenly spread over
+#: the config's own ``[pwm_min, pwm_max]``, six points so at least
+#: :data:`aqua_bridge.control.fancurve.MIN_BINS` fall in distinct accumulator bins
+#: with room to spare.
+_FAN_CURVE_SCAN_LEVELS = 6
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -102,12 +149,52 @@ def ensure_scratch_path(path: Path) -> Path:
     return resolved
 
 
-def warm_snapshot(cfg, *, ticks: int, seed: int, preset: str) -> TickResult:
-    """A ``TickResult`` after ``ticks`` DAS closed-loop steps (module docstring):
-    ``solver_memory`` at roughly the size a running daemon's store reaches, not the
-    empty document a cold start would write."""
+def _fan_curve_dwell_scan(plant, cfg: MpcConfig, state: MpcState) -> MpcState:
+    """Appends a fixed-duty dwell scan to ``state.solver_memory["fan_fit"]`` /
+    ``["fan_curves"]`` after the closed loop (module docstring, *The warm-up is forced*):
+    holds every channel of ``plant`` at :data:`_FAN_CURVE_SCAN_LEVELS` duties spanning
+    ``[cfg.pwm_min, cfg.pwm_max]``, each long enough to clear ``cfg.fan_curve_settle_s``
+    with a few samples to spare, feeding the real :func:`aqua_bridge.control.fancurve.update`
+    the daemon's own ``step()`` calls. Pure in the sense that matters here: it only ever
+    grows ``fan_fit`` / ``fan_curves``, and every reading comes from ``plant`` like any
+    other tick -- nothing here is a made-up ``(pwm, rpm)`` pair."""
+    span = cfg.pwm_max - cfg.pwm_min
+    levels = [
+        cfg.pwm_min + span * i / (_FAN_CURVE_SCAN_LEVELS - 1) for i in range(_FAN_CURVE_SCAN_LEVELS)
+    ]
+    # fancurve.update() only *attempts* a refit once every cfg.fan_curve_refit_s of
+    # controller time since its last attempt (accepted or not) -- the bins fill on every
+    # settled tick, but nothing reads them back into a fit before that clock elapses, and
+    # the closed loop above already primed it to an unknown phase. So each level gets
+    # enough ticks that the scan's total span safely clears a whole refit interval
+    # (2x, so a scan that starts right after a refit attempt still crosses one) on top of
+    # the settle time each level needs, not merely the shorter of the two.
+    settle_ticks = int(cfg.fan_curve_settle_s / cfg.dt) + 10
+    refit_ticks = int(2.0 * cfg.fan_curve_refit_s / cfg.dt / _FAN_CURVE_SCAN_LEVELS) + 1
+    dwell_ticks = max(settle_ticks, refit_ticks)
+    memory = dict(state.solver_memory)
+    for level in levels:
+        u = dict.fromkeys(cfg.channels, level)
+        for _ in range(dwell_ticks):
+            plant.apply(u)
+            plant.advance()
+            obs = plant.observe()
+            update = fancurve.update(memory.get("fan_fit"), cfg, u=u, rpm=obs.rpm, ts=obs.ts)
+            memory["fan_fit"] = update.memory
+            if update.curves:
+                memory["fan_curves"] = update.curves
+    return dataclasses.replace(state, solver_memory=memory)
+
+
+def warm_snapshot(cfg: MpcConfig, *, ticks: int, seed: int, preset: str) -> TickResult:
+    """A ``TickResult`` after ``ticks`` DAS closed-loop steps plus the fan-curve dwell
+    scan (module docstring): ``solver_memory`` at roughly the size a running daemon's
+    store reaches, not the empty document a cold start would write. ``cfg`` should
+    already carry ``fan_curve_online: true`` (:func:`bench_writes` forces it); this
+    function does not force it itself, so a caller that wants the old, unforced
+    behaviour still gets it by passing the config unchanged."""
     bench_step = _load_bench_step()
-    plant = bench_step.das_plant(cfg, ticks, seed, preset=preset)
+    plant = bench_step.das_plant(cfg, ticks, seed, preset=preset, inject_smart_serials=True)
     state = MpcState.cold()
     result: TickResult | None = None
     for i in range(ticks):
@@ -120,11 +207,21 @@ def warm_snapshot(cfg, *, ticks: int, seed: int, preset: str) -> TickResult:
         plant.apply(cmd.pwm)
         plant.advance()
     assert result is not None  # ticks > 0, checked by the caller
-    return result
+    state = _fan_curve_dwell_scan(plant, cfg, state)
+    return dataclasses.replace(result, state=state)
 
 
-def bench_writes(cfg, path: Path, *, warm_ticks: int, seed: int, preset: str, repeats: int):
-    result = warm_snapshot(cfg, ticks=warm_ticks, seed=seed, preset=preset)
+def bench_writes(
+    cfg: MpcConfig, path: Path, *, warm_ticks: int, seed: int, preset: str, repeats: int
+):
+    # Forced on for the warm-up and the document alike (module docstring, *The warm-up
+    # is forced*): a config that ships fan_curve_online: false can still carry an
+    # accepted curve in its store from when it was true, so a document built against
+    # this forced config is not a fabrication, only a choice of which real config's
+    # store this size estimate is of. Reported below so a reader is never left
+    # guessing which config actually produced the numbers.
+    warm_cfg = dataclasses.replace(cfg, fan_curve_online=True)
+    result = warm_snapshot(warm_cfg, ticks=warm_ticks, seed=seed, preset=preset)
     memory = result.state.solver_memory
     diagnostics = getattr(result.mpc_cmd, "diagnostics", None)
     bays = diagnostics.get("bays") if isinstance(diagnostics, dict) else None
@@ -133,9 +230,9 @@ def bench_writes(cfg, path: Path, *, warm_ticks: int, seed: int, preset: str, re
     ts = float(ts) if isinstance(ts, int | float) else None
     wall = time.time()
     # ident_settle=None: this warm-up loop never runs an identification experiment, so
-    # the document's "ident_settle" section is unconditionally empty here too, alongside
-    # fan_curves/calibration/bays (module docstring, PROJECT.md item 48's floor-size caveat).
-    doc = build_document(cfg, memory, ts=ts, wall=wall, bays=bays, ident_settle=None)
+    # the document's "ident_settle" section is empty; calibration/fan_curves/bays are
+    # not (module docstring, PROJECT.md item 133).
+    doc = build_document(warm_cfg, memory, ts=ts, wall=wall, bays=bays, ident_settle=None)
     data = json.dumps(doc, allow_nan=False, separators=(",", ":")).encode()
 
     times_ms: list[float] = []
@@ -149,6 +246,9 @@ def bench_writes(cfg, path: Path, *, warm_ticks: int, seed: int, preset: str, re
     return {
         "warm_ticks": warm_ticks,
         "sim_preset": preset,
+        "fan_curve_online_forced": warm_cfg.fan_curve_online and not cfg.fan_curve_online,
+        "calibrated_bays": sum(1 for v in doc["calibration"].values() if v),
+        "fan_curve_fit_accepted": sorted(doc["fan_curves"]),
         "size_bytes": len(data),
         "size_bytes_on_disk": on_disk,
         "sections": sorted(k for k, v in doc.items() if k not in ("schema", "v", "saved_wall")),
@@ -181,7 +281,12 @@ def main(argv: list[str] | None = None) -> int:
         "refused unless it resolves under a scratch directory (module docstring, Safety)",
     )
     parser.add_argument(
-        "--warm-ticks", type=int, default=600, help="closed-loop ticks before timing (default: 600)"
+        "--warm-ticks",
+        type=int,
+        default=4320,
+        help="closed-loop ticks before timing (default: 4320, 6 h at dt=5 s -- section 8 item "
+        "133's own measurement: enough for most bays' SMART calibration to accept and, with the "
+        "dwell scan appended after it, an accepted fan-curve fit)",
     )
     parser.add_argument("--sim-preset", default="rich", choices=("basic", "rich"))
     parser.add_argument("--seed", type=int, default=7)

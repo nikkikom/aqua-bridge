@@ -163,9 +163,10 @@ change, i.e. a write, and is the owner's call (PROJECT.md section 8 item 115).
 Speed and output duty are in **every** report and take no part in any of this --
 block 7 read 251-253 rpm and duty 2000 in all 45 -- which is what makes an absent
 bus device judgeable at all: :func:`aquabus_present` reads the speed fields of
-the aquabus blocks and nothing else. At what interval the aquaero polls the bus
-*behind* those two fields is not known and was never measured; it is not the
-number above.
+the aquabus blocks (plus the aquabus flow slot, the second witness item 130 adds
+for a bus device with no fan outputs -- see that function's own docstring) and
+nothing else. At what interval the aquaero polls the bus *behind* those fields is
+not known and was never measured; it is not the number above.
 
 A bus device can also **leave the bus while the controller runs** (2026-09-15,
 PROJECT.md section 8 item 92): its fan blocks then read speed ``0xFFFF`` and its
@@ -500,6 +501,17 @@ class DeviceKind:
     #: indistinguishable in a single report (PROJECT.md section 2), so the field
     #: may not be published as that output's rail. A hardware fact.
     aquabus_outputs_report_rail: bool = True
+    #: 1-based index into :attr:`flow_offsets` of the flow slot a device on this kind's
+    #: aquabus fills (the aquaero's ``flow3``, ``0xFD``); ``None`` on a kind with no
+    #: aquabus (the Quadro). Confirmed against the live devices (module docstring,
+    #: "aquabus fields checked against the live devices", PROJECT.md section 2): it
+    #: read ``0x7FFF`` (no data) with nothing on the aquaero's aquabus and 0 (present,
+    #: nothing connected to the bus device's own flow header) with the Quadro on it,
+    #: never the other way, in every capture -- the same two-state shape
+    #: :attr:`aquabus_temp_names` has, and unlike the aquabus fan blocks
+    #: (:func:`aquabus_present`) it does not need the bus device to have any fan
+    #: outputs at all (PROJECT.md section 8 item 130). A hardware fact, not a tunable.
+    aquabus_flow_index: int | None = None
 
     @property
     def temp_names(self) -> tuple[str, ...]:
@@ -682,6 +694,7 @@ AQUAERO = DeviceKind(
     own_outputs_measures_current=False,
     aquabus_outputs_report_power=False,
     aquabus_outputs_report_rail=False,
+    aquabus_flow_index=3,
 )
 
 QUADRO = DeviceKind(
@@ -894,10 +907,12 @@ def aquabus_present(kind: DeviceKind, status: StatusReport) -> bool | None:
     """Whether a device answers on the controller's aquabus, from one status report.
 
     ``True`` when at least one of the kind's aquabus fan blocks has a device
-    behind it, ``False`` when every one of them reads speed ``0xFFFF``, and
-    ``None`` on a kind with no aquabus outputs (the Quadro), which cannot say.
+    behind it **or** its aquabus flow slot carries data, ``False`` when every fan
+    block reads speed ``0xFFFF`` and the flow slot (if the kind has one) reads
+    "no data", and ``None`` on a kind with no aquabus outputs (the Quadro), which
+    cannot say.
 
-    The evidence is the speed field alone, and deliberately so. ``0xFFFF`` there
+    The primary evidence is the speed field, and deliberately so. ``0xFFFF`` there
     means *nothing on aquabus at all*, not an output with no fan: with the
     Quadro present, its outputs with no fan read 0 rpm (PROJECT.md section 2,
     2026-09-17). Speed and output duty are in every report, while the blocks'
@@ -908,11 +923,17 @@ def aquabus_present(kind: DeviceKind, status: StatusReport) -> bool | None:
     and 45 more in 2026-09-18 the speed field never took part in that
     substitution.
 
-    What this cannot see: a bus device with **no fan outputs** is
-    indistinguishable from an empty bus here, so on such a device it answers
-    ``False`` while the device is in fact answering. In the supported topology
-    the bus device is a Quadro, whose four outputs fill blocks 5-8 (PROJECT.md
-    section 2, "Supported topology").
+    **A bus device with no fan outputs** (item 130's audit) is indistinguishable
+    from an empty bus on the fan blocks alone -- every one of the four would read
+    ``0xFFFF``, exactly what an empty bus reads, since there is no fan behind any
+    of them to report 0 rpm instead. :attr:`DeviceKind.aquabus_flow_index` is the
+    second, independent witness for exactly that case: it is confirmed to read
+    "no data" with an empty bus and a real value (0, "present, nothing connected"
+    in every capture so far) with the Quadro on it, and it needs no fan output on
+    the bus device at all -- the aquaero relays it whether or not the device
+    behind it drives anything. On a kind with no such slot (or a report that
+    predates one, :attr:`aquabus_flow_index` ``None``) this function falls back to
+    the fan blocks alone, exactly as before item 130.
 
     The caller that matters is the aquabus temperature slots: they keep the last
     value they read when the device leaves the bus instead of reading
@@ -924,7 +945,11 @@ def aquabus_present(kind: DeviceKind, status: StatusReport) -> bool | None:
     outputs = kind.aquabus_outputs
     if not outputs:
         return None
-    return any(status.fans[number - 1].present for number in outputs)
+    if any(status.fans[number - 1].present for number in outputs):
+        return True
+    if kind.aquabus_flow_index is not None:
+        return status.flows[kind.aquabus_flow_index - 1] is not None
+    return False
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,13 @@ Two gates on ``mpc.step`` in a closed loop, timed like ``tools/bench_step.py``:
   (das p99 / legacy p99) against the named constant :data:`RELATIVE_FACTOR` -- a
   high percentile rather than the single worst repeat, so one outlier repeat does
   not flake the gate while a real regression across most repeats still trips it.
+  Timed with **CPU time** (:func:`time.process_time`), not wall clock (§8 item 126):
+  the two-sided alternation above only cancels a bias that favours one side every
+  repeat, not a runner that is merely busy elsewhere while one of the two ``step()``
+  calls happens to run, which wall clock cannot tell from the solver actually taking
+  longer. CPU time is unaffected by a process being descheduled, so it stays a
+  property of the two solvers under sustained contention as well as on an idle
+  machine (see the test's own docstring for the measurement).
 
 * **absolute, only on the Pi** (marker ``pi``): the DAS MPC's p99 step time is at
   most ``mpc.budget_ms`` of ``config.example-das.yaml`` (the per-tick gate at
@@ -59,6 +66,7 @@ import platform
 import re
 import statistics
 import time
+from collections.abc import Callable
 
 import pytest
 
@@ -153,7 +161,9 @@ def p99(samples: list[float]) -> float:
     return ordered[min(len(ordered) - 1, round(0.99 * (len(ordered) - 1)))]
 
 
-def legacy_mpc_times(ticks: int = TICKS) -> list[float]:
+def legacy_mpc_times(
+    ticks: int = TICKS, *, clock: Callable[[], float] = time.perf_counter
+) -> list[float]:
     cfg = dataclasses.replace(load_config(EXAMPLE_CONFIG).mpc, solver=SolverKind.MPC)
     plant = Plant(
         PlantParams(dt=cfg.dt, heat_w=100.0, noise_sigma_c=0.2, delay_ticks=1),
@@ -162,7 +172,7 @@ def legacy_mpc_times(ticks: int = TICKS) -> list[float]:
         t_air=30.0,
         seed=7,
     )
-    return _timed(cfg, plant, ticks)
+    return _timed(cfg, plant, ticks, clock=clock)
 
 
 def das_mpc_config() -> MpcConfig:
@@ -177,6 +187,7 @@ def das_mpc_times(
     *,
     solved: list[bool] | None = None,
     work: list[tuple[int, int]] | None = None,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> list[float]:
     topology = topology_from_config(cfg)
     for entry in topology["sensors"].values():
@@ -189,7 +200,7 @@ def das_mpc_times(
         seed=7,
         heat_schedule={"b02": [(0.0, 1.0)], "b10": [(300.0, 1.0)], "b13": [(0.0, 0.5)]},
     )
-    return _timed(cfg, plant, ticks, solved=solved, work=work)
+    return _timed(cfg, plant, ticks, solved=solved, work=work, clock=clock)
 
 
 def _timed(
@@ -199,11 +210,18 @@ def _timed(
     *,
     solved: list[bool] | None = None,
     work: list[tuple[int, int]] | None = None,
+    clock: Callable[[], float] = time.perf_counter,
 ) -> list[float]:
     """Step times of ``ticks`` closed-loop ticks; ``solved`` collects, per measured tick,
     whether the solver ran its solve rather than replaying a stored plan, and ``work`` the
     solve work it reports -- ``(outer iterations, box-QP iterations)``, ``(0, 0)`` on a
-    replay tick, which is the structural difference behind the timing one."""
+    replay tick, which is the structural difference behind the timing one.
+
+    ``clock`` defaults to :func:`time.perf_counter` (wall clock), right for the absolute
+    Pi gate below, which is a real-time deadline: the actual wall-clock cost of one tick
+    is exactly what must fit inside ``dt`` on the board. The relative gate
+    (:func:`test_das_mpc_step_p99_within_the_relative_budget`) passes
+    :func:`time.process_time` instead -- see that test and PROJECT.md section 8 item 126."""
     state = MpcState.cold()
     times: list[float] = []
     enabled = gc.isenabled()
@@ -211,9 +229,9 @@ def _timed(
     try:
         for i in range(ticks):
             obs = plant.observe()
-            t0 = time.perf_counter()
+            t0 = clock()
             cmd, state = step(obs, cfg, state)
-            elapsed = (time.perf_counter() - t0) * 1e3
+            elapsed = (clock() - t0) * 1e3
             if i >= WARMUP:
                 times.append(elapsed)
                 diag = cmd.diagnostics.get("solver_diag", {})
@@ -237,17 +255,40 @@ def percentile(samples: list[float], q: float) -> float:
 
 
 def test_das_mpc_step_p99_within_the_relative_budget():
-    """Method: module docstring "relative, every CI run"."""
+    """Method: module docstring "relative, every CI run".
+
+    Timed with :func:`time.process_time` (CPU time), not :func:`time.perf_counter` (wall
+    clock) -- section 8 item 126. The ratio this gate checks is meant to be the DAS
+    solver's cost relative to the legacy one, a property of the two solvers, not of
+    whatever else the machine was doing while this process waited for the scheduler.
+    Wall clock conflates the two: on a runner shared with other work (this project's own
+    contention, an 8-way ``ci_pytest_shards.py`` run, or several branches' suites at
+    once, as this repository's CI is run) a preemption that lands inside one timed
+    ``step()`` and not the other inflates that repeat's ratio without either solver
+    doing more work, and it inflates the DAS side more often simply because its ``step()``
+    takes longer wall clock to begin with (more calls it can be preempted inside, and
+    every ``ci_pytest_shards.py`` shard is itself CPU-bound, so the two sides are never
+    actually idle-waiting at the same rate). CPU time is immune to that: a process
+    descheduled while another one runs accrues no CPU time for the gap, wall clock or
+    not, so the ratio measures instruction cost, not scheduler luck. Measured on this
+    change (module-level ``python`` alone, on a host already running three other
+    branches' test suites, no ``taskset`` or quiescing): ``perf_counter`` ratios of
+    3.1x-39.3x across five independent single-repeat samples -- both under and over
+    :data:`RELATIVE_FACTOR`, on the same code -- against ``process_time`` ratios of
+    9.6x-11.7x, in the same range item 126's own prior measurements report (10.4x-10.6x,
+    10.57x-10.62x). The absolute Pi gate below keeps wall clock: there, real elapsed time
+    against ``dt`` is exactly the question, and the Pi runs this suite alone.
+    """
     cfg = das_mpc_config()
     ratios: list[float] = []
     runs: list[tuple[float, float]] = []  # (das_p99, legacy_p99), every repeat, for the message
     for i in range(REPEATS):
         if i % 2 == 0:
-            legacy_ms = p99(legacy_mpc_times())
-            das_ms = p99(das_mpc_times(cfg))
+            legacy_ms = p99(legacy_mpc_times(clock=time.process_time))
+            das_ms = p99(das_mpc_times(cfg, clock=time.process_time))
         else:
-            das_ms = p99(das_mpc_times(cfg))
-            legacy_ms = p99(legacy_mpc_times())
+            das_ms = p99(das_mpc_times(cfg, clock=time.process_time))
+            legacy_ms = p99(legacy_mpc_times(clock=time.process_time))
         runs.append((das_ms, legacy_ms))
         if i >= WARMUP_REPEATS:
             ratios.append(das_ms / legacy_ms)

@@ -11,6 +11,28 @@ the same seed. Three tests:
 * item 111 -- what the bays whose ``rel_se(k)`` stays above the bound actually lack,
   measured by running the same schedule for 36 h instead of 16 h.
 
+**Nightly cost (section 8 item 122).** Measured at 9 cases (3 seeds x 3 tests) in
+~12.5-13.7 min, isolated or under an 8-way ``ci_pytest_shards.py`` run alike (item 126
+covers what contention does to a *timing* gate; this suite has none). The 36 h case is
+the one item 122 names as worth trimming: at 16 h all three seeds' evidence is already
+in :data:`MEASURED`, and the 36 h re-run mainly re-confirms convergence rather than
+finding something new -- seeds 2 and 4 converge every zone with **no** blocked bay,
+seed 3 alone still has one (b15, module docstring above). So the 36 h case now runs
+:data:`NIGHTLY_LONG_SEEDS` (seed 3 only), not every seed in :data:`MEASURED_LONG`:
+seed 3 is the one case that both confirms the 16 h -> 36 h improvement *and* exercises
+the residual-blocker assertions (``blocked_bays``), which no other seed does. **What
+this drops**: nightly no longer re-verifies that seeds 2 and 4 also reach full,
+unblocked convergence at 36 h -- that is now a one-time, dated measurement
+(:data:`MEASURED_LONG`, kept for both seeds as the historical record and the module
+docstring's own numbers) rather than a nightly-checked fact. A regression that broke
+convergence on seed 2 or 4 specifically at 36 h (and not at 16 h, and not on seed 3)
+would go unnoticed until someone re-runs those seeds by hand
+(``pytest tests/test_ident_converge_sim.py -m nightly -k "second_gate and (2 or 4)"``).
+That risk was judged smaller than the wall clock two more 36 h runs cost every night,
+given seed 3 already exercises the same mechanism (the air block is never the
+blocker, ``se(k)`` falls with excited windows) and the two dropped seeds add no new
+*kind* of evidence, only more of the same kind.
+
 Until this test there was no closed-loop convergence evidence at all: every
 ``converged`` number came from ``tests/test_thermal_ident.py``, which drives the outputs
 **open loop** (fixed 0.35 / 0.8 levels, an independent sequence on every channel at once)
@@ -118,6 +140,12 @@ MEASURED_LONG: dict[int, dict[str, Any]] = {
     3: {"converged": ("z0", "z1", "z2"), "blocked_bays": {"z3": ("b15",)}},
     4: {"converged": ("z0", "z1", "z2", "z3"), "blocked_bays": {}},
 }
+#: Which of :data:`MEASURED_LONG`'s seeds the nightly job actually re-runs at 36 h
+#: (section 8 item 122): seed 3 alone, the one with a real ``blocked_bays`` entry to
+#: exercise. Seeds 2 and 4's rows stay in :data:`MEASURED_LONG` as the dated
+#: measurement the module docstring's "Nightly cost" section describes, not as a
+#: nightly-checked fact -- see that section for what dropping them costs.
+NIGHTLY_LONG_SEEDS = (3,)
 LONG_HOURS = 36.0
 #: Floors on the converged zones, from the runs above (peak 0.24-0.34, end 0.09-0.28,
 #: 466-474 windows) rather than from the ``converged`` rule's own 0.05 / 30, which
@@ -384,7 +412,7 @@ def test_a_released_experiment_hands_the_solver_its_own_level_not_the_fans(das_e
 
 
 @pytest.mark.nightly
-@pytest.mark.parametrize("seed", sorted(MEASURED_LONG))
+@pytest.mark.parametrize("seed", NIGHTLY_LONG_SEEDS)
 def test_the_bays_second_gate_closes_on_observations_not_on_more_excitation(das_example_cfg, seed):
     """Section 8 item 111: what the bays whose ``rel_se(k)`` stays high actually lack.
 
