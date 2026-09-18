@@ -33,6 +33,16 @@ A source that reads less than the whole word says so: the conditions it did not
 read are ``None``, ``partial`` is true and ``unknown`` names them. An unknown bit is
 never reported as a false one. A board with none of the three sources gets ``None``
 and warns about nothing.
+
+Besides the throttling state, :func:`read_mount_ro` reports whether the filesystem
+under a given path is mounted read-only -- the kernel's own report, not a write
+probe: on an SD card the first sign of a dying card is usually the kernel
+remounting the root filesystem read-only after an I/O error (``errors=remount-ro``),
+and that state already shows up in ``/proc/mounts`` without this daemon writing
+anything to find out. It feeds :mod:`aqua_bridge.health`'s host-health rules
+(PROJECT.md section 8, "the disk nobody watches") next to ``disk_used_pct`` and
+``disk_free_gb``, which ``collect_hostinfo`` already read. Like the throttling word,
+a reading that cannot be determined is ``None``, never guessed either way.
 """
 
 from __future__ import annotations
@@ -49,6 +59,7 @@ from typing import Any
 
 __all__ = [
     "HWMON_ROOT",
+    "MOUNTS_PATH",
     "RPI_VOLT_HWMON_NAME",
     "THROTTLED_BITS",
     "THROTTLED_SINCE_BOOT_SHIFT",
@@ -62,6 +73,7 @@ __all__ = [
     "read_disk",
     "read_loadavg",
     "read_memory",
+    "read_mount_ro",
     "read_rpi_volt_hwmon",
     "read_throttled",
     "read_throttled_sysfs",
@@ -171,6 +183,65 @@ def read_disk(path: str | os.PathLike[str] = "/") -> dict[str, float] | None:
         "free_gb": free / (1024**3),
         "used_pct": used_pct,
     }
+
+
+#: Where the kernel lists every mount, its point and its current options --
+#: including ``ro``, which a filesystem gains on its own when the kernel remounts it
+#: read-only after an I/O error (``errors=remount-ro``, the usual ``ext4`` default).
+#: A plain file, refreshed by the kernel on every mount change; reading it costs
+#: nothing and writes nothing to the card :func:`read_mount_ro` is asking about.
+MOUNTS_PATH = Path("/proc/mounts")
+
+
+def read_mount_ro(
+    path: str | os.PathLike[str] = "/", mounts_path: Path = MOUNTS_PATH
+) -> bool | None:
+    """Whether the filesystem carrying ``path`` is mounted read-only, or ``None``
+    when that cannot be determined.
+
+    Reads it from the kernel's own ``/proc/mounts`` rather than probing with a
+    write: the failure this exists to catch -- an SD card the kernel has already
+    remounted read-only after an I/O error -- is already a fact in that table the
+    moment it happens, and a write probe would add both a write and a fsync, on
+    every check, to the very card a dying-card rule is trying to protect. The kernel
+    updates ``/proc/mounts`` synchronously on every mount and remount, so there is no
+    staleness a poll interval would need to cover (contrast
+    :class:`ThrottledReader`, whose ``vcgencmd`` source is rate limited because it
+    forks a process; this one never does).
+
+    ``path`` is matched to the mount whose mount point is the longest prefix of it
+    (the same rule the kernel itself uses to answer a lookup), so a path on a
+    sub-mount is judged by its own entry and not the root filesystem's; on two
+    entries for the same mount point (a remount, which appends a new line rather
+    than rewriting the old one) the later entry wins, since that is the one in
+    effect. Returns ``None`` -- never guessed as read-only or as read-write --
+    when ``mounts_path`` does not read, is empty, or names no mount point that is a
+    prefix of ``path``; never raises.
+    """
+    text = _read_text(mounts_path)
+    if text is None:
+        return None
+    try:
+        resolved = os.path.realpath(path)
+    except OSError:
+        return None
+    best_point: str | None = None
+    best_ro: bool | None = None
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        mount_point, options = fields[1], fields[3]
+        if mount_point == "/":
+            matches = True
+        else:
+            matches = resolved == mount_point or resolved.startswith(mount_point + "/")
+        if not matches:
+            continue
+        if best_point is None or len(mount_point) >= len(best_point):
+            best_point = mount_point
+            best_ro = "ro" in options.split(",")
+    return best_ro
 
 
 def read_wifi_rssi(
@@ -530,6 +601,7 @@ def collect_hostinfo(
     meminfo_path: Path = Path("/proc/meminfo"),
     uptime_path: Path = Path("/proc/uptime"),
     disk_path: str | os.PathLike[str] = "/",
+    mounts_path: Path = MOUNTS_PATH,
     wireless_path: Path = Path("/proc/net/wireless"),
     wifi_iface: str | None = None,
     throttled_path: Path = THROTTLED_SYSFS,
@@ -545,6 +617,11 @@ def collect_hostinfo(
     :func:`aqua_bridge.health.host_metrics_reader` builds -- to use a source chain
     that may start a ``vcgencmd`` process; left ``None`` the file sources are read
     and no process is ever started.
+
+    ``read_only`` (:func:`read_mount_ro`) answers for the same ``disk_path`` that
+    ``disk_used_pct``/``disk_free_gb`` describe -- the filesystem this daemon's
+    recorder, model store and (on the Pi) journal all write to -- so the three
+    numbers a health rule about that card needs come from one consistent mount.
     """
     load = read_loadavg(loadavg_path)
     mem = read_memory(meminfo_path)
@@ -561,6 +638,7 @@ def collect_hostinfo(
         "wifi_rssi_dbm": read_wifi_rssi(wireless_path, wifi_iface),
         "uptime_s": read_uptime_s(uptime_path),
         "throttled": _throttled(throttled, throttled_path, hwmon_root),
+        "read_only": read_mount_ro(disk_path, mounts_path),
     }
 
 

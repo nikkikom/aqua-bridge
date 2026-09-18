@@ -211,12 +211,22 @@ function renderDevices(health) {
 
 // The board itself: /api/state's "device_health.host" -- its temperature against
 // the enclosure-air reference, whether the CPU was idle when that was judged, the
-// decoded get_throttled word, and the board's own problems. A health signal only:
-// nothing here is a solver input (§8 item 103).
+// decoded get_throttled word, the free space and read-only state of the card the
+// daemon runs from, and the board's own problems. A health signal only: nothing
+// here is a solver input (§8 item 103, "the disk nobody watches").
 function hostHealthRows(health) {
   const h = (health || {}).host;
   if (!h) return [];
   const rows = [];
+  // The disk nobody watches: disk_free_gb/disk_used_pct were always published
+  // under "host" (below), but nothing judged them before item 103's shape was
+  // extended to the card. read_only rides the kernel's own /proc/mounts report.
+  if (h.disk_free_gb !== null && h.disk_free_gb !== undefined) {
+    rows.push(row("Disk free", fmt(h.disk_free_gb) + " GB (" + fmt(h.disk_used_pct, 0) + " % used)"));
+  }
+  if (h.read_only !== null && h.read_only !== undefined) {
+    rows.push(row("Filesystem", h.read_only ? "READ-ONLY" : "read-write"));
+  }
   if (h.air_c !== null && h.air_c !== undefined) {
     const idle = h.idle === null || h.idle === undefined ? "?" : (h.idle ? "idle" : "busy");
     rows.push(row("Board vs air", fmt(h.divergence_c) + " C (air " + fmt(h.air_c) +

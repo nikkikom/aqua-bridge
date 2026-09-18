@@ -130,6 +130,9 @@ _EMPTY_BOARD: dict[str, Any] = {
     "load1": None,
     "idle": None,
     "throttled": None,
+    "disk_free_gb": None,
+    "disk_used_pct": None,
+    "read_only": None,
     "faults": [],
     "hints": [],
     "problems": [],
@@ -692,12 +695,31 @@ def test_every_host_threshold_is_a_key_with_one_default() -> None:
         "log_interval_s",
         "vcgencmd_interval_s",
         "vcgencmd_timeout_s",
+        "disk_free_min_gb",
+        "disk_free_fault_s",
     }
     assert defaults.enabled is True and defaults.air_temps == ()
     assert defaults.temp_limit_c == 75.0 and defaults.divergence_c == 40.0
     assert defaults.vcgencmd_timeout_s == 2.0 and defaults.vcgencmd_interval_s == 60.0
+    assert defaults.disk_free_min_gb == 2.0 and defaults.disk_free_fault_s == 60.0
     assert HostHealthConfig.from_section(None) == defaults
     assert HostHealthConfig.from_section({}) == defaults
+
+
+def test_disk_free_min_gb_default_clears_the_bounded_writers_with_room_to_spare() -> None:
+    """The default is argued from what actually writes to the card, not a round
+    number: the recorder's own worst case (its file plus every rotated backup),
+    the model store's measured floor, and the journal cap
+    deploy/install-board-watchdogs.sh sets -- together well under the default,
+    with margin to still act."""
+    from aqua_bridge.recorder import DEFAULT_BACKUP_COUNT, DEFAULT_MAX_BYTES
+
+    recorder_worst_case_mb = DEFAULT_MAX_BYTES * (DEFAULT_BACKUP_COUNT + 1) / 1_000_000
+    journal_cap_mb = 200  # deploy/install-board-watchdogs.sh JOURNAL_MAX_USE
+    model_store_mb = 1  # generous: item 48 measured a 1424-byte floor
+    bounded_mb = recorder_worst_case_mb + journal_cap_mb + model_store_mb
+    assert bounded_mb == pytest.approx(321.0)
+    assert HostHealthConfig().disk_free_min_gb * 1000 > bounded_mb * 2
 
 
 def test_host_from_section_overrides_and_keeps_the_other_defaults() -> None:
@@ -722,6 +744,10 @@ def test_host_from_section_overrides_and_keeps_the_other_defaults() -> None:
         ({"air_temps": "inlet_a"}, "host_health.air_temps must be a list"),
         ({"air_temps": [""]}, "air_temps entries must be non-empty strings"),
         ({"air_temps": [3]}, "air_temps entries must be non-empty strings"),
+        ({"disk_free_min_gb": -1.0}, "host_health.disk_free_min_gb must be >="),
+        ({"disk_free_min_gb": "2"}, "host_health.disk_free_min_gb must be a number"),
+        ({"disk_free_fault_s": 0}, "host_health.disk_free_fault_s must be >="),
+        ({"disk_free_fault_s": float("nan")}, "host_health.disk_free_fault_s must be finite"),
     ],
 )
 def test_a_bad_host_health_key_is_a_config_error(section: dict[str, Any], match: str) -> None:
@@ -959,6 +985,75 @@ def test_without_an_air_reading_the_divergence_rule_is_off() -> None:
     assert board.check(_host_info(cpu_temp_c=70.0), {}, 10.0)["problems"] == []
 
 
+# --- the disk nobody watches ------------------------------------------------------------
+
+
+def test_low_free_space_is_reported_only_after_disk_free_fault_s_and_clears() -> None:
+    board = _board(HostHealthConfig(disk_free_min_gb=2.0, disk_free_fault_s=60.0))
+    low = _host_info(disk_free_gb=1.5)
+    assert board.check(low, {}, 0.0)["problems"] == []
+    assert board.check(low, {}, 59.0)["problems"] == []
+    problems = board.check(low, {}, 60.0)["problems"]
+    assert len(problems) == 1 and "1.50 GB free" in problems[0] and "below the 2 GB" in problems[0]
+    assert board.check(low, {}, 60.0)["ok"] is False
+    # back above the limit: the window is forgotten, not merely paused
+    assert board.check(_host_info(disk_free_gb=5.0), {}, 61.0)["problems"] == []
+    assert board.check(low, {}, 120.0)["problems"] == []
+
+
+def test_a_missing_disk_free_reading_never_fires_the_free_space_rule() -> None:
+    """An unreadable statvfs (hostinfo.read_disk returning None) degrades to
+    unknown, not a fault -- the tick path never raises and never asserts a number
+    nobody measured."""
+    board = _board(HostHealthConfig(disk_free_fault_s=1.0))
+    verdict = board.check(_host_info(disk_free_gb=None), {}, 0.0)
+    assert verdict["disk_free_gb"] is None
+    assert board.check(_host_info(disk_free_gb=None), {}, 1000.0)["problems"] == []
+
+
+def test_disk_used_pct_rides_along_in_the_verdict() -> None:
+    board = _board()
+    verdict = board.check(_host_info(disk_used_pct=73.2), {}, 0.0)
+    assert verdict["disk_used_pct"] == pytest.approx(73.2)
+
+
+def test_read_only_is_reported_the_tick_it_is_seen_and_clears() -> None:
+    """Like throttling now: the kernel has already remounted the filesystem, so a
+    sustained window would only delay a fact."""
+    board = _board()
+    verdict = board.check(_host_info(read_only=True), {}, 0.0)
+    assert len(verdict["problems"]) == 1
+    assert "read-only" in verdict["problems"][0]
+    assert verdict["ok"] is False
+    assert board.check(_host_info(read_only=False), {}, 1.0)["problems"] == []
+
+
+def test_an_unknown_read_only_state_never_fires_the_rule() -> None:
+    """Never guessed either way: only a confirmed True raises this rule."""
+    board = _board()
+    verdict = board.check(_host_info(read_only=None), {}, 0.0)
+    assert verdict["read_only"] is None and verdict["problems"] == []
+
+
+def test_a_non_boolean_read_only_value_degrades_to_unknown_not_raised() -> None:
+    """Never let an unverified or substituted reading reach a health rule as a
+    confident number: a malformed value in the mapping is unknown, not truthy."""
+    board = _board()
+    verdict = board.check(_host_info(read_only="yes"), {}, 0.0)
+    assert verdict["read_only"] is None and verdict["problems"] == []
+
+
+def test_both_disk_rules_can_fire_together() -> None:
+    board = _board(HostHealthConfig(disk_free_min_gb=2.0, disk_free_fault_s=0.001))
+    low_and_ro = _host_info(disk_free_gb=0.5, read_only=True)
+    board.check(low_and_ro, {}, 0.0)
+    verdict = board.check(low_and_ro, {}, 1.0)
+    assert len(verdict["faults"]) == 2
+    assert any("free" in p for p in verdict["faults"])
+    assert any("read-only" in p for p in verdict["faults"])
+    assert verdict["problems"] == verdict["faults"]
+
+
 def test_air_temps_from_the_config_override_the_default_reference() -> None:
     settings = HostHealthConfig(air_temps=("air_z3",))
     board = HostHealth(settings, air_temps=("air_z1",))
@@ -967,9 +1062,21 @@ def test_air_temps_from_the_config_override_the_default_reference() -> None:
 
 
 def test_host_health_disabled_still_publishes_the_numbers_but_runs_no_rule() -> None:
-    board = _board(HostHealthConfig(enabled=False, temp_fault_s=0.001))
-    verdict = board.check(_host_info(cpu_temp_c=95.0, throttled=decode_throttled(0x7)), {}, 10.0)
+    board = _board(HostHealthConfig(enabled=False, temp_fault_s=0.001, disk_free_fault_s=0.001))
+    verdict = board.check(
+        _host_info(
+            cpu_temp_c=95.0,
+            throttled=decode_throttled(0x7),
+            disk_free_gb=0.1,
+            disk_used_pct=99.0,
+            read_only=True,
+        ),
+        {},
+        10.0,
+    )
     assert verdict["cpu_temp_c"] == 95.0 and verdict["throttled"]["throttled_now"] is True
+    assert verdict["disk_free_gb"] == 0.1 and verdict["disk_used_pct"] == 99.0
+    assert verdict["read_only"] is True
     assert verdict["problems"] == [] and verdict["ok"] is True
 
 
@@ -1044,12 +1151,36 @@ def test_a_hot_board_is_a_daemon_problem_and_the_hint_rides_along() -> None:
     assert verdict["problems"] == [*verdict["faults"], *verdict["hints"]]
 
 
+def test_on_tick_publishes_the_disk_rules_and_they_join_the_daemon_problems() -> None:
+    """Published the same way item 103 publishes the board's temperature: in the
+    health payload, and its facts in the one daemon-wide problems list."""
+    published: list[dict[str, Any]] = []
+    mon = HealthMonitor(
+        _cfg(),
+        FanHealthConfig(),
+        publish=published.append,
+        host_settings=HostHealthConfig(disk_free_min_gb=2.0, disk_free_fault_s=0.001),
+        hostinfo=lambda: _host_info(disk_free_gb=0.5, disk_used_pct=97.0, read_only=True),
+    )
+    mon.on_tick(_tick(PlantObservation(temps={}, rpm={}, pwm={}, ts=0.0, inputs={})))
+    mon.on_tick(_tick(PlantObservation(temps={}, rpm={}, pwm={}, ts=5.0, inputs={})))
+    payload = published[-1]
+    assert payload["host"]["disk_free_gb"] == pytest.approx(0.5)
+    assert payload["host"]["disk_used_pct"] == pytest.approx(97.0)
+    assert payload["host"]["read_only"] is True
+    assert len(payload["host"]["faults"]) == 2
+    assert payload["host"]["ok"] is False
+    assert payload["problems"] == payload["host"]["problems"]
+    assert payload["ok"] is False
+
+
 def test_on_tick_without_a_hostinfo_reader_publishes_an_empty_board_verdict() -> None:
     published: list[dict[str, Any]] = []
     mon = HealthMonitor(_cfg(), FanHealthConfig(), publish=published.append)
     mon.on_tick(_tick(PlantObservation(temps={}, rpm={}, pwm={}, ts=0.0, inputs={})))
     host = published[-1]["host"]
     assert host["cpu_temp_c"] is None and host["throttled"] is None and host["ok"] is True
+    assert host["disk_free_gb"] is None and host["read_only"] is None
 
 
 def test_on_tick_survives_a_hostinfo_reader_that_raises() -> None:

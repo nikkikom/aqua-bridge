@@ -230,6 +230,20 @@ def test_install_script_creates_a_self_signed_certificate_but_never_overwrites_o
     assert "openssl" in (DEPLOY / "packages-rpi.txt").read_text().split()
 
 
+def test_install_script_does_not_duplicate_the_board_scripts_journal_cap():
+    """The disk-free rule's default is argued partly from a journal cap (health.py's
+    HostHealthConfig.disk_free_min_gb docstring), and the cap it means is
+    install-board-watchdogs.sh's JOURNAL_MAX_USE
+    (test_board_script_takes_every_value_from_a_variable_with_a_default), not a
+    second one here: two drop-ins governing one journal from two different
+    defaults is the failure mode, not a feature, and this script does not touch
+    the controllers or config.yaml either."""
+    text = (DEPLOY / "install-pi.sh").read_text()
+    assert "JOURNAL_MAX_USE" not in text
+    assert "journald.conf.d" not in text
+    assert "systemd-journald" not in text
+
+
 # --- DAS install path (section 8 item 7) -------------------------------------------------
 
 
