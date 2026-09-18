@@ -124,7 +124,10 @@ is not yet confirmed on real hardware, on either board.
    and nothing else: it never reboots, never restarts `aqua-bridge` and
    never touches a controller, because the network is outside the cooling
    path (PROJECT.md §2 *Watchdog layering*, §9 *Board hardening*). Every
-   value is a variable at the top of the script.
+   value is a variable at the top of the script. A router that is simply
+   switched off costs one journal line and then silence; `--no-net-recover`
+   turns the Wi-Fi timer off again (it stops, disables and removes it), and
+   `--check` reports without writing anything.
 
 6. **Config.** Edit `/etc/aqua-bridge/config.yaml`: `mpc.channels` /
    `mpc.temps` / `mpc.sensors` / `mpc.topology` for the enclosure, the

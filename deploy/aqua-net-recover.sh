@@ -11,8 +11,8 @@
 #     aqua-heartbeat.service,
 #   * never opens a controller and never writes one,
 #   * gives up quietly after AQUA_NET_MAX_BOUNCES fruitless re-associations, so
-#     a router that is simply off costs one journal line and nothing else,
-#     rather than an endless bounce loop.
+#     a router that is simply off costs one journal line and then silence --
+#     not an endless bounce loop, and not a line every timer period either.
 # The failure it does fix is the one seen on 2026-09-17: the BCM43430 in power
 # save, associated and answering nothing for hours. Power save is now off
 # (deploy/install-board-watchdogs.sh writes the NetworkManager drop-in); this is
@@ -43,6 +43,15 @@ set -euo pipefail
 # and the deadline keeps one check far below the timer's interval.
 : "${AQUA_NET_PING_COUNT:=3}"
 : "${AQUA_NET_PING_DEADLINE_S:=5}"
+# How long each of the two nmcli device commands may take, in seconds. nmcli's
+# own defaults are 10 s for "device disconnect" and 90 s for "device connect"
+# (nmcli(1) on this board), which together are longer than a systemd start
+# timeout: the unit would be SIGKILLed part-way through the re-association, and
+# a killed run is a run that never finished what it was doing. 20 s is far more
+# than an association on this board needs and keeps one whole check --
+# 2*20 s + AQUA_NET_PING_DEADLINE_S -- inside aqua-net-recover.service's
+# TimeoutStartSec=90, which tests/test_deploy.py checks against these defaults.
+: "${AQUA_NET_NMCLI_WAIT_S:=20}"
 # Where the counters live. On tmpfs on purpose: they mean nothing across a
 # reboot and must not wear the card. aqua-net-recover.service sets
 # RuntimeDirectory=aqua-net-recover, which is exactly this path.
@@ -93,8 +102,12 @@ for tool in nmcli ip ping; do
 done
 
 # GENERAL.STATE reads like "100 (connected)". Anything else -- disconnected,
-# unavailable, connecting -- means NetworkManager is already retrying on its
-# own, and a second hand on the same interface only gets in its way.
+# unavailable, connecting -- is not this script's business: either
+# NetworkManager is bringing the interface up on its own, or somebody took it
+# down by hand ("nmcli device down", which also blocks autoconnect until a
+# manual activation, nmcli(1)). Either way a second hand on the same interface
+# only gets in the way, and this script never leaves the interface in that
+# state itself: it restores autoconnect before it re-associates, below.
 state="$(nmcli -t -f GENERAL.STATE device show "$AQUA_NET_IFACE" 2> /dev/null \
   | cut -d: -f2- || true)"
 if [[ "$state" != 100* ]]; then
@@ -144,7 +157,13 @@ if [[ "$bounces" -ge "$AQUA_NET_MAX_BOUNCES" ]]; then
       touch "$AQUA_NET_STATE_DIR/gave-up"
     fi
   fi
-  set_counter fails 0
+  # Hold "fails" at the threshold rather than resetting it. Resetting would send
+  # the next run down the "(1/N); waiting" branch and print a line every second
+  # timer period for as long as the router stays off -- in a unit whose whole
+  # promise is that a router switched off costs one journal line. Held here,
+  # every later check falls straight through to this branch and says nothing
+  # until a probe succeeds (which clears the latch and both counters).
+  set_counter fails "$AQUA_NET_FAIL_CHECKS"
   exit 0
 fi
 
@@ -154,11 +173,26 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   log "--dry-run: nmcli device disconnect/connect $AQUA_NET_IFACE not run"
   exit 0
 fi
-# Both are best effort: a failed re-association is a journal line, never a
-# failed unit and never an escalation to anything larger.
-nmcli device disconnect "$AQUA_NET_IFACE" > /dev/null 2>&1 \
-  || log "nmcli device disconnect $AQUA_NET_IFACE failed"
-nmcli device connect "$AQUA_NET_IFACE" > /dev/null 2>&1 \
-  || log "nmcli device connect $AQUA_NET_IFACE failed"
+# The counters move BEFORE the nmcli pair, not after: an nmcli that hangs long
+# enough for systemd to kill this unit still has to count as the attempt it
+# was, or "bounces" never reaches AQUA_NET_MAX_BOUNCES and the give-up above --
+# the whole guard against bouncing a dead network forever -- is dead code in
+# exactly the case it was written for.
 set_counter fails 0
 set_counter bounces "$((bounces + 1))"
+# All three are best effort: a failed re-association is a journal line, never a
+# failed unit and never an escalation to anything larger. Each nmcli carries an
+# explicit --wait, because nmcli's own default for "device connect" is 90 s,
+# which alone would outlast the unit's start timeout.
+nmcli -w "$AQUA_NET_NMCLI_WAIT_S" device disconnect "$AQUA_NET_IFACE" > /dev/null 2>&1 \
+  || log "nmcli device disconnect $AQUA_NET_IFACE failed"
+# "device disconnect" is an alias for "device down", which also prevents the
+# device from automatically activating further connections until a manual one
+# (nmcli(1)). Restore that here, between the two, and not after the connect: if
+# this run is killed part-way through the connect, NetworkManager still retries
+# on its own instead of leaving the board off the network until somebody logs in
+# locally. Idempotent, and it only ever undoes this script's own disconnect.
+nmcli device set "$AQUA_NET_IFACE" autoconnect yes > /dev/null 2>&1 \
+  || log "nmcli device set $AQUA_NET_IFACE autoconnect yes failed"
+nmcli -w "$AQUA_NET_NMCLI_WAIT_S" device connect "$AQUA_NET_IFACE" > /dev/null 2>&1 \
+  || log "nmcli device connect $AQUA_NET_IFACE failed"

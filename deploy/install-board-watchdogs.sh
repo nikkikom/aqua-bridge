@@ -15,8 +15,12 @@
 #   sudo deploy/install-board-watchdogs.sh --no-net-recover
 #
 # --check needs no root and writes nothing; it prints what would change.
-# --no-net-recover skips the Wi-Fi script, its unit and its timer (the watchdog
-# and journald settings are installed either way).
+# --no-net-recover installs no Wi-Fi script, unit or timer, and *removes* the
+# ones a previous run installed: it stops and disables aqua-net-recover.timer
+# and deletes the three files, so the flag is a real off switch and not just a
+# skipped step (a timer left enabled would keep running an old copy of the
+# script with whatever thresholds it was installed with). The watchdog and
+# journald settings are installed either way.
 #
 # ---------------------------------------------------------------------------
 # Knobs. Every one can be overridden from the environment, e.g.
@@ -133,6 +137,22 @@ as_root() {
   fi
 }
 
+# remove_path <destination>. The counterpart of install_text for --no-net-recover:
+# silent when there is nothing there, so a re-run changes nothing.
+remove_path() {
+  local path="$1"
+  if [[ ! -e "$path" ]]; then
+    return 0
+  fi
+  CHANGED=1
+  if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    echo "  would remove: $path"
+    return 0
+  fi
+  as_root rm -f "$path"
+  echo "  removed: $path"
+}
+
 # install_text <destination> <mode>, content on stdin. Writes only when the
 # content differs, so a re-run is silent and leaves the mtime alone. Never call
 # it on the right-hand side of a pipe: it sets shell variables.
@@ -231,7 +251,24 @@ if [[ "$NET_RECOVER" -eq 1 ]]; then
   install_text "$NET_TIMER_DST" 644 < "$timer_tmp"
   rm -f "$timer_tmp"
 else
-  echo "== Wi-Fi re-association timer: skipped (--no-net-recover) =="
+  echo "== Wi-Fi re-association timer: off (--no-net-recover) =="
+  # Not just "skip": an earlier run may have enabled the timer, and a timer left
+  # enabled keeps running the copy of the script installed back then, with the
+  # thresholds it had back then. The flag has to be able to turn it off again.
+  if [[ -e "$NET_TIMER_DST" ]]; then
+    CHANGED=1
+    if [[ "$CHECK_ONLY" -eq 1 ]]; then
+      echo "  would stop and disable aqua-net-recover.timer"
+    else
+      as_root systemctl disable --now aqua-net-recover.timer || true
+      echo "  stopped and disabled aqua-net-recover.timer"
+    fi
+  fi
+  remove_path "$NET_TIMER_DST"
+  remove_path "$NET_UNIT_DST"
+  remove_path "$NET_RECOVER_DST"
+  echo "  (nothing here touches the fans either way: the network is outside the" \
+    "cooling path, PROJECT.md §2)"
 fi
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
@@ -286,10 +323,20 @@ cat <<EOF
                                                        timeout -> every fan 100 %
 
 The last line lives on the aquaero and is independent of this board; its value
-is set on the device (30 s on the owner's controller), not here.
+is set on the device (30 s on the owner's controller), not here. Both watchdogs
+above it fire LATER than that 30 s, and deliberately so (the service watchdog
+has to stay above the daemon's own worst-case tick): while the daemon writes
+the heartbeat itself, a kill by either of them has already cost the alarm --
+every fan at 100 % -- before the recovery starts. Loud, never under-cooled.
+PROJECT.md §2 has the timeline.
 
 Nothing above reacts to the network. aqua-net-recover only re-associates the
 Wi-Fi interface: it never reboots, never restarts aqua-bridge and never touches
-a controller (PROJECT.md §2). Try it by hand with
-  ${NET_RECOVER_DST} --dry-run
+a controller (PROJECT.md §2).
 EOF
+if [[ "$NET_RECOVER" -eq 1 ]]; then
+  echo "Try it by hand with"
+  echo "  ${NET_RECOVER_DST} --dry-run"
+else
+  echo "It is not installed (--no-net-recover)."
+fi

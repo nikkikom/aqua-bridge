@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -98,19 +99,31 @@ def test_the_unit_watchdog_leaves_the_margin_the_daemons_own_bound_does_not_coun
     has to be more than the largest single thing they can do on the loop thread. That
     is one `vcgencmd get_throttled` at host_health.vcgencmd_timeout_s (the MQTT
     publisher refreshes the host metrics from `on_tick`). Checked for the DAS example
-    as it ships and for the two-controller alternative it describes."""
+    as it ships and for the two-controller alternative it describes.
+
+    The timings come from the example's own entries (`from_section`, exactly what
+    config.py builds), not from `for_kind(name)` alone: the example spells its timing
+    keys out, and defaults that happen to equal them today would hide the day they
+    stop -- which is the one thing this test exists to notice."""
     from aqua_bridge.config import load_config
     from aqua_bridge.health import HostHealthConfig
-    from aqua_bridge.hw.aquacomputer_adapter import AquacomputerTiming
+    from aqua_bridge.hw.aquacomputer_adapter import KINDS, AquacomputerTiming
 
     app = load_config(DEPLOY.parent / "config.example-das.yaml")
     watchdog = float(unit["WatchdogSec"][0])
     publisher_worst = HostHealthConfig.from_section(app.section("host_health")).vcgencmd_timeout_s
-    shipped = [entry["device"] for entry in app.aquacomputer]
-    for devices in (shipped, ["aquaero", "quadro"]):
-        controllers = sum(AquacomputerTiming.for_kind(name).worst_case_tick_s() for name in devices)
+    shipped = [
+        AquacomputerTiming.from_section(entry, f"aquacomputer[{i}]", KINDS[entry["device"]])
+        for i, entry in enumerate(app.aquacomputer)
+    ]
+    assert [entry["device"] for entry in app.aquacomputer] == ["aquaero"]  # Quadro on aquabus
+    # The alternative that section describes: the Quadro on its own USB port, at its
+    # defaults, next to the aquaero the example declares.
+    alternative = [*shipped, AquacomputerTiming.for_kind("quadro")]
+    for timings in (shipped, alternative):
+        controllers = sum(timing.worst_case_tick_s() for timing in timings)
         bound = app.mpc.dt + app.mpc.budget_alarm_ms / 1000.0 + controllers
-        assert watchdog - bound >= publisher_worst, devices
+        assert watchdog - bound >= publisher_worst, timings
 
 
 def test_unit_gives_the_model_store_a_state_directory(unit):
@@ -526,7 +539,7 @@ def test_network_recovery_never_escalates_beyond_re_associating():
                 for forbidden in ("reboot", "systemctl", "aqua-bridge.service", "hidraw"):
                     assert forbidden not in value, f"{path.name}: {key}={value}"
     script = NET_SCRIPT.read_text()
-    assert "nmcli device disconnect" in script and "nmcli device connect" in script
+    assert "device disconnect" in script and "device connect" in script
 
 
 def test_the_recovery_unit_is_wired_to_nothing_that_cools():
@@ -541,8 +554,46 @@ def test_the_recovery_unit_is_wired_to_nothing_that_cools():
             assert "network-online" not in value  # it exists for the offline case
 
 
-def _stub_bin(root: Path, *, connected: bool, gateway: str, ping_ok: bool) -> Path:
-    """nmcli / ip / ping stubs under ``root`` that log every call to ``root/calls.log``."""
+def test_one_check_cannot_outlast_the_units_start_timeout():
+    """Every wait in the script is a knob, and the unit's TimeoutStartSec is above what
+    those knobs allow one run to cost. Without the explicit --wait, nmcli's own default
+    for `device connect` alone (90 s) is already above systemd's default start timeout,
+    and a run killed part-way through is a run that finished none of its bookkeeping."""
+    script = NET_SCRIPT.read_text()
+    assert script.count('nmcli -w "$AQUA_NET_NMCLI_WAIT_S" device') == 2
+    wait = float(_shell_default(NET_SCRIPT, "AQUA_NET_NMCLI_WAIT_S"))
+    ping_deadline = float(_shell_default(NET_SCRIPT, "AQUA_NET_PING_DEADLINE_S"))
+    timeout = float(_unit_values(NET_UNIT.read_text())["TimeoutStartSec"][0])
+    assert timeout >= 2 * wait + ping_deadline
+    minutes = re.fullmatch(r"(\d+)min", _shell_default(BOARD_SCRIPT, "NET_RECOVER_INTERVAL"))
+    assert minutes is not None and timeout < 60 * int(minutes.group(1))  # no run overlaps itself
+
+
+def test_no_net_recover_is_an_off_switch_and_not_a_skipped_step():
+    """Section 9 *Board hardening*: the flag has to be able to turn the recovery off
+    again. Skipping the install alone would leave a timer that an earlier run enabled
+    still running the copy of the script installed back then, on its old thresholds."""
+    text = BOARD_SCRIPT.read_text()
+    assert "systemctl disable --now aqua-net-recover.timer" in text
+    for dst in ('"$NET_TIMER_DST"', '"$NET_UNIT_DST"', '"$NET_RECOVER_DST"'):
+        assert f"remove_path {dst}" in text
+
+
+def _stub_bin(
+    root: Path,
+    *,
+    connected: bool,
+    gateway: str,
+    ping_ok: bool,
+    connect_rc: int = 0,
+    connect_delay_s: float = 0.0,
+) -> Path:
+    """nmcli / ip / ping stubs under ``root`` that log every call to ``root/calls.log``.
+
+    ``connect_rc``/``connect_delay_s`` are the branches the guards exist for: with the
+    router off, `nmcli device connect` does not return 0 in a millisecond -- it fails, or
+    it takes long enough that systemd kills the unit part-way through.
+    """
     bin_dir = root / "bin"
     bin_dir.mkdir(parents=True)
     state = "100 (connected)" if connected else "30 (disconnected)"
@@ -551,6 +602,7 @@ def _stub_bin(root: Path, *, connected: bool, gateway: str, ping_ok: bool) -> Pa
         f'echo "nmcli $*" >> "{root}/calls.log"\n'
         'case "$*" in\n'
         f'  *"device show"*) echo "GENERAL.STATE:{state}" ;;\n'
+        f'  *"device connect"*) sleep {connect_delay_s}; exit {connect_rc} ;;\n'
         "esac\n"
         "exit 0\n"
     )
@@ -602,6 +654,84 @@ def test_a_router_that_is_simply_off_stops_bouncing_instead_of_looping(tmp_path)
     assert sum(1 for line in calls if "device disconnect" in line) == bounces
     assert sum(1 for line in calls if "device connect" in line) == bounces
     assert sum(1 for out in outputs if "stopping here" in out) == 1  # said once, not per run
+    # And then nothing at all, rather than a "(1/2); waiting" line every second run in a
+    # journal this same script caps at 200 MB.
+    said_it = next(i for i, out in enumerate(outputs) if "stopping here" in out)
+    assert [out for out in outputs[said_it + 1 :] if out.strip()] == []
+
+
+def test_a_re_association_that_fails_is_still_an_attempt(tmp_path):
+    """With the router off, `nmcli device connect` does not succeed -- and the give-up
+    guard is written for exactly that branch. A failing re-association must move
+    `bounces` all the same, or the script keeps bouncing the interface for as long as
+    the router stays off, which is the loop the owner forbade."""
+    bin_dir = _stub_bin(tmp_path, connected=True, gateway="192.0.2.1", ping_ok=False, connect_rc=1)
+    bounces = int(_shell_default(NET_SCRIPT, "AQUA_NET_MAX_BOUNCES"))
+    checks = int(_shell_default(NET_SCRIPT, "AQUA_NET_FAIL_CHECKS"))
+    outputs = _run_recovery(tmp_path, bin_dir, runs=checks * (bounces + 4))
+    calls = (tmp_path / "calls.log").read_text().splitlines()
+    assert sum(1 for line in calls if "device connect" in line) == bounces
+    assert sum(1 for out in outputs if "stopping here" in out) == 1
+    assert sum(1 for out in outputs if "device connect" in out and "failed" in out) == bounces
+
+
+def test_a_re_association_restores_autoconnect_before_it_reconnects(tmp_path):
+    """`nmcli device disconnect` is an alias for `device down`, which also prevents the
+    device from auto-activating until a manual activation (nmcli(1)). Restoring
+    autoconnect *between* the two is what keeps a connect that fails -- or a run systemd
+    kills mid-connect -- from leaving the board off the network until somebody logs in
+    locally, with this script's own state guard then standing down every five minutes
+    because "NetworkManager is already retrying"."""
+    bin_dir = _stub_bin(tmp_path, connected=True, gateway="192.0.2.1", ping_ok=False, connect_rc=1)
+    _run_recovery(tmp_path, bin_dir, runs=int(_shell_default(NET_SCRIPT, "AQUA_NET_FAIL_CHECKS")))
+    calls = [line for line in (tmp_path / "calls.log").read_text().splitlines() if "nmcli" in line]
+    order = [
+        i
+        for i, line in enumerate(calls)
+        if "device disconnect" in line or "autoconnect yes" in line or "device connect" in line
+    ]
+    assert len(order) == 3 and order == sorted(order)
+    assert "device disconnect" in calls[order[0]]
+    assert "autoconnect yes" in calls[order[1]]
+    assert "device connect" in calls[order[2]]
+
+
+def test_a_re_association_killed_part_way_through_still_counts_as_a_bounce(tmp_path):
+    """systemd's TimeoutStartSec is a real end to a run. The counters therefore move
+    before the nmcli pair, not after: a killed run that advanced nothing would leave
+    `bounces` at zero forever, and the give-up guard would never engage in the one case
+    it was written for."""
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - bash is in packages-rpi.txt and in CI
+        pytest.skip("bash not available")
+    bin_dir = _stub_bin(
+        tmp_path,
+        connected=True,
+        gateway="192.0.2.1",
+        ping_ok=False,
+        connect_rc=1,
+        connect_delay_s=30.0,
+    )
+    checks = int(_shell_default(NET_SCRIPT, "AQUA_NET_FAIL_CHECKS"))
+    _run_recovery(tmp_path, bin_dir, runs=checks - 1)  # the failed checks before the bounce
+    state = tmp_path / "state"
+    env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "AQUA_NET_STATE_DIR": str(state),
+        "AQUA_NET_PING_DEADLINE_S": "1",
+    }
+    proc = subprocess.Popen([bash, str(NET_SCRIPT)], env=env, stdout=subprocess.DEVNULL)
+    try:
+        deadline = time.monotonic() + 30.0
+        while "device connect" not in (tmp_path / "calls.log").read_text():
+            assert proc.poll() is None and time.monotonic() < deadline, "never re-associated"
+            time.sleep(0.05)
+    finally:
+        proc.kill()  # what systemd's TimeoutStartSec comes down to
+        proc.wait(timeout=30)
+    assert (state / "bounces").read_text().strip() == "1"
+    calls = (tmp_path / "calls.log").read_text()
+    assert "autoconnect yes" in calls  # restored before the connect, so NM retries alone
 
 
 def test_no_gateway_and_no_carrier_are_both_no_ops(tmp_path):
