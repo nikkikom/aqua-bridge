@@ -205,6 +205,156 @@ def test_the_host_problem_template_and_the_host_key_read_the_published_state_blo
     assert blob["host"]["throttled"]["hex"] == "0x4"
 
 
+def test_discovery_has_one_aquabus_problem_sensor_in_both_modes(
+    cfg: MpcConfig, das_example_cfg: MpcConfig
+) -> None:
+    """Item 129: the aquabus gets its own problem entity, keyed on ``lost`` (not on
+    the mere absence of a device), with the per-controller detail as its
+    attributes."""
+    for config in (cfg, das_example_cfg):
+        entities = build_discovery_entities(
+            config, node_id=NODE_ID, discovery_prefix=PREFIX, control_mode=ControlMode.AUTO
+        )
+        found = [e for e in entities if e.object_id == "aquabus_problem"]
+        assert len(found) == 1
+        entity = found[0]
+        assert entity.component == "binary_sensor"
+        assert entity.config_topic == f"{PREFIX}/binary_sensor/{NODE_ID}/aquabus_problem/config"
+        assert entity.payload["device_class"] == "problem"
+        assert entity.payload["entity_category"] == "diagnostic"
+        assert "value_json.device_health.devices" in entity.payload["value_template"]
+        assert "aquabus.lost" in entity.payload["value_template"]
+        assert entity.payload["json_attributes_topic"] == f"{NODE_ID}/state"
+        assert "aquabus" in entity.payload["json_attributes_template"]
+
+
+def test_the_aquabus_problem_template_reads_the_published_state_blob(cfg: MpcConfig) -> None:
+    """The device list the template reads exists in ``ControlSnapshot.to_dict()``,
+    each device carrying the ``aquabus`` block :meth:`AquacomputerAdapter.bus_device`
+    publishes (``state``, ``present``, ``seen``, ``absent_s``, ``lost``,
+    ``temps_missing``)."""
+    from aqua_bridge.control.intents import ControlSnapshot, Preset, SolverStatus
+
+    devices = [
+        {
+            "label": "aquaero",
+            "aquabus": {
+                "state": "lost",
+                "present": False,
+                "seen": True,
+                "absent_s": 42.0,
+                "lost": True,
+                "temps_missing": [],
+            },
+        }
+    ]
+    snapshot = ControlSnapshot(
+        obs=None,
+        last_cmd=None,
+        control_mode=ControlMode.AUTO,
+        setpoints={},
+        overrides={},
+        preset=Preset.NORMAL,
+        channels=cfg.channels,
+        temps=cfg.temps,
+        pwm_min=cfg.pwm_min,
+        pwm_max=cfg.pwm_max,
+        solver_status=SolverStatus.FAULT,
+        fault_reason=None,
+        fault_since_ts=None,
+        usb_present=False,
+        mqtt_connected=None,
+        uptime_s=0.0,
+        device_health={"devices": devices, "fans": {}, "problems": [], "ok": True},
+    )
+    blob = state_payload(snapshot.to_dict(), {})
+    assert blob["device_health"]["devices"][0]["aquabus"]["lost"] is True
+    assert blob["device_health"]["devices"][0]["aquabus"]["state"] == "lost"
+
+
+def test_discovery_has_a_model_block_sensor_per_zone_and_an_unexcitable_sensor(
+    das_example_cfg: MpcConfig,
+) -> None:
+    """Item 121: ``pe_diag``/``blocked`` (items 110, 111) and ``excitation`` reach
+    Home Assistant as *value* sensors, not as a ``device_class: problem`` binary
+    sensor -- a zone still learning is not a fault."""
+    entities = {
+        e.object_id: e
+        for e in build_discovery_entities(
+            das_example_cfg, node_id=NODE_ID, discovery_prefix=PREFIX, control_mode=ControlMode.AUTO
+        )
+    }
+    for zone in das_example_cfg.topology.zones:
+        oid = f"model_block_{zone}"
+        assert oid in entities
+        entity = entities[oid]
+        assert entity.component == "sensor"
+        assert entity.payload.get("device_class") is None
+        assert f"thermal.zones.{zone}.blocked" in entity.payload["value_template"]
+        assert f"thermal.zones.{zone}" in entity.payload["json_attributes_template"]
+        assert entity.payload["entity_category"] == "diagnostic"
+
+    assert "unexcitable_channels" in entities
+    unexcitable = entities["unexcitable_channels"]
+    assert unexcitable.component == "sensor"
+    assert unexcitable.payload.get("device_class") is None
+    assert "extra.experiment.unexcitable" in unexcitable.payload["value_template"]
+    assert "extra.experiment.excitation" in unexcitable.payload["json_attributes_template"]
+
+
+def test_model_block_and_excitation_templates_read_the_published_state_blob(
+    das_example_cfg: MpcConfig,
+) -> None:
+    """The paths the two new sensors read exist in the blob the daemon actually
+    publishes: ``cmd.diagnostics.thermal.zones.<zone>`` (:func:`aqua_bridge.control.
+    thermal.summary`) and ``extra.experiment`` (:func:`aqua_bridge.control.ident.
+    status`)."""
+    from aqua_bridge.control.intents import ControlSnapshot, Preset, SolverStatus
+    from aqua_bridge.model import Mode, MpcCommand
+
+    zone = next(iter(das_example_cfg.topology.zones))
+    thermal_zone = {
+        "status": "learning",
+        "pred_err_c": 0.4,
+        "pe_diag": {"g0": 0.02},
+        "blocked": [f"pe:{zone}", "pred_err"],
+    }
+    cmd = MpcCommand(
+        pwm=dict.fromkeys(das_example_cfg.channels, 0.5),
+        mode=Mode.AUTO,
+        diagnostics={"thermal": {"zones": {zone: thermal_zone}}},
+    )
+    snapshot = ControlSnapshot(
+        obs=None,
+        last_cmd=cmd,
+        control_mode=ControlMode.AUTO,
+        setpoints={},
+        overrides={},
+        preset=Preset.NORMAL,
+        channels=das_example_cfg.channels,
+        temps=das_example_cfg.temps,
+        pwm_min=das_example_cfg.pwm_min,
+        pwm_max=das_example_cfg.pwm_max,
+        solver_status=SolverStatus.OK,
+        fault_reason=None,
+        fault_since_ts=None,
+        usb_present=True,
+        mqtt_connected=None,
+        uptime_s=0.0,
+        extra={
+            "experiment": {
+                "running": False,
+                "unexcitable": ["xt1"],
+                "excitation": {"xt1": {"excitable": False}},
+            }
+        },
+    )
+    blob = state_payload(snapshot.to_dict(), {})
+    zone_blob = blob["cmd"]["diagnostics"]["thermal"]["zones"][zone]
+    assert zone_blob["blocked"] == [f"pe:{zone}", "pred_err"]
+    assert blob["extra"]["experiment"]["unexcitable"] == ["xt1"]
+
+
 def test_discovery_has_a_setpoint_number_per_setpoint(cfg: MpcConfig) -> None:
     entities = build_discovery_entities(
         cfg, node_id=NODE_ID, discovery_prefix=PREFIX, control_mode=ControlMode.AUTO
@@ -726,6 +876,7 @@ def _expected_entity_table(
         table[f"pwm_{ch}"] = ("sensor", "%", None, "measurement")
     table["device_problem"] = ("binary_sensor", None, "problem", None)
     table["host_problem"] = ("binary_sensor", None, "problem", None)
+    table["aquabus_problem"] = ("binary_sensor", None, "problem", None)
     for temp in config.setpoints:
         table[f"setpoint_{temp}"] = ("number", "°C", None, None)
     for drive_class in config.drive_classes:
@@ -735,8 +886,10 @@ def _expected_entity_table(
         table["model_pred_err_c"] = ("sensor", "°C", None, "measurement")
         table["noise_db"] = ("sensor", "dB", None, "measurement")
         table["ident_running"] = ("binary_sensor", None, "running", None)
+        table["unexcitable_channels"] = ("sensor", None, None, None)
         for zone in config.topology.zones:
             table[f"zone_status_{zone}"] = ("sensor", None, None, None)
+            table[f"model_block_{zone}"] = ("sensor", None, None, None)
         for bay in config.topology.bays:
             table[f"drive_temp_{bay}"] = ("sensor", "°C", "temperature", "measurement")
             table[f"drive_margin_{bay}"] = ("sensor", "°C", None, "measurement")

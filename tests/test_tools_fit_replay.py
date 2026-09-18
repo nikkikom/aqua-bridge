@@ -381,6 +381,33 @@ def test_fit_fan_curves_fits_models_with_tach_data(
         json.dumps(info, allow_nan=False)
 
 
+def test_fit_fan_curves_reports_channels_with_a_measured_rail(
+    recording: tuple[MpcConfig, Path, list[dict[str, Any]]],
+) -> None:
+    """Item 127: ``channels_with_rail_reported`` names a channel only where some
+    record's ``fans.<ch>.rail_reported`` was true (:func:`aqua_bridge.recorder.
+    rail_known`); it plays no part in the curve fit itself."""
+    cfg, _, records = recording
+    ch = next(iter(cfg.fans))
+    model = cfg.fans[ch].model
+
+    with_rail = [{**records[0], "fans": {ch: {"voltage_v": 12.0, "rail_reported": True}}}]
+    with_rail += records[1:]
+    curves = fit_fans.fit_fan_curves(cfg, with_rail)
+    assert ch in curves[model]["channels_with_rail_reported"]
+
+    # A "fans" entry with no rail_reported key at all (every recording made before
+    # item 127) must never be read as a measured rail, whatever voltage_v holds.
+    no_flag = [{**r, "fans": {ch: {"voltage_v": 0.0}}} for r in records]
+    curves_no_flag = fit_fans.fit_fan_curves(cfg, no_flag)
+    assert curves_no_flag[model]["channels_with_rail_reported"] == []
+
+    # A recording with no "fans" key at all (also pre-item-79) reports none either.
+    no_fans = [{k: v for k, v in r.items() if k != "fans"} for r in records]
+    curves_no_fans = fit_fans.fit_fan_curves(cfg, no_fans)
+    assert curves_no_fans[model]["channels_with_rail_reported"] == []
+
+
 def test_fit_fans_cli_writes_fan_curves_json(
     recording: tuple[MpcConfig, Path, list[dict[str, Any]]], config_path: Path, tmp_path: Path
 ) -> None:

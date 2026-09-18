@@ -85,6 +85,15 @@ _DEVICE_HEALTH: dict[str, Any] = {
             "unconfigured_channels": [],
             "flows": {"flow1": 0, "flow2": 0, "flow3": None},
             "active_profile": 1,
+            # the aquabus itself (PROJECT.md section 8 items 92, 114, 115, 129)
+            "aquabus": {
+                "state": "lost",
+                "present": False,
+                "seen": True,
+                "absent_s": 42.0,
+                "lost": True,
+                "temps_missing": [],
+            },
             # the software-sensor heartbeat and the controller's softN slots
             # (PROJECT.md section 8 items 83, 113)
             "heartbeat": {"on": True, "ok": True, "sensor": 1, "value_c": 20.0},

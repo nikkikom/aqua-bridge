@@ -109,6 +109,39 @@ divergence is: a filling card can sit below its threshold for days, and a
 daemon-wide flag latched that long would read exactly like a missing aquabus
 device.
 
+The aquaero's aquabus (PROJECT.md section 8 items 92, 114, 115, 129) has its own
+binary sensor, ``aquabus_problem`` (``device_class: problem``, diagnostic, both
+modes): on whenever some controller's ``value_json.device_health.devices[].aquabus.
+lost`` is true -- a device that had answered has now been missing for
+``bus_absent_s``. A bus that has simply never had anything on it (``state:
+"never_seen"``, the normal state of an aquaero with nothing on its aquabus) is not
+a problem and never turns this on; neither is a report or two of ``"empty"`` before
+``bus_absent_s`` has passed. Its attributes are the ``aquabus`` block of every
+controller in ``device_health.devices`` (``state``, ``present``, ``seen``,
+``absent_s``, ``lost``, ``temps_missing``), so the state a person needs --
+``never_seen`` apart from ``lost`` -- is one tap away without reading the journal.
+
+DAS mode also publishes, per zone, one sensor ``model_block_<zone>``
+(PROJECT.md section 8 items 110, 111, 121): state is the zone's
+``value_json.cmd.diagnostics.thermal.zones.<zone>.blocked`` list joined with ", ",
+or ``"none"`` once the zone has nothing left to wait on -- naming the gate and the
+group or bay it names (``windows:<block>``, ``pe:<block>``, ``rel_se:<coefficient>``,
+``pred_err``) rather than leaving a zone that has sat in ``learning`` for a day
+looking the same as one that just started. Its attributes are the whole per-zone
+``diagnostics["thermal"]["zones"][<zone>]`` block, so ``pe_diag`` (the measured
+diagonal beside ``pe_min``, naming which group is not moving) and every other field
+of the identification summary are one tap away too. This is a value, not a fault:
+there is no ``device_class`` and nothing here turns a problem sensor on, because a
+zone still learning is not broken (module docstring, ``zone_status_<zone>`` below,
+which is the solver's own trust/fault state and stays separate).
+
+DAS mode also publishes one sensor ``unexcitable_channels``
+(PROJECT.md section 8 item 121, :func:`aqua_bridge.control.ident.excitation`):
+state is ``value_json.extra.experiment.unexcitable`` joined with ", ", or ``"none"``
+when every channel can clear the model's PE bound at ``ident_amplitude`` from where
+it sits. Its attributes are the full per-channel ``excitation`` mapping (``rel_swing``,
+``pe_reach``, ``pe_bound``, ``excitable``, ``pe_reach_at_cap``, ``excitable_at_cap``).
+
 DAS mode (``mpc.topology``) subscribes to the limit and bay topics and adds one
 ``limit_<class>`` number entity per drive class (state from
 ``value_json.limits.classes.<class>``, range ``temp_min_c`` .. the configured
@@ -391,6 +424,38 @@ def _sensor(
     return MqttEntity("sensor", object_id, topic, payload)
 
 
+def _sensor_with_attributes(
+    *,
+    discovery_prefix: str,
+    node_id: str,
+    object_id: str,
+    name: str,
+    value_template: str,
+    json_attributes_template: str,
+) -> MqttEntity:
+    """A diagnostic-category text sensor whose state is a short summary and whose
+    ``json_attributes`` carry the detail behind it, one tap away -- the same shape as
+    the ``device_problem``/``host_problem`` binary sensors below, for a *value*
+    rather than a condition (PROJECT.md section 8 item 121: ``pe_diag``, ``blocked``
+    and ``excitation`` are readings about the model, not faults, so they get a
+    ``sensor``, never a ``binary_sensor`` with ``device_class: problem``)."""
+    unique_id = f"{node_id}_{object_id}"
+    payload: dict[str, Any] = {
+        "name": name,
+        "unique_id": unique_id,
+        "object_id": unique_id,
+        "state_topic": state_topic(node_id),
+        "value_template": value_template,
+        "json_attributes_topic": state_topic(node_id),
+        "json_attributes_template": json_attributes_template,
+        "entity_category": "diagnostic",
+        "device": _device_block(node_id),
+        **_availability(node_id),
+    }
+    topic = f"{discovery_prefix}/sensor/{node_id}/{object_id}/config"
+    return MqttEntity("sensor", object_id, topic, payload)
+
+
 def host_sensor_specs() -> tuple[tuple[str, str, str | None, str | None], ...]:
     """``(object_id, name, unit, device_class)`` for every host sensor.
 
@@ -538,6 +603,42 @@ def build_discovery_entities(
         )
     )
 
+    # The aquabus itself (PROJECT.md section 8 items 92, 114, 115, 129): on only when
+    # a device that had answered has now been missing for bus_absent_s -- a healthy
+    # aquaero with nothing on its bus ("never_seen") never turns this on, which is why
+    # the template checks "lost" and not merely the absence of a device.
+    object_id = "aquabus_problem"
+    unique_id = f"{node_id}_{object_id}"
+    entities.append(
+        MqttEntity(
+            "binary_sensor",
+            object_id,
+            f"{discovery_prefix}/binary_sensor/{node_id}/{object_id}/config",
+            {
+                "name": "Aquabus problem",
+                "unique_id": unique_id,
+                "object_id": unique_id,
+                "state_topic": state_topic(node_id),
+                "value_template": (
+                    "{{ 'ON' if (value_json.device_health.devices | default([]) "
+                    "| selectattr('aquabus.lost', 'equalto', true) | list | length > 0) "
+                    "else 'OFF' }}"
+                ),
+                "payload_on": "ON",
+                "payload_off": "OFF",
+                "device_class": "problem",
+                "entity_category": "diagnostic",
+                "json_attributes_topic": state_topic(node_id),
+                "json_attributes_template": (
+                    "{{ (value_json.device_health.devices | default([]) "
+                    "| map(attribute='aquabus') | list) | tojson }}"
+                ),
+                "device": _device_block(node_id),
+                **_availability(node_id),
+            },
+        )
+    )
+
     for temp in cfg.setpoints:
         object_id = f"setpoint_{temp}"
         unique_id = f"{node_id}_{object_id}"
@@ -610,6 +711,21 @@ def build_discovery_entities(
                 unit="dB",
             )
         )
+        entities.append(
+            _sensor_with_attributes(
+                discovery_prefix=discovery_prefix,
+                node_id=node_id,
+                object_id="unexcitable_channels",
+                name="Unexcitable channels",
+                value_template=(
+                    "{{ (value_json.extra.experiment.unexcitable | default([]) "
+                    "| join(', ')) or 'none' }}"
+                ),
+                json_attributes_template=(
+                    "{{ value_json.extra.experiment.excitation | default({}) | tojson }}"
+                ),
+            )
+        )
         object_id = "ident_running"
         unique_id = f"{node_id}_{object_id}"
         payload = {
@@ -640,6 +756,19 @@ def build_discovery_entities(
                         f"{{{{ value_json.cmd.diagnostics.zones.{zone}.policy | default('off') }}}}"
                     ),
                     state_class=None,
+                )
+            )
+            thermal_zone = f"value_json.cmd.diagnostics.thermal.zones.{zone}"
+            entities.append(
+                _sensor_with_attributes(
+                    discovery_prefix=discovery_prefix,
+                    node_id=node_id,
+                    object_id=f"model_block_{zone}",
+                    name=f"{zone} zone convergence block",
+                    value_template=(
+                        f"{{{{ ({thermal_zone}.blocked | default([]) | join(', ')) or 'none' }}}}"
+                    ),
+                    json_attributes_template=f"{{{{ {thermal_zone} | default({{}}) | tojson }}}}",
                 )
             )
 
