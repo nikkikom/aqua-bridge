@@ -1,13 +1,12 @@
 """Tests for tools/aquabus_watch.py: the read-only aquabus measurement (items 114, 115, 92).
 
-What is checked here is the tool's own arithmetic and its presence/refresh
-classification, over the captured reports, played back at a cadence taken from the
-90-report run of 2026-09-17 (one report in four carried the bus device's own
-measurements). The cadence is written out literally below, so that
-``AQUABUS_REFRESH_REPORTS`` is an expectation of these tests and not their input. What
-the hardware does over a long run is not tested here and cannot be: the captured
-sequence of that run is not in the repository, and §8 item 115 keeps the
-``--reports 600 --raw`` run as the measurement that answers it.
+What is checked here is the tool's own arithmetic and its presence/sampling
+classification, over the captured reports, played back at the cadence the two
+fixtures give: one report whose electrical sample fell in the on phase of a 20 %
+duty, then three whose sample missed. That ratio is a property of *this playback*
+and is written out literally below -- the hardware's ratio is a function of the
+duty (4 of 14 at 25 %, 16 of 16 at 60 %, PROJECT.md section 2), not a constant any
+code carries, which is exactly why no constant is imported here any more.
 
 ``tools/`` is not on ``pythonpath``, so this file adds it to ``sys.path`` itself (the
 same way tests/test_aquacomputer_probe.py does).
@@ -21,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from aqua_bridge.hw.aquacomputer import AQUABUS_REFRESH_REPORTS, AQUAERO
+from aqua_bridge.hw.aquacomputer import AQUAERO
 from aquacomputer_fakes import FakeClock, fixture_bytes
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
@@ -94,37 +93,39 @@ def _run(rig, reports: list[bytes], **kwargs) -> tuple[int, str, ScriptedControl
     return code, out.getvalue(), controller
 
 
-#: The cadence of the 2026-09-17 run, written out rather than derived from the constant:
-#: one report that carried the bus device's measurements, then three that did not.
+#: The cadence the two fixtures play back: one report whose electrical sample landed
+#: in the on phase of the output's 20 % duty, then three whose sample missed.
 _CADENCE = ("m", "s", "s", "s")
 
 
-def _refresh_pattern(count: int) -> list[bytes]:
+def _sampling_pattern(count: int) -> list[bytes]:
     """The reports in that cadence, `count` of them."""
     measuring, substituted = fixture_bytes(MEASURING), fixture_bytes(SUBSTITUTED)
     return [measuring if _CADENCE[i % len(_CADENCE)] == "m" else substituted for i in range(count)]
 
 
-def test_it_measures_the_refresh_interval_and_closes_the_device(rig) -> None:
-    """Item 115: how many reports carry a measurement, how far apart they are in reports
-    and in seconds, and whether the four blocks refresh together. The numbers below are
-    the tool's arithmetic over the played-back cadence; the constant the daemon carries
-    is checked against that cadence rather than used to derive it."""
-    assert len(_CADENCE) == AQUABUS_REFRESH_REPORTS
-    code, text, controller = _run(rig, _refresh_pattern(40))
+def test_it_measures_the_share_of_sampling_reports_and_closes_the_device(rig) -> None:
+    """Item 115: how many reports carried a sample **against that block's duty**, how far
+    apart they were, and whether the blocks are sampled together. The share is the
+    measurement -- read on its own it says nothing, because it follows the duty, and the
+    duty is printed beside it so a second run at another duty can be compared."""
+    code, text, controller = _run(rig, _sampling_pattern(40))
     assert code == 0 and controller.closed
     assert "40 status reports in 39.0 s" in text
     assert "every 1.00 s (min 1, max 1, sd 0.00)" in text
-    assert "pwm7  10 of 40 reports  every 4.00 reports" in text
+    assert "pwm7  duty  20.00 %  10 of 40 reports (25%)  every 4.00 reports" in text
     assert "every 4.00 s (min 4, max 4, sd 0.00)" in text
-    assert "10 of 10 refreshing reports refreshed every block: the refresh is atomic" in text
+    assert (
+        "10 of 10 sampling reports carried every block: one sampling instant for the "
+        "whole device" in text
+    )
 
 
 def test_it_reports_a_healthy_bus_as_quiet(rig) -> None:
     """Item 92: the rule is meant to stay silent on a healthy bus, and this is how a run
-    on the hardware shows that -- presence is read from the speed field, so the refresh
-    gap never counts as an absence."""
-    _code, text, _controller = _run(rig, _refresh_pattern(40))
+    on the hardware shows that -- presence is read from the speed field, so a report whose
+    electrical sample missed never counts as an absence."""
+    _code, text, _controller = _run(rig, _sampling_pattern(40))
     assert "a device answers on aquabus in 40 of 40 reports" in text
     assert "no report showed the bus empty: the bus-absent rule stays quiet" in text
     assert "aquabus temperature slots with a value: bus2 23.68..23.68 degC" in text
@@ -133,27 +134,28 @@ def test_it_reports_a_healthy_bus_as_quiet(rig) -> None:
 def test_it_measures_how_long_the_bus_was_empty(rig) -> None:
     """A run over a bus device that goes away: the longest stretch with no device, which
     is what ``bus_absent_s`` is judged against."""
-    reports = _refresh_pattern(6) + [fixture_bytes(NO_DEVICE)] * 9 + _refresh_pattern(4)
+    reports = _sampling_pattern(6) + [fixture_bytes(NO_DEVICE)] * 9 + _sampling_pattern(4)
     _code, text, _controller = _run(rig, reports)
     assert "a device answers on aquabus in 10 of 19 reports" in text
     assert "longest stretch with no device: 9 reports, 8.0 s" in text
 
 
 def test_the_unidentified_field_is_shown_with_the_duty_and_the_current(rig) -> None:
-    """Item 114: the raw ``u16`` next to the duty, current and power of the same block,
-    and duty-weighted, which is the only regularity the captures show. The tool names
-    nothing -- it prints the evidence."""
-    _code, text, _controller = _run(rig, _refresh_pattern(8))
+    """Item 114: the raw ``u16`` next to the duty, current and power of the same sample.
+    The tool names nothing and weights nothing -- the four are one instant inside the PWM
+    cycle, so it prints the combinations and how often each occurred."""
+    _code, text, _controller = _run(rig, _sampling_pattern(8))
     assert "the unidentified u16 at +0x0A" in text
-    assert "pwm7  duty  20.00 %     6 mA   0.07 W  +0x0A    26  (+0x0A x duty =  5.20 mA)" in text
-    # An output with no fan is refreshed too, and measures 0 mA and 0 there.
+    assert "pwm7  duty  20.00 %     6 mA   0.07 W  +0x0A    26  x2" in text
+    assert "+0x0A x duty" not in text  # the withdrawn relation is not offered to a reader
+    # An output with no fan is in the same sample, and measures 0 mA and 0 there.
     assert "pwm5  duty  20.00 %     0 mA   0.00 W  +0x0A     0" in text
 
 
-def test_the_raw_listing_marks_the_reports_that_carried_a_measurement(rig) -> None:
-    _code, text, _controller = _run(rig, _refresh_pattern(5), raw=True)
+def test_the_raw_listing_marks_the_reports_that_carried_a_sample(rig) -> None:
+    _code, text, _controller = _run(rig, _sampling_pattern(5), raw=True)
     assert "every report, aquabus blocks (rpm, duty, V, mA, cW, +0x0A):" in text
-    assert text.count("*") >= 2 * len(AQUAERO.aquabus_outputs)  # two refreshing reports
+    assert text.count("*") >= 2 * len(AQUAERO.aquabus_outputs)  # two sampling reports
 
 
 def test_no_device_found_is_exit_1(rig, tmp_path: Path) -> None:

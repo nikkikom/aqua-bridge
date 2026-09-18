@@ -380,10 +380,10 @@ class AquacomputerTiming:
     #: report, without waiting (module docstring, Reading). What it buys is the
     #: blip: a device re-enumerating shows one or two reports of ``0xFFFF``
     #: (item 90), and a window of a few report periods keeps those out of the
-    #: health payload. It is *not* bounded by the aquabus refresh interval
-    #: (:attr:`~aqua_bridge.hw.aquacomputer.DeviceKind.aquabus_refresh_s`, item
-    #: 115): that interval moves the electrical fields, never the speed field
-    #: presence is read from.
+    #: health payload. Nothing about the aquabus bounds it from below: the
+    #: electrical fields of a bus device's block are sampled inside the PWM cycle
+    #: and alternate with the duty, but the speed field presence is read from is
+    #: in every report and takes no part in that (item 115).
     bus_absent_s: float = 10.0
     #: Software sensor (``softN``) that gets the heartbeat every ``apply()``;
     #: 0 is off. Only the aquaero has a known software-sensor report.
@@ -829,11 +829,16 @@ class AquacomputerAdapter:
         ``lost`` whether a device that *had* answered has now been absent for
         ``bus_absent_s`` and is reported -- it stays False on a bus nothing was ever
         on, which is why a consumer with room for one field should show ``state``;
-        ``temps_missing`` the logical names whose aquabus slot is reported as
+        and ``temps_missing`` the logical names whose aquabus slot is reported as
         missing this tick instead of as the frozen value the controller keeps
-        there; and ``refresh_reports`` the kind's mean aquabus refresh interval
-        (item 115), which is why this is judged from the speed field and not
-        from a voltage or a current.
+        there.
+
+        There is no ``refresh_reports`` any more. It carried a mean aquabus
+        refresh interval measured from how many reports held a non-zero current,
+        and that count is now known to follow the output's duty rather than any
+        bus poll (item 115, PROJECT.md section 2), so the number was withdrawn
+        rather than re-rounded. Nothing keyed on it; presence is judged from the
+        speed field, which every report carries.
         """
         absent_s: float | None = None
         if self._bus_absent_since is not None and self._status_t is not None:
@@ -853,7 +858,6 @@ class AquacomputerAdapter:
             "absent_s": absent_s,
             "lost": state == "lost",
             "temps_missing": sorted(self._bus_temps) if self._bus_present is False else [],
-            "refresh_reports": self.kind.aquabus_refresh_reports,
         }
 
     @property
@@ -919,12 +923,13 @@ class AquacomputerAdapter:
         a number, where the device does not measure it for that output, because the
         figure there is a placeholder and not a measurement. Two flags say which:
         ``power_reported`` (an aquaero reports 0 mA and 0 W for its own outputs in PWM
-        mode, and fills its aquabus blocks 5-8 with the bus device's current in about
-        one report in four and with 0 mA in the rest) and ``rail_reported`` (the same
-        aquabus blocks hold the *aquaero's own* rail in those other three reports out
-        of four, indistinguishable from the bus device's in a single report, so an
+        mode, and the current its aquabus blocks 5-8 carry is the bus device's own
+        sample taken inside the PWM cycle, which at a low duty reads 0 mA in most
+        reports with the fan turning) and ``rail_reported`` (the same aquabus blocks
+        hold the *aquaero's own* rail in every report that sample missed the on
+        phase, indistinguishable from the bus device's in a single report, so an
         aquabus output's rail is published as unknown rather than as the aquaero's
-        -- PROJECT.md section 2, 2026-09-17, section 8 item 89). An aquabus slot with
+        -- PROJECT.md section 2, section 8 items 89, 115). An aquabus slot with
         no device behind it is left out entirely: its whole block is meaningless; a
         bound tachometer on such a slot leaves ``rpm`` ``None`` rather than publishing
         its ``0xFFFF``.
@@ -976,26 +981,19 @@ class AquacomputerAdapter:
         if cached is not None:
             return cached
         out: dict[str, str] = {}
-        aquabus = number in self._aquabus
         if not rail:
             out["rail"] = (
                 f"pwm{number} is an output of a device on the {self.kind.name}'s aquabus: "
-                "that block holds the bus device's rail in about one report in four and the "
-                f"{self.kind.name}'s own in the rest, with nothing to tell them apart, so no "
-                "rail is published and a rail sagging behind the bus device is NOT detected "
+                "that block's voltage alternates between the bus device's rail and the "
+                f"{self.kind.name}'s own with the sampling of the block's electrical group, "
+                "with nothing in a report to tell them apart, so no rail is published and a "
+                "rail sagging behind the bus device is NOT detected "
                 "(PROJECT.md section 8 item 117)"
             )
         if not reported:
             out["power"] = (
                 f"pwm{number} reports no current or power this daemon may judge: "
-                + (
-                    "that block carries the bus device's measurement in about one report in "
-                    "four and 0 mA / 0 W in the rest"
-                    if aquabus
-                    else f"the {self.kind.name} reports 0 mA and 0 W for its own outputs in "
-                    "PWM mode however fast the fan turns"
-                )
-                + " (PROJECT.md section 8 item 79)"
+                f"{self.kind.no_power_reason(number)} (PROJECT.md section 8 items 79, 115)"
             )
         self._not_measured_cache[number] = out
         return out

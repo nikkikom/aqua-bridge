@@ -806,7 +806,7 @@ What every decoder assumption now stands at:
 | `0x7FFF` = not connected, in every temperature group | confirmed | 18 of the 28 slots held it in all 90 reports; the 10 that carried a value are `temp6`, `bus2` and `soft1..soft8` (pinned against the fixtures in `tests/test_hw_aquacomputer.py`) |
 | fan blocks at `0x167 + 12k`, rpm +0, duty +2, voltage +4 | confirmed, blocks 1-8 | rpm agrees with the fans that turn; duty 2000 on all eight = preset 1's 20.00 %; voltage 12.04–12.10 V |
 | rpm `0xFFFF` = no device behind the block | confirmed, and narrower than it reads | it means *no device on aquabus at all*: with the Quadro present, its outputs with no fan read 0 rpm, not `0xFFFF` |
-| fan block current +6 and power +8 | **contradicted as a per-report reading** | see below |
+| fan block current +6 and power +8 | **contradicted as a per-report reading**, and the cause corrected on 2026-09-18 | see below, and "The current and power of a fan block are a sample inside the PWM cycle" |
 | fan block voltage +4 = *that output's* 12 V rail | confirmed on blocks 1-4, **contradicted on the aquabus blocks 5-8** | block 7 read 12.10 V (the Quadro's rail) in a measuring report and 12.09 V (the aquaero's own) one second later at an unchanged duty, and the outputs with no fan read 0.00 V then 12.09 V; nothing in a single report tells the two apart, so `DeviceKind.reports_rail` is False for 5-8 and the adapter publishes no rail for them |
 | the `u16` at `+0x0A` of a fan block = current in mA (item 89's guess) | **contradicted, and still unidentified** | it read 26 while the same block's current field read 6 mA; over the run it tracked current and power but matched neither (26↔6 mA/7 cW, 22↔5/6, 15↔4/4, 11↔3/3, 3↔1/1). The captures suggest a *duty-weighted* reading, but they hold one point that can test it: 26 × 20 % = 5.2 against 6 mA, 13 % low (at 100 % duty the product is the raw value itself and tests nothing — item 114 below). It is decoded raw as `FanStatus.unidentified_raw`, for `tools/aquabus_watch.py` only, and published nowhere |
 | flow `flow1..3` at `0xF9`, `flow3` from aquabus | confirmed | all three read 0 with the Quadro present; `flow3` read `0x7FFF` without it (2026-09-15), so `0x7FFF` is the absent-slot sentinel and 0 is "present, nothing connected" |
@@ -832,6 +832,14 @@ mA with power 0, another had blocks 5 and 6 refreshed and block 8 not. So on the
 aquaero neither its own outputs (PWM mode, always 0 mA) nor its aquabus outputs
 give a current a health rule may judge, and `DeviceKind.reports_power` is False
 for all eight.
+
+> **Corrected 2026-09-18, and left standing as the record.** The paragraph below reads
+> the 23-in-90 as the aquaero's aquabus poll interval. It is not one: that count is
+> the share of reports whose electrical sample fell in the on phase of a 20 % duty,
+> and it follows the duty (16 of 16 at 60 %). `AQUABUS_REFRESH_REPORTS`,
+> `AQUABUS_REFRESH_S`, `DeviceKind.aquabus_refresh_reports` / `aquabus_refresh_s` and
+> `device_health.aquabus.refresh_reports` are **withdrawn**. See "The current and
+> power of a fan block are a sample inside the PWM cycle" below.
 
 **That interval is now a number the code carries**: 23 measuring reports in 90
 over 88.6 s is a *mean* of one in 3.9 reports, 3.85 s, which
@@ -1017,6 +1025,196 @@ What still needs the board: run `tools/aquabus_watch.py --seconds 900`
 against the healthy bus and confirm it reports no empty stretch at all (the rule
 quiet on a healthy system), and repeat the departure with the daemon running once
 the owner is willing to unplug the Quadro again.
+
+### The current and power of a fan block are a sample inside the PWM cycle (2026-09-18)
+
+A measurement on the owner's hardware replaces the cause recorded above for the
+CURRENT and POWER fields of an aquabus block. One fan on the Quadro's output 3
+(the aquaero's aquabus block 7), its duty driven live, nothing saved:
+
+| commanded duty | rpm | reports with a non-zero current | values |
+|---|---|---|---|
+| 25 % | 311 | 4 of 14 | 3, 6 mA |
+| 60 % | 720–1022 | 16 of 16 | 1–22 mA |
+| 100 % | 311 → 1016 | 18 of 20 | 16–44 mA |
+
+The share of reports carrying a number tracks the **duty**, not an interval: 4 of
+14 and the earlier 9 of 32 are 29 % and 28 % at a 25 % duty, and 16 of 16 at 60 %
+is what no fixed one-in-four poll can produce. The current is sampled
+instantaneously inside the PWM cycle, so at a low duty most samples land in the
+off phase and read zero, and at full duty the values become plausible for a 12 V
+fan at last — tens of milliamps, where the one-in-four samples had suggested
+single digits.
+
+Read-only confirmation on the same board, at the duty the earlier run used
+(2026-09-18, 45 consecutive status reports over 44.0 s, the aquaero on firmware
+2104, all eight outputs at 20.00 %, the fan on block 7 turning at 251–253 rpm
+throughout; no feature report fetched for this run, nothing written, the
+heartbeat service left alone):
+
+- **11 of 45** reports carried a non-zero current on block 7 — 24 %, against
+  25.6 % in the 90-report run at the same duty, and against a duty of 20 %.
+- **The whole electrical group alternates together, across blocks.** Block 7's
+  current was non-zero in exactly the 11 reports in which block 5 (an output with
+  no fan) read 0.00 V, and in no other: 11 and 34 with nothing off the diagonal.
+  So it is one sampling instant for all four blocks of the bus device, whose four
+  identical outputs run the same duty in the same phase — not a per-block refresh,
+  and the earlier "the refresh is not atomic" reading came from a classifier that
+  mixed the two effects.
+- **The voltage field goes with it**, which is why nothing changes in what the
+  code does with it: in a sampling report block 7 read the Quadro's rail and the
+  three outputs with no fan read 0.00 V; in the other 34 all four read the
+  aquaero's own. A single report still does not say which, so
+  `aquabus_outputs_report_rail` stays False and no rail is published for those
+  outputs. Only the *cause* in the text was wrong.
+- **The aquaero's own outputs are a different, stronger case**: three fans turning
+  at 350, 174 and 375 rpm at a 20 % duty read **0 mA in all 45 reports**. The
+  aquaero measures no current on its own outputs at all.
+
+What changed in the code, and why:
+
+- `AQUABUS_REFRESH_REPORTS` (4), `AQUABUS_REFRESH_S` (4.0),
+  `DeviceKind.aquabus_refresh_reports` / `aquabus_refresh_s` and the
+  `device_health.aquabus.refresh_reports` key are **withdrawn**, not re-rounded.
+  The number measured the duty of the run, so there is nothing to round: no
+  aquabus poll interval has been measured on a field that is not duty-sampled.
+  Nothing was bounded by it — `bus_absent_s` was deliberately not floored by it,
+  and that reasoning stands and is now better founded.
+- `QUADRO.own_outputs_report_power` becomes **False**. The numbers above are the
+  Quadro's own measurement of its own output, relayed by the aquaero, so the
+  sampling is the Quadro's: a Quadro on its own USB would report the same field
+  the same way. It has not been watched over that path, and the safe direction is
+  not to judge. `DeviceKind.reports_power` is now False for every output of both
+  kinds, and the two reasons behind that one answer are kept apart in
+  `DeviceKind.no_power_reason`: the aquaero measures nothing, a bus device samples.
+- Item 114's `u16` at `+0x0A`: the suspicion that it is a current over the
+  output's on-time *of which the current field is the duty average* is
+  **withdrawn**. It rested on the current field being an average over the report;
+  it is one sample, so a pair of the two fields is two coordinates of one instant
+  and fitting a duty relation to them means nothing. The 45-report run adds a pair
+  no scaling of the current survives at all: one report read 2 mA with the field
+  at 0, next to nine that read 6 mA with 26 and one that read 1 mA with 3.
+- Item 92's bus-departure rule is **unchanged**: presence is read from the speed
+  field, which is in every report (251–253 rpm and duty 2000 in all 45), and takes
+  no part in the sampling. What changes is the sentence that justified it.
+- `tools/aquabus_watch.py` now measures the right thing: the share of reports
+  carrying a sample **against that block's duty**, and whether the blocks are
+  sampled together. A run at one duty says nothing on its own; two runs at two
+  duties say everything, and the tool prints the duty next to the share so they
+  can be compared.
+
+**One good consequence for the fan work.** The same measurement that takes the
+current away as a general health signal hands it back for one specific use: at a
+high duty it reads in nearly every report (16 of 16 at 60 %, 18 of 20 at 100 %),
+and a spin-up kick drives the channel high by definition. So during a kick a
+non-zero current *is* evidence that the rotor turns — the only such evidence
+this installation has for an output with no tachometer. It is bounded by the same
+measurement: it can only ever apply to an output **behind a bus device**, because
+the aquaero's own outputs report 0 mA in every report at every duty. That is
+written up as a proposed item, not built here.
+
+The earlier text is left standing with a correction marked above it. It was
+written honestly from what was then measurable — a single duty, read-only — and
+the record should show what it took to find it out.
+
+### The controller's own start boost (2026-09-18)
+
+The daemon's spin-up kick only helps while the daemon runs, and the case that
+motivates it — power comes back, the controller holds its saved preset, the fans
+do not start — happens before any board is up. The aquaero's firmware has a
+per-output start boost (a duty held for a time when an output goes from stopped
+to running), so the question is whether this project can read it, publish it, and
+possibly write it.
+
+**The answer for now is: it cannot be picked out read-only.** The controller
+block is where the rest of an output's settings live, and six of its ten `u16`
+are undecoded — but nothing in a read-only capture says which of them is the
+boost, or even that the boost is there at all. What the captures give:
+
+- The controller-block array is **twelve blocks**, not eight: `0x20C + 20k` for
+  `k` = 0..11, ending at `0x2FB`. Blocks 1–4 are the aquaero's own outputs and
+  5–8 the Quadro's four on aquabus — established by writing outputs 1–4 and
+  output 7 and watching the fans follow; that 9–12 are four more aquabus outputs
+  is an inference from their position, not something a capture shows. What the captures do
+  show is that they are controller blocks: 9–12 read, in every capture, byte for
+  byte what block 8 read while it was unconfigured in the 2026-09-15 capture:
+  `01 C2 07 D0 0D AC 27 10 27 10 00 02 00 02 00 00 FF FF 03 E8`. That is the
+  firmware's default for an output nothing is assigned to, and it is the reference
+  a changed block can be diffed against.
+- Four of the block's ten `u16` are decoded and unchanged: minimum power `+0x04`,
+  maximum power `+0x06`, the mode word `+0x0E` and the control source `+0x10`.
+  The other six are **not identified**: `+0x00`, `+0x02`, `+0x08`, `+0x0A`,
+  `+0x0C`, `+0x12`.
+
+| word | never-configured block | owner's outputs, 2026-09-15 | owner's outputs, 2026-09-17 and 2026-09-18 |
+|---|---|---|---|
+| `+0x00` | 450 | 500, 500, 500, 500, 450, 300, 500 | 100 on output 1, 450 on 2–8 |
+| `+0x02` | 2000 | 1000, 1000, 1600, 1600, 2800, 2000, 1500 | 2000 on all eight |
+| `+0x08` | 10000 | 5000 on all seven configured | 10000 on all eight |
+| `+0x0A` | 2 | 2 | 2 |
+| `+0x0C` | 2 | 2 | 2 |
+| `+0x12` | 1000 | 1000 | 1000 |
+
+What that does and does not allow:
+
+- `+0x08` is a per-output field in centi-percent, like the two power limits next
+  to it: 100.00 % in every unconfigured block, and 50.00 % on the seven outputs
+  the owner had configured before reconfiguring them. That is the shape of a
+  start-boost power — and equally the shape of any other per-output percentage the
+  aquaero keeps. **Nothing in a read-only capture chooses between them.**
+- `+0x0A` and `+0x0C` both read 2 in every block of every capture. A boost
+  duration in seconds and a tachometer's pulses per revolution are both plausible
+  2s, and neither can be told from the other.
+- The one difference *between outputs* that the current configuration shows is
+  `+0x00` (100 on output 1, 450 on the rest), and nothing says what the owner
+  changed there.
+
+So the honest outcome is the plain one: **the evidence does not support decoding
+the start boost, and the code stays honest.**
+Nothing here names a boost. What the code does instead is make the next capture
+cheap: the six words are read into `ChannelState.undecoded` (raw, no unit, no
+name — the same treatment as the fan block's `+0x0A`), printed by
+`tools/aquacomputer_probe.py` under each output, published by nothing, judged by
+nothing and written by nothing.
+
+**What would settle it**, and only the owner can produce it: set the start boost
+to two clearly different values on two outputs in the aquaero's own menu — say
+output 1 at 100 % for 5 s and output 2 at 40 % for 1 s — and capture a control
+report. Two of the six words will differ between those two blocks in the way the
+two settings differ, and that is the decode. A capture before and after, on one
+output, would do as well.
+
+**Writing it is the owner's decision, and no writer is implemented.** Not because
+the write is hard — it is the same control-report SET the daemon already does —
+but because it would be a write of a field this project cannot name. If the layout
+is settled later, this is what making the boost survive a power cycle costs:
+
+- The boost has to be **saved**, not written live. A SET alone is gone at the next
+  power cycle (§8 item 84), which is exactly the case the boost exists for. Saving
+  means the save report (`DeviceKind.save_report`, feature report 6), which this
+  daemon sends **never** (§8 item 86).
+- The risk is not the boost: it is everything else in the report. A save persists
+  the *whole* control report into the controller's memory, including whatever the
+  daemon last wrote — its presets, its control sources, its 0 % / 100 % power
+  limits — over the configuration the owner set by hand on the device. An
+  administrator on the vendor's forum describes report 6 as the one that "controls
+  the device, lock unlock, reset", to be sent only deliberately.
+- So if it is ever built: behind an explicit opt-in key that is off by default, as
+  a one-shot commissioning action in `tools/aquacomputer_commission.py` rather
+  than anything the daemon does on a tick, with the control report captured to a
+  file before and after, and only with the owner's own configuration already in
+  the report being saved. The daemon's own writes must never be part of a saved
+  report.
+- And it would only be worth doing at all if a fan measurably fails to start from
+  the preset the controller holds. There is a hint that it would: the sweep of
+  2026-09-15 found both test fans starting only at 25 % while holding 355–375 rpm
+  all the way down to 14 % (§2, "USB spike results"), and on 2026-09-18 three fans
+  were turning at a 20 % duty (350, 174 and 375 rpm) — running only because
+  something had already spun them up. A controller that comes back holding 20 % is
+  exactly the case the boost exists for. But that is a hint, not the observation:
+  the observation is one bench test — hold an output at its preset, stop the fan,
+  and see whether it starts again — and it needs the owner, because stopping a fan
+  by hand is not something a daemon can do.
 
 
 ---
@@ -3502,7 +3700,7 @@ a model converges only with them.
   | `duty_mismatch_s` | 5.0 | finite, > 0 | a mismatch lasting longer re-reads the report and rewrites every channel |
   | `write_min_interval_s` | 0.0 | finite, ≥ 0 | a falling duty is written at most this long after the device's last write (rises at once); 0 writes every fall; only limits USB traffic since writes are not saved (§8 item 86) |
   | `write_deadband` | 0 | integer 0..10000 | 1/100 %: a falling duty is written only this far below the written one; 0 writes every fall (§8 item 86) |
-  | `bus_absent_s` | 10.0 | finite, > 0 | how long every aquabus fan block must read "no device" (rpm `0xFFFF`), over received reports, before the controller reports the device on its aquabus as lost (§8 item 92). It bounds the *report* only — a bound `busN` reads as missing from the first such report — and what it buys is the blip: a device re-enumerating shows one or two reports of `0xFFFF` (§8 item 90). It is deliberately **not** floored by the aquabus refresh interval (§8 item 115): that interval moves an aquabus block's electrical fields, while presence is read from the speed field every report carries, so a skipped poll cannot look like a departure at any window |
+  | `bus_absent_s` | 10.0 | finite, > 0 | how long every aquabus fan block must read "no device" (rpm `0xFFFF`), over received reports, before the controller reports the device on its aquabus as lost (§8 item 92). It bounds the *report* only — a bound `busN` reads as missing from the first such report — and what it buys is the blip: a device re-enumerating shows one or two reports of `0xFFFF` (§8 item 90). Nothing about the aquabus floors it (§8 item 115, as corrected 2026-09-18): an aquabus block's electrical fields are one sample taken inside the PWM cycle and read 0 mA at a low duty with the fan turning, while presence is read from the speed field every report carries, so no report can look like a departure at any window |
   | `heartbeat_sensor` | 0 (off) | integer 0..8, aquaero only | the software sensor `softN` every `apply()` writes, after its duty work and only when that succeeded, as the heartbeat of the controller's own watchdog; 0 only while no software sensor is enabled on the device (§8 item 84) |
   | `heartbeat_value_c` | 20.0 | finite, −327.68..327.66 °C | the temperature the heartbeat writes; it must stay below the alarm the controller has on that sensor |
 
@@ -3634,8 +3832,9 @@ a model converges only with them.
     `current_ma` and
     `power_w` are `None`, not a number, wherever `power_reported` is false,
     and `voltage_v` is `None` wherever `rail_reported` is false (the
-    aquaero's aquabus outputs, whose voltage field is the aquaero's own rail
-    in about three reports out of four), so a placeholder can never be read
+    aquaero's aquabus outputs, whose voltage field holds the aquaero's own
+    rail in every report the block's electrical sample missed the on phase of
+    the output's duty — most of them at a low duty), so a placeholder can never be read
     as a measurement (§8 item 89); `rpm` from
     the channel's *bound*
     tachometer (`fans.<ch>.rpm`, named in `tach`), the one `obs.rpm` and a
@@ -3660,7 +3859,7 @@ a model converges only with them.
     `state` — `unknown`, `present`, `empty`, `lost` or `never_seen`, the one
     field a single line can show — plus `present`, `seen`, `absent_s`, `lost`
     (a device that answered and then stopped, never an empty bus nothing was
-    ever on), `temps_missing` and `refresh_reports`), serial, firmware,
+    ever on) and `temps_missing`), serial, firmware,
     power cycles, status age, and `active_profile` when a later change
     publishes one (read defensively; absent until then). `problems` is the
     human-readable list, empty exactly when nothing is wrong. Two more
@@ -3733,12 +3932,14 @@ a model converges only with them.
     depend on the duty, so it is judged at every duty and a duty move never
     restarts it: a rail that sags while the solver modulates is exactly the
     case worth catching.
-  - **power against the duty.** Only where the device reports power at
-    all: an aquaero reports 0 mA and 0 W for its *own* outputs 1–4 in PWM
-    mode however fast the fan turns, and fills its aquabus blocks 5–8 with
-    the bus device's current in only about one report in four (§2,
-    2026-09-17), so on that controller absence of current is no fault
-    there and `power_reported` says so per output. Expected power is
+  - **power against the duty.** Only where the device reports a current a
+    single report may be judged on — which no supported output does (§2,
+    2026-09-18). An aquaero reports 0 mA and 0 W for its *own* outputs 1–4
+    in PWM mode however fast the fan turns, and a bus device's outputs
+    (its aquabus blocks 5–8, and a Quadro's own four) sample the current
+    inside the PWM cycle, so at a low duty most reports read 0 mA with the
+    fan turning. Absence of current is therefore no fault anywhere, and
+    `power_reported` says so per output. Expected power is
     `count * power_w_at_max * phi(duty) ** power_exponent` over the same
     band; `fan_models.<m>.power_w_at_max` has no default (the figure
     depends on the fan), so without it this rule is simply off for that
@@ -3794,17 +3995,31 @@ a model converges only with them.
   problem line: it is a fact about the controller's configuration, and on
   the owner's board seven of eight are in that state.
 
+  **The controller block's undecoded words** (§2, "The controller's own start
+  boost"). Four of the ten `u16` of an aquaero controller block are decoded —
+  minimum power, maximum power, the mode word and the control source — and six
+  are not: `+0x00`, `+0x02`, `+0x08`, `+0x0A`, `+0x0C`, `+0x12`
+  (`aquacomputer.CONTROL_BLOCK_UNDECODED`). They are read raw into
+  `ChannelState.undecoded` and printed by `tools/aquacomputer_probe.py` under
+  each output, exactly like the fan block's `+0x0A`: no name, no unit,
+  published by nothing, judged by nothing and written by nothing — a duty write
+  touches the preset, the source and the two power limits and nothing else in
+  the block. The firmware's per-output **start boost** is one of the six and a
+  read-only capture cannot say which, because every output of the owner's
+  controller carries the same value in each. Printing them is what makes the
+  capture that settles it a diff.
+
   **Absence is judged on the speed field and on nothing else** (items 90,
-  116). An aquabus block in a report that carries no measurement looks
-  exactly like an empty slot, so the rule that separates them matters: it
-  is `rpm == 0xFFFF` (`FanStatus.present`), the one field the aquaero does
-  not substitute. The voltage cannot do it in either direction — an
-  aquabus output with no fan reads 0.00 V in a measuring report, which is
-  byte for byte what a slot with no device on the bus reads, and the same
-  present output reads 12.09 V one second later — so a rule keyed on it
-  would call a present device absent in one report and present in the
-  next. Nothing in the project keys on it, and no confirmation window is
-  added either: the sentinel is invariant across the refresh, so a present
+  116). An aquabus block whose electrical sample fell in the off phase of
+  its output's PWM cycle looks exactly like an empty slot, so the rule that
+  separates them matters: it is `rpm == 0xFFFF` (`FanStatus.present`), the
+  one field that takes no part in the sampling. The voltage cannot do it in
+  either direction — an aquabus output with no fan reads 0.00 V in a
+  sampling report, which is byte for byte what a slot with no device on the
+  bus reads, and the same present output reads 12.09 V one second later —
+  so a rule keyed on it would call a present device absent in one report and
+  present in the next. Nothing in the project keys on it, and no confirmation
+  window is added either: the sentinel is invariant across the sampling, so a present
   bus device is never judged absent, and an absent one is judged absent on
   the first report that shows `0xFFFF` — how soon the aquaero shows it,
   and whether a bus hiccup can show it for one report only, no capture
@@ -4735,7 +4950,14 @@ the board.
   output's own), the aquaero's own blocks reporting no current whatever the
   fan does, the live temperature groups with 10 of 28 slots populated and the
   rest at the `0x7FFF` sentinel, the live control report with every block on
-  preset 1, and the aquabus mode word read but never interpreted.
+  preset 1, and the aquabus mode word read but never interpreted. The
+  2026-09-18 pass adds the controller block itself (§2 "The controller's own
+  start boost"): twelve blocks, not eight, with the spare four byte-identical
+  to the block 8 that was caught unconfigured; the six undecoded `u16` read
+  raw for every channel and none for the Quadro; that all eight outputs carry
+  the same value in each of them, which is why no start boost can be named;
+  that a duty write touches none of them; and that no kind carries an aquabus
+  refresh interval any more (item 115, corrected).
 - `tests/test_hw_hidraw.py` — discovery on a fake sysfs tree (interface
   selection, serial selection, ambiguity naming the serials, not found,
   uevent lines without `=`), the ioctl request numbers, draining reports
@@ -6780,9 +7002,11 @@ Owner decision (2026-09-16):
     What this item does **not** cover, and where the remainder lives, so
     "Done" is not read for more than it is: **current is never judged on
     its own** — on the aquaero neither its own outputs (0 mA in PWM mode)
-    nor its aquabus blocks (a measurement in about one report in four) give
-    a number a rule may act on, so `power_reported` is false for all eight
-    and both fields publish as `None`; **the rail rule cannot fire for an
+    nor its aquabus blocks (a sample taken inside the PWM cycle, which at a
+    low duty reads 0 mA with the fan turning — the cause corrected
+    2026-09-18, §2) give a number a rule may act on, so `power_reported` is
+    false for all eight, and for a Quadro's own four as well, and both
+    fields publish as `None`; **the rail rule cannot fire for an
     aquaero's aquabus outputs**, which is item 117, accepted and now
     declared per channel in the verdict; and **the thresholds are still the
     wide guesses**, with `fan_models.<m>.power_w_at_max` unset in both
@@ -8442,19 +8666,25 @@ Owner decision (2026-09-16):
     evidence, not less heat. The **report** waits for the new `bus_absent_s`
     (10.0 s, > 0, floored by nothing else): one error line naming what went
     missing, an entry in `device_health`'s `problems`, and
-    `device_health.aquabus` with `state`, `present`, `seen`, `absent_s`, `lost`,
-    `temps_missing` and `refresh_reports`. `state` (`unknown`, `present`,
+    `device_health.aquabus` with `state`, `present`, `seen`, `absent_s`, `lost`
+    and `temps_missing` (the `refresh_reports` key this item shipped was removed
+    on 2026-09-18 with the number behind it, item 115; nothing keyed on it). `state` (`unknown`, `present`,
     `empty`, `lost`, `never_seen`) is the field a one-line consumer shows, and
     `lost` is True only for a device that answered and then stopped — the empty
     bus of a plain aquaero is `never_seen`, not a fault. `seen` separates "the
     Quadro left" from "nothing has ever answered here", and the window keeps a
-    re-enumeration blip (item 90) out of the report. It is deliberately **not**
-    floored by item 115's refresh interval: that interval moves the electrical
-    fields, never the speed field presence is read from, so no skipped poll can
-    look like a departure at any window. Tests cover the departure on one adapter
+    re-enumeration blip (item 90) out of the report. Nothing about the aquabus
+    floors it: an aquabus block's electrical fields are one sample taken inside
+    the PWM cycle and read 0 mA at a low duty with the fan turning (item 115, as
+    corrected 2026-09-18), while the speed field presence is read from is in
+    every report, so no report can look like a departure at any window. The
+    conclusion is the one this item shipped; only the sentence that justified it
+    has changed, and it is now better founded, since what was taken for a poll
+    interval was never one. Tests cover the departure on one adapter
     and through the loop (a bound `bus2`, where no tick after the loss commands
     any channel below what it commanded before it, ending at `fallback_pwm`),
-    the refresh gap never being read as an absence, a single transient
+    a report whose electrical sample missed never being read as an absence, a
+    single transient
     `0xFFFF`, a controller with nothing bound on the bus, a bus that was never
     there, and a reopen of the node (which does not restart the clock on an
     empty bus, so `lost` and `absent_s` stay one pair). §3 Track B and the
@@ -8624,7 +8854,22 @@ Owner decision (2026-09-16):
     disabled `soft3..8` are exactly the slots those reports show as
     `0x7FFF`. No hardware access was needed and none was used for this.
 
-114. **Read-only evidence gathered, the answer needs a write** (2026-09-17;
+114. **The duty-average suspicion is withdrawn; the field is still
+    unidentified** (corrected 2026-09-18). The reading below — "a current
+    measured over the output's on-time, of which the current field is the duty
+    average" — rested on the current field being an average over the report. It
+    is not: it is one sample taken inside the PWM cycle (§2, 2026-09-18), so a
+    pair of `+0x0A` and the current field is two coordinates of one instant and
+    the fit below has no meaning, not merely thin support. The 45-report run adds
+    a pair no scaling of the current survives: one report read 2 mA with the
+    field at 0, next to nine that read 6 mA with 26 and one that read 1 mA with
+    3. The field stays decoded raw, published by nothing and judged by nothing.
+    What would now identify it is a run at a **high** duty, where the current
+    field reads in every report and both numbers are steady — which is a duty
+    change, i.e. still a write, and still the owner's call.
+
+    *The entry this corrects, left as the record —* **Read-only evidence
+    gathered, the answer needs a write** (2026-09-17;
     §2 "The bus in three questions"). What the `u16` at `+0x0A` of a fan block
     is *not*: not the current (26 against the same block's 6 mA in the same
     report), not the power (7 cW there), not a constant, and nothing at all on
@@ -8651,7 +8896,34 @@ Owner decision (2026-09-16):
     output, and one output in DC mode) and writing it off for good. The
     experiment is what the decision needs, not more read-only watching.
 
-115. **Interval measured and recorded, its cause still open** (2026-09-17).
+115. **The interval is withdrawn: what was measured was the duty**
+    (corrected 2026-09-18; §2, "The current and power of a fan block are a sample
+    inside the PWM cycle"). The 23-in-90 below counted the reports whose aquabus
+    block held a non-zero current, and that count follows the output's **duty**,
+    not any bus poll: 4 of 14 at 25 %, 16 of 16 at 60 %, 18 of 20 at 100 % on the
+    owner's hardware, and 11 of 45 at 20 % on a read-only run the same day. A
+    fixed one-in-four poll cannot give 16 of 16. So `AQUABUS_REFRESH_REPORTS`,
+    `AQUABUS_REFRESH_S`, `DeviceKind.aquabus_refresh_reports` /
+    `aquabus_refresh_s` and `device_health.aquabus.refresh_reports` are removed
+    rather than re-rounded — there is no number to round, because no bus poll
+    interval has been measured on a field that is not duty-sampled. Nothing was
+    bounded by them. The 45-report run also corrects the reading in the other
+    direction: the four aquabus blocks are sampled **together** (block 7's
+    current was non-zero in exactly the 11 reports where block 5 read 0.00 V, and
+    in no other), so "the refresh is not atomic" was an artifact of the same
+    mixed classifier. What is still open is the question this item was really
+    about, now asked of a field that can answer it: **at what interval does the
+    aquaero poll its aquabus behind the speed and duty fields?** Those two are in
+    every report and may simply be held between polls, so a run at a duty where
+    the current is steady (60 % or more, where it reads in every report) is what
+    would show a poll gap at all. `tools/aquabus_watch.py` now prints the share
+    of sampling reports against the block's duty, which is the measurement; a run
+    at one duty says nothing on its own. Whether a poll rate is a **device
+    setting** is unchanged and still needs the owner's menu and a before/after
+    control report.
+
+    *The entry this corrects, left as the record —* **Interval measured and
+    recorded, its cause still open** (2026-09-17).
     From the 90-report run: 23 reports carried the bus device's own electrical
     values and 67 carried substitutes over 88.6 s — one refresh in 3.9 reports,
     3.85 s, at a report cadence of 0.98 s — and the refresh is per block, not

@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from aqua_bridge.hw.aquacomputer import AQUABUS_REFRESH_S, AQUAERO, KINDS, QUADRO
+from aqua_bridge.hw.aquacomputer import AQUAERO, KINDS, QUADRO
 from aqua_bridge.hw.aquacomputer_adapter import (
     ENTRY_KEYS,
     KIND_TIMING_DEFAULTS,
@@ -602,15 +602,16 @@ def test_the_unit_watchdog_fits_the_das_example_as_it_ships_and_with_two_control
 
 def test_bus_absent_s_defaults_and_is_bounded_only_by_being_a_positive_time() -> None:
     """The key that says how long every aquabus block must read "no device" before the
-    daemon reports the bus device lost (item 92). It has no floor from the aquabus
-    refresh interval (item 115): that interval moves an aquabus block's electrical
-    fields, while presence is read from the speed field every report carries, so no
-    skipped poll can look like a departure however short the window is. A short window
-    only risks reporting a re-enumeration blip, which costs a log line and never
-    cooling -- the temperatures go missing from the first empty report either way."""
+    daemon reports the bus device lost (item 92). Nothing about the aquabus floors it
+    (item 115): an aquabus block's electrical fields are sampled inside the PWM cycle
+    and read 0 mA in most reports at a low duty, while presence is read from the speed
+    field every report carries, so no report can look like a departure however short the
+    window is. A short window only risks reporting a re-enumeration blip, which costs a
+    log line and never cooling -- the temperatures go missing from the first empty report
+    either way."""
     assert _parse(_SECTION).timing.bus_absent_s == 10.0
     assert "bus_absent_s" in TIMING_KEYS and "bus_absent_s" in ENTRY_KEYS
-    assert _parse(dict(_SECTION, bus_absent_s=AQUABUS_REFRESH_S)).timing.bus_absent_s == 4.0
+    assert _parse(dict(_SECTION, bus_absent_s=4.0)).timing.bus_absent_s == 4.0
     assert _parse(dict(_SECTION, bus_absent_s=1.0)).timing.bus_absent_s == 1.0
     with pytest.raises(ConfigError, match="bus_absent_s must be a finite number > 0"):
         _parse(dict(_SECTION, bus_absent_s=0))

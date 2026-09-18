@@ -165,7 +165,8 @@ def test_decodes_the_quadro_on_the_aquaeros_aquabus(tmp_path: Path) -> None:
     assert "  aquabus temperature slots (bus1..bus8, degC):\n    bus2      24.14\n" in text
     # The aquaero measures neither its own nor its aquabus outputs dependably (item 89):
     # the raw figures are shown, marked as not measured -- on an aquabus block that
-    # includes the voltage, which is the aquaero's own rail in three reports out of four.
+    # includes the voltage, which is the aquaero's own rail in every report the block's
+    # electrical sample missed the on phase of the output's PWM cycle.
     assert (
         "pwm7/fan7   1105 rpm  duty 100.00 %  not measured (12.10 V, 27 mA, 0.32 W)  "
         "(aquabus)" in text
@@ -173,4 +174,12 @@ def test_decodes_the_quadro_on_the_aquaeros_aquabus(tmp_path: Path) -> None:
     assert "pwm5/fan5      0 rpm" in text and "no device" not in text
     assert "flow3  0" in text
     assert "pwm7  duty 100.00 %  source 0x0059  min 39.96 %" in text
+    # Under every output, the six words of its controller block nobody here has
+    # identified -- raw, with no name and no unit. The firmware's per-output start
+    # boost is one of them, and this listing is what a capture with the boost set
+    # differently on two outputs would be diffed against (PROJECT.md section 2,
+    # "The controller's own start boost").
+    assert "      not decoded: +0x00 500  +0x02 1000  +0x08 5000  +0x0A 2" in text
+    assert text.count("not decoded: ") == 8  # one per output, and no twelfth block
+    assert "boost" not in text  # nothing here names what it cannot prove
     assert controller.sets() == [] and controller.saves() == []
