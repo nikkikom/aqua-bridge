@@ -8830,6 +8830,35 @@ Owner decision (2026-09-16):
     interval becomes configurable, an aquabus output's current becomes
     a health signal again and `aquabus_outputs_report_power` can be
     True for a controller configured that way.
+135. A fan with no tachometer is invisible to the spin-up rule (item
+    75); the owner's idea is to watch its **current** instead, and the
+    evidence says what would have to be settled first. A stalled rotor
+    draws differently from a turning one, so an output's current could
+    in principle stand in for a tachometer the fan does not have — but
+    32 status reports over 31.7 s with the Quadro's own USB unplugged
+    (aquabus path alone) show three problems: the aquaero's own outputs
+    report 0 mA / 0 W in every report, so no current-based rule can
+    ever cover a fan wired to the controller itself, where three of the
+    owner's four fans are — the device does not measure the field at
+    all, not a gap to close (§3 "Fan and device health",
+    `power_reported`); an output behind the aquabus device carries a
+    non-zero current in only 9 of the 32 reports, the same roughly
+    one-in-four refresh item 115 describes, and unplugging the slave's
+    USB changed nothing, so it is the controller's own bus polling; and
+    the values themselves are implausible as they stand — 1, 2, 4 and
+    6 mA for a 12 V fan turning at about 310 rpm, where tens of
+    milliamps would be expected, so the field's scale is not settled
+    (item 114 is about exactly that field family). Not shippable yet:
+    first settle the current field's **scale** (item 114's bench
+    experiment, or writing the field off), then find a **sampling
+    window that outlasts the refresh pattern** — a single report proves
+    nothing when three in four carry a substitute, so the rule would
+    have to accumulate over several refresh intervals (item 115
+    measured a 3.85 s mean, not the longest gap). Any such rule could
+    only ever cover outputs behind a bus device, never the aquaero's
+    own, so at most a quarter of the owner's enclosure, and would have
+    to declare that in its `monitored` flag like every other rule that
+    does not cover what it looks at.
 
 ### 8.4 Open — Zero 2 W upgrade
 
