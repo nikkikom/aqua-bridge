@@ -9082,6 +9082,17 @@ Owner decision (2026-09-16):
     look. Worth deciding whether the two budgets should be one key at all, or
     whether the reset wants its own, since a key named for one rule quietly
     gating another is what makes that setting a trap.
+146. **A genuine sensor-only aquabus device has never been captured**
+    (item 130). A Farbwerk 360, or any bus slave with zero fan outputs, has
+    never actually been on the owner's bus; item 130's flow-slot witness is
+    inferred to generalise from the Quadro's own flow header, not measured
+    against a second device kind. Worth a bench session if one becomes
+    available.
+147. **`bench_model_store.py`'s dwell scan and SMART-serial injection are
+    dev-machine-only conveniences** (item 133). They have no bearing on and
+    are not exercised by anything that runs on the Pi. Worth a one-line note
+    in PROJECT.md section 4 pointing future readers at item 133 if the bench
+    tool's warm-up ever needs revisiting again.
 
 ### 8.3 Open — needs the DAS hardware
 
