@@ -26,7 +26,13 @@ inserted), per sensor one lag node, per bay one SMART lag node::
 Airflow: each output (PWM channel) drives ``count`` fans (1 = direct, 2 = a
 splitter). Fan ``k`` of output ``i`` turns at
 ``rpm_k = rpm_max,k * clip((u - u0_i) / (1 - u0_i), 0, 1)`` (dead band ``u0``),
-lagged by ``tau_s`` and zero when stalled, and moves
+lagged by ``tau_s`` and zero when stalled. A *stopped* rotor also needs
+``start_duty`` before it begins to turn at all (PROJECT.md section 8 item 75: the
+owner's aquaero test fan stops at 13 % and starts at 25 %), so a fan commanded
+between the dead band and its start duty from a standstill reports 0 rpm for ever
+-- the stalled-fan scenario the spin-up kick is tested against. It defaults to 0,
+which is the physics every run had before the parameter existed. A turning fan
+moves
 ``e_i * fouling_i(t) * (rpm_k / rpm_max,i)^exponent_i`` W/K of air. The
 output's airflow splits over zones by ``share``. ``Qn_z`` is ``Q_z``
 normalised by the zone's clean full-speed airflow. ``kappa`` is symmetric
@@ -239,6 +245,13 @@ class FanParams:
     shares: dict[str, float]
     count: int = 1
     tach: bool = True
+    #: The duty a *stopped* rotor needs before it begins to turn (PROJECT.md section 8
+    #: item 75: a fan's starting duty is above its running duty -- the owner's aquaero
+    #: test fan stops at 13 % and starts at 25 %). A fan below it that is already
+    #: turning keeps turning down to its dead band; a fan below it that is stopped
+    #: stays stopped however long it is commanded. ``0.0`` (the default) is the
+    #: physics every run had before this parameter existed, exactly.
+    start_duty: float = 0.0
     rpm_max: float = 1500.0
     rpm_spread: tuple[float, ...] = ()
     deadband: float = 0.1
@@ -257,6 +270,8 @@ class FanParams:
             raise ValueError(f"fan {self.name}: needs at least one zone with share > 0")
         if not 0 <= self.deadband < 1:
             raise ValueError(f"fan {self.name}: deadband must be in [0, 1)")
+        if not 0 <= self.start_duty <= 1:
+            raise ValueError(f"fan {self.name}: start_duty must be in [0, 1]")
         if not self.exponent > 0 or not self.rpm_max > 0 or self.e_w_per_k < 0:
             raise ValueError(f"fan {self.name}: exponent and rpm_max > 0, e >= 0")
         if self.fouling_per_day < 0 or not 0 < self.fouling_floor <= 1 or self.tau_s < 0:
@@ -437,6 +452,7 @@ _FAN_KEYS = {
     "zones",
     "count",
     "tach",
+    "start_duty",
     "rpm_max",
     "rpm_spread",
     "deadband",
@@ -789,6 +805,7 @@ def build_das_params(
         for name in (
             "rpm_max",
             "deadband",
+            "start_duty",
             "exponent",
             "e_w_per_k",
             "fouling_per_day",
@@ -971,7 +988,14 @@ class DasPlant:
             start = dict.fromkeys(p.channels, float(initial_pwm))
         start = {ch: min(1.0, max(0.0, v)) for ch, v in start.items()}
         self._history: list[dict[str, float]] = [start]
-        self._fan_frac = {f.name: np.full(f.count, f.rpm_frac(start[f.name])) for f in p.fans}
+        # Whether each rotor is turning (``start_duty``): a fan started below its start
+        # duty has never begun to turn, which is the state a controller restart meets.
+        # With the default ``start_duty`` of 0 every rotor turns and the speed below is
+        # exactly what it always was.
+        self._turning = {f.name: np.full(f.count, start[f.name] >= f.start_duty) for f in p.fans}
+        self._fan_frac = {
+            f.name: np.where(self._turning[f.name], f.rpm_frac(start[f.name]), 0.0) for f in p.fans
+        }
         self._noise = np.zeros(ns)
         self._dropout = np.zeros(ns, dtype=bool)
         self.energy = {"in_j": 0.0, "out_j": 0.0, "swap_j": 0.0}
@@ -1131,10 +1155,20 @@ class DasPlant:
 
     def _update_fans(self, pwm: Mapping[str, float], dt: float, lag: bool = True) -> None:
         for f in self.params.fans:
-            target = f.rpm_frac(pwm[f.name])
+            u = pwm[f.name]
+            target = f.rpm_frac(u)
             frac = self._fan_frac[f.name]
+            turning = self._turning[f.name]
             for k in range(f.count):
-                tgt = 0.0 if (f.name, k) in self.stalled else target
+                # A stopped rotor needs ``start_duty`` to begin; a turning one keeps
+                # turning until the dead band stops it (item 75). With the default
+                # ``start_duty`` of 0 the first test is always true and the second only
+                # matters at ``target == 0``, so the fan state is what it always was.
+                if turning[k]:
+                    turning[k] = target > 0.0
+                else:
+                    turning[k] = u >= f.start_duty and target > 0.0
+                tgt = 0.0 if (f.name, k) in self.stalled or not turning[k] else target
                 if lag and f.tau_s > 0:
                     frac[k] += (tgt - frac[k]) * (1.0 - math.exp(-dt / f.tau_s))
                 else:
