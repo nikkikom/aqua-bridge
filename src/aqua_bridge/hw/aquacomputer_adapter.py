@@ -75,10 +75,11 @@ The device on aquabus
     since this adapter started reading, which is what separates "the Quadro left"
     from "nothing has ever been on this bus". What the window keeps out is a
     device re-enumerating: one transient ``0xFFFF`` (item 90) is a blip, not a
-    departure. It is *not* bounded by the aquabus refresh interval of item 115:
-    that interval moves the electrical fields only, while presence is read from
-    the speed field, which every report carries, so a poll the controller skipped
-    cannot look like a departure however short this window is.
+    departure. Nothing about the aquabus bounds it from below: an aquabus block's
+    electrical fields alternate with the output's duty (item 115), while presence
+    is read from the speed field, which every report carries, so nothing the
+    controller does on the bus can look like a departure however short this
+    window is.
 
     What this cannot see is a bus device with **no fan outputs** at all: presence
     is judged from the fan blocks, so such a device reads as an empty bus and its
@@ -414,11 +415,11 @@ class AquacomputerTiming:
         """Validates what only the device kind can bound: which software sensors
         exist, and whether the kind has a software-sensor report at all.
 
-        ``bus_absent_s`` is deliberately *not* bounded here by the kind's aquabus
-        refresh interval: that interval moves the electrical fields of an aquabus
-        block, while presence is read from the speed field, which every report
-        carries (PROJECT.md section 8 items 115 and 92), so no skipped poll can be
-        read as a departure at any window. A very short window only risks
+        Nothing about the aquabus bounds ``bus_absent_s`` from below, which is why
+        nothing here does: an aquabus block's electrical fields are duty-dependent,
+        while presence is read from the speed field, which every report carries
+        (PROJECT.md section 8 items 115 and 92), so nothing the controller does on
+        the bus can be read as a departure at any window. A very short window only risks
         reporting a re-enumeration blip, which costs a log line, never cooling.
         """
         if not self.heartbeat_on:
@@ -985,7 +986,7 @@ class AquacomputerAdapter:
             out["rail"] = (
                 f"pwm{number} is an output of a device on the {self.kind.name}'s aquabus: "
                 "that block's voltage alternates between the bus device's rail and the "
-                f"{self.kind.name}'s own with the sampling of the block's electrical group, "
+                f"{self.kind.name}'s own, in step with the block's current, "
                 "with nothing in a report to tell them apart, so no rail is published and a "
                 "rail sagging behind the bus device is NOT detected "
                 "(PROJECT.md section 8 item 117)"

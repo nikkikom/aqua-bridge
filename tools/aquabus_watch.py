@@ -12,15 +12,20 @@ control report is written, no duty is touched. It is the measurement behind thre
 questions the captures left open.
 
 *How are an aquabus block's electrical fields sampled?* Only speed and output duty
-are in every report. The voltage, current, power and the ``+0x0A`` word of blocks
-5-8 come from one instantaneous sample inside the output's PWM cycle, so the share
-of reports carrying a non-zero current follows the **duty**: 4 of 14 at 25 %, 16 of
-16 at 60 %, 18 of 20 at 100 %, 11 of 45 at 20 % (PROJECT.md section 2). This prints,
-per block, how many reports carried one against that block's duty, and whether the
-blocks alternate together -- they did in all 45 reports of 2026-09-18, which is one
-sampling instant for the whole device and not a per-block refresh. An earlier
-version of this tool read the same count as a fixed bus-poll interval of about four
-reports; that reading is withdrawn, and a run at two duties is what shows why.
+are in every report. The current of blocks 5-8 is one instantaneous sample inside
+the output's PWM cycle, so the share of reports carrying a non-zero one rises with
+the **duty**: 4 of 14 at 25 %, 16 of 16 at 60 %, 18 of 20 at 100 %, 11 of 45 at
+20 % (PROJECT.md section 2). This prints, per block, how many reports carried a
+sample against that block's duty, and whether the blocks alternate together -- they
+did in all 45 reports of 2026-09-18, one instant for the whole device and not a
+per-block refresh. An earlier version of this tool read the same count as a fixed
+bus-poll interval of about four reports; that reading is withdrawn, and a run at
+two duties is what shows why. What a run at **60 % or more** would settle on top of
+that: whether the *voltage* alternates for the same reason. An output with no fan
+draws no current in either phase, so its 0.00 V is not a PWM phase, and for that
+block the share printed here is its 0.00 V share -- under in-cycle sampling it
+rises with the duty like the current's, under "the aquaero does not carry the bus
+device's values in every report" it stays near a quarter (item 115).
 
 *Is a bus device there the whole time?* An aquabus block with no device behind it
 reads speed ``0xFFFF``, and that is how the daemon judges the bus

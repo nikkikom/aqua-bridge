@@ -73,9 +73,9 @@ the 12 V rail
     publish as one it checked and passed.
 
     **The rule cannot fire for an aquaero's aquabus outputs at all**, and that is
-    deliberate: a populated aquabus block reads the bus device's rail in the
-    reports whose electrical sample fell in the on phase of the output's PWM cycle
-    and the *aquaero's own* rail in the rest -- most of them at a low duty -- with
+    deliberate: a populated aquabus block reads the bus device's rail in some
+    reports and the *aquaero's own* rail in the rest -- most of them at a low
+    duty, and the field alternates in step with the block's current -- with
     nothing in a single report to tell them apart (PROJECT.md section 2), so the
     adapter publishes ``voltage_v`` as ``None`` there with ``rail_reported``
     false, and a reading with no voltage is skipped like any other. A sagging rail
@@ -250,8 +250,8 @@ class FanHealthConfig:
     #: Low end of the 12 V rail window, volts; a block reading 0.0 V is not judged
     #: (that is what an empty aquabus slot reads, not a dead rail), and neither is
     #: one with no voltage at all (an aquaero's aquabus outputs, whose rail reading
-    #: is the aquaero's own in every report the block's electrical sample did not
-    #: fall in the on phase of the output's PWM cycle -- most of them at a low duty).
+    #: is the aquaero's own in every report that does not carry the bus device's
+    #: electrical sample -- most of them at a low duty).
     rail_min_v: float = 11.0
     #: High end of the 12 V rail window, volts (> ``rail_min_v``).
     rail_max_v: float = 13.0

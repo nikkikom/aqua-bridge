@@ -87,6 +87,9 @@ def test_lists_and_decodes_both_devices_without_writing(rig) -> None:
     assert "(unconfigured: no control source, not commanded)" in text
     # Quadro: power cycles, duty from the control report, software sensors
     assert "power cycles:" in text and "pwm3  duty 100.00 %" in text
+    # Its own outputs measure a current, but sample it inside the PWM cycle, so the
+    # probe prints the numbers as not measured rather than as a reading (item 115).
+    assert "pwm3/fan3    119 rpm  duty 100.00 %  12.12 V  not measured (0 mA, 0.00 W)" in text
     assert "software sensors (soft1..soft16, degC):" in text
     assert "  active profile: 1" in text  # the aquaero's control report byte 0x06
     for controller in rig[3].values():

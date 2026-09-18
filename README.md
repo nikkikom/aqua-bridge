@@ -316,7 +316,11 @@ is not yet confirmed on real hardware, on either board.
     thresholds are the `fan_health:` section of `config.yaml`; the rpm rule
     needs an `mpc.fan_models` curve (fit one with `tools/fit_fans.py` from a
     recording) and the power rule needs `fan_models.<m>.power_w_at_max`,
-    without which it stays off. These two rules always read `fan_models`,
+    without which it stays off — and it stays off on this hardware either
+    way, because neither supported controller reports a current a single
+    report may be judged on (the aquaero measures none on its own outputs,
+    and a bus device samples it inside the PWM cycle), which the verdict
+    says per channel. These two rules always read `fan_models`,
     never the curve `mpc.fan_curve_online` fits while the daemon runs: a
     curve fitted to the very tachometer readings being judged would follow
     a fan that slows down, and the deviation would never show.

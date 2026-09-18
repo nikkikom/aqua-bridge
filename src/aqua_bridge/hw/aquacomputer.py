@@ -114,12 +114,14 @@ that one channel out of its writes, and reports it, rather than writing it blind
 **A fan block's current and power are a sample taken inside the PWM cycle, not
 an average over the report.** A fan that is driven by a chopped supply draws its
 current only during the on phase, and the controller samples that current at one
-instant, so the share of reports carrying a non-zero current follows the *duty*
-and nothing else. Measured on the owner's hardware (2026-09-18, one fan on the
+instant, so the share of reports carrying a non-zero current rises with the
+*duty*. Measured on the owner's hardware (2026-09-18, one fan on the
 Quadro's output 3 behind the aquaero's aquabus, duty driven live): 4 of 14
 reports non-zero at 25 % (3-6 mA), 16 of 16 at 60 %, 18 of 20 at 100 % (16-44
-mA), and 11 of 45 at 20 % on a later run -- 25 to 29 % of reports at a quarter
-duty, all of them at full duty. A single report's 0 mA is therefore no evidence
+mA), and 11 of 45 at 20 % on a later run. The relation is monotone and not a
+share equal to the duty -- 16 of 16 is well above 60 %, 18 of 20 below 100 % --
+but it moves with the duty, which no fixed poll of the bus can do. A single
+report's 0 mA is therefore no evidence
 about a fan at any duty, and even a non-zero one is one sample of a switching
 load: :attr:`DeviceKind.reports_power` is False for every output of both kinds,
 and nothing here publishes a current or a power a rule could judge. The aquaero's
@@ -137,18 +139,26 @@ duty. The constants that carried the number (``AQUABUS_REFRESH_REPORTS``,
 measured a bus poll interval on a field that is not duty-sampled (PROJECT.md
 section 2, section 8 item 115). Nothing was bounded by them.
 
-The voltage field of an aquabus block alternates with the same sampling, so it
-is no more a per-report reading than the current: in a report whose sample fell
-in the on phase, block 7 read 12.10 V (the Quadro's rail) and the three outputs
-with no fan read 0.00 V, and in the rest all four read the aquaero's own rail,
-12.09 V. The two go together exactly -- over 45 consecutive reports block 7's
-current was non-zero in 11 and block 5's voltage read 0.00 V in the same 11, and
-in no other (2026-09-18) -- which is one sampling instant for all four blocks,
-not a per-block refresh. A single report therefore does not say whose rail its
-aquabus block holds, so :attr:`DeviceKind.reports_rail` is False for those
-outputs (:meth:`DeviceKind.reports_rail`) and nothing publishes that field as the
-output's rail. The aquaero's own blocks 1-4 do report their own rail and are
-unaffected.
+The voltage field of an aquabus block alternates in step with the current, and is
+no more a per-report reading than it is: over 45 consecutive reports block 7's
+current was non-zero in 11 and block 5's voltage (an output with no fan) read
+0.00 V in exactly those same 11, and in no other (2026-09-18). The four blocks
+therefore carry one instant between them, not a refresh each. *What* the voltage's
+alternation is, that measurement does not settle: an output with no fan draws no
+current in either phase, so its 0.00 V is not itself a phase of a PWM cycle, and
+"the aquaero does not put the bus device's values in every report" accounts for
+the field as well as the sampling does. The conclusion is the same under either,
+and it is the one the captures have always carried: in some reports block 7 reads
+12.10 V (the Quadro's rail) and the three outputs with no fan read 0.00 V, in the
+rest all four read the aquaero's own 12.09 V, and nothing in a single report says
+which. So :attr:`DeviceKind.reports_rail` is False for those outputs
+(:meth:`DeviceKind.reports_rail`) and nothing publishes that field as the output's
+rail. The aquaero's own blocks 1-4 do report their own rail and are unaffected.
+What would separate the two accounts is the no-fan block's 0.00 V share at a 60 %
+duty -- the sampling account has it rise with the duty exactly as the current's
+share does, a relay account has it stay near a quarter -- which needs a duty
+change, i.e. a write, and is the owner's call (PROJECT.md section 8 item 115).
+``tools/aquabus_watch.py`` prints that share per block.
 
 Speed and output duty are in **every** report and take no part in any of this --
 block 7 read 251-253 rpm and duty 2000 in all 45 -- which is what makes an absent
@@ -217,10 +227,16 @@ capture can be diffed against this one; nothing publishes or judges them, and no
 write touches them. The aquaero's firmware has a per-output **start boost** (a
 duty held for a time when an output goes from stopped to running), and this block
 is where the rest of an output's settings live -- but a read-only capture cannot
-say which word it is, or even that it is here at all: on the owner's controller
-all eight outputs carry the same value in each of the six, so there is no
-difference between outputs to read (PROJECT.md section 2, "The controller's own
-start boost"). What the shapes allow, and no more: ``+0x08`` is
+say which word it is, or even that it is here at all (PROJECT.md section 2, "The
+controller's own start boost"). Four of the six -- ``+0x08``, ``+0x0A``, ``+0x0C``
+and ``+0x12`` -- hold one value across all eight outputs in every capture, so
+there is no difference between outputs to read in them. The two that do differ,
+``+0x00`` (100 on output 1 and 450 on the rest today; 500, 450 and 300 in
+2026-09-15's capture) and ``+0x02`` (1000 to 2800 across the seven outputs the
+owner had configured by hand then), differ in a way nothing connects to a boost:
+they read like a per-fan rpm pair, and no capture pairs either of them with a
+boost setting known from the device's own menu. What the shapes allow, and no
+more: ``+0x08`` is
 a per-output centi-percent field that reads 100.00 % in every unconfigured block
 and read 50.00 % on the seven outputs the owner had configured in 2026-09-15's
 capture; ``+0x0A`` and ``+0x0C`` both read 2 in every block of every capture, so
@@ -320,15 +336,20 @@ TEMP_MAX_C = 327.66
 #: default for an unassigned output --
 #: source ``0xFFFF``, minimum power 35.00 %, maximum 100.00 % -- byte for byte
 #: what block 8 read while it was unconfigured in 2026-09-15's capture, and the
-#: series ends at ``0x2FB`` (PROJECT.md section 2, "The controller's own start
-#: boost"). A layout fact of the report, not a tunable.
+#: series ends at ``0x2FB``: the 20 bytes at ``0x2FC`` are a different structure
+#: (PROJECT.md section 2, "The controller's own start boost"). A recorded layout
+#: fact of the report, not a tunable and not a count any code here consumes --
+#: what the daemon drives is :attr:`DeviceKind.ctrl_channels`. It is written down,
+#: and pinned against the captures in ``tests/test_hw_aquacomputer.py``, so that a
+#: later capture is read against the whole array and not against the first eight.
 AQUAERO_CTRL_BLOCKS = 12
 
 #: Offsets inside an aquaero controller block whose ``u16`` this project has
 #: **not** identified, read into :attr:`ChannelState.undecoded` for a diagnostic
 #: tool and published, judged and written by nothing. The firmware's per-output
-#: start boost could be one of them and cannot be picked out read-only, because
-#: every output of the owner's controller carries the same value in each (module
+#: start boost could be one of them and cannot be picked out read-only: four of
+#: the six hold one value across all eight outputs, and the two that do differ
+#: between outputs differ in no way a boost setting is known to explain (module
 #: docstring, PROJECT.md section 2, "The controller's own start boost").
 CONTROL_BLOCK_UNDECODED = (0x00, 0x02, 0x08, 0x0A, 0x0C, 0x12)
 
@@ -474,7 +495,7 @@ class DeviceKind:
     #: section 2). A hardware fact.
     aquabus_outputs_report_power: bool = True
     #: The voltage field of an aquabus block is that *output's* 12 V rail. False on
-    #: the aquaero: that field alternates with the same in-cycle sampling, holding
+    #: the aquaero: that field alternates in step with the current, holding
     #: the bus device's rail in some reports and the aquaero's own in the rest,
     #: indistinguishable in a single report (PROJECT.md section 2), so the field
     #: may not be published as that output's rail. A hardware fact.
@@ -583,9 +604,9 @@ class DeviceKind:
         """Output ``number`` (1-based) reports its *own* 12 V rail voltage.
 
         False only for the aquaero's aquabus outputs 5-8: the voltage field of
-        such a block alternates with the same in-cycle sampling that makes their
-        current a single sample, holding the bus device's rail in the reports
-        whose sample fell in the on phase and the aquaero's own in the rest, and
+        such a block alternates in step with the block's current, holding the bus
+        device's rail in the reports that carry that device's electrical sample
+        and the aquaero's own in the rest, and
         nothing in a single report tells the two apart (module docstring;
         PROJECT.md section 2, section 8 item 89). A kind always reports the rail
         of its own outputs.
