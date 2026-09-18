@@ -3837,13 +3837,27 @@ a model converges only with them.
      zone cannot *lose* cooling because one of its fans died. The floor is a
      hold, not a computed compensation: how much more air the zone needs is
      something only the measured temperatures know, and they raise the
-     siblings through the solver like any other heat. A failed channel is
-     retried once every `retry_s`, so a fan replaced while the daemon runs is
-     picked up without a restart and a dead one is kicked at most once per
-     interval instead of for ever — and that retry runs *under* the floor,
-     which keeps the level recorded at the **first** failure rather than being
-     re-recorded, so repeated retries across a hot spell cannot ratchet the
-     siblings upward. Only the tachometer lifts it.
+     siblings through the solver like any other heat. A failed channel gets one
+     more sequence every `retry_s`, so a fan replaced while the daemon runs is
+     picked up without a restart and a dead one costs at most `max_attempts`
+     kicks per interval instead of for ever — and that retry runs *under* the
+     floor, which keeps the level recorded at the **first** failure rather than
+     being re-recorded, so repeated retries across a hot spell cannot ratchet
+     the siblings upward.
+
+     Three bounds keep a hold from outliving its reason. It is never recorded
+     above `failed_channel_floor_max` (0.6), because a failure declared in the
+     middle of a hot spell would otherwise pin the enclosure at that duty for as
+     long as the fan stays dead, and above the cap the temperatures hold the
+     siblings up on their own anyway. It is never carried by a channel whose own
+     fan is declared dead — a rotor that does not turn moves no air at any duty,
+     so holding it high is noise and nothing else. And it is lifted only by the
+     tachometer: a *declared* failure is retracted after `clear_s` of live
+     readings above `min_rpm`, never by one sample, because a dead rotor
+     windmilled by the air of its siblings reads a handful of rpm — and never by
+     a gap, which is not evidence of anything, least of all that a fan came
+     back. The alarm stands through the ticks of a retry for the same reason:
+     the daemon trying again is not the fan working again.
   4. *At start too.* Every commanded channel is under the rule from the first
      tick; the same confirmation window covers the seconds a healthy fan needs
      to spin up. Nothing is boosted on start without evidence.
@@ -3889,7 +3903,22 @@ a model converges only with them.
   Every threshold and timing is a `spin_up:` key with one default declared once
   in `control.spinup.SpinUpConfig`, validated there and — for the per-channel
   names and the reachability of the kick duty, which need `mpc` —
-  in `validate_spin_up`, both at startup before anything is opened.
+  in `validate_spin_up`, both at startup before anything is opened. In full, the
+  section is `enabled` (false switches the whole rule off, and every channel's
+  verdict says so), `stall_duty` (0.15), `kick_duty` (0.5), `kick_s` (30 s),
+  `confirm_s` (30 s), `verify_s` (30 s), `max_attempts` (3), `min_rpm` (60),
+  `retry_s` (900 s), `clear_s` (30 s), `failed_channel_floor` (true),
+  `failed_channel_floor_max` (0.6), `log_interval_s` (300 s — one line per
+  channel and transition at most that often, like `fan_health.log_interval_s`)
+  and `channels`; per output, `channels.<ch>` carries `fan`, `tachometer`,
+  `stall_duty` and `kick_duty`, the last two defaulting to the section's.
+  `validate_spin_up` refuses a `kick_s` that does not cover the `d_pwm_max`
+  ramp from `pwm_min` up to the largest kick duty plus one tick: a
+  kick the fans can never reach does not fail quietly, it condemns the fan for a
+  kick it never got. A floor that raises a channel a running identification
+  experiment drives aborts that experiment (`spin_up:<channel>`), because the
+  experiment plans its levels from the solver's demand and cannot see the floor
+  `compose` applies after it.
 
   **Noise cost of a kick**, measured on `config.example-das.yaml` at the shipped
   defaults (`control/noise.py`'s energetic index, `noise.exponent: 5`, ten fans
@@ -3904,9 +3933,11 @@ a model converges only with them.
 
   The cost is paid for at most `kick_s` (30 s) per attempt and at most
   `max_attempts` (3) attempts per sequence, so the worst case is 90 s of an
-  audible rise against a channel that is moving no air at all — and it is zero
-  whenever the solver already commands more than the kick, which is the whole
-  reason the kick is a floor. The quiet-enclosure figures are the expensive
+  audible rise against a channel that is moving no air at all — and, once the
+  fan is declared dead, one such sequence per `retry_s` (900 s) and no more,
+  which is 10 % of the time at the shipped defaults. It is zero whenever the
+  solver already commands more than the kick, which is the whole reason the kick
+  is a floor. The quiet-enclosure figures are the expensive
   ones, and the aquabus outputs' lower kick duty is most of why: the same
   measurement that made the duty per output also made the kick cheaper on the
   outputs that need less of it.
@@ -5061,8 +5092,8 @@ tests carry the `nightly` marker.
 | `tests/test_ident_replan_sim.py` | re-planned against frozen experiment levels on the truth sim (`rich`, the real loop and supervisor), both solvers and three seeds: no tick below the solver's own command (and the frozen plan does hold one back), no anchor more than `ident_amplitude` above the demand the frozen arm saw (the ratchet guard, which the pre-review `_replan` fails on the MPC arm), and the fit no worse than frozen beyond a loose margin | nightly |
 | `tests/test_ident_converge_sim.py` | closed-loop identification on the daemon's own path, 16 h on the truth sim (`rich`, the real loop and supervisor), three seeds. Item 102: a zone-wide `ident_parallel: true` schedule against a one-channel-at-a-time round robin over *all eight* channels on the same plant — the measured converged zones per seed on both arms (z0+z3 / z0+z2 / z0+z3 against none / none / z0), `pe_min` and `excited_windows` on the converged zones held to the values the runs reached rather than to the rule's own thresholds, which of the round robin's converged zones still hold `PE_MIN` at the end of the run rather than latching from a burst, the zones that close no window at all named per seed (none since §8 item 109), zero limit violations in either arm, both arms' true margin above a floor and the mean-PWM gap bounded both ways. Item 112: no channel is left with a floor above `pwm_min` after an experiment ends, and both the enclosure's mean PWM and qd1's own stay under what the old release spent (the channel mean is what separates the two releases on the seeds where qd1 already reached `pwm_min`). Item 111: the same schedule at 36 h — the zones that converge with more windows (6 of 12 at 16 h to 11 of 12 at 36 h since §8 item 109's fix), no zone blocked by an `E`'s relative standard error, the one bay that still blocks a zone (b15, seed 3) named, and `se(k)` under 0.12 on every bay | nightly |
 | `tests/test_sim_das.py` | the truth plant: energy balance through transients and hot swap, steady state, more airflow never warms anything, dead band and exponent, quantisation per sensor type, lags, SMART cadence, determinism per seed | PR |
-| `tests/test_spinup.py` | the spin-up kick's section and its sequence (§8 item 75), driving the supervisor the way the loop does with the tachometer scripted: every key, every rejection, the per-output kick duty and its clamp, the `mpc`-aware checks (an unknown channel, a `kick_s` shorter than a tick), both example configs at their defaults; confirm → kick → verify → the next kick → failed; a fan that starts on the first kick and one that needs two; the failed fan's message and its siblings' floor holding while the solver asks for less, with an unrelated zone's channel left alone; the kick as a no-op while the solver commands more; an output with no fan, a fan with no tachometer, a channel with no tachometer bound, a duty below the stall duty and a legacy config all off with their reason; a gap starting the window again; the floor applied under `fallback` too and absent from the diagnostics when nothing is in force; the log lines; a run with the rule on never below the same run with it off; the measured noise cost of a kick (§3 "Spin-up kick"); the health payload carrying the verdict and the failed fans, and a bad key or a channel typo exiting 2 before anything opens | PR |
-| `tests/test_spinup_sim.py` | the same rule through the real `Loop` against the DAS truth plant, where the rotor really does not turn (the simulator's `start_duty`): a stalled fan starting on the first kick and staying turning at `pwm_min` afterwards, one the first kick's `d_pwm_max` ramp does not reach given a second, a seized fan declared failed with its zone's other channels floored, an output with no fan and a fan with no tach wire never kicked, a kick that changes no command while the solver is above it, the command never lower than the same run with the rule off and never outside `[pwm_min, pwm_max]` or past `d_pwm_max`, a healthy enclosure never kicked, and `start_duty: 0` reproducing the plant bit for bit | PR |
+| `tests/test_spinup.py` | the spin-up kick's section and its sequence (§8 item 75), driving the supervisor the way the loop does with the tachometer scripted: every key, every rejection, the per-output kick duty and its clamp, the `mpc`-aware checks (an unknown channel, a `kick_s` shorter than a tick), both example configs at their defaults; confirm → kick → verify → the next kick → failed; a fan that starts on the first kick and one that needs two; the failed fan's message and its siblings' floor holding while the solver asks for less, with an unrelated zone's channel left alone; the kick as a no-op while the solver commands more; an output with no fan, a fan with no tachometer, a channel with no tachometer bound, a duty below the stall duty and a legacy config all off with their reason; a gap starting the window again; the floor surviving both a gap during a retry and one windmilled reading, and going only after `clear_s`; a second dead fan neither ratcheting the floor nor being pinned by it, and a hold recorded in a hot spell capped; a `kick_s` too short for the `d_pwm_max` ramp refused; the floor applied under `fallback` too, pinned against the same run with the rule off, and absent from the diagnostics when nothing is in force; the log lines; a run with the rule on never below the same run with it off; the measured noise cost of a kick (§3 "Spin-up kick"); the health payload carrying the verdict and the failed fans, and a bad key or a channel typo exiting 2 before anything opens | PR |
+| `tests/test_spinup_sim.py` | the same rule through the real `Loop` against the DAS truth plant, where the rotor really does not turn (the simulator's `start_duty`): a stalled fan starting on the first kick and staying turning at `pwm_min` afterwards, a `kick_s` too short for the `d_pwm_max` ramp refused rather than condemning the fan, a seized fan declared failed with its zone's other channels floored, an output with no fan and a fan with no tach wire never kicked, a kick that changes no command while the solver is above it, the command never lower than the same run with the rule off and never outside `[pwm_min, pwm_max]` or past `d_pwm_max`, a healthy enclosure never kicked, and `start_duty: 0` reproducing the plant bit for bit | PR |
 
 Test cost: the PR selection is about 1,900 tests in under five minutes
 on the development machine (`HYPOTHESIS_PROFILE=ci`); PR CI stays under
@@ -8212,6 +8243,24 @@ Owner decision (2026-09-16):
     tachometer (`tachometer: false`, or no `rpm:` in the `aquacomputer:`
     binding) and a channel with no fitted curve are never kicked and never
     alarmed, and each says so in its verdict.
+
+    **What the review changed** (same item, before the merge): the declaration
+    of a failed fan is now a fact of its own rather than a state string, so the
+    alarm and the sibling floor survive a dropped reading and the ticks of a
+    `retry_s` retry, and are retracted only after `clear_s` of readings above
+    `min_rpm` — one windmilled sample used to clear both. The hold a failure
+    records is capped at `failed_channel_floor_max` and is never carried by a
+    channel whose own fan is declared dead, so two failures across a hot spell
+    cannot leave the enclosure pinned at 90 % for ever. `validate_spin_up`
+    refuses a `kick_s` that cannot cover the `d_pwm_max` ramp up to the kick
+    duty, which used to be named in the message and not enforced — a fan would
+    have been condemned for a kick it never got. A kick that raises a channel a
+    running identification experiment drives now aborts that experiment
+    (`spin_up:<channel>`) instead of silently making its excitation something
+    other than what it planned. And `build_health_monitor` asks whether the rule
+    can cover any channel at all rather than whether the section is enabled, so
+    a legacy deployment that turned both health sections off does not get an
+    observer built behind it to publish "off" verdicts.
 
     **The duty-to-rpm mapping is the output's, not the fan model's** — measured
     2026-09-18 on the owner's hardware: the same fan model reads 174 rpm on an
