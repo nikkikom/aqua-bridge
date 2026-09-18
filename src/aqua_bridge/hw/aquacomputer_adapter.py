@@ -830,9 +830,17 @@ class AquacomputerAdapter:
         ``lost`` whether a device that *had* answered has now been absent for
         ``bus_absent_s`` and is reported -- it stays False on a bus nothing was ever
         on, which is why a consumer with room for one field should show ``state``;
-        and ``temps_missing`` the logical names whose aquabus slot is reported as
-        missing this tick instead of as the frozen value the controller keeps
-        there.
+        ``bound`` whether anything of this controller's own configuration reads the
+        bus at all (an aquabus output, an aquabus tachometer or an aquabus
+        temperature slot) -- a bus can read ``lost`` on a controller with nothing
+        bound behind it (aquabus presence is judged from the status report, not from
+        the binding), and that is not a problem of this daemon's, which is why
+        ``device_health``'s own ``problems`` and ``self._bus_lost and self._bus_bound``
+        (below) already gate on it; a consumer that turns ``lost`` into a fault must
+        gate on ``bound`` too, or it disagrees with the daemon about what counts as
+        broken; and ``temps_missing`` the logical names whose aquabus slot is
+        reported as missing this tick instead of as the frozen value the controller
+        keeps there.
 
         There is no ``refresh_reports`` any more. It carried a mean aquabus
         refresh interval measured from how many reports held a non-zero current,
@@ -858,6 +866,7 @@ class AquacomputerAdapter:
             "seen": self._bus_seen,
             "absent_s": absent_s,
             "lost": state == "lost",
+            "bound": self._bus_bound,
             "temps_missing": sorted(self._bus_temps) if self._bus_present is False else [],
         }
 

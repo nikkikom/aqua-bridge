@@ -111,15 +111,27 @@ device.
 
 The aquaero's aquabus (PROJECT.md section 8 items 92, 114, 115, 129) has its own
 binary sensor, ``aquabus_problem`` (``device_class: problem``, diagnostic, both
-modes): on whenever some controller's ``value_json.device_health.devices[].aquabus.
-lost`` is true -- a device that had answered has now been missing for
-``bus_absent_s``. A bus that has simply never had anything on it (``state:
-"never_seen"``, the normal state of an aquaero with nothing on its aquabus) is not
-a problem and never turns this on; neither is a report or two of ``"empty"`` before
-``bus_absent_s`` has passed. Its attributes are the ``aquabus`` block of every
-controller in ``device_health.devices`` (``state``, ``present``, ``seen``,
-``absent_s``, ``lost``, ``temps_missing``), so the state a person needs --
-``never_seen`` apart from ``lost`` -- is one tap away without reading the journal.
+modes): on whenever ``value_json.device_health.aquabus_lost`` is true --
+:func:`aqua_bridge.health._aquabus_lost`'s own answer to the same question
+``device_health``'s ``problems`` list already asks before it reports a lost bus,
+namely whether some controller's aquabus is both ``lost`` (a device that had
+answered has now been missing for ``bus_absent_s``) *and* ``bound`` (something
+of that controller's own configuration -- an aquabus output, tachometer or
+temperature slot -- actually reads the bus). A controller whose aquabus a device
+sits on that this daemon reads over its own USB instead has nothing bound behind
+it, so its bus reading ``lost`` is not a problem of this daemon's and must not
+turn this sensor on; keying the template on ``aquabus.lost`` alone, without the
+``bound`` gate, would disagree with the daemon about what counts as broken. A
+bus that has simply never had anything on it (``state: "never_seen"``, the
+normal state of an aquaero with nothing on its aquabus) is not a problem either,
+and neither is a report or two of ``"empty"`` before ``bus_absent_s`` has
+passed -- both are already folded into ``lost`` staying false. Its attributes
+are ``{"devices": [...], "aquabus": [...]}``, the label and ``aquabus`` block
+(``state``, ``present``, ``seen``, ``absent_s``, ``lost``, ``bound``,
+``temps_missing``) of every controller in ``device_health.devices``, index for
+index (a bare list is not a valid Home Assistant attributes payload, which must
+be a JSON object), so the state a person needs -- ``never_seen`` apart from
+``lost``, and which controller -- is one tap away without reading the journal.
 
 DAS mode also publishes, per zone, one sensor ``model_block_<zone>``
 (PROJECT.md section 8 items 110, 111, 121): state is the zone's
@@ -137,10 +149,20 @@ which is the solver's own trust/fault state and stays separate).
 
 DAS mode also publishes one sensor ``unexcitable_channels``
 (PROJECT.md section 8 item 121, :func:`aqua_bridge.control.ident.excitation`):
-state is ``value_json.extra.experiment.unexcitable`` joined with ", ", or ``"none"``
-when every channel can clear the model's PE bound at ``ident_amplitude`` from where
-it sits. Its attributes are the full per-channel ``excitation`` mapping (``rel_swing``,
-``pe_reach``, ``pe_bound``, ``excitable``, ``pe_reach_at_cap``, ``excitable_at_cap``).
+state is ``value_json.extra.experiment.unexcitable`` joined with ", ", ``"none"``
+once every channel has cleared the model's PE bound at ``ident_amplitude`` from
+where it sits, or ``"not evaluated"`` while ``value_json.extra.experiment.
+excitation`` is still empty -- :func:`aqua_bridge.control.ident.status` returns
+that mapping empty until an identification experiment has actually run
+(``exp is None``), which is the normal state of a daemon with no experiment
+under way (``ident_enabled: false``, or simply between runs), so ``"none"``
+must never be what an *unevaluated* channel reads as: that would read as a
+health claim -- every channel has enough PE headroom -- the daemon never made
+(module docstring's own rule about ``note()``/§8 item 117, applied here to a
+sensor instead of the page). Its attributes are the full per-channel
+``excitation`` mapping (``rel_swing``, ``pe_reach``, ``pe_bound``,
+``excitable``, ``pe_reach_at_cap``, ``excitable_at_cap``), empty for the same
+reason the state reads "not evaluated".
 
 DAS mode (``mpc.topology``) subscribes to the limit and bay topics and adds one
 ``limit_<class>`` number entity per drive class (state from
@@ -604,9 +626,13 @@ def build_discovery_entities(
     )
 
     # The aquabus itself (PROJECT.md section 8 items 92, 114, 115, 129): on only when
-    # a device that had answered has now been missing for bus_absent_s -- a healthy
-    # aquaero with nothing on its bus ("never_seen") never turns this on, which is why
-    # the template checks "lost" and not merely the absence of a device.
+    # some controller's aquabus is both "lost" (a device that had answered has now
+    # been missing for bus_absent_s) and "bound" (something of that controller's own
+    # config actually reads the bus) -- aqua_bridge.health._aquabus_lost's own
+    # answer, the same gate device_health's problems list applies before it reports a
+    # lost bus, so this entity can never call something a fault that the daemon
+    # itself does not. A healthy aquaero with nothing on its bus ("never_seen") never
+    # turns this on either way.
     object_id = "aquabus_problem"
     unique_id = f"{node_id}_{object_id}"
     entities.append(
@@ -620,8 +646,7 @@ def build_discovery_entities(
                 "object_id": unique_id,
                 "state_topic": state_topic(node_id),
                 "value_template": (
-                    "{{ 'ON' if (value_json.device_health.devices | default([]) "
-                    "| selectattr('aquabus.lost', 'equalto', true) | list | length > 0) "
+                    "{{ 'ON' if value_json.device_health.aquabus_lost | default(false) "
                     "else 'OFF' }}"
                 ),
                 "payload_on": "ON",
@@ -630,8 +655,10 @@ def build_discovery_entities(
                 "entity_category": "diagnostic",
                 "json_attributes_topic": state_topic(node_id),
                 "json_attributes_template": (
-                    "{{ (value_json.device_health.devices | default([]) "
-                    "| map(attribute='aquabus') | list) | tojson }}"
+                    "{{ {'devices': (value_json.device_health.devices | default([]) "
+                    "| map(attribute='label') | list), "
+                    "'aquabus': (value_json.device_health.devices | default([]) "
+                    "| map(attribute='aquabus') | list)} | tojson }}"
                 ),
                 "device": _device_block(node_id),
                 **_availability(node_id),
@@ -718,8 +745,10 @@ def build_discovery_entities(
                 object_id="unexcitable_channels",
                 name="Unexcitable channels",
                 value_template=(
-                    "{{ (value_json.extra.experiment.unexcitable | default([]) "
-                    "| join(', ')) or 'none' }}"
+                    "{{ ((value_json.extra.experiment.unexcitable | default([]) "
+                    "| join(', ')) or 'none') "
+                    "if (value_json.extra.experiment.excitation | default({})) "
+                    "else 'not evaluated' }}"
                 ),
                 json_attributes_template=(
                     "{{ value_json.extra.experiment.excitation | default({}) | tojson }}"
