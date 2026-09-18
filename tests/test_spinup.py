@@ -62,7 +62,9 @@ def test_the_key_list_is_the_documented_one() -> None:
         "max_attempts",
         "min_rpm",
         "retry_s",
+        "clear_s",
         "failed_channel_floor",
+        "failed_channel_floor_max",
         "log_interval_s",
         "channels",
     }
@@ -80,6 +82,8 @@ def test_the_key_list_is_the_documented_one() -> None:
         ({"max_attempts": 0}, "spin_up.max_attempts must be >= 1"),
         ({"max_attempts": 2.5}, "spin_up.max_attempts must be an integer"),
         ({"min_rpm": -1}, "spin_up.min_rpm must be >="),
+        ({"clear_s": 0}, "spin_up.clear_s must be >="),
+        ({"failed_channel_floor_max": 1.5}, "spin_up.failed_channel_floor_max must be <= 1"),
         ({"kick_duty": 0.1, "stall_duty": 0.2}, "must be above spin_up.stall_duty"),
         ({"nope": 1}, r"spin_up: unknown key\(s\)"),
         ({"channels": {"fa1": {"nope": 1}}}, r"spin_up.channels.fa1: unknown key\(s\)"),
@@ -98,6 +102,22 @@ def test_an_unknown_channel_is_refused_against_the_controller_config() -> None:
     with pytest.raises(ConfigError, match="spin_up.channels names"):
         validate_spin_up(cfg, SpinUpConfig(channels={"nope": SpinUpChannel()}))
     validate_spin_up(cfg, SpinUpConfig(channels={"fa1": SpinUpChannel()}))
+
+
+def test_a_kick_too_short_to_reach_the_kick_duty_is_refused() -> None:
+    """A ``kick_s`` above ``mpc.dt`` but below the ``d_pwm_max`` ramp is worse than a
+    rule that never fires: the channel is kicked to a duty it never reaches and then
+    declared failed, alarmed and its siblings floored for a kick it never got."""
+    cfg = das_cfg()  # dt 1, d_pwm_max 0.1, pwm_min 0.15: 0.15 -> 0.6 is 5 ticks of ramp
+    with pytest.raises(ConfigError, match="cannot deliver a kick to 0.6"):
+        validate_spin_up(cfg, SpinUpConfig(kick_duty=0.6, kick_s=3.0))
+    validate_spin_up(cfg, SpinUpConfig(kick_duty=0.6, kick_s=6.0))  # the ramp plus a tick
+    # the largest per-channel kick duty is what has to be reachable, not the section's
+    with pytest.raises(ConfigError, match="cannot deliver a kick to 0.8"):
+        validate_spin_up(
+            cfg,
+            SpinUpConfig(kick_duty=0.3, kick_s=3.0, channels={"fa1": SpinUpChannel(kick_duty=0.8)}),
+        )
 
 
 def test_a_kick_shorter_than_a_tick_is_refused() -> None:
@@ -377,6 +397,102 @@ def test_the_floor_survives_a_retry_and_never_ratchets_upward() -> None:
     assert min(pwm["fa2"] for pwm in later) >= floor - 1e-12, "and never went below it"
 
 
+def test_a_gap_during_a_retry_does_not_lift_the_zones_floor() -> None:
+    """A tick with no live reading is not evidence of anything -- least of all that a
+    dead fan came back. The floor under the zone's remaining fans has to survive one,
+    including in the middle of a ``retry_s`` retry, where the channel's own state is
+    ``confirming`` / ``kicking`` / ``verifying`` rather than ``failed``."""
+    cfg = das_cfg()
+    sup = Supervisor(cfg, spin_up=spin(max_attempts=1, retry_s=10.0))
+    dead = {"fa1": 0.0, "fa2": 900.0, "fb1": 900.0, "fc1": 900.0}
+    run = Run(sup, cfg, rpm=dead, demand={"fa1": 0.3, "fa2": 0.4, "fb1": 0.4, "fc1": 0.4})
+    run.ticks(20)
+    assert sup.spin_up_status()["fa1"]["failed"] is True
+    assert run.history[-1]["fa2"] == pytest.approx(0.4)
+    run._demand = {"fa1": 0.3, "fa2": 0.2, "fb1": 0.2, "fc1": 0.2}
+    run.ticks(12)  # into the retry: the channel is in a sequence again, not in `failed`
+    assert sup.spin_up_status()["fa1"]["state"] in ("confirming", "kicking", "verifying")
+    run.tick(live=False)  # an ordinary USB hiccup
+    run.ticks(10)
+    assert sup.spin_up_status()["fa1"]["failed"] is True, "the fan is still dead"
+    assert run.history[-1]["fa2"] == pytest.approx(0.4), "and its zone still has its floor"
+    assert run.history[-1]["fb1"] == pytest.approx(0.4)
+
+
+def test_one_reading_does_not_retract_a_declared_failure() -> None:
+    """Declaring a fan dead costs a confirmation window and every attempt; retracting it
+    may not cost one sample. A dead rotor windmilled by the air of its siblings reads a
+    handful of rpm, and that must not clear the alarm, reset the attempts or drop the
+    floor -- only ``clear_s`` of readings does."""
+    cfg = das_cfg()
+    sup = Supervisor(cfg, spin_up=spin(max_attempts=1, retry_s=600.0, clear_s=5.0))
+    speed = {"fa1": 0.0, "fa2": 900.0, "fb1": 900.0, "fc1": 900.0}
+    run = Run(sup, cfg, rpm=speed, demand={"fa1": 0.3, "fa2": 0.4, "fb1": 0.4, "fc1": 0.4})
+    run.ticks(20)
+    assert sup.spin_up_status()["fa1"]["failed"] is True
+    run._demand = {"fa1": 0.3, "fa2": 0.2, "fb1": 0.2, "fc1": 0.2}
+    speed["fa1"] = 90.0  # windmilled: above min_rpm, and no evidence of a motor
+    run.tick()
+    verdict = sup.spin_up_status()["fa1"]
+    assert verdict["failed"] is True and verdict["state"] == "failed"
+    assert "reads 90 rpm again" in verdict["reason"]
+    assert run.history[-1]["fa2"] == pytest.approx(0.4), "the floor stands"
+    speed["fa1"] = 0.0  # one reading each way is one reading: the window starts again
+    run.ticks(3)
+    speed["fa1"] = 900.0
+    run.ticks(4)
+    assert sup.spin_up_status()["fa1"]["failed"] is True
+    run.ticks(3)  # ... and clear_s of readings does retract it
+    verdict = sup.spin_up_status()["fa1"]
+    assert verdict["state"] == "turning" and verdict["failed"] is False
+    assert verdict["attempts"] == 0
+    run.ticks(6)
+    assert run.history[-1]["fa2"] == pytest.approx(0.2), "the floor went with the failure"
+
+
+def test_a_second_dead_fan_neither_ratchets_the_floor_nor_is_pinned_by_it() -> None:
+    """Two failures in one zone: the floor each leaves is the duty its siblings carried
+    when it was declared, and neither dead channel is floored by the other -- a rotor the
+    daemon has declared dead moves no air at any duty, so holding it high is noise."""
+    cfg = das_cfg()
+    sup = Supervisor(cfg, spin_up=spin(max_attempts=1, retry_s=600.0, failed_channel_floor_max=0.5))
+    speed = {"fa1": 0.0, "fa2": 900.0, "fb1": 900.0, "fc1": 900.0}
+    run = Run(sup, cfg, rpm=speed, demand=dict.fromkeys(cfg.channels, 0.4))
+    run.ticks(20)
+    assert sup.spin_up_status()["fa1"]["failed"] is True
+    run._demand = dict.fromkeys(cfg.channels, 0.9)  # a hot spell
+    run.ticks(20)
+    speed["fa2"] = 0.0  # ... and now the zone's other fan dies too
+    run.ticks(20)
+    assert sup.spin_up_status()["fa2"]["failed"] is True
+    run._demand = dict.fromkeys(cfg.channels, 0.2)  # the heat passes
+    run.ticks(30)
+    end = run.history[-1]
+    assert end["fa1"] == pytest.approx(0.2), "a fan declared dead is not pinned high"
+    assert end["fa2"] == pytest.approx(0.2), "... not even by the floor its sibling left"
+    # fa1's own hold was recorded at 0.4 and never re-recorded; fa2 died in the hot spell
+    # and its hold is bounded by failed_channel_floor_max rather than by that 0.9.
+    assert end["fb1"] == pytest.approx(0.5)
+    assert end["fc1"] == pytest.approx(0.2), "an unrelated zone is never floored"
+
+
+def test_a_floor_recorded_in_a_hot_spell_is_capped() -> None:
+    """The hold is released only by the tachometer, so a level captured while the
+    enclosure was hot would otherwise pin it there for as long as the fan stays dead.
+    ``failed_channel_floor_max`` is the operator's bound on that."""
+    cfg = das_cfg()
+    sup = Supervisor(cfg, spin_up=spin(max_attempts=1, failed_channel_floor_max=0.5))
+    dead = {"fa1": 0.0, "fa2": 900.0, "fb1": 900.0, "fc1": 900.0}
+    run = Run(sup, cfg, rpm=dead, demand=dict.fromkeys(cfg.channels, 0.9))
+    run.ticks(30)
+    assert sup.spin_up_status()["fa1"]["failed"] is True
+    assert run.history[-1]["fa2"] == pytest.approx(0.9), "the solver is above the floor anyway"
+    run._demand = dict.fromkeys(cfg.channels, 0.2)
+    run.ticks(30)
+    assert run.history[-1]["fa2"] == pytest.approx(0.5), "the cap, not the hot spell's 0.9"
+    assert run.history[-1]["fc1"] == pytest.approx(0.2)
+
+
 def test_a_kick_is_a_no_op_while_the_solver_already_commands_more() -> None:
     cfg = das_cfg()
     sup = Supervisor(cfg, spin_up=spin(kick_duty=0.4))
@@ -489,12 +605,18 @@ def test_without_a_floor_compose_returns_the_solver_command_untouched() -> None:
 
 
 def test_a_fallback_command_still_gets_the_floor_because_it_only_raises() -> None:
+    """The one behavioural change to the fallback path, measured against the same run
+    with the rule off: the harness's own demand raises ``fa1`` from ``pwm_min`` to 0.3 by
+    itself, so only the difference between the two traces is evidence of the floor."""
     cfg = das_cfg()
     sup = Supervisor(cfg, spin_up=spin())
     run = Run(sup, cfg, rpm=0.0, demand=0.3, mode=Mode.FALLBACK)
     run.ticks(6)
+    plain = Run(Supervisor(cfg, spin_up=SpinUpConfig(enabled=False)), cfg, rpm=0.0, demand=0.3)
+    plain.ticks(6)
     assert any(ch == "fa1" for _, ch, _ in run.kicked)
-    assert run.history[-1]["fa1"] > run.history[0]["fa1"]
+    assert [round(p["fa1"], 2) for p in plain.history] == [0.25, 0.3, 0.3, 0.3, 0.3, 0.3]
+    assert [round(p["fa1"], 2) for p in run.history] == [0.25, 0.3, 0.3, 0.3, 0.4, 0.5]
 
 
 def test_the_kick_is_logged_once_per_attempt_and_the_failure_as_an_error(caplog) -> None:

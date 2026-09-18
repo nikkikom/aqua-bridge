@@ -78,7 +78,7 @@ from typing import Any
 
 from aqua_bridge.config import AppConfig, ConfigError, load_config
 from aqua_bridge.control.loop import Loop, Sink, Source
-from aqua_bridge.control.spinup import SpinUpConfig, validate_spin_up
+from aqua_bridge.control.spinup import SpinUpConfig, covers_any, validate_spin_up
 from aqua_bridge.control.supervisor import Supervisor
 from aqua_bridge.health import (
     FanHealthConfig,
@@ -346,9 +346,15 @@ def build_health_monitor(
     app: AppConfig, supervisor: Supervisor, source: Any
 ) -> HealthMonitor | None:
     """The fan-, device- and host-health observer for ``on_tick``, or ``None`` when
-    ``fan_health.enabled``, ``host_health.enabled`` and ``spin_up.enabled`` are all
-    false and the source has no device health of its own to publish either (PROJECT.md
-    section 8 items 79, 83, 103 and 75).
+    ``fan_health.enabled`` and ``host_health.enabled`` are false, the spin-up rule can
+    cover no channel of this config, and the source has no device health of its own to
+    publish either (PROJECT.md section 8 items 79, 83, 103 and 75).
+
+    The spin-up clause asks ``control.spinup.covers_any`` rather than
+    ``spin_up.enabled``, which defaults to true: an existing config with no ``spin_up:``
+    section at all -- a legacy one above all, where the rule can never run for want of a
+    fitted curve -- must not get a monitor built behind an operator who turned both
+    health sections off, only to publish "off" verdicts.
 
     ``fan_health:`` and ``host_health:`` are validated here, so a bad threshold is a
     startup :class:`ConfigError` (exit 2) rather than a rule that silently never
@@ -375,7 +381,7 @@ def build_health_monitor(
     if (
         not settings.enabled
         and not host_settings.enabled
-        and not spin_settings.enabled
+        and not covers_any(app.mpc, spin_settings)
         and not hasattr(source, "device_health")
     ):
         return None
