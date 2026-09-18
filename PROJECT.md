@@ -7899,6 +7899,47 @@ Owner decision (2026-09-16):
     whether the tool should force those on (a rich-enough preset/config
     override) for a size estimate that means something without the
     board, or whether only a live board run ever answers this.
+134. **Done** (2026-09-18): board watchdogs, and the network proved to be
+    outside the cooling path, argued from the owner's board rather than
+    copied (§2 *Watchdog layering, and the network outside the cooling
+    path*, §9 *Board hardening*, §10 step 6b). `deploy/install-board-
+    watchdogs.sh` (idempotent, `--check`, every value a documented
+    variable at the top) installs the SoC watchdog
+    (`RuntimeWatchdogSec=60s`, `RebootWatchdogSec=120s`), journald caps
+    for the now-persistent journal (`SystemMaxUse=200M`,
+    `SystemMaxFileSize=16M`, `MaxRetentionSec=30day`,
+    `SyncIntervalSec=5m` — the default would have been 10 % of the card),
+    Wi-Fi power save off through a NetworkManager drop-in rather than the
+    SSID-carrying connection profile, and `deploy/aqua-net-recover.
+    {sh,service,timer}`, which may only re-associate the interface: no
+    reboot, no `systemctl`, no controller, and it gives up after three
+    fruitless re-associations so a router that is off costs one journal
+    line and then silence rather than a bounce loop. `deploy/aqua-
+    bridge.service` lost `Wants=`/`After=network-online.target` (with the
+    router off, `NetworkManager-wait-online` spent its full 30 s default
+    before the daemon's first write to the controllers — a whole
+    aquaero software-sensor window, spent on a router) and gained
+    `StartLimitIntervalSec=0` (systemd's default rate limit parks the
+    unit in `failed`, the one state where nothing writes the controllers
+    or the heartbeat again) and `RestartSec=5`; `WatchdogSignal` stays
+    `SIGABRT`, with the fan behaviour of a kill written down (about 25 s
+    at 100 % from the alarm, then the saved profile's preset until the
+    duty-mismatch rewrite). Values argued from measurement, not copied:
+    `step()` p50 50 ms / p99 82 ms / max 87 ms over 60 ticks against the
+    DAS plant, a healthy boot reaching the first controller write at
+    27.7 s, and the `check_watchdog` bound of 18.5 s (31.5 s with the
+    Quadro on its own USB port) — so SoC 60 s > service 45 s > worst-case
+    tick 18.5 s > healthy tick, under the aquaero's own 30 s
+    software-sensor timeout. Every publisher path into the tick was
+    traced and pinned: `on_tick` runs after `sink.apply()` and after
+    `notifier.watchdog()`, so a hung publisher (MQTT, HTTPS, Home
+    Assistant discovery) can delay only the next tick, never this tick's
+    command or its ping; SMART absence widens a zone's σ and so can only
+    raise duty, never lower it. `tests/test_deploy.py` (17 new cases) and
+    one in `tests/test_loop.py` pin the unit never waiting on the
+    network, the rate-limit/margin/knob values, and the recovery
+    script's re-association, give-up and silence behaviour against
+    `nmcli`/`ip`/`ping` stubs.
 
 ### 8.3 Open — needs the DAS hardware
 
