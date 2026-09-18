@@ -334,7 +334,9 @@ def test_the_aquaero_has_twelve_controller_blocks_and_the_spare_four_are_the_def
     reference a later capture's changed block is diffed against.
 
     This project drives the first eight (its own four and one Quadro's four); the last
-    four are recorded, not used."""
+    four are recorded, not used. Where the array *ends* is pinned too: the 20 bytes at
+    ``0x2FC`` are not another controller block, which is what makes twelve the count
+    rather than the first number that happened to be looked at."""
     firmware = _bin("aquaero-ctrl-firmware.bin")
     owner = _bin("aquaero-ctrl-aquabus-all-on-preset1.bin")
     assert AQUAERO_CTRL_BLOCKS == 12
@@ -343,6 +345,12 @@ def test_the_aquaero_has_twelve_controller_blocks_and_the_spare_four_are_the_def
     default = _ctrl_block(firmware, 8)
     for report in (firmware, owner):
         assert [_ctrl_block(report, k) for k in range(8, 12)] == [default] * 4
+        # The series ends at 0x2FB: what follows is a different structure, not a
+        # thirteenth block holding the default an unassigned output would hold.
+        assert _ctrl_block(report, AQUAERO_CTRL_BLOCKS) != default
+        assert int.from_bytes(_ctrl_block(report, AQUAERO_CTRL_BLOCKS)[0x10:0x12], "big") != (
+            SOURCE_UNCONFIGURED
+        )
     # Block 8 was unconfigured when the firmware capture was taken: the same bytes.
     assert _ctrl_block(firmware, 7) == default
     assert int.from_bytes(default[0x04:0x06], "big") == 3500  # minimum power 35.00 %
@@ -354,15 +362,19 @@ def test_the_undecoded_words_of_a_controller_block_are_read_and_named_nothing() 
     """The six ``u16`` of a controller block nobody here has identified are decoded raw
     into ``ChannelState.undecoded`` so a probe can print them and a later capture can be
     diffed against this one. The aquaero's per-output **start boost** is one of them and
-    a read-only capture cannot say which: in the owner's report all eight outputs carry
-    the same value in each of the six.
+    a read-only capture cannot say which.
 
     What the captures do show, and what is pinned here so a later one can be compared
-    against it: ``+0x08`` is a per-output centi-percent field that read 50.00 % on the
+    against it: ``+0x08``, ``+0x0A``, ``+0x0C`` and ``+0x12`` hold one value across all
+    eight outputs, so there is nothing in them to tell one output's configuration from
+    another's -- ``+0x08`` is a per-output centi-percent field that read 50.00 % on the
     seven outputs the owner had configured and 100.00 % on the unconfigured eighth, and
     reads 100.00 % everywhere since; ``+0x0A`` and ``+0x0C`` both read 2 in every block
     of every capture, so a boost duration in seconds and a tachometer's pulses per
-    revolution could not be told apart even if both were there."""
+    revolution could not be told apart even if both were there. ``+0x00`` and ``+0x02``
+    do differ between outputs, and that is pinned as well -- but in a way nothing
+    connects to a boost (they read like a per-fan rpm pair, and no capture pairs either
+    with a boost setting known from the device's own menu)."""
     firmware = _bin("aquaero-ctrl-firmware.bin")
     owner = _bin("aquaero-ctrl-aquabus-all-on-preset1.bin")
     assert CONTROL_BLOCK_UNDECODED == (0x00, 0x02, 0x08, 0x0A, 0x0C, 0x12)
@@ -373,16 +385,28 @@ def test_the_undecoded_words_of_a_controller_block_are_read_and_named_nothing() 
         assert [value for _, value in state.undecoded] == [
             int.from_bytes(block[offset : offset + 2], "big") for offset in CONTROL_BLOCK_UNDECODED
         ]
-    # Nothing separates the eight outputs in any of the six: no start boost to read.
-    assert len({tuple(value for _, value in state.undecoded) for state in states}) == 2
-    assert {dict(state.undecoded)[0x08] for state in states} == {DUTY_MAX}
-    assert {dict(state.undecoded)[0x0A] for state in states} == {2}
-    assert {dict(state.undecoded)[0x0C] for state in states} == {2}
-    # The one difference between the outputs is +0x00, and only on output 1.
-    assert [dict(state.undecoded)[0x00] for state in states] == [100] + [450] * 7
-    # +0x08 was 50.00 % on the seven configured outputs of the earlier capture.
+    # Four of the six hold one value across all eight outputs: nothing in them
+    # separates one output's configuration from another's.
+    for offset, value in ((0x08, DUTY_MAX), (0x0A, 2), (0x0C, 2), (0x12, 1000)):
+        assert {dict(state.undecoded)[offset] for state in states} == {value}
     before = [channel_state(AQUAERO, firmware, k) for k in range(AQUAERO.pwm_count)]
+    for offset, value in ((0x0A, 2), (0x0C, 2), (0x12, 1000)):
+        assert {dict(state.undecoded)[offset] for state in before} == {value}
+    # +0x08 was 50.00 % on the seven configured outputs of the earlier capture.
     assert [dict(state.undecoded)[0x08] for state in before] == [5000] * 7 + [DUTY_MAX]
+    # The two that do differ between outputs -- nothing here reads them as a boost.
+    assert [dict(state.undecoded)[0x00] for state in states] == [100] + [450] * 7
+    assert [dict(state.undecoded)[0x00] for state in before] == [500] * 4 + [450, 300, 500, 450]
+    assert [dict(state.undecoded)[0x02] for state in before] == [
+        1000,
+        1000,
+        1600,
+        1600,
+        2800,
+        2000,
+        1500,
+        2000,
+    ]
     # The Quadro's channels have no such block at all.
     assert all(
         state.undecoded == ()

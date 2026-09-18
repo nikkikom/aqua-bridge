@@ -215,8 +215,13 @@ xt6:
 # keys decide when a deviation is reported. Defaults shown. The rpm and power rules
 # need mpc.fans / mpc.fan_models, which a legacy config like this one leaves empty, so
 # in this config only the rail rule is live; tools/fit_fans.py fits the curve the rpm
-# rule compares against, and fan_models.<m>.power_w_at_max (no default: measure it)
-# turns the power rule on.
+# rule compares against, and fan_models.<m>.power_w_at_max (no default: measure it) is
+# what the power rule judges against. That rule still cannot run on either supported
+# controller: the aquaero measures no current on its own outputs, and a bus device's
+# outputs sample it inside the PWM cycle, so most reports read 0 mA with the fan turning
+# (PROJECT.md section 2, 2026-09-18). The keys are kept for a controller that reports a
+# judgeable current; until then the published verdict names power as a rule that did
+# not run.
 fan_health:
   enabled: true              # false: the readings are still recorded and published, no rule runs
   min_duty: 0.25             # below this output duty no rpm or power rule fires (0..1)

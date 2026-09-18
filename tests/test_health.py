@@ -537,8 +537,8 @@ def test_no_supported_output_gives_the_power_rule_a_number_to_judge() -> None:
 
 
 def test_an_aquabus_outputs_rail_is_never_judged_however_the_reports_alternate() -> None:
-    """An aquabus block's voltage holds the bus device's rail in the reports whose
-    electrical sample fell in the on phase of the output's duty and the aquaero's *own*
+    """An aquabus block's voltage holds the bus device's rail in the reports that carry
+    that device's electrical sample and the aquaero's *own*
     rail in the rest -- most of them at a low duty -- and nothing in a single report
     tells them apart, so the block's voltage is published as unknown and the rail rule
     never sees it: it neither fires on the aquaero's rail nor has its timer reset by one
