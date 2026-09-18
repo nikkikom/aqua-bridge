@@ -9132,6 +9132,18 @@ Owner decision (2026-09-16):
     are not exercised by anything that runs on the Pi. Worth a one-line note
     in PROJECT.md section 4 pointing future readers at item 133 if the bench
     tool's warm-up ever needs revisiting again.
+148. **`bench_model_store.py`'s scratch-root check doesn't look at what
+    filesystem backs the path** (item 48). The module docstring's *Safety*
+    check accepts any path under `tempfile.gettempdir()` or `/tmp` without
+    checking what filesystem backs it. On the owner's board `/tmp` is
+    `tmpfs`, a different mount from the SD card the daemon's own store
+    lives on, so every write this tool times there is RAM write-and-fsync,
+    not disk, and the tool gives no signal that it measured the wrong thing
+    (item 48's board run). Worth deciding whether the tool should read the
+    resolved path's filesystem (`os.statvfs` or `/proc/mounts`) and warn,
+    or refuse, when it isn't disk-backed, and whether the owner wants to
+    grant a disk-backed scratch path for a run that actually answers item
+    48's write-latency question.
 
 ### 8.3 Open — needs the DAS hardware
 
