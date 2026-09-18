@@ -7665,10 +7665,16 @@ Owner decision (2026-09-16):
     again during this merge): the gate fails intermittently under an
     8-way parallel `ci_pytest_shards.py` run and passes alone every time,
     while the ratio's own distribution does not move (10.4–10.6 on one
-    measurement, 10.57–10.62 on another). Worth deciding whether the gate
-    should measure with the machine quiesced, take the median of more
-    repeats, or report the ratio and fail only on a trend, so that a red
-    CI run means a regression rather than a busy runner.
+    measurement, 10.57–10.62 on another). A fourth independent
+    measurement (item 95's PR): the same test flaked once under a host
+    load average over 160 on 32 cores from concurrent workflow runs, and
+    passed reliably both alone and in a single-process (`--shards 1`)
+    full run on the same host — a single-process run sidesteps the
+    contention this item is about, at the cost of the wall-clock time
+    sharding buys. Worth deciding whether the gate should measure with
+    the machine quiesced, take the median of more repeats, or report the
+    ratio and fail only on a trend, so that a red CI run means a
+    regression rather than a busy runner.
 127. `tools/fit_fans.py` and the recorder do not keep `rail_reported`
     (item 117's audit). The recorder whitelists `duty, rpm, voltage_v,
     current_ma, power_w` plus `power_reported`. A recorded
@@ -7685,6 +7691,16 @@ Owner decision (2026-09-16):
     visible without reading the journal. Key both on `state`, not on
     `lost` alone: `state` tells `never_seen` (a healthy aquaero with an
     empty bus) from `lost`.
+133. `tools/bench_model_store.py`'s warm-up loop never gets `calibration`
+    or `fan_curves` populated against the shipped
+    `config.example-das.yaml` (`fan_curve_online: false`, and the DAS
+    truth-plant closed loop doesn't accumulate an accepted SMART
+    calibration in a modest number of ticks), so its dev-machine size
+    sanity check (1424 bytes, item 48) is close to the store's floor
+    rather than a representative steady-state size. Worth deciding
+    whether the tool should force those on (a rich-enough preset/config
+    override) for a size estimate that means something without the
+    board, or whether only a live board run ever answers this.
 
 ### 8.3 Open — needs the DAS hardware
 
