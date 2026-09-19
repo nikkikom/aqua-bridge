@@ -4892,7 +4892,13 @@ multi-value checks below. Helpers: `resolve_prev_pwm`, `obs_pwm_trusted`
   → `mode=fallback`. With `median3` on, a finite out-of-range value is
   not structural: the median removes a single Spike.
 - untrusted observation → `mode=fallback` and the hold-then-high policy
-  in §3 (never a step toward `pwm_min` *because* of the fault)
+  in §3 (never a step toward `pwm_min` *because* of the fault).
+  `checked_step` asserts that floor on **every** legacy fallback tick, not
+  only the untrusted ones — a trusted tick still inside `confirm_ticks`
+  and a solver fault hold the same way: `pwm ≥ min(prev, pwm_max)` per
+  channel, the `pwm_max` allowance being the clamp a `prev` taken from
+  `obs.pwm` may need. A hold at `pwm_min` is not a violation when `prev`
+  was already there; the rule is about the step, not the level
 - same `(obs, config, state)` → same `(cmd, state)` (deterministic)
 
 On a zoned config `checked_step` also runs `assert_zone_step_safe`:
@@ -5020,6 +5026,14 @@ Config / solver:
 - a fault that starts above `fallback_pwm` (at `pwm_max`, or between)
   never lowers the fans; the ramp target is `max(prev, fallback_pwm)` per
   channel
+- the mirror of it: a fault that opens with the fans already **at**
+  `pwm_min` (both readings frozen ten degrees C under setpoint, so the
+  solver walked them down there long before the Stuck window filled, then
+  gate rule 3 fired on the first full window) holds at `pwm_min` for
+  `fallback_hold_s` and only then ramps to `fallback_pwm`, never below the
+  tick before it at any tick. §4.1 forbids a step toward `pwm_min`
+  *because of* the fault, not a hold at a level the controller had already
+  chosen while it was trusted
 
 Loop / glue (`tests/test_loop.py`, still no HID):
 
@@ -5102,6 +5116,15 @@ Properties (N random examples per test, shrinking on failure):
   total variation at most
   `(n − 1) * d_pwm_max`. That is the only bound that holds for any
   solver; a tighter PI-specific bound would not survive the solver swap.
+  "A plausible plant" is bounded on **both** sides, by the gate's own keys:
+  each tick's temperature step is larger than `stuck_eps_c`, and the walk is
+  reflected back inside `[temp_min_c, temp_max_c]`. A reading that never
+  moves is a Stuck sensor, and one outside that range is not a reading at
+  all; §3 requires the gate to fault both, so neither belongs under "never
+  a fault". Without the lower bound the strategy draws a frozen sensor (a
+  zero step is its own shrink target) and the property asks the gate *not*
+  to catch a dead one — the 2026-09-19 nightly drew exactly that, and
+  `test_mpc_failures.py` now pins that sequence as a fault instead.
 - **Random lies mixed in:** with probability p (and random `median3`),
   apply a lie from §4.4 → still invariants; `mode=fallback` whenever the
   gate says untrusted; an untrusted tick never lowers a channel below

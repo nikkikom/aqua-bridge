@@ -509,6 +509,66 @@ def test_fault_above_fallback_pwm_never_lowers_the_fans(fast_cfg, start, fault):
     assert cmd.diagnostics["target_pwm"] == pytest.approx(held)
 
 
+def test_stuck_at_pwm_min_holds_there_then_ramps_high(cfg):
+    """The mirror of the case above: a fault that opens with the fans already at
+    ``pwm_min``. Nightly ``test_mpc_fuzzy`` draw of 2026-09-19, reproduced exactly.
+
+    Both readings are frozen to the bit, ten degrees C *under* the setpoint, so the
+    solver walks the fans all the way down to ``pwm_min`` long before the Stuck
+    window fills. On the first tick with a full window (``stuck_ticks``) the net
+    commanded move across it is the whole 1.0 -> ``pwm_min`` travel, far more than
+    ``stuck_pwm_net``, and gate rule 3 flags both temperatures: a reading that has
+    not moved by one code in a whole ``stuck_s`` while the fans went from full to
+    minimum is a dead sensor, not a cold loop.
+
+    What the fallback must then command is ``prev`` -- which here *is* ``pwm_min``.
+    Section 4.1 forbids a step toward ``pwm_min`` **because of** the fault, not a
+    hold at a level the controller had already chosen while it was trusted, and
+    section 3's ramp lifts the fans to ``fallback_pwm`` once the hold is over. So
+    the command at ``pwm_min`` in the failure report is the contract working, and
+    this test pins it end to end: never below the tick before, at any tick.
+    """
+    assert cfg.stuck_ticks * cfg.dt == cfg.stuck_s, "the example config's real window"
+    state = MpcState.cold()
+    hold_ticks = int(cfg.fallback_hold_s / cfg.dt) + 1
+    ramp_ticks = math.ceil((cfg.fallback_pwm["radiator"] - cfg.pwm_min) / cfg.d_pwm_max)
+    trace = []
+    prev = None
+    for i in range(cfg.stuck_ticks + hold_ticks + ramp_ticks + 2):
+        obs = make_obs(
+            cfg,
+            i * cfg.dt,
+            temps=dict.fromkeys(cfg.temps, SP - 10.0),
+            pwm=dict.fromkeys(cfg.channels, 1.0),
+        )
+        cmd, state = checked_step(obs, cfg, state)
+        if prev is not None and cmd.mode is Mode.FALLBACK:
+            for ch in cfg.channels:
+                assert cmd.pwm[ch] >= prev[ch] - TOL, f"tick {i}: the fault lowered {ch}"
+        trace.append(cmd)
+        prev = dict(cmd.pwm)
+
+    # The whole window is trusted: the rule needs a full one, and cannot fire before.
+    auto, fault = trace[: cfg.stuck_ticks], trace[cfg.stuck_ticks :]
+    assert all(c.mode is not Mode.FALLBACK for c in auto), "Stuck fired before a full window"
+    assert auto[-1].pwm == pytest.approx(dict.fromkeys(cfg.channels, cfg.pwm_min)), (
+        "a loop ten degrees C under setpoint should have been walked down to pwm_min"
+    )
+    # ... and the first tick with one is a sensor-gate fault on both temperatures.
+    assert fault[0].mode is Mode.FALLBACK and not fault[0].diagnostics["trusted"]
+    assert state.fault_reason is FaultReason.SENSOR_GATE
+    assert fault[0].diagnostics["gate"]["stuck"] == dict.fromkeys(cfg.temps, True)
+    assert all(c.mode is Mode.FALLBACK for c in fault), "a frozen reading never confirms back"
+
+    # Hold at prev (== pwm_min here), then ramp to fallback_pwm. Never toward pwm_min.
+    at_min = dict.fromkeys(cfg.channels, cfg.pwm_min)
+    for cmd in fault[:hold_ticks]:
+        assert cmd.diagnostics["policy"] == "hold"
+        assert cmd.pwm == pytest.approx(at_min)
+    assert fault[hold_ticks].diagnostics["policy"] == "ramp_high"
+    assert fault[-1].pwm == pytest.approx(cfg.fallback_pwm)
+
+
 def test_ramp_high_target_is_max_of_prev_and_fallback_per_channel(fast_cfg):
     """One channel above fallback_pwm is held, the other is raised to it."""
     cfg = fast_cfg

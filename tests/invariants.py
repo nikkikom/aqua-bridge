@@ -237,6 +237,19 @@ def assert_command_safe(
             assert cmd.mode is Mode.FALLBACK, (
                 f"observation is structurally untrusted but cmd.mode={cmd.mode.value!r}"
             )
+        # "A fault never reduces cooling" (section 4.1: never a step toward
+        # ``pwm_min`` *because* of the fault). Every fallback tick, not only the
+        # untrusted ones: a trusted tick still inside ``confirm_ticks`` and a solver
+        # fault follow the same hold-then-high policy. Only the clamp into
+        # ``[pwm_min, pwm_max]`` may lower a ``prev`` that came from ``obs.pwm``
+        # above ``pwm_max``. The zoned counterpart is in
+        # :func:`assert_zone_step_safe`, per faulted zone's reach.
+        if cmd.mode is Mode.FALLBACK:
+            for ch in cfg.channels:
+                floor = min(prev_pwm[ch], cfg.pwm_max)
+                assert cmd.pwm[ch] >= floor - TOL, (
+                    f"the fault lowered {ch!r}: {cmd.pwm[ch]} < {floor}"
+                )
         return
     # Zones: the structurally faulted zones must be in fault, their channels under
     # fallback policy and never commanded below prev (clamped into the box).
