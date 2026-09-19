@@ -67,6 +67,52 @@ def obs_in_box(cfg: MpcConfig, ts: float):
     )
 
 
+#: Widest temperature step one tick of a "slow drift" may take, degC. Far below
+#: ``dT_max_tick`` (the gate's slew limit), so the walk never trips gate rule 2.
+DRIFT_MAX_C = 0.5
+
+
+def drift_step(cfg: MpcConfig):
+    """One tick of a slow drift: more than ``stuck_eps_c``, at most :data:`DRIFT_MAX_C`.
+
+    The lower bound is the gate's own definition of "this reading changed"
+    (section 3 rule 3, ``mpc.stuck_eps_c``), and it is what makes "never a fault"
+    a statement about the controller instead of about the strategy. A value that
+    stays inside that band for a whole ``stuck_s`` window while the command moves
+    by more than ``stuck_pwm_net`` across it is a **Stuck sensor**, and section 3
+    requires the gate to fault it: that is not a plant drifting slowly, it is a
+    reading that stopped. Without the bound the strategy draws exactly that
+    (``0.0`` is its own shrink target) and the property asserts that the gate must
+    *not* catch a dead sensor.
+
+    The band is measured against the *oldest* sample of the window, so one step
+    wider than it puts the second sample of every window outside the band and the
+    rule can never fire here. ``TOL`` covers the single float addition that
+    realises the step: a bound taken exactly at the band could round back into it.
+    """
+    return st.builds(
+        lambda size, up: size if up else -size,
+        st.floats(min_value=cfg.stuck_eps_c + TOL, max_value=DRIFT_MAX_C),
+        st.booleans(),
+    )
+
+
+def drifted(value: float, step: float, cfg: MpcConfig) -> float:
+    """``value + step``, reflected back inside ``[temp_min_c, temp_max_c]``.
+
+    Outside that range the gate has no reading at all (section 3 rule 2), so a
+    walk that leaves it has stopped being a plant and become an invalid sample --
+    and 100 ticks of ``DRIFT_MAX_C`` reach well past both ends. Reflecting rather
+    than clamping keeps ``abs(step)`` exactly, so the Stuck bound above survives;
+    clamping would park the walk on a rail and freeze it, which is the very case
+    the bound exists to keep out.
+    """
+    nxt = value + step
+    if not cfg.temp_min_c <= nxt <= cfg.temp_max_c:
+        nxt = value - step
+    return nxt
+
+
 LIES = ["spike_hi", "spike_lo", "none", "nan", "inf", "missing", "extra", "garbage", "swap", "jump"]
 
 
@@ -116,15 +162,28 @@ def test_random_valid_obs_in_plausible_boxes_hold_invariants(cfg, data):
 @given(data=st.data())
 def test_random_sequences_of_small_perturbations(cfg, data):
     """20-100 steps, each obs a small perturbation of the last: invariants every tick,
-    deterministic step, PWM total variation bounded by the rate limit."""
+    deterministic step, PWM total variation bounded by the rate limit.
+
+    "A plausible plant" is bounded on *both* sides, and both bounds are the gate's
+    own config keys rather than numbers picked to make this pass: the reading moves
+    every tick by more than ``stuck_eps_c`` (:func:`drift_step`) and never leaves
+    ``[temp_min_c, temp_max_c]`` (:func:`drifted`). A walk that fails either has left
+    the envelope -- it is a frozen sensor or an invalid sample, and section 3 requires
+    the gate to fault both. The frozen end is pinned as a fault, with its fallback
+    command, by ``test_mpc_failures.test_stuck_at_pwm_min_holds_there_then_ramps_high``.
+    """
     n = data.draw(st.integers(min_value=20, max_value=100))
     temps = {name: data.draw(st.floats(min_value=25.0, max_value=45.0)) for name in cfg.temps}
     pwm = dict.fromkeys(cfg.channels, data.draw(st.floats(min_value=0.15, max_value=1.0)))
+    drift = drift_step(cfg)
     state = MpcState.cold()
     series: dict[str, list[float]] = {ch: [] for ch in cfg.channels}
     for i in range(n):
         for name in cfg.temps:
-            temps[name] += data.draw(st.floats(min_value=-0.5, max_value=0.5))
+            was = temps[name]
+            temps[name] = drifted(was, data.draw(drift), cfg)
+            # the premise of "never a fault", checked rather than assumed
+            assert abs(temps[name] - was) > cfg.stuck_eps_c
         for ch in cfg.channels:
             pwm[ch] = min(
                 1.0, max(0.0, pwm[ch] + data.draw(st.floats(min_value=-0.05, max_value=0.05)))
@@ -138,7 +197,7 @@ def test_random_sequences_of_small_perturbations(cfg, data):
         state = nxt
         for ch in cfg.channels:
             series[ch].append(cmd.pwm[ch])
-        # small perturbations of a plausible plant are never a fault
+        # a plausible plant drifting slowly is never a fault
         assert cmd.mode is not Mode.FALLBACK, f"tick {i}: slow drift treated as a fault"
     for ch in cfg.channels:
         s = series[ch]
@@ -169,11 +228,13 @@ def test_random_lies_mixed_in_keep_invariants_and_fallback_when_untrusted(cfg, d
         if not cmd.diagnostics["trusted"]:
             assert cmd.mode is Mode.FALLBACK, f"tick {i}: untrusted but mode {cmd.mode}"
             assert state.in_fault
-            # an untrusted tick never steps toward pwm_min because of the fault:
-            # not below prev (only the clamp into [pwm_min, pwm_max] may lower it)
+        if cmd.mode is Mode.FALLBACK:
+            # a fault never steps toward pwm_min: not below prev (only the clamp into
+            # [pwm_min, pwm_max] may lower it). Every fallback tick, not only the
+            # untrusted ones -- a trusted tick still inside confirm_ticks holds too.
             for ch in cfg.channels:
                 lo = min(prev[ch], cfg.pwm_max)
-                assert cmd.pwm[ch] >= lo - TOL
+                assert cmd.pwm[ch] >= lo - TOL, f"tick {i}: the fault lowered {ch}"
         if obs_structurally_untrusted(obs, cfg):
             assert cmd.mode is Mode.FALLBACK
 
