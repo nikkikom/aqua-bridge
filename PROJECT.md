@@ -3967,7 +3967,7 @@ a model converges only with them.
       temp_map: {}            # bind Quadro inputs once they are connected
   onewire:
     sensors: {prox_b01: 28-0316a27a0aff, ...}   # logical name -> ROM id
-    resolution_bits: 10       # 9..12; default 10 (§8 item 39)
+    resolution_bits: 12       # 9..12; default 12 (§8 item 39)
     max_age_s: 7.5            # default 1.5 * dt
     bulk_read: auto           # auto (probe each bus) | off; default auto
     bulk_timeout_s: 2.0       # default; bound on the one wait in a cycle
@@ -3983,9 +3983,10 @@ a model converges only with them.
   cross-checks them (the sections are validated apart, and a mismatch is
   not fatal: it mis-sizes `R = sensor_noise_c² + quant_c²/12` and
   `stuck_eps_c = 1.5 * quant_c`, it does not lose a reading).
-  `config.example-das.yaml` ships `resolution_bits: 10` and, for now,
-  `quant_c: 0.0625` on its DS18B20 sensors — the golden trajectories of
-  `tests/test_das_core.py` are fitted to that value.
+  `config.example-das.yaml` ships `resolution_bits: 12` and
+  `quant_c: 0.0625` on its DS18B20 sensors, which is the 12-bit step, so the
+  two agree; the golden trajectories of `tests/test_das_core.py` are fitted
+  to that `quant_c` and do not move (§8 item 39, the re-derivation).
 
   An `xt6:` section is still accepted as one more device. Every
   `mpc.temps` name must be bound exactly once across all `temp_map`s and
@@ -4574,10 +4575,15 @@ a model converges only with them.
   from and `tools/w1_commission.py --check` prints it beside the measured
   cycle time, because a cycle time read against the wrong tier is worse
   than no number. With the netlink tier available every bus can have a
-  bulk path, which is the premise the 10-bit default was chosen against
-  (§8 item 39: the default had to fit the bus that could never have one);
-  revisiting `resolution_bits` is a change of its own and not part of the
-  tier work. Now the sysfs tiers. A
+  bus-wide conversion, which removed the premise the 10-bit default was
+  chosen against (§8 item 39: the default had to fit the bus that could
+  never have one), and `resolution_bits` was re-derived against the ladder
+  as it now stands and is **12 bit** again — 0.96 s per cycle for 12 sensors
+  over netlink, 1.00 s over the kernel's bulk read, about a quarter of the
+  `max_age_s / 2` budget. It does *not* fit the serial tier (9.6 s for the
+  same 12), which is a demoted bus's floor and is stated as such rather than
+  designed around; the same §8 item has the arithmetic per tier and what a
+  demotion costs. Now the sysfs tiers. A
   cycle reads `therm_bulk_read`, writes the trigger — `"trigger\n"`,
   **eight bytes**, because the kernel compares the write size against
   `sizeof("trigger")` with its NUL and ignores a short one silently — and
@@ -4591,12 +4597,14 @@ a model converges only with them.
   to serial reads, finishes the same cycle serially so no sample is lost,
   and probes again after `bulk_retry_s`. Nothing waits on a signal that may
   never come. Bulk costs one conversion plus ~19 ms per sensor (12 sensors
-  at 10 bit: 0.39 s); serial costs `conv_time` + ~40 ms per sensor (2.7 s),
-  inside `max_age_s / 2 = 3.75 s` at `dt = 5 s`. The default resolution has
-  to fit the serial path because only **one master system-wide** ever gets
-  a `therm_bulk_read` at all, and a phantom slave can take it away from the
+  at the default 12 bit: 1.00 s, inside `max_age_s / 2 = 3.75 s` at
+  `dt = 5 s`); serial costs `conv_time` + ~40 ms per sensor, 9.6 s for the
+  same 12 — 2.6 × that budget. Only **one master system-wide** ever gets a
+  `therm_bulk_read` at all, and a phantom slave can take it away from the
   one that has it (§8 item 38 for both defects, item 39 for the
-  arithmetic). `onewire.buses` is documentation only: bus masters are discovered, the
+  arithmetic), so this tier is *not* what makes the default affordable —
+  netlink is, and it is available on every bus.
+  `onewire.buses` is documentation only: bus masters are discovered, the
   overlays are in `config.txt` (§9), and the `w1_bus_master<N>` numbering
   does not follow the order of the overlay lines. Undeclared slaves are
   ignored, which is what keeps the family-`00` phantoms of an unterminated
@@ -5505,8 +5513,10 @@ the board.
   case a reading, no exception, a wait bounded by `bulk_timeout_s`, no
   second trigger inside `bulk_retry_s`, and the fast path back once the
   probe succeeds again. `bulk_read: off` never touches the attribute, and
-  the `resolution_bits` default is checked against the measured per-sensor
-  costs (serial and bulk) and the per-bus budget of item 39.
+  the `resolution_bits` default is checked against the measured per-tier
+  cycle costs and the per-bus budget of item 39 — including that it does
+  *not* fit the serial tier at the planned scale, so the day someone makes
+  serial affordable that assertion is what tells them to re-derive.
   Then the tier ladder: a bus whose connector answers reads over netlink
   (and the readings prove it — the fake tree's `temperature` files and its
   scratchpads carry different values on purpose), a master the connector
@@ -9504,7 +9514,10 @@ Owner decision (2026-09-16):
       `therm_bulk_read` is created on **one master system-wide** — whichever
       owns the first bulk-capable slave to attach anywhere. Confirmed:
       `w1_bus_master2` has the file, `w1_bus_master1` does not. The owner's
-      second bus will have no bulk control at all. (The attribute's
+      second bus will have no *sysfs* bulk control at all — the netlink tier
+      added later (§3) gives it a bus-wide conversion anyway, addressing the
+      master by id, which is what let `resolution_bits` go back to 12 bit
+      (item 39). (The attribute's
       appearing only once the first `w1_therm` slave attaches is the same
       mechanism, and is why the udev rule has to fix the master's attribute
       from the *slave* event.)
@@ -9531,8 +9544,9 @@ Owner decision (2026-09-16):
       (`deploy/99-w1-therm.rules`, §9 "udev"): every w1 attribute is
       created root-owned and the service user is not root. Without it the
       `resolution` write fails with `EACCES` — handled, warned, and the
-      sensors stay at their power-on 12 bit — and the trigger fails too, so
-      every bus reads serially.
+      sensors stay at their power-on 12 bit, which since item 39's
+      re-derivation is the default anyway — and the trigger fails too, so
+      every bus reads a tier lower.
     - `features=3` (bit 1 check the conversion result, bit 2 poll for
       completion) was worth about 7 % on the serial path (456 → 424 ms for
       two sensors at 10 bit). The daemon does not write it; the udev rule
@@ -9552,9 +9566,11 @@ Owner decision (2026-09-16):
     cycle returns empty in about 1 ms without touching the bus.
 
     Not settled by this: anything that needs a full bus. The per-sensor
-    cost model of item 39 is measured on two and three sensors, the CRC
-    error rate at 12 per bus is unmeasured (no failed read in ~50 reads
-    here, which says nothing about a 5 m chain), the second bus is not
+    cost model of item 39 was measured on two and three sensors here and has
+    since been re-measured on up to eight (item 39, the re-derivation), but
+    the CRC error rate at 12 per bus is still unmeasured (no failed read in
+    ~50 reads here, nor in 600 there, which says nothing about a 5 m chain),
+    the second bus is not
     wired — so defect (a) is observed as "the unwired master has no
     attribute", not yet as "the wired second bus cannot bulk-read" — and
     defect (b) has not been reproduced deliberately by putting a phantom on
@@ -9569,7 +9585,7 @@ Owner decision (2026-09-16):
     bit is *slower* than 10, and the knob to reach for is fewer bits, not
     more.
 
-A **serial** read costs the sensor's own conversion plus about 40 ms of
+    A **serial** read costs the sensor's own conversion plus about 40 ms of
     kernel bit-banging and sysfs overhead: 800 / 415 / 227 / 131 ms per
     sensor at 12 / 11 / 10 / 9 bit (item 38, measured on three sensors). A
     **bulk** cycle costs one conversion for the whole bus plus ~19 ms of
@@ -9589,18 +9605,17 @@ A **serial** read costs the sensor's own conversion plus about 40 ms of
     | 10 bit | 0.39 s | 2.7 s |
     | 9 bit | 0.32 s | 1.6 s |
 
-    **Only one master system-wide ever gets a `therm_bulk_read`** (item 38,
-    defect (a)), so with two buses one of them reads serially always, and
-    the default has to be a value that fits *that* bus. 12 bit does not
-    (9.6 s, nearly two whole ticks); 11 bit does not (5.0 s, over a tick
-    and 1.33 × the budget); 10 bit does, at 0.73 of the budget and 0.55 dt.
-    Note how little the choice matters on the bulk-capable bus — 0.98 s
-    against 0.39 s — and how much on the other.
-    A bus that grows a phantom (defect (b)) falls onto the same serial path
-    for `bulk_retry_s`, which is the other reason the default must survive
-    it.
-
-    **Default: 10 bit.** It leaves room for 16 sensors on a serial bus at
+    **Default: 10 bit**, and the world it was chosen in — one bus-wide read
+    path in the kernel's gift, and two buses. **Only one master system-wide
+    ever gets a `therm_bulk_read`** (item 38, defect (a)), so with two buses
+    one of them reads serially always, and the default has to be a value
+    that fits *that* bus. 12 bit does not (9.6 s, nearly two whole ticks);
+    11 bit does not (5.0 s, over a tick and 1.33 × the budget); 10 bit does,
+    at 0.73 of the budget and 0.55 dt. Note how little the choice matters on
+    the bulk-capable bus — 0.98 s against 0.39 s — and how much on the
+    other. A bus that grows a phantom (defect (b)) falls onto the same
+    serial path for `bulk_retry_s`, which is the other reason the default
+    must survive it. 10 bit leaves room for 16 sensors on a serial bus at
     `dt = 5 s` (6 at `dt = 2 s`, where `max_age_s` is 3 s). 9 bit would fit
     more and is not worth it: its 0.5 °C step is exactly the estimator's
     `jump_min_c`, it is 1.5 × the Stuck band the 12-bit default assumes,
@@ -9610,22 +9625,122 @@ A **serial** read costs the sensor's own conversion plus about 40 ms of
     estimator carries is `quant_c²/12`, σ = 0.072 °C: a seventh of the
     DS18B20's own ±0.5 °C accuracy, which is the systematic term §2 cares
     about and the one item 40's commissioning cross-check exists for.
-    Quantisation is not why this sensor is imprecise.
+    Quantisation is not why this sensor is imprecise. An installation that
+    puts every sensor on the one bulk-capable bus can run 12 bit (0.98 s for
+    12 sensors, 1.2 s for 24) — `resolution_bits` is a config key and
+    `--check` prints which path each bus got. Splitting by zone pairs is
+    what §2 asks for, though, and that costs the second bus its bulk.
 
-    An installation that puts every sensor on the one bulk-capable bus can
-    run 12 bit (0.98 s for 12 sensors, 1.2 s for 24) — `resolution_bits` is
-    a config key and `--check` prints which path each bus got. Splitting by
-    zone pairs is what §2 asks for, though, and that costs the second bus
-    its bulk.
+    **Re-derived: 12 bit** (2026-09-25, after the netlink tier landed on the
+    read ladder). The premise the paragraph above rests on — "one of them
+    reads serially always" — is the thing that changed, and it is the only
+    thing that changed: the netlink tier (§3, `hw/w1_netlink.py` /
+    `hw/w1_therm_netlink.py`) does a bus-wide Skip ROM + Convert T on a
+    master addressed by **id**, so it needs no `therm_bulk_read` at all and
+    no phantom can silence it. Confirmed on the board with the tier's own
+    code: `W1_LIST_MASTERS` answers with both masters, and the bus-wide
+    conversion command issues on `w1_bus_master1` — the master the kernel
+    gave no `therm_bulk_read` — in 6.7 ms (9.4 ms when the tier was
+    measured).
+
+    Re-measured through `hw/onewire.py` itself, **8 sensors** on one bus (the
+    owner adds sensors as this goes, so the count belongs with the numbers),
+    cycle time against the number of declared sensors `n`, least squares over
+    `n` = 2, 4, 6, 8:
+
+    | tier | 12 bit | 10 bit |
+    |---|---|---|
+    | netlink | 764 + 16.6 `n` ms | 203 + 16.3 `n` ms |
+    | sysfs bulk | 759 + 20.5 `n` ms | 211 + 15.9 `n` ms |
+    | serial | 800.0 `n` ms | 228.3 `n` ms |
+
+    No failed read in 480 bus-wide reads and 120 serial ones. The serial
+    slope is 800.0 ms per sensor at 12 bit and 228 ms at 10 — the same
+    per-sensor cost the three-sensor table above projected from, which is
+    the check that these are per-sensor costs and not an artefact of one
+    count. At the planned 12 sensors per bus, against the same 3.75 s:
+
+    | tier | 12 bit | 10 bit | 12 bit, of the budget |
+    |---|---|---|---|
+    | netlink | 0.96 s | 0.40 s | 26 % |
+    | sysfs bulk | 1.00 s | 0.40 s | 27 % |
+    | serial | 9.6 s | 2.74 s | **256 %** |
+
+    So 12 bit fits both bus-wide tiers with three quarters of the budget
+    unspent, and does not fit serial. Which of those matters is a question
+    about the ladder, not about the arithmetic: netlink is the top tier and
+    the only one available on *every* master, the kernel's bulk read is a
+    second bus-wide tier on the one master that gets the attribute, and
+    serial is the floor under both — not where a bus lives.
+
+    **What a demoted bus costs, plainly.** A bus reaches serial only when
+    netlink fails *and* the kernel's bulk read is absent or refused; on the
+    second bus, which has no `therm_bulk_read`, one netlink failure is
+    enough. It then stays there for `netlink_retry_s` (300 s), because that
+    retry window is exactly what keeps the probe from costing every cycle.
+    At 12 bit and 12 sensors that is a 9.6 s cycle against `max_age_s` =
+    7.5 s, so every sample is older than `read()` will accept for 2.1 s out
+    of each 9.6 s: the whole bus reads as missing on roughly a fifth of the
+    ticks, and one failed cycle stretches the gap to 19.2 s, over two ticks
+    dark. Nothing unsafe happens — `read()` never blocks, so the tick is
+    never held up, and a missing reading raises cooling and never lowers it
+    (§2) — but the *model* is lost for up to five minutes: those bays go
+    unobserved, σ grows, the trust gate falls back. At 10 bit the same
+    demotion costs 2.74 s, inside the budget, and nothing is lost at all.
+    One more consequence of the longer cycle: `stop()` joins each reader
+    thread with a 5 s bound and `run_bus_cycle` has no stop check between
+    serial reads, so a 12-bit serial cycle outlives that join — the threads
+    are daemons, so the process still exits, but shutdown no longer waits
+    the bus out the way a 2.7 s cycle did.
+
+    That trade is stated rather than designed around, deliberately. The
+    reader keeps the configured resolution while it is demoted (`resolution`
+    is written once per sensor, never per cycle), and lowering it on
+    demotion is a change of its own rather than a detail of this one,
+    because `sensors.<name>.quant_c` cannot follow from config: the
+    estimator would size `R = sensor_noise_c² + quant_c²/12` for 0.0625 °C
+    while the sensor delivered 0.25, and — the worse half —
+    `stuck_eps_c = 1.5 × quant_c` = 0.094 °C would sit *below* one 10-bit
+    LSB, so a sensor idling on one code would trip the Stuck rule instead of
+    being cleared by its own dither. Either the resolution a sample was
+    taken at travels with the sample, or the demoted resolution is its own
+    config key with its own `quant_c`. Neither belongs in a default's
+    re-derivation.
+
+    **12 bit is also the step the rest of the config already assumes.**
+    0.0625 °C is what `config.example-das.yaml` declares as `quant_c` on its
+    DS18B20 sensors and what the golden trajectories of
+    `tests/test_das_core.py` are fitted to, so the two sections agree again
+    (§3, the `onewire:` block: nothing cross-checks them, which is why they
+    have to be moved together). The quantisation the estimator carries is
+    `quant_c²/12`, σ = 0.018 °C, the Stuck band is 0.094 °C — above one LSB,
+    so an idle sensor's own dither clears it — and the worst-case standing
+    error on a sensor sitting on one code is 0.031 °C, under a third of the
+    0.1 °C of offset item 40 is sensitive to.
+
+    The 10-bit default was **correct for the world it was chosen in** and is
+    not being corrected here. With only one bus-wide path in the kernel's
+    gift, the second bus really did have to read one sensor at a time, and
+    12 bit really was 9.6 s against a 3.75 s budget — the same 9.6 s
+    measured again above. What moved is the ladder, not the numbers.
+
+    Coarser steps stay one config key away: 0.125 °C at 11 bit (~0.6 s
+    bus-wide for 12 sensors, 5.0 s serial), 0.25 at 10 (0.40 / 2.74 s), 0.5
+    at 9 (~0.3 / 1.6 s) — and 9 bit is still not worth it, for the reasons
+    above. An installation on a kernel with no `w1` netlink connector has no
+    bus-wide tier on a second bus at all and wants 10 bit; that is not
+    guesswork, `--check` prints the tier each bus ended up on beside its
+    measured cycle time.
 
     Whoever changes `resolution_bits` moves `sensors.<name>.quant_c` with
     it (§3, the `onewire:` block): 0.0625 at 12 bit, 0.125 at 11, 0.25 at
     10, 0.5 at 9.
 
     Still open, and what the wiring is for: the cycle time and CRC error
-    rate at 12 sensors per bus (`--check` reports the read path, the
-    driver's `conv_time` and ms/cycle per bus), the second bus, and every
-    ROM id bound with `--identify`.
+    rate at 12 sensors per bus (clean at 8 on one bus so far, 0 failed reads
+    in 600; `--check` reports the read path, the driver's `conv_time` and
+    ms/cycle per bus), the second bus, and every ROM id bound with
+    `--identify`.
 40. Cross-check zone-air against inlet sensor offsets at commissioning
     (0.1 °C of offset biases `E` by 15–35 %).
 41. Run the SMART agent on the PC against the real drives (smartctl
@@ -11017,19 +11132,24 @@ every cycle whether a declared ROM id has a directory, so a sensor that
 comes back with its drive (§2 "Failure and redundancy") reappears only
 because the kernel keeps searching. A bus that never searches never
 notices it. The cost of searching is small next to the reads it competes
-with — a cycle is 2.7 s of conversions for 12 sensors at 10 bit, a search
-a few ms per device every 10 s — and nothing measured says otherwise, so
+with — a cycle is 0.96 s for 12 sensors at the default 12 bit over netlink,
+9.6 s read one at a time, against a search of a few ms per device every
+10 s — and nothing measured says otherwise, so
 nothing is changed. If the interval ever has to grow it is
 `options wire timeout=<seconds>` in `/etc/modprobe.d/`, board-wide and an
 operator's decision, and it is paid for in how long a re-attached sensor
 stays missing.
 
 **CPU note:** 1-Wire is bit-banged by the kernel with busy-waits; the
-~40 ms a serial read spends above `conv_time` is roughly that, so 12
-sensors cost about 0.5 s of one core per 2.7 s cycle, ~18 % of a core per
-bus, two buses ~9 % of the 4-core Zero 2 W. The conversion itself is a
-sleep, not a spin. Measure with `tools/w1_commission.py --check`, which
-prints the read path, the driver's `conv_time` and ms/cycle per bus.
+conversion itself is a sleep, not a spin, so what costs a core is the
+per-sensor traffic around it — the ~40 ms a serial read spends above
+`conv_time`, or the ~17 ms a bus-wide tier spends per scratchpad. At the
+default 12 bit and 12 sensors that is ~0.2 s of one core per 0.96 s netlink
+cycle, ~21 % of a core per bus, two buses ~10 % of the 4-core Zero 2 W;
+read one at a time the same 12 cost ~0.6 s per 9.6 s cycle, a smaller
+share of a core for a cycle that no longer fits the budget (§8 item 39).
+Measure with `tools/w1_commission.py --check`, which prints the read path,
+the driver's `conv_time` and ms/cycle per bus.
 
 I2C userspace module: `/etc/modules-load.d/i2c-dev.conf` → `i2c-dev`.
 
@@ -11431,14 +11551,16 @@ ACTION=="add|change", SUBSYSTEM=="w1", KERNEL=="28-*", RUN+="/bin/sh -c 'for f i
 What it grants and why: the kernel creates every w1 sysfs attribute
 root-owned, and the daemon runs as the service user (`plugdev` through the
 unit's `SupplementaryGroups=`). It **writes** each sensor's `resolution`
-once — the 10-bit default is what makes 12 sensors per bus fit the tick
-(§8 item 39), and without the grant every sensor stays at its power-on 12
-bit, where a serial cycle no longer fits — and it writes the eight-byte
+once — the default is 12 bit, the DS18B20's own power-on value, so a
+refused write leaves the sensors where the default wanted them and only a
+config asking for 9, 10 or 11 is silently not applied (§8 item 39 for the
+arithmetic, and the warning that says so) — and it writes the eight-byte
 `"trigger\n"` to the bus master's `therm_bulk_read` once per cycle, which
 is what makes a bulk read ten times cheaper than reading the sensors one
 at a time (§8 item 38). Without this rule that write fails with `EACCES`,
-which is handled — the bus reads serially — but then nothing on the board
-is at the resolution the tick budget assumes either. `conv_time` is read
+which is handled — the bus drops a tier and the same cycle finishes there —
+but then the `resolution` write has failed too and nothing on the board is
+necessarily at the resolution config asked for. `conv_time` is read
 (it is granted because it is writable and an experiment may want it) and
 `features` is not written today, only measured (§8 item 38). Nothing here
 changes a value; group `plugdev`, group write, on four attributes.

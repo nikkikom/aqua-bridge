@@ -107,8 +107,11 @@ its own log (section 8 item 38):
 * ``bulk_read_device_counter`` is a file-scope global, so
   ``therm_bulk_read`` is created on **one master system-wide** -- whichever
   owns the first bulk-capable slave to attach anywhere. A second 1-Wire bus
-  has no bulk control at all and is always read serially. This is why
-  ``resolution_bits`` defaults to a value that fits the *serial* path.
+  has no bulk control at all. That used to mean it was always read serially,
+  and the ``resolution_bits`` default had to fit the *serial* path; the
+  netlink tier above addresses a master by id and so gives that bus a
+  bus-wide conversion too, which is what let the default go back to 12 bit
+  (see :data:`_DEFAULT_RESOLUTION_BITS`).
 * One slave with ``family_data == NULL`` on a master makes every trigger a
   no-op returning ``-ENODEV``. The family-``00`` phantoms an unterminated
   bit-banged bus manufactures on every kernel search are exactly such
@@ -179,7 +182,7 @@ _BULK_STATES = (_BULK_IDLE, _BULK_RUNNING, _BULK_DONE)
 _BULK_TRIGGER = b"trigger\n"
 
 _VALID_RESOLUTIONS = (9, 10, 11, 12)
-#: Measured on the board, three sensors, per sensor:
+#: Measured on the board, per sensor (three sensors):
 #:
 #: ============  =========  =============  ====================
 #: resolution    conv_time  serial / sens  bulk scratchpad read
@@ -190,28 +193,55 @@ _VALID_RESOLUTIONS = (9, 10, 11, 12)
 #: 9 bit          95 ms     131 ms         18.8 ms
 #: ============  =========  =============  ====================
 #:
-#: A serial cycle is ``n * (conv_time + ~40 ms)``; a bulk cycle is
-#: ``conv_time + n * ~19 ms``, one conversion for the whole bus.
+#: A serial cycle is ``n * (conv_time + ~40 ms)``; a bus-wide cycle (netlink or
+#: the kernel's bulk read) is one conversion for the whole bus plus ~17-20 ms
+#: per sensor. Re-measured through this module, eight sensors on one bus, cycle
+#: time fitted against the sensor count over n = 2, 4, 6, 8:
+#:
+#: ============  =====================  =====================
+#: tier          12 bit                 10 bit
+#: ============  =====================  =====================
+#: netlink       764 + 16.6 n ms        203 + 16.3 n ms
+#: sysfs bulk    759 + 20.5 n ms        211 + 15.9 n ms
+#: serial        800 n ms               228 n ms
+#: ============  =====================  =====================
 #:
 #: The budget is ``max_age_s / 2`` per bus (default ``0.75 * dt`` = 3.75 s at
 #: ``dt = 5 s``): a cycle that fits it refreshes every sensor twice inside
-#: ``max_age_s``, so one lost cycle never ages a sensor out of ``read()``.
-#: For the planned 24 sensors on two buses -- 12 per bus, read in parallel by
-#: their own threads -- and given that only one master system-wide ever gets a
-#: ``therm_bulk_read`` (module docstring), the default has to fit the bus that
-#: cannot have it: serially, 12 sensors cost 9.6 s at 12 bit and 5.0 s at 11,
-#: both over the budget and both over a whole tick, against 2.7 s at 10 bit
-#: (0.55 dt, 27 % of margin) and 1.6 s at 9. So 10 bit, the finest resolution
-#: that fits the serial bus; the bulk-capable bus then costs 0.39 s and would
-#: fit 12 bit (0.98 s) on its own.
+#: ``max_age_s``, so one lost cycle never ages a sensor out of ``read()``. For
+#: the planned 24 sensors on two buses -- 12 per bus, read in parallel by their
+#: own threads -- 12 bit costs **0.96 s** over netlink and **1.00 s** over the
+#: kernel's bulk read: about a quarter of the budget, 0.2 of a tick. Both tiers
+#: are bus-wide, and netlink addresses a master by id, so it serves the second
+#: bus too -- the one the kernel never gives a ``therm_bulk_read`` to (module
+#: docstring). That is what the default rests on, and it is why the default is
+#: the finest step the sensor has.
 #:
-#: 9 bit is not worth its 0.5 C step: one LSB would equal the estimator's
-#: ``jump_min_c`` and double the standing offset item 40 is sensitive to. At 10
-#: bit a serial bus takes 16 sensors inside the budget at ``dt = 5 s`` (6 at
-#: ``dt = 2 s``); the quantisation the estimator carries is
-#: ``quant_c ** 2 / 12``, sigma 0.072 C, still seven times under the
-#: DS18B20's own +/-0.5 C accuracy (PROJECT.md section 8 item 39).
-_DEFAULT_RESOLUTION_BITS = 10
+#: **It does not fit the serial tier**, and that is deliberate, not overlooked:
+#: 12 sensors read one at a time cost 9.6 s at 12 bit, 2.6x the budget and
+#: longer than ``max_age_s`` itself, so a bus demoted that far publishes each
+#: sensor less often than ``read()`` will accept it and the bus reads as
+#: missing on roughly a fifth of the ticks (missing raises cooling and never
+#: lowers it -- PROJECT.md section 2 -- and ``read()`` still never blocks, so
+#: the tick is never held up). Serial is the floor under two bus-wide tiers,
+#: reached only when netlink fails *and* the kernel's bulk read is absent or
+#: refused, and then only for ``netlink_retry_s``. An installation whose kernel
+#: has no ``w1`` connector at all has no netlink tier on any bus and should set
+#: ``onewire.resolution_bits`` to 10 (2.7 s serial, 0.73 of the budget) or 9
+#: (1.6 s); ``tools/w1_commission.py --check`` prints the tier each bus got
+#: beside its measured cycle time, which is how that is noticed rather than
+#: guessed (PROJECT.md section 8 items 38 and 39).
+#:
+#: The step itself is why 12 bit is worth its conversion: 0.0625 C, which the
+#: estimator carries as ``quant_c ** 2 / 12``, sigma 0.018 C, and the Stuck
+#: rule as ``1.5 * quant_c`` = 0.094 C, comfortably above one LSB so an idle
+#: sensor's own dither clears the band. Coarser steps stay one config key away:
+#: 0.125 C at 11 bit, 0.25 at 10, 0.5 at 9 -- and at 9 bit one LSB would equal
+#: the estimator's ``jump_min_c`` and put the standing error at 0.25 C, 2.5x
+#: the offset item 40 is sensitive to. Whichever is chosen,
+#: ``sensors.<name>.quant_c`` has to be moved with it: nothing cross-checks the
+#: two sections.
+_DEFAULT_RESOLUTION_BITS = 12
 _DEFAULT_POLL_INTERVAL_S = 0.02
 # The kernel's bulk read sleeps the conversion out inside write(), so the status
 # is 1 by the time the write returns and this timeout is never reached there. It
@@ -279,10 +309,13 @@ class W1Source:
         sensors, plan section 1); every listed name then gets the same
         reading.
     resolution_bits:
-        Written once to each slave's ``resolution`` file the first time it
-        is seen (never rewritten after that -- not every cycle: a scratchpad
-        write is not free and the value does not change on its own). The
-        driver's own ``conv_time`` is read back afterwards and reported by
+        9..12; 12 by default (:data:`_DEFAULT_RESOLUTION_BITS` for the
+        arithmetic and what a coarser one buys). Written once to each slave's
+        ``resolution`` file the first time it is seen (never rewritten after
+        that -- not every cycle: a scratchpad write is not free and the value
+        does not change on its own), so it is also the resolution a bus keeps
+        while it is demoted down the tier ladder. The driver's own
+        ``conv_time`` is read back afterwards and reported by
         :meth:`conv_time_ms`.
     max_age_s:
         :meth:`read` reports ``None`` for a sensor whose latest sample is
@@ -840,7 +873,7 @@ class W1Source:
                 self._publish(result)
                 self._cycle_counts[bus_dir.name] += 1
             # The conversions pace this loop on their own (12 sensors at the
-            # default 10 bit: 2.7 s read serially, 0.39 s in bulk); this floor
+            # default 12 bit: 0.96 s over netlink, 9.6 s read serially); this floor
             # only guards the pathological/test case of a bus with no declared
             # sensor on it, or a fake that answers instantly, so the thread
             # never busy-spins a core.

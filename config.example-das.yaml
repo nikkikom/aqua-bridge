@@ -839,21 +839,29 @@ spin_up:
 # Bind ROM ids with tools/w1_commission.py --list / --identify and verify the
 # bindings, read path, cycle time and CRC error rate with --check --config this file.
 onewire:
-  # 9..12 bits. A bulk read costs one conversion for the whole bus plus ~19 ms
-  # per sensor, so 12 sensors on a bus take 0.98 s at 12 bit; read one sensor at
-  # a time (conversion + ~40 ms each) the same 12 take 9.6 s at 12 bit, 5.0 s at
-  # 11, 2.7 s at 10, 1.6 s at 9. Only ONE bus master system-wide ever gets a
-  # therm_bulk_read from the kernel, so with two buses one of them always reads
-  # one sensor at a time -- and the default has to fit that one: 10 bit, 0.55 of
-  # dt = 5 s (PROJECT.md section 8 items 38, 39). An installation whose sensors
-  # all sit on the bulk-capable bus can run 12 bit; --check prints which path
-  # each bus got.
+  # 9..12 bits. The two bus-wide tiers cost one conversion for the whole bus plus
+  # ~17-20 ms per sensor, so 12 sensors on a bus take 0.96 s over netlink and
+  # 1.00 s over the kernel's bulk read at 12 bit (0.40 s either way at 10 bit) --
+  # about a quarter of the per-bus budget of max_age_s / 2 = 3.75 s. Netlink
+  # addresses a master by id, so EVERY bus gets a bus-wide conversion, including
+  # the second one, which the kernel never gives a therm_bulk_read to: that is
+  # what the 12-bit default rests on (PROJECT.md section 8 items 38, 39).
   #
-  # 10 bit puts one LSB at 0.25 C, which the estimator carries as quant_c^2 / 12:
-  # a DS18B20 in the sensors: block above belongs at quant_c: 0.25 (0.0625 at 12
-  # bit, 0.125 at 11, 0.5 at 9). The block above still ships 0.0625 -- the golden
-  # regression trajectories are fitted to it and re-fitting them is its own change.
-  resolution_bits: 10
+  # Read one sensor at a time (conversion + ~40 ms each) the same 12 take 9.6 s
+  # at 12 bit, 5.0 s at 11, 2.7 s at 10, 1.6 s at 9. So 12 bit does NOT fit the
+  # serial tier, which is the floor under the other two: a bus that loses netlink
+  # AND has no working therm_bulk_read reads serially for netlink_retry_s, and at
+  # 12 bit its sensors then read as missing on roughly a fifth of the ticks
+  # (missing raises cooling and never lowers it, and the tick is never blocked --
+  # PROJECT.md section 2). --check prints the tier each bus got beside its cycle
+  # time. On a kernel with no w1 netlink connector at all there is no such tier
+  # on any bus: set 10 here (2.7 s serially, 0.73 of the budget) or 9 (1.6 s).
+  #
+  # 12 bit puts one LSB at 0.0625 C, which the estimator carries as quant_c^2 / 12
+  # and the Stuck rule as 1.5 * quant_c: a DS18B20 in the sensors: block above
+  # belongs at quant_c: 0.0625, which is what it ships (0.125 at 11 bit, 0.25 at
+  # 10, 0.5 at 9 -- move it with this key, nothing cross-checks the two).
+  resolution_bits: 12
   max_age_s: 7.5         # 1.5 * dt: an older sample reads as missing
   # auto: trigger the kernel's bulk read on each bus and check once that it
   # happened; a bus where it did not (no therm_bulk_read at all, or a family-00

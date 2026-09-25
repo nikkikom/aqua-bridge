@@ -277,10 +277,13 @@ is not yet confirmed on real hardware, on either board.
    a tier keeps reading in the same cycle one tier down, so the tier tells
    you what the cycle time means, not whether anything is wrong
    (PROJECT.md §8 item 38, `onewire.read_tier` to pin one for debugging).
-   At the default `onewire.resolution_bits: 10` that is 0.23 s per sensor
-   read one at a time, so such a bus takes 16 sensors inside the budget at
-   `dt = 5 s`, against ~0.19 s for a whole bulk-read bus (PROJECT.md §8
-   item 39).
+   At the default `onewire.resolution_bits: 12` a whole bus costs about
+   0.96 s over `netlink` and 1.00 s over `bulk` for 12 sensors — roughly a
+   quarter of the budget — but 0.8 s *per sensor* read one at a time, so a
+   bus that falls all the way to `serial` will not keep 12 sensors fresh at
+   `dt = 5 s`. That is the tier to watch for in `--check`; a kernel with no
+   w1 netlink connector at all has no bus-wide tier on a second bus and
+   wants `resolution_bits: 10` (PROJECT.md §8 item 39).
 
 9. **Diagnostic tick**, as the service user:
 
