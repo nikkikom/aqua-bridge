@@ -10942,7 +10942,8 @@ Notes that only show up on a real board:
   than leaving it to `Storage=auto`'s directory-existence rule. A re-run also
   removes the hand-made `10-persistent.conf` and `99-aqua-persistent.conf`
   the board carried from working around this by hand before the script did
-  it properly, so the three drop-ins do not pile up saying the same thing.
+  it properly, plus the script's own old `20-aqua-journal-limits.conf`, so the
+  four drop-ins do not pile up saying the same thing.
 - **The script checks the result instead of trusting the write, for both
   drop-ins above.** Both `--check` and a real run print the effective
   `RuntimeWatchdogUSec`/`RebootWatchdogUSec` — from `systemctl show`,

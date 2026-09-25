@@ -521,11 +521,22 @@ def test_journald_dropin_sets_storage_explicitly_from_a_validated_knob():
 
 def test_board_script_cleans_up_the_hand_made_journald_dropins():
     """A board that already carries the by-hand workaround (10-persistent.conf,
-    99-aqua-persistent.conf) must not end up with three drop-ins saying the same
+    99-aqua-persistent.conf) must not end up with four drop-ins saying the same
     thing once this script installs its own equivalent."""
     text = BOARD_SCRIPT.read_text()
     assert '"/etc/systemd/journald.conf.d/10-persistent.conf"' in text
     assert '"/etc/systemd/journald.conf.d/99-aqua-persistent.conf"' in text
+    assert 'for legacy in "${LEGACY_JOURNALD_DROPINS[@]}"; do' in text
+    assert 'remove_path "$legacy"' in text
+
+
+def test_board_script_cleans_up_its_own_old_journald_dropin_name():
+    """A board that already carries this script's previous, losing name
+    (20-aqua-journal-limits.conf) must not end up with two journald drop-ins
+    saying the same thing once a re-run installs the new one -- the same gap
+    PR #69 closed for the watchdog drop-in's own previous name."""
+    text = BOARD_SCRIPT.read_text()
+    assert '"/etc/systemd/journald.conf.d/20-aqua-journal-limits.conf"' in text
     assert 'for legacy in "${LEGACY_JOURNALD_DROPINS[@]}"; do' in text
     assert 'remove_path "$legacy"' in text
 

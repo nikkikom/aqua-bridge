@@ -130,12 +130,14 @@ LEGACY_SYSTEM_DROPINS=(
 # which is what beat this file's old name, 20-aqua-journal-limits.conf
 # (PROJECT.md §9 "Board hardening").
 JOURNALD_DROPIN="/etc/systemd/journald.conf.d/99-aqua-journal-limits.conf"
-# Hand-made on the board before this script set Storage= itself; a run that
-# installs its own equivalent removes these so three drop-ins never end up
-# saying the same thing.
+# Hand-made on the board before this script set Storage= itself, plus this
+# script's own previous name for $JOURNALD_DROPIN; a run that installs the
+# current one removes all three so four drop-ins never end up saying the same
+# thing.
 LEGACY_JOURNALD_DROPINS=(
   "/etc/systemd/journald.conf.d/10-persistent.conf"
   "/etc/systemd/journald.conf.d/99-aqua-persistent.conf"
+  "/etc/systemd/journald.conf.d/20-aqua-journal-limits.conf"
 )
 NM_DROPIN="/etc/NetworkManager/conf.d/10-aqua-wifi-powersave.conf"
 NET_RECOVER_SRC="$SCRIPT_DIR/aqua-net-recover.sh"
@@ -392,8 +394,9 @@ MaxRetentionSec=${JOURNAL_MAX_RETENTION}
 SyncIntervalSec=${JOURNAL_SYNC_INTERVAL}
 EOF
 NEEDS_JOURNALD_RESTART="$LAST_WROTE"
-# Hand-made before this script wrote Storage= itself; clean them up so a
-# re-run does not leave three drop-ins saying the same thing.
+# Hand-made before this script wrote Storage= itself, plus this script's own
+# previous name for $JOURNALD_DROPIN; clean them up so a re-run does not leave
+# four drop-ins saying the same thing.
 for legacy in "${LEGACY_JOURNALD_DROPINS[@]}"; do
   if [[ -e "$legacy" ]]; then
     NEEDS_JOURNALD_RESTART=1
