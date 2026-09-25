@@ -12,6 +12,10 @@
 # HTTP credentials file are never overwritten; users are not created (the
 # script prints the tools/http_user.py command).
 #
+# Both udev rules are installed either way: the Aqua Computer one
+# (99-aquacomputer.rules) and the DS18B20 one (99-w1-therm.rules); a board
+# without 1-Wire sensors simply has nothing for the second one to match.
+#
 # --das: install config.example-das.yaml instead of config.example.yaml
 # (still only when /etc/aqua-bridge/config.yaml is absent; an existing config
 # is never overwritten either way), and install a systemd drop-in
@@ -39,6 +43,8 @@ INSTALL_DIR="/opt/aqua-bridge"
 CONFIG_DIR="/etc/aqua-bridge"
 UDEV_RULE_SRC="$SCRIPT_DIR/99-aquacomputer.rules"
 UDEV_RULE_DST="/etc/udev/rules.d/99-aquacomputer.rules"
+W1_RULE_SRC="$SCRIPT_DIR/99-w1-therm.rules"
+W1_RULE_DST="/etc/udev/rules.d/99-w1-therm.rules"
 UNIT_SRC="$SCRIPT_DIR/aqua-bridge.service"
 UNIT_DST="/etc/systemd/system/aqua-bridge.service"
 DAS_DROPIN_SRC="$SCRIPT_DIR/aqua-bridge-das.conf"
@@ -185,13 +191,19 @@ else
   echo "created self-signed certificate: $TLS_CERT (key $TLS_KEY, $TLS_DAYS days)"
 fi
 
-echo "== udev rule =="
+echo "== udev rules =="
 sudo install -m 644 "$UDEV_RULE_SRC" "$UDEV_RULE_DST"
+# The DS18B20 buses: the daemon writes each sensor's resolution and probes the
+# bus master's therm_bulk_read, both root-owned (PROJECT.md §9 "udev").
+sudo install -m 644 "$W1_RULE_SRC" "$W1_RULE_DST"
 sudo udevadm control --reload-rules
 # Re-run the rules for a device that is already attached: the hidraw rule
 # (group plugdev on /dev/hidrawN) only applies on an add event.
 sudo udevadm trigger --action=add --subsystem-match=hidraw
 sudo udevadm trigger --action=add --subsystem-match=usb --attr-match=idVendor=0c70
+# The w1 rules are ACTION=="add|change": a change event is enough for sensors
+# the kernel has already found, and does not disturb the bus.
+sudo udevadm trigger --action=change --subsystem-match=w1
 sudo udevadm settle || true
 
 echo "== systemd unit =="

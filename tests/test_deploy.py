@@ -14,6 +14,7 @@ import pytest
 DEPLOY = Path(__file__).resolve().parent.parent / "deploy"
 UNIT = DEPLOY / "aqua-bridge.service"
 RULES = DEPLOY / "99-aquacomputer.rules"
+W1_RULES = DEPLOY / "99-w1-therm.rules"
 DAS_DROPIN = DEPLOY / "aqua-bridge-das.conf"
 
 
@@ -38,13 +39,22 @@ def das_dropin() -> dict[str, list[str]]:
     return _unit_values(DAS_DROPIN.read_text())
 
 
-@pytest.fixture(scope="module")
-def rules() -> list[str]:
+def _rule_lines(path: Path) -> list[str]:
     return [
         line.strip()
-        for line in RULES.read_text().splitlines()
+        for line in path.read_text().splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
+
+
+@pytest.fixture(scope="module")
+def rules() -> list[str]:
+    return _rule_lines(RULES)
+
+
+@pytest.fixture(scope="module")
+def w1_rules() -> list[str]:
+    return _rule_lines(W1_RULES)
 
 
 # --- systemd unit (section 9) ---------------------------------------------------------
@@ -186,6 +196,49 @@ def test_install_script_triggers_udev_for_an_already_attached_device():
     text = (DEPLOY / "install-pi.sh").read_text()
     assert "udevadm control --reload-rules" in text
     assert "udevadm trigger" in text and "subsystem-match=hidraw" in text
+
+
+# --- the DS18B20 buses (PROJECT.md §9 "udev", §8 item 38) -------------------------------
+
+
+def test_w1_rules_grant_a_unit_group_the_attributes_the_daemon_writes(unit, w1_rules):
+    """hw/onewire.py writes each sensor's resolution and probes the master's
+    therm_bulk_read; both are created root-owned, and the unit runs as a
+    non-root user. Without the grant every sensor stays at 12 bit, where a
+    cycle no longer fits dt."""
+    groups = set()
+    for value in unit.get("SupplementaryGroups", []):
+        groups.update(value.split())
+    assert groups, "unit runs as a non-root user without any supplementary group"
+    assert w1_rules, "no udev rule for the w1 subsystem"
+    for rule in w1_rules:
+        assert 'SUBSYSTEM=="w1"' in rule
+        assert "g+w" in rule
+        granted = {g for g in groups if re.search(rf"chgrp {g}\b", rule)}
+        assert granted, f"w1 rule grants none of the unit's groups {sorted(groups)}: {rule}"
+    joined = " ".join(w1_rules)
+    assert "therm_bulk_read" in joined
+    assert "resolution" in joined
+
+
+def test_w1_rules_cover_both_the_master_and_the_slave_attributes(w1_rules):
+    """therm_bulk_read appears on a master only once its first w1_therm slave has
+    attached, so the slave rule has to fix the parent's attribute too -- the
+    master rule alone can fire before the file exists."""
+    master = [r for r in w1_rules if 'KERNEL=="w1_bus_master*"' in r]
+    slave = [r for r in w1_rules if 'KERNEL=="28-*"' in r]
+    assert master and slave
+    assert "therm_bulk_read" in slave[0], "the slave rule must reach the parent's attribute"
+    for rule in w1_rules:
+        # The kernel re-announces devices on every bus search; a rule that only
+        # matched "add" would miss them and miss install-pi.sh's change trigger.
+        assert 'ACTION=="add|change"' in rule
+
+
+def test_install_script_installs_and_triggers_the_w1_rules():
+    text = (DEPLOY / "install-pi.sh").read_text()
+    assert "99-w1-therm.rules" in text
+    assert "--subsystem-match=w1" in text
 
 
 # --- SMART agent example unit (milestone smart-agent) -----------------------------------
