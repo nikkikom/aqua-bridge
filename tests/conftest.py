@@ -14,6 +14,7 @@ import pytest
 from hypothesis import HealthCheck, settings
 
 from aqua_bridge.config import load_config
+from aqua_bridge.hw import w1_netlink
 from aqua_bridge.hw.aquacomputer import AQUAERO
 from aqua_bridge.hw.hidraw import (
     DEFAULT_DEV_DIR,
@@ -75,6 +76,25 @@ def find_aquaero_hidraw(
         if matches_kind(info, AQUAERO):
             return info
     return None
+
+
+@pytest.fixture(autouse=True)
+def no_netlink_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test runs with no netlink family, so nothing can open that socket.
+
+    The 1-Wire netlink tier (``hw/w1_netlink.py``) talks to the running
+    kernel's w1 connector. On a dev machine or a CI runner that means a socket
+    which either answers about somebody else's hardware or -- far more likely
+    -- answers nothing at all until the bounded wait expires, which is neither
+    offline nor fast. Patching the module's one seam is enough and touches
+    nothing else: a missing family raises the same
+    ``W1NetlinkUnavailable`` a kernel without the connector does, so the
+    tier-fall-through tests see the real failure shape, while the tests of the
+    transport itself inject a fake socket and never consult the family
+    (``tests/test_hw_w1_netlink.py``). The HTTP and MQTT suites keep binding
+    real loopback ports; only netlink is out of reach.
+    """
+    monkeypatch.setattr(w1_netlink, "netlink_family", lambda: None)
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
