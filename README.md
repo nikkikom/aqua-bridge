@@ -265,12 +265,18 @@ is not yet confirmed on real hardware, on either board.
    `--identify` is how each ROM id gets a name (`prox_b01`, `inlet_b`,
    …) in `onewire.sensors` — repeat per sensor. `--check` builds the
    exact composite the daemon would (every name bound once, every ROM
-   present) and reports, per bus, which read path the kernel gave it (the
-   bulk read is triggered per bus and checked; a bus the kernel refuses it
-   on — only one master system-wide gets the attribute at all — reads its
-   sensors one at a time instead, PROJECT.md §8 item 38), the conversion
-   time the driver reports, the cycle time, and the CRC error rate per
-   sensor over 20 cycles: aim for < 1 % and a cycle under `max_age_s / 2`.
+   present) and reports, per bus, which of the three read tiers it ended up
+   on, the conversion time the driver reports, the cycle time, and the CRC
+   error rate per sensor over 20 cycles: aim for < 1 % and a cycle under
+   `max_age_s / 2`. The tiers are `netlink` (one conversion for the whole
+   bus over the kernel's netlink connector, no root and no udev rule
+   needed, available on **every** bus), `bulk` (the kernel's own
+   `therm_bulk_read`, which only one master system-wide ever gets and which
+   one family-`00` phantom on that master silences) and `serial` (one
+   sensor at a time). `auto` walks that ladder per bus and a bus that loses
+   a tier keeps reading in the same cycle one tier down, so the tier tells
+   you what the cycle time means, not whether anything is wrong
+   (PROJECT.md §8 item 38, `onewire.read_tier` to pin one for debugging).
    At the default `onewire.resolution_bits: 10` that is 0.23 s per sensor
    read one at a time, so such a bus takes 16 sensors inside the budget at
    `dt = 5 s`, against ~0.19 s for a whole bulk-read bus (PROJECT.md §8

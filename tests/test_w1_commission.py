@@ -189,6 +189,11 @@ def test_cmd_check_reports_cycle_time_and_crc_rate(
     assert "binding check" in out
     assert "w1_bus_master1" in out
     assert "ms/cycle over 3 cycles" in out
+    # The tier the number was measured on, without which the number cannot be
+    # read at all (PROJECT.md section 8 item 38). Neither fast tier exists
+    # under a fake tree: no netlink connector in the suite, and this fake's
+    # therm_bulk_read is a plain file, so the bus ends up reading one at a time.
+    assert "(serial reads)" in out
     assert "28-000000000001" in out
 
 

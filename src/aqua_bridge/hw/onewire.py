@@ -26,8 +26,39 @@ until it (re)appears. Undeclared slaves are ignored, which is also what
 keeps the family-``00`` phantoms an unterminated bus manufactures on every
 kernel search out of the readings (section 9 "Overlays and modules").
 
-**Reading strategy (section 8 item 38).** Two paths exist and the driver is
-asked, never assumed, which one it gives for a given bus:
+**Reading strategy (section 8 item 38).** Three tiers exist, tried in
+this order per bus, and each one's availability is a *decision from what the
+kernel just did*, never a guess from config:
+
+1. *netlink* -- one bus-wide conversion and one scratchpad read per sensor over
+   the kernel's netlink connector (:mod:`aqua_bridge.hw.w1_netlink`,
+   :mod:`aqua_bridge.hw.w1_therm_netlink`). Same shape as *bulk* below and the
+   same cost, but it addresses a master by **id**, so it works on the bus the
+   kernel never gave a ``therm_bulk_read`` to, and on a master carrying
+   family-``00`` phantoms that make the sysfs trigger a silent no-op. A bus
+   takes this tier when the connector answers ``W1_LIST_MASTERS`` with this
+   master's id in it, every present sensor's 8-byte identifier is readable, and
+   every present sensor has a known ``conv_time``; it keeps it as long as the
+   conversion command and at least one scratchpad succeed. Anything else drops
+   it one tier for ``netlink_retry_s``, **and the same cycle still finishes on
+   the tier below, so no sample is lost**. Measured on the board, 7 sensors at
+   12 bit (the owner swaps sensors in and out, so the count belongs with the
+   numbers): 6 ms for the conversion command, 16 ms per scratchpad, 876 ms per
+   cycle against 904 ms for sysfs bulk and 5664 ms read one at a time; at 10
+   bit 316, 324 and 1604 ms.
+2. *bulk* -- the kernel's own ``therm_bulk_read``, described below. It exists
+   on one master system-wide and one phantom disables it.
+3. *serial* -- one sensor at a time, also described below. Always available.
+
+``onewire.read_tier`` forces one tier for debugging (``auto`` is the default
+and the only production value); ``onewire.bulk_read: off`` still means "never
+write ``therm_bulk_read``", which under ``auto`` leaves netlink then serial.
+:meth:`W1Source.read_tiers` reports which tier produced each bus's last
+numbers, and ``tools/w1_commission.py --check`` prints it next to the measured
+cycle time, so a number is never read against the wrong path.
+
+The sysfs tiers, unchanged (section 8 item 38). The driver is asked, never
+assumed, which one it gives for a given bus:
 
 * *bulk* -- write ``trigger\n`` to the master's ``therm_bulk_read``, then
   read every slave's ``temperature``, which returns the scratchpad of that
@@ -113,6 +144,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from aqua_bridge.hw.w1_netlink import W1Netlink, W1NetlinkError
+from aqua_bridge.hw.w1_therm_netlink import (
+    CONVERSION_TIME_S,
+    ScratchpadError,
+    W1Therm,
+    reg_num_from_rom_name,
+    rom_name_from_reg_num,
+)
 from aqua_bridge.model import ConfigError
 
 __all__ = ["W1Source", "build_onewire_from_config"]
@@ -120,11 +159,15 @@ __all__ = ["W1Source", "build_onewire_from_config"]
 _LOG = logging.getLogger("aqua_bridge.hw.onewire")
 
 DEFAULT_ROOT = "/sys/bus/w1/devices"
-_BUS_GLOB = "w1_bus_master*"
+_BUS_PREFIX = "w1_bus_master"
+_BUS_GLOB = f"{_BUS_PREFIX}*"
 _TRIGGER_FILE = "therm_bulk_read"
 _RESOLUTION_FILE = "resolution"
 _CONV_TIME_FILE = "conv_time"
 _TEMPERATURE_FILE = "temperature"
+#: A slave's raw ``struct w1_reg_num``: the 8 bytes a netlink slave command
+#: addresses it by (``drivers/w1/w1.c``, ``id_show``).
+_ID_FILE = "id"
 #: ``therm_bulk_read`` read values, per the kernel's ``w1_therm`` ABI.
 _BULK_IDLE = "0"  # no bulk conversion pending
 _BULK_RUNNING = "-1"  # at least one sensor still converting
@@ -188,6 +231,35 @@ _DEFAULT_BULK_RETRY_S = 300.0
 #: ``therm_bulk_read`` at all.
 _BULK_READ_MODES = ("auto", "off")
 _DEFAULT_BULK_READ = "auto"
+#: ``onewire.read_tier``: the tier ladder's top. ``auto`` is the full ladder
+#: (netlink, then the kernel's bulk read, then one sensor at a time); the other
+#: three name one tier and forbid the rest, which is a debugging aid -- a bus
+#: that cannot run the tier it was pinned to publishes nothing that cycle, and
+#: a sensor with no sample reads as missing, which the control loop turns into
+#: more cooling and never less (PROJECT.md section 3).
+_READ_TIERS = ("auto", "netlink", "sysfs_bulk", "serial")
+_DEFAULT_READ_TIER = "auto"
+#: Tier names as :meth:`W1Source.read_tiers` reports them.
+_TIER_NETLINK = "netlink"
+_TIER_BULK = "bulk"
+_TIER_SERIAL = "serial"
+_TIER_UNPROBED = "unprobed"
+_TIER_NONE = "none"
+# Bound on one netlink request. A request of ours costs the bus 6 ms (the
+# conversion command) to 16 ms (a scratchpad), but the kernel serialises every
+# path on the master's bus_mutex, so a sysfs reader that got there first can
+# hold it for a whole conversion -- 750 ms at 12 bit. One second covers that
+# plus scheduling on a loaded single core and still gives up well inside one
+# tick at the recommended dt = 5 s. A cycle makes one request plus one per
+# sensor, and the first request that goes unanswered ends the cycle
+# (hw/w1_therm_netlink.py, read_bus), so the worst case is about two of these
+# and not one per sensor.
+_DEFAULT_NETLINK_TIMEOUT_S = 1.0
+# How long a bus that failed the netlink tier stays on the tier below before it
+# is tried again. Same argument as bulk_retry_s: what takes the tier away
+# (a sensor pulled out mid-cycle, a kernel busy elsewhere) can go away again,
+# and a failed probe costs one command that returns in milliseconds.
+_DEFAULT_NETLINK_RETRY_S = 300.0
 
 
 @dataclass
@@ -232,6 +304,19 @@ class W1Source:
     bulk_retry_s:
         How long a bus that failed the bulk probe reads serially before it
         is probed again.
+    read_tier:
+        ``auto`` (the full ladder, module docstring) or one tier name, which
+        forbids the others. Debugging only.
+    netlink_timeout_s:
+        Bound on one netlink request. Every wait on that socket is bounded by
+        it and a request that goes unanswered ends the cycle.
+    netlink_retry_s:
+        How long a bus that failed the netlink tier stays on the tier below
+        before it is tried again.
+    netlink_factory:
+        Called with no arguments to build one
+        :class:`~aqua_bridge.hw.w1_netlink.W1Netlink` per bus master. Injected
+        so tests drive the whole ladder without opening a socket.
     """
 
     def __init__(
@@ -246,6 +331,10 @@ class W1Source:
         bulk_timeout_s: float = _DEFAULT_BULK_TIMEOUT_S,
         bulk_retry_s: float = _DEFAULT_BULK_RETRY_S,
         bulk_read: str = _DEFAULT_BULK_READ,
+        read_tier: str = _DEFAULT_READ_TIER,
+        netlink_timeout_s: float = _DEFAULT_NETLINK_TIMEOUT_S,
+        netlink_retry_s: float = _DEFAULT_NETLINK_RETRY_S,
+        netlink_factory: Callable[[], W1Netlink] | None = None,
     ) -> None:
         if not sensors:
             raise ConfigError("onewire.sensors must not be empty")
@@ -266,6 +355,12 @@ class W1Source:
             raise ConfigError(
                 f"onewire.bulk_read must be one of {_BULK_READ_MODES}, got {bulk_read!r}"
             )
+        if read_tier not in _READ_TIERS:
+            raise ConfigError(f"onewire.read_tier must be one of {_READ_TIERS}, got {read_tier!r}")
+        if not netlink_timeout_s > 0:
+            raise ConfigError(f"onewire netlink_timeout_s must be > 0, got {netlink_timeout_s}")
+        if not netlink_retry_s > 0:
+            raise ConfigError(f"onewire netlink_retry_s must be > 0, got {netlink_retry_s}")
 
         self.sensors: dict[str, str] = dict(sensors)
         self._rom_to_names: dict[str, list[str]] = {}
@@ -279,6 +374,10 @@ class W1Source:
         self._bulk_timeout_s = float(bulk_timeout_s)
         self._bulk_retry_s = float(bulk_retry_s)
         self._bulk_read = bulk_read
+        self._read_tier = read_tier
+        self._netlink_timeout_s = float(netlink_timeout_s)
+        self._netlink_retry_s = float(netlink_retry_s)
+        self._netlink_factory = netlink_factory
 
         self._lock = threading.Lock()
         self._latest: dict[str, _Sample] = {}
@@ -290,6 +389,17 @@ class W1Source:
         # probed yet), and when a bus that failed may be probed again.
         self._bulk_ok: dict[str, bool] = {}
         self._bulk_retry_at: dict[str, float] = {}
+        # The same, for the netlink tier, plus the socket each bus reads over
+        # (one per reader thread: a netlink socket carries one exchange at a
+        # time), the identifiers slaves are addressed by, the resolution each
+        # sensor last reported about itself, and the tier each bus's last
+        # numbers came from.
+        self._netlink_ok: dict[str, bool] = {}
+        self._netlink_retry_at: dict[str, float] = {}
+        self._transports: dict[str, W1Netlink] = {}
+        self._slave_ids: dict[str, bytes] = {}
+        self._observed_bits: dict[str, int] = {}
+        self._tier: dict[str, str] = {}
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
 
@@ -313,31 +423,227 @@ class W1Source:
     # -- one read cycle (synchronous; also used directly by tests and tools) --
 
     def run_bus_cycle(self, bus_dir: Path) -> dict[str, float | None]:
-        """Runs one read cycle on ``bus_dir`` (bulk where the driver answers, else serial).
+        """Runs one read cycle on ``bus_dir``, on the best tier that bus answers on.
 
         Returns ``{name: value_or_None}`` for every declared sensor name
         currently found under ``bus_dir`` (empty if none of the declared ROM
-        ids live there). Never raises: every failure mode narrows to
-        ``None`` for the sensor(s) it affects, per the module docstring.
+        ids live there, if the bus is pinned to a tier it cannot run, or if
+        :meth:`stop` arrived mid-conversion). Never raises: every failure mode
+        narrows to ``None`` for the sensor(s) it affects or to a tier below,
+        per the module docstring.
         """
         present = {rom: bus_dir / rom for rom in self._rom_to_names if (bus_dir / rom).is_dir()}
         if not present:
+            self._tier[bus_dir.name] = _TIER_NONE
             return {}
         self._ensure_resolution(present)
-        if self._bulk_read != "off" and self._bulk_probe_due(bus_dir.name):
+        if self._netlink_due(bus_dir.name):
+            netlink_result = self._netlink_cycle(bus_dir, present)
+            if netlink_result is not None:
+                return netlink_result
+        if self._read_tier == _TIER_NETLINK:
+            # Pinned to netlink and this bus cannot run it: publish nothing
+            # rather than quietly reading it another way. Missing samples read
+            # as missing, which raises cooling and never lowers it.
+            self._tier[bus_dir.name] = _TIER_NONE
+            return {}
+        if (
+            self._bulk_read != "off"
+            and self._read_tier != _TIER_SERIAL
+            and self._bulk_probe_due(bus_dir.name)
+        ):
             self._bulk_convert(bus_dir)
         result: dict[str, float | None] = {}
         for rom, slave_dir in present.items():
             value = self._read_temperature(slave_dir, rom)
             for name in self._rom_to_names[rom]:
                 result[name] = value
+        self._tier[bus_dir.name] = self._sysfs_tier(bus_dir.name)
         return result
+
+    # -- the netlink tier -------------------------------------------------------
+
+    def _netlink_due(self, bus_name: str) -> bool:
+        """Whether this cycle may try the netlink tier on ``bus_name``."""
+        if self._read_tier not in ("auto", _TIER_NETLINK):
+            return False
+        if self._netlink_ok.get(bus_name, True):
+            return True
+        return self._clock() >= self._netlink_retry_at.get(bus_name, 0.0)
+
+    def _sysfs_tier(self, bus_name: str) -> str:
+        if self._bulk_read == "off" or self._read_tier == _TIER_SERIAL:
+            return _TIER_SERIAL
+        return _TIER_BULK if self._bulk_ok.get(bus_name) else _TIER_SERIAL
+
+    def _netlink_cycle(
+        self, bus_dir: Path, present: Mapping[str, Path]
+    ) -> dict[str, float | None] | None:
+        """One netlink cycle on ``bus_dir``, or ``None`` if this bus cannot run it.
+
+        ``None`` means "fall through to the tier below, this same cycle" and
+        drops the bus for ``netlink_retry_s``; an empty dict means the cycle was
+        abandoned (:meth:`stop` during the conversion) and nothing is published.
+        Never raises.
+        """
+        bus_name = bus_dir.name
+        interrupted: list[bool] = []
+        try:
+            # What this host can know on its own first, so a bus that cannot run
+            # the tier costs no traffic at all: the identifiers, then the wait.
+            targets = {rom: self._slave_id_of(slave_dir, rom) for rom, slave_dir in present.items()}
+            conversion_s = self._conversion_s(present)
+            transport = self._transport_for(bus_name)
+            master_id = self._master_id_of(bus_dir, transport)
+            therm = W1Therm(
+                transport,
+                sleeper=lambda seconds: interrupted.append(bool(self._stop.wait(seconds))),
+            )
+            read = therm.read_bus(
+                master_id, targets, conversion_s=conversion_s, timeout_s=self._netlink_timeout_s
+            )
+        except (W1NetlinkError, ScratchpadError, OSError, ValueError) as exc:
+            # A fresh socket next time: one that erred may have a reply to this
+            # cycle still queued behind it, and a new port id has no backlog.
+            self._close_transport(bus_name)
+            self._demote_netlink(bus_dir, str(exc))
+            return None
+        if any(interrupted):
+            # stop() landed inside the conversion, so the scratchpads that
+            # followed it are one conversion stale and nobody will use them.
+            return {}
+        if read.all_failed:
+            reasons = "; ".join(sorted(set(read.failures.values())))
+            self._demote_netlink(bus_dir, f"every sensor on the bus failed ({reasons})")
+            return None
+        if self._netlink_ok.get(bus_name) is not True:
+            _LOG.info(
+                "onewire: %s reads over netlink (master id %d, %d sensor(s), %.3f s conversion)",
+                bus_name,
+                master_id,
+                len(targets),
+                conversion_s,
+            )
+        self._netlink_ok[bus_name] = True
+        self._tier[bus_name] = _TIER_NETLINK
+        result: dict[str, float | None] = {}
+        for rom, reading in read.readings.items():
+            if reading is None:
+                self._crc_errors[rom] = self._crc_errors.get(rom, 0) + 1
+                _LOG.debug("onewire: %s over netlink: %s", rom, read.failures.get(rom))
+                value: float | None = None
+            else:
+                self._observed_bits[rom] = reading.resolution_bits
+                value = reading.temperature_c
+                if not math.isfinite(value):
+                    value = None
+            for name in self._rom_to_names[rom]:
+                result[name] = value
+        return result
+
+    def _transport_for(self, bus_name: str) -> W1Netlink:
+        """The open netlink socket this bus reads over, opening it if needed."""
+        transport = self._transports.get(bus_name)
+        if transport is None:
+            transport = (
+                self._netlink_factory()
+                if self._netlink_factory is not None
+                else W1Netlink(timeout_s=self._netlink_timeout_s)
+            )
+            self._transports[bus_name] = transport
+        if not transport.is_open:
+            transport.open()
+        return transport
+
+    def _close_transport(self, bus_name: str) -> None:
+        transport = self._transports.pop(bus_name, None)
+        if transport is not None:
+            transport.close()
+
+    def _master_id_of(self, bus_dir: Path, transport: W1Netlink) -> int:
+        """The kernel's master id for ``bus_dir``, confirmed against the kernel's own list.
+
+        A master's sysfs name is ``w1_bus_master%u`` of the very id a netlink
+        master command carries (``drivers/w1/w1_int.c``), so the number in the
+        name is the id -- but that is read out of a directory name, so it is
+        checked against ``W1_LIST_MASTERS`` rather than trusted. The check is
+        also the tier's liveness probe: a kernel with no w1 connector never
+        answers it, and one round trip costs 0.13 ms (measured on the board)
+        against a cycle of hundreds.
+        """
+        suffix = bus_dir.name.removeprefix(_BUS_PREFIX)
+        if not suffix.isdigit():
+            raise ValueError(f"{bus_dir.name} does not end in a bus master id")
+        master_id = int(suffix)
+        masters = transport.list_masters(timeout_s=self._netlink_timeout_s)
+        if master_id not in masters:
+            raise ValueError(f"the w1 connector lists masters {masters}, without {master_id}")
+        return master_id
+
+    def _slave_id_of(self, slave_dir: Path, rom: str) -> bytes:
+        """The 8-byte ``struct w1_reg_num`` a netlink slave command addresses ``rom`` by.
+
+        The slave's own ``id`` attribute is the authority; it is checked against
+        the directory name, and a name that cannot be read falls back to
+        rebuilding the identifier from that name and its CRC-8
+        (:func:`~aqua_bridge.hw.w1_therm_netlink.reg_num_from_rom_name`).
+        Cached: a ROM id is unique and does not change under its own name.
+        """
+        cached = self._slave_ids.get(rom)
+        if cached is not None:
+            return cached
+        raw = b""
+        try:
+            raw = (slave_dir / _ID_FILE).read_bytes()
+        except OSError as exc:
+            _LOG.debug("onewire: cannot read %s/%s: %s", rom, _ID_FILE, exc)
+        if len(raw) == 8 and rom_name_from_reg_num(raw) == rom:
+            self._slave_ids[rom] = raw
+            return raw
+        derived = reg_num_from_rom_name(rom)
+        self._slave_ids[rom] = derived
+        return derived
+
+    def _conversion_s(self, present: Mapping[str, Path]) -> float:
+        """How long to wait for the bus-wide conversion, from what the sensors report.
+
+        The driver's own ``conv_time`` for each present sensor, and -- for a
+        sensor that has already been read this way -- the conversion time of
+        the resolution it reported about *itself*, whichever is longer: a
+        ``resolution`` write that silently failed would otherwise have us read
+        the conversion before last. A sensor with no ``conv_time`` yet has not
+        answered the driver at all, which is not a bus to run this tier on.
+        """
+        waits: list[float] = []
+        for rom in present:
+            conv_time_ms = self._conv_time_ms.get(rom)
+            if conv_time_ms is None:
+                raise ValueError(f"{rom} reports no {_CONV_TIME_FILE}")
+            observed = self._observed_bits.get(rom)
+            waits.append(max(conv_time_ms / 1000.0, CONVERSION_TIME_S.get(observed or 0, 0.0)))
+        return max(waits)
+
+    def _demote_netlink(self, bus_dir: Path, reason: str) -> None:
+        first = self._netlink_ok.get(bus_dir.name) is not False
+        self._netlink_ok[bus_dir.name] = False
+        self._netlink_retry_at[bus_dir.name] = self._clock() + self._netlink_retry_s
+        # Once loudly, then quietly: a kernel without the w1 connector at all
+        # would otherwise warn every netlink_retry_s for the life of the daemon.
+        log = _LOG.warning if first else _LOG.debug
+        log(
+            "onewire: %s does not read over netlink for the next %.0f s (%s); PROJECT.md item 38",
+            bus_dir.name,
+            self._netlink_retry_s,
+            reason,
+        )
 
     def bulk_read_modes(self) -> dict[str, str]:
         """Bus master name -> ``"bulk"``, ``"serial"`` or ``"unprobed"``.
 
-        Diagnostics for ``tools/w1_commission.py --check``: which path each bus
-        ended up on, so the measured cycle time can be read against it.
+        Whether the *sysfs* bulk probe succeeded on a bus, which is not the
+        same question as which tier it read on: a bus reading over netlink
+        never writes ``therm_bulk_read`` at all and so stays ``unprobed``
+        here. :meth:`read_tiers` is the one that says what a bus used.
         """
         names = set(self._cycle_counts) | set(self._bulk_ok)
         if self._bulk_read == "off":
@@ -345,6 +651,22 @@ class W1Source:
         out: dict[str, str] = dict.fromkeys(names, "unprobed")
         for name, ok in self._bulk_ok.items():
             out[name] = "bulk" if ok else "serial"
+        return out
+
+    def read_tiers(self) -> dict[str, str]:
+        """Bus master name -> the tier that produced its last numbers.
+
+        ``netlink``, ``bulk`` or ``serial``; ``none`` for a bus with no
+        declared sensor on it (or one pinned to a tier it cannot run) and
+        ``unprobed`` for one that has not run a cycle yet. Diagnostics for
+        ``tools/w1_commission.py --check``: a cycle time means nothing without
+        the tier it was measured on.
+        """
+        names = (
+            set(self._cycle_counts) | set(self._tier) | set(self._bulk_ok) | set(self._netlink_ok)
+        )
+        out = dict.fromkeys(names, _TIER_UNPROBED)
+        out.update(self._tier)
         return out
 
     def conv_time_ms(self) -> dict[str, int]:
@@ -525,11 +847,16 @@ class W1Source:
             self._stop.wait(self._poll_interval_s)
 
     def stop(self) -> None:
-        """Stops every reader thread. Idempotent; safe to call if never started."""
+        """Stops every reader thread and closes every netlink socket.
+
+        Idempotent; safe to call if never started.
+        """
         self._stop.set()
         for thread in self._threads:
             thread.join(timeout=5.0)
         self._threads.clear()
+        for bus_name in list(self._transports):
+            self._close_transport(bus_name)
 
     # -- read (non-blocking, loop thread) ----------------------------------------
 
@@ -627,6 +954,19 @@ def build_onewire_from_config(
         raise ConfigError(
             f"onewire.poll_interval_s must be a number, got {type(poll_interval_s).__name__}"
         )
+    read_tier = section.get("read_tier", _DEFAULT_READ_TIER)
+    if not isinstance(read_tier, str):
+        raise ConfigError(f"onewire.read_tier must be a string, got {type(read_tier).__name__}")
+    netlink_timeout_s = section.get("netlink_timeout_s", _DEFAULT_NETLINK_TIMEOUT_S)
+    if not isinstance(netlink_timeout_s, int | float) or isinstance(netlink_timeout_s, bool):
+        raise ConfigError(
+            f"onewire.netlink_timeout_s must be a number, got {type(netlink_timeout_s).__name__}"
+        )
+    netlink_retry_s = section.get("netlink_retry_s", _DEFAULT_NETLINK_RETRY_S)
+    if not isinstance(netlink_retry_s, int | float) or isinstance(netlink_retry_s, bool):
+        raise ConfigError(
+            f"onewire.netlink_retry_s must be a number, got {type(netlink_retry_s).__name__}"
+        )
     root = section.get("root", DEFAULT_ROOT)
 
     try:
@@ -640,6 +980,9 @@ def build_onewire_from_config(
             bulk_timeout_s=float(bulk_timeout_s),
             bulk_retry_s=float(bulk_retry_s),
             bulk_read=bulk_read,
+            read_tier=read_tier,
+            netlink_timeout_s=float(netlink_timeout_s),
+            netlink_retry_s=float(netlink_retry_s),
         )
     except ConfigError as exc:
         raise ConfigError(f"onewire: {exc}") from exc

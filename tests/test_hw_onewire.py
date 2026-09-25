@@ -10,8 +10,20 @@ from pathlib import Path
 
 import pytest
 
+from aqua_bridge.config import load_config
 from aqua_bridge.hw.onewire import W1Source, build_onewire_from_config
+from aqua_bridge.hw.w1_netlink import W1Netlink
+from aqua_bridge.hw.w1_therm_netlink import reg_num_from_rom_name
 from aqua_bridge.model import ConfigError
+from conftest import EXAMPLE_CONFIG, EXAMPLE_DAS_CONFIG
+from w1_netlink_fakes import (
+    CAPTURED_SCRATCHPAD,
+    FakeSocket,
+    convert_exchange,
+    list_masters_reply,
+    scratchpad,
+    scratchpad_exchange,
+)
 
 
 class _FakeClock:
@@ -41,6 +53,7 @@ def _make_slave(
     *,
     resolution: str | None = None,
     conv_time: str | None = None,
+    identifier: bytes | None = None,
 ) -> Path:
     slave = bus / rom
     slave.mkdir(parents=True)
@@ -50,6 +63,10 @@ def _make_slave(
         (slave / "resolution").write_text(resolution)
     if conv_time is not None:
         (slave / "conv_time").write_text(conv_time)
+    if identifier is not None:
+        # The slave's ``id`` attribute: the raw struct w1_reg_num a netlink
+        # slave command addresses it by (8 bytes, not text).
+        (slave / "id").write_bytes(identifier)
     return slave
 
 
@@ -776,6 +793,9 @@ def test_build_onewire_defaults_the_read_strategy_keys(tmp_path: Path) -> None:
     assert src._bulk_timeout_s == pytest.approx(2.0)
     assert src._bulk_retry_s == pytest.approx(300.0)
     assert src._poll_interval_s == pytest.approx(0.02)
+    assert src._read_tier == "auto"
+    assert src._netlink_timeout_s == pytest.approx(1.0)
+    assert src._netlink_retry_s == pytest.approx(300.0)
 
 
 def test_build_onewire_passes_the_read_strategy_keys_through(tmp_path: Path) -> None:
@@ -787,6 +807,9 @@ def test_build_onewire_passes_the_read_strategy_keys_through(tmp_path: Path) -> 
             "bulk_timeout_s": 3.5,
             "bulk_retry_s": 30.0,
             "poll_interval_s": 0.05,
+            "read_tier": "sysfs_bulk",
+            "netlink_timeout_s": 0.25,
+            "netlink_retry_s": 60.0,
         },
         default_max_age_s=7.5,
     )
@@ -795,6 +818,9 @@ def test_build_onewire_passes_the_read_strategy_keys_through(tmp_path: Path) -> 
     assert src._bulk_timeout_s == pytest.approx(3.5)
     assert src._bulk_retry_s == pytest.approx(30.0)
     assert src._poll_interval_s == pytest.approx(0.05)
+    assert src._read_tier == "sysfs_bulk"
+    assert src._netlink_timeout_s == pytest.approx(0.25)
+    assert src._netlink_retry_s == pytest.approx(60.0)
 
 
 def test_build_onewire_uses_default_max_age_when_absent(tmp_path: Path) -> None:
@@ -827,6 +853,15 @@ def test_build_onewire_explicit_max_age_overrides_default(tmp_path: Path) -> Non
         ({"sensors": {"a": "28-1"}, "bulk_retry_s": -5}, "bulk_retry_s must be > 0"),
         ({"sensors": {"a": "28-1"}, "poll_interval_s": "x"}, "poll_interval_s must be a number"),
         ({"sensors": {"a": "28-1"}, "poll_interval_s": -1}, "poll_interval_s must be > 0"),
+        ({"sensors": {"a": "28-1"}, "read_tier": 1}, "read_tier must be a string"),
+        ({"sensors": {"a": "28-1"}, "read_tier": "bulk"}, "read_tier must be one of"),
+        (
+            {"sensors": {"a": "28-1"}, "netlink_timeout_s": "x"},
+            "netlink_timeout_s must be a number",
+        ),
+        ({"sensors": {"a": "28-1"}, "netlink_timeout_s": 0}, "netlink_timeout_s must be > 0"),
+        ({"sensors": {"a": "28-1"}, "netlink_retry_s": "x"}, "netlink_retry_s must be a number"),
+        ({"sensors": {"a": "28-1"}, "netlink_retry_s": -1}, "netlink_retry_s must be > 0"),
         ({"sensors": {"a": "28-1"}, "enabled": "true"}, "onewire.enabled must be true or false"),
         # item 57: the check runs even when it would otherwise return None (no sensors) --
         # a mistyped enabled: is a config mistake regardless of whether anything reads it.
@@ -837,3 +872,453 @@ def test_build_onewire_explicit_max_age_overrides_default(tmp_path: Path) -> Non
 def test_build_onewire_malformed_section_is_config_error(section: object, match: str) -> None:
     with pytest.raises(ConfigError, match=match):
         build_onewire_from_config(section, default_max_age_s=7.5)  # type: ignore[arg-type]
+
+
+# -- the tier ladder: netlink, then the kernel's bulk read, then one at a time ------
+#
+# These drive the real transport and the real framing over a fake socket, so a
+# cycle's requests are the bytes the board would see; nothing opens a socket
+# (tests/conftest.py takes the netlink family away as well). A sensor's sysfs
+# ``temperature`` file and its scratchpad are given *different* readings on
+# purpose: the value alone then says which tier produced it.
+
+_SYSFS_MILLI = "20000"  # what the sysfs tiers would report: 20.0 C
+_NETLINK_C = 22.1875  # what the captured scratchpad decodes to
+_OTHER_C = 24.0
+
+
+def _netlink_bus(
+    root: Path, roms: list[str], *, conv_time: str = "750"
+) -> tuple[Path, list[bytes]]:
+    """A one-master fake tree whose slaves carry an ``id`` attribute."""
+    bus = _make_bus(root, "w1_bus_master1")
+    ids = []
+    for rom in roms:
+        identifier = reg_num_from_rom_name(rom)
+        ids.append(identifier)
+        _make_slave(
+            bus, rom, _SYSFS_MILLI, resolution="12", conv_time=conv_time, identifier=identifier
+        )
+    return bus, ids
+
+
+def _cycle_replies(seq: int, scratchpads: dict[bytes, bytes], *, masters: tuple[int, ...] = (1,)):
+    """Every datagram one netlink cycle is answered with, in order."""
+    out = [list_masters_reply(seq, masters), *convert_exchange(seq + 1)]
+    for index, (identifier, data) in enumerate(scratchpads.items()):
+        out += scratchpad_exchange(seq + 2 + index, identifier, data)
+    return out
+
+
+def _source(
+    root: Path, roms: dict[str, str], sock: FakeSocket | None, **kwargs: object
+) -> W1Source:
+    factory = None
+    if sock is not None:
+        factory = lambda: W1Netlink(  # noqa: E731 - one expression, and it needs this socket
+            timeout_s=0.5, socket_factory=lambda *a, **kw: sock
+        )
+    return W1Source(
+        roms,
+        resolution_bits=12,
+        max_age_s=10.0,
+        root=root,
+        clock=kwargs.pop("clock", _FakeClock()),  # type: ignore[arg-type]
+        netlink_factory=factory,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def _probe_count(sock: FakeSocket) -> int:
+    """How many ``W1_LIST_MASTERS`` requests were sent (one per netlink attempt)."""
+    return sum(1 for packet in sock.sent if packet[36] == 6)
+
+
+def test_a_bus_reads_over_netlink_when_the_connector_answers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The preferred tier: one conversion for the bus, one scratchpad per sensor,
+    and the kernel's own bulk attribute never touched."""
+    root = tmp_path / "w1"
+    bus, ids = _netlink_bus(root, ["28-000000000001", "28-000000000002"])
+    log = _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["1"])
+    sock = FakeSocket(_cycle_replies(1, {ids[0]: CAPTURED_SCRATCHPAD, ids[1]: scratchpad(0x0180)}))
+    src = _source(root, {"a": "28-000000000001", "b": "28-000000000002"}, sock)
+
+    result = src.run_bus_cycle(bus)
+
+    assert result == {"a": pytest.approx(_NETLINK_C), "b": pytest.approx(_OTHER_C)}, (
+        "the readings are the scratchpads', not the sysfs temperature files'"
+    )
+    assert src.read_tiers() == {"w1_bus_master1": "netlink"}
+    assert log.writes == [], "the kernel's bulk trigger was not written at all"
+    assert _probe_count(sock) == 1
+    assert src.crc_error_counts() == {"28-000000000001": 0, "28-000000000002": 0}
+
+
+def test_a_bus_the_connector_does_not_answer_falls_to_the_kernels_bulk_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A kernel without the w1 connector answers nothing, which is a timeout. The
+    same cycle still finishes one tier down, so no sample is lost."""
+    root = tmp_path / "w1"
+    bus, _ids = _netlink_bus(root, ["28-000000000001"])
+    log = _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
+    sock = FakeSocket([])  # every recv times out
+    src = _source(root, {"a": "28-000000000001"}, sock)
+
+    with caplog.at_level("WARNING"):
+        result = src.run_bus_cycle(bus)
+
+    assert result == {"a": pytest.approx(20.0)}, "read through sysfs in the same cycle"
+    assert src.read_tiers() == {"w1_bus_master1": "bulk"}
+    assert log.writes == [b"trigger\n"]
+    assert "does not read over netlink" in caplog.text
+
+
+def test_a_bus_can_fall_all_the_way_to_one_sensor_at_a_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both fast tiers gone -- no connector, and a bulk trigger the kernel refuses
+    (the phantom case) -- and the sensor still reports."""
+    root = tmp_path / "w1"
+    bus, _ids = _netlink_bus(root, ["28-000000000001"])
+    log = _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "0"])  # refused, silently
+    src = _source(root, {"a": "28-000000000001"}, FakeSocket([]))
+
+    assert src.run_bus_cycle(bus) == {"a": pytest.approx(20.0)}
+    assert src.read_tiers() == {"w1_bus_master1": "serial"}
+    assert log.writes == [b"trigger\n"]
+
+
+def test_a_master_the_connector_does_not_list_is_not_addressed_by_netlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tier is chosen from what the kernel says, not from a directory name: a
+    master id missing from ``W1_LIST_MASTERS`` drops the bus a tier instead of
+    sending commands to a master id nobody confirmed."""
+    root = tmp_path / "w1"
+    bus, ids = _netlink_bus(root, ["28-000000000001"])
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
+    sock = FakeSocket(_cycle_replies(1, {ids[0]: CAPTURED_SCRATCHPAD}, masters=(7, 9)))
+    src = _source(root, {"a": "28-000000000001"}, sock)
+
+    assert src.run_bus_cycle(bus) == {"a": pytest.approx(20.0)}
+    assert src.read_tiers() == {"w1_bus_master1": "bulk"}
+    assert len(sock.sent) == 1, "it asked once and sent no command to an unlisted master"
+
+
+def test_a_bus_that_lost_netlink_is_left_alone_until_netlink_retry_s(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What takes the tier away can come back (a sensor pulled out, a kernel busy
+    elsewhere), so the drop is timed, not permanent -- and inside the window not
+    one request is sent."""
+    root = tmp_path / "w1"
+    bus, ids = _netlink_bus(root, ["28-000000000001"])
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
+    clock = _FakeClock()
+    sock = FakeSocket([])
+    src = _source(root, {"a": "28-000000000001"}, sock, clock=clock, netlink_retry_s=300.0)
+
+    src.run_bus_cycle(bus)
+    assert _probe_count(sock) == 1
+    clock.t += 299.0
+    src.run_bus_cycle(bus)
+    assert _probe_count(sock) == 1, "probed again inside netlink_retry_s"
+
+    clock.t += 2.0
+    # The demotion closed that socket, so the next attempt opens a fresh
+    # transport and its sequence numbers start again at 1.
+    sock.replies = _cycle_replies(1, {ids[0]: CAPTURED_SCRATCHPAD})
+    assert src.run_bus_cycle(bus) == {"a": pytest.approx(_NETLINK_C)}
+    assert _probe_count(sock) == 2
+    assert src.read_tiers() == {"w1_bus_master1": "netlink"}
+
+
+@pytest.mark.parametrize(
+    ("tier", "expected_tier", "expected_value"),
+    [
+        pytest.param("sysfs_bulk", "bulk", 20.0, id="the kernel's bulk read only"),
+        pytest.param("serial", "serial", 20.0, id="one sensor at a time only"),
+    ],
+)
+def test_a_forced_lower_tier_never_touches_the_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tier: str,
+    expected_tier: str,
+    expected_value: float,
+) -> None:
+    """``read_tier`` is for debugging, and a pinned tier has to really be the only
+    one used -- otherwise a measurement cannot tell the tiers apart."""
+    root = tmp_path / "w1"
+    bus, _ids = _netlink_bus(root, ["28-000000000001"])
+    log = _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
+
+    def refuse() -> W1Netlink:
+        raise AssertionError(f"read_tier={tier} must not build a netlink transport")
+
+    src = W1Source(
+        {"a": "28-000000000001"},
+        resolution_bits=12,
+        max_age_s=10.0,
+        root=root,
+        clock=_FakeClock(),
+        read_tier=tier,
+        netlink_factory=refuse,
+    )
+    assert src.run_bus_cycle(bus) == {"a": pytest.approx(expected_value)}
+    assert src.read_tiers() == {"w1_bus_master1": expected_tier}
+    assert log.writes == ([b"trigger\n"] if tier == "sysfs_bulk" else [])
+
+
+def test_a_bus_pinned_to_netlink_publishes_nothing_rather_than_read_another_way(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of pinning a tier. A sensor with no sample reads as missing,
+    which the control loop turns into more cooling and never less, so this is safe
+    -- but it is a debugging setting and the default stays ``auto``."""
+    root = tmp_path / "w1"
+    bus, _ids = _netlink_bus(root, ["28-000000000001"])
+    log = _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
+    src = _source(root, {"a": "28-000000000001"}, FakeSocket([]), read_tier="netlink")
+
+    assert src.run_bus_cycle(bus) == {}
+    assert src.read_tiers() == {"w1_bus_master1": "none"}
+    assert log.writes == []
+    assert src.read() == {"a": None}
+
+
+def test_one_sensor_with_a_bad_crc_loses_its_reading_and_the_bus_keeps_the_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CRC is this module's job now (the driver only checks it on its own
+    ``temperature`` path), and a sensor that fails it is counted where
+    ``w1_commission.py --check`` looks."""
+    root = tmp_path / "w1"
+    bus, ids = _netlink_bus(root, ["28-000000000001", "28-000000000002"])
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["1"])
+    corrupt = CAPTURED_SCRATCHPAD[:8] + bytes([CAPTURED_SCRATCHPAD[8] ^ 0xFF])
+    sock = FakeSocket(_cycle_replies(1, {ids[0]: corrupt, ids[1]: CAPTURED_SCRATCHPAD}))
+    src = _source(root, {"a": "28-000000000001", "b": "28-000000000002"}, sock)
+
+    result = src.run_bus_cycle(bus)
+
+    assert result == {"a": None, "b": pytest.approx(_NETLINK_C)}
+    assert src.read_tiers() == {"w1_bus_master1": "netlink"}
+    assert src.crc_error_counts() == {"28-000000000001": 1, "28-000000000002": 0}
+
+
+def test_a_bus_where_every_scratchpad_is_zeros_drops_a_tier_and_still_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nine zero bytes pass CRC-8 and are what a family-00 phantom answers with on
+    the board. Every sensor failing is the bus's symptom, not the sensors', so the
+    bus drops a tier -- and the same cycle still reads them the slow way."""
+    root = tmp_path / "w1"
+    bus, ids = _netlink_bus(root, ["28-000000000001"])
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
+    sock = FakeSocket(_cycle_replies(1, {ids[0]: bytes(9)}))
+    src = _source(root, {"a": "28-000000000001"}, sock)
+
+    assert src.run_bus_cycle(bus) == {"a": pytest.approx(20.0)}
+    assert src.read_tiers() == {"w1_bus_master1": "bulk"}
+
+
+def test_the_identifier_comes_from_the_id_attribute_and_falls_back_to_the_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The slave's own ``id`` attribute is the authority, checked against the
+    directory name; a slave whose ``id`` cannot be read is still addressable,
+    because a ROM name plus its CRC-8 *is* the identifier."""
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["1"])
+    with_id = reg_num_from_rom_name("28-000000000001")
+    _make_slave(bus, "28-000000000001", _SYSFS_MILLI, conv_time="750", identifier=with_id)
+    _make_slave(bus, "28-000000000002", _SYSFS_MILLI, conv_time="750")  # no id attribute
+    derived = reg_num_from_rom_name("28-000000000002")
+    sock = FakeSocket(
+        _cycle_replies(1, {with_id: CAPTURED_SCRATCHPAD, derived: CAPTURED_SCRATCHPAD})
+    )
+    src = _source(root, {"a": "28-000000000001", "b": "28-000000000002"}, sock)
+
+    assert src.run_bus_cycle(bus) == {
+        "a": pytest.approx(_NETLINK_C),
+        "b": pytest.approx(_NETLINK_C),
+    }
+    addressed = [packet[40:48] for packet in sock.sent if packet[36] == 5]
+    assert addressed == [with_id, derived]
+
+
+def test_a_sensor_with_no_conv_time_is_not_a_bus_to_run_this_tier_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wait has to come from a fact. A sensor the driver has not answered about
+    has no ``conv_time``, so the bus reads a tier down instead of guessing one."""
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
+    identifier = reg_num_from_rom_name("28-000000000001")
+    _make_slave(bus, "28-000000000001", _SYSFS_MILLI, identifier=identifier)  # no conv_time
+    sock = FakeSocket(_cycle_replies(1, {identifier: CAPTURED_SCRATCHPAD}))
+    src = _source(root, {"a": "28-000000000001"}, sock)
+
+    assert src.run_bus_cycle(bus) == {"a": pytest.approx(20.0)}
+    assert src.read_tiers() == {"w1_bus_master1": "bulk"}
+    assert sock.sent == [], "no conv_time, no commands"
+
+
+class _RecordingStop:
+    """``threading.Event``'s two methods the reader uses, with the waits recorded."""
+
+    def __init__(self) -> None:
+        self.waits: list[float] = []
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.waits.append(float(timeout or 0.0))
+        return False
+
+    def is_set(self) -> bool:
+        return False
+
+
+def test_the_conversion_wait_is_the_slowest_sensor_the_driver_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One conversion covers the bus, so it has to be long enough for the slowest
+    sensor on it -- 750 ms for a 12-bit one next to a 10-bit one."""
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["1"])
+    ids = []
+    for rom, conv_time in (("28-000000000001", "190"), ("28-000000000002", "750")):
+        identifier = reg_num_from_rom_name(rom)
+        ids.append(identifier)
+        _make_slave(bus, rom, _SYSFS_MILLI, conv_time=conv_time, identifier=identifier)
+    sock = FakeSocket(_cycle_replies(1, dict.fromkeys(ids, CAPTURED_SCRATCHPAD)))
+    src = _source(root, {"a": "28-000000000001", "b": "28-000000000002"}, sock)
+    stop = _RecordingStop()
+    monkeypatch.setattr(src, "_stop", stop)
+
+    src.run_bus_cycle(bus)
+
+    assert stop.waits == [0.750]
+
+
+def test_a_sensor_that_reports_a_finer_resolution_than_the_driver_lengthens_the_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``resolution`` write that silently failed leaves the driver believing 10 bit
+    while the sensor converts for 750 ms, and reading too early returns the
+    conversion before last. The sensor's own config register settles it."""
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["1"])
+    identifier = reg_num_from_rom_name("28-000000000001")
+    _make_slave(bus, "28-000000000001", _SYSFS_MILLI, conv_time="190", identifier=identifier)
+    sock = FakeSocket(
+        _cycle_replies(1, {identifier: CAPTURED_SCRATCHPAD})  # config 0x7f: 12 bit
+        + _cycle_replies(4, {identifier: CAPTURED_SCRATCHPAD})
+    )
+    src = _source(root, {"a": "28-000000000001"}, sock)
+    stop = _RecordingStop()
+    monkeypatch.setattr(src, "_stop", stop)
+
+    src.run_bus_cycle(bus)
+    src.run_bus_cycle(bus)
+
+    assert stop.waits == [0.190, 0.750], "the second cycle waits for what the sensor reported"
+
+
+def test_stop_closes_every_netlink_socket(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "w1"
+    bus, ids = _netlink_bus(root, ["28-000000000001"])
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["1"])
+    sock = FakeSocket(_cycle_replies(1, {ids[0]: CAPTURED_SCRATCHPAD}))
+    src = _source(root, {"a": "28-000000000001"}, sock)
+
+    src.run_bus_cycle(bus)
+    assert not sock.closed
+    src.stop()
+    assert sock.closed
+
+
+def test_a_cycle_abandoned_by_stop_publishes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``stop()`` landing inside the conversion leaves the scratchpads that follow
+    one conversion stale, and nothing is going to use them anyway."""
+    root = tmp_path / "w1"
+    bus, ids = _netlink_bus(root, ["28-000000000001"])
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["1"])
+    sock = FakeSocket(_cycle_replies(1, {ids[0]: CAPTURED_SCRATCHPAD}))
+    src = _source(root, {"a": "28-000000000001"}, sock)
+
+    class _StoppedDuringConversion(_RecordingStop):
+        def wait(self, timeout: float | None = None) -> bool:
+            super().wait(timeout)
+            return True
+
+    monkeypatch.setattr(src, "_stop", _StoppedDuringConversion())
+    assert src.run_bus_cycle(bus) == {}
+    assert src.read() == {"a": None}
+
+
+# -- the read path's keys, in both example configs ----------------------------------
+
+#: Every ``onewire:`` key that chooses a read path, with the one default the code
+#: uses for it. Both example configs have to account for all of them (the DAS one
+#: by carrying them at these values, the legacy one by naming them in the comment
+#: over its placeholder section), and this list is the gate: a new tunable that
+#: nobody documented fails here.
+READ_PATH_DEFAULTS: dict[str, object] = {
+    "read_tier": "auto",
+    "netlink_timeout_s": 1.0,
+    "netlink_retry_s": 300.0,
+    "bulk_read": "auto",
+    "bulk_timeout_s": 2.0,
+    "bulk_retry_s": 300.0,
+    "poll_interval_s": 0.02,
+    "resolution_bits": 10,
+}
+
+
+def test_the_das_example_shows_every_read_path_key_at_its_default() -> None:
+    """Every operator tunable is a documented key with one default, and the example
+    the owner's enclosure runs on shows all of them at it."""
+    section = load_config(EXAMPLE_DAS_CONFIG).section("onewire")
+    for key, default in READ_PATH_DEFAULTS.items():
+        assert key in section, f"config.example-das.yaml does not document onewire.{key}"
+        if isinstance(default, float):
+            assert section[key] == pytest.approx(default), key
+        else:
+            assert section[key] == default, key
+    built = build_onewire_from_config(section, default_max_age_s=7.5)
+    assert built is not None
+    assert built._read_tier == READ_PATH_DEFAULTS["read_tier"]
+    assert built._netlink_timeout_s == pytest.approx(READ_PATH_DEFAULTS["netlink_timeout_s"])
+    assert built._netlink_retry_s == pytest.approx(READ_PATH_DEFAULTS["netlink_retry_s"])
+
+
+def test_the_legacy_example_names_the_read_path_keys_it_leaves_at_their_defaults() -> None:
+    """The legacy single-controller config has no 1-Wire sensors, so its section is a
+    placeholder -- but a reader still has to be able to find out what the defaults
+    are without reading the source."""
+    text = EXAMPLE_CONFIG.read_text()
+    section = load_config(EXAMPLE_CONFIG).section("onewire")
+    assert not section.get("sensors")
+    for key in READ_PATH_DEFAULTS:
+        assert key in text, f"config.example.yaml does not name onewire.{key}"
+
+
+def test_a_config_written_before_these_keys_existed_still_loads(tmp_path: Path) -> None:
+    """A new key must never refuse an older config: the ladder's default is the same
+    behaviour as before on a bus the netlink tier cannot serve."""
+    src = build_onewire_from_config(
+        {"resolution_bits": 12, "max_age_s": 7.5, "sensors": {"a": "28-000000000001"}},
+        default_max_age_s=7.5,
+    )
+    assert src is not None
+    assert src._read_tier == "auto"
