@@ -68,6 +68,46 @@ def test_discover_all_lists_rom_shaped_subdirs_only(tmp_path: Path) -> None:
     assert found == {"w1_bus_master1": ["28-000000000001"]}
 
 
+def test_discover_all_skips_the_phantoms_of_an_unterminated_bus(tmp_path: Path) -> None:
+    """The kernel's periodic search reads family-00 garbage off an unterminated
+    bus (PROJECT.md section 8 item 38: three of them, a different set every
+    search, on the board's unwired second bus). Those are ROM-shaped and would
+    otherwise be offered as sensors to bind."""
+    root = tmp_path / "w1"
+    wired = _make_bus(root, "w1_bus_master2")
+    _make_slave(wired, "28-000000000001", "20000")
+    unwired = root / "w1_bus_master1"
+    unwired.mkdir(parents=True)
+    (unwired / "00-b00000000000").mkdir()
+    (unwired / "00-700000000000").mkdir()
+
+    assert w1_commission.discover_all(root) == {
+        "w1_bus_master1": [],
+        "w1_bus_master2": ["28-000000000001"],
+    }
+    assert w1_commission.discover_other_families(root) == {
+        "w1_bus_master1": ["00-700000000000", "00-b00000000000"]
+    }
+
+
+def test_cmd_list_names_the_phantom_family_and_what_it_means(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master2")
+    _make_slave(bus, "28-000000000001", "20000")
+    _make_trigger_always_done(monkeypatch, bus / "therm_bulk_read")
+    unwired = root / "w1_bus_master1"
+    unwired.mkdir(parents=True)
+    (unwired / "00-b00000000000").mkdir()
+
+    assert w1_commission.cmd_list(root) == 0
+    out = capsys.readouterr().out
+    assert "28-000000000001" in out
+    assert "00-b00000000000" in out and "another family" in out
+    assert "unterminated" in out
+
+
 def test_discover_all_missing_root_is_empty(tmp_path: Path) -> None:
     assert w1_commission.discover_all(tmp_path / "nope") == {}
 
@@ -118,7 +158,7 @@ def test_cmd_list_bus_with_no_roms(tmp_path: Path, capsys: pytest.CaptureFixture
     _make_bus(root, "w1_bus_master1")
     rc = w1_commission.cmd_list(root)
     assert rc == 1
-    assert "no ROM ids" in capsys.readouterr().out
+    assert "no DS18B20" in capsys.readouterr().out
 
 
 # --- cmd_check -----------------------------------------------------------------------
