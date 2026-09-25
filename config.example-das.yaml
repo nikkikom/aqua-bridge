@@ -834,11 +834,41 @@ spin_up:
 
 # 1-Wire: two w1-gpio buses (dtoverlay=w1-gpio,gpiopin=4 and gpiopin=17 in
 # config.txt); bus masters are discovered under root (default /sys/bus/w1/devices).
+# The w1_bus_master<N> numbering does not follow the order of the overlay lines,
+# so nothing here names a bus -- sensors are found by ROM id wherever they are.
 # Bind ROM ids with tools/w1_commission.py --list / --identify and verify the
-# bindings, cycle time and CRC error rate with --check --config this file.
+# bindings, read path, cycle time and CRC error rate with --check --config this file.
 onewire:
-  resolution_bits: 12    # 9..12; 11 halves the conversion time
+  # 9..12 bits. A bulk read costs one conversion for the whole bus plus ~19 ms
+  # per sensor, so 12 sensors on a bus take 0.98 s at 12 bit; read one sensor at
+  # a time (conversion + ~40 ms each) the same 12 take 9.6 s at 12 bit, 5.0 s at
+  # 11, 2.74 s at 10, 1.58 s at 9. Only ONE bus master system-wide ever gets a
+  # therm_bulk_read from the kernel, so with two buses one of them always reads
+  # one sensor at a time -- and the default has to fit that one: 10 bit, 0.55 of
+  # dt = 5 s (PROJECT.md section 8 items 38, 39). An installation whose sensors
+  # all sit on the bulk-capable bus can run 12 bit; --check prints which path
+  # each bus got.
+  #
+  # 10 bit puts one LSB at 0.25 C, which the estimator carries as quant_c^2 / 12:
+  # a DS18B20 in the sensors: block above belongs at quant_c: 0.25 (0.0625 at 12
+  # bit, 0.125 at 11, 0.5 at 9). The block above still ships 0.0625 -- the golden
+  # regression trajectories are fitted to it and re-fitting them is its own change.
+  resolution_bits: 10
   max_age_s: 7.5         # 1.5 * dt: an older sample reads as missing
+  # auto: trigger the kernel's bulk read on each bus and check once that it
+  # happened; a bus where it did not (no therm_bulk_read at all, or a family-00
+  # phantom on the master, which makes every trigger a no-op) reads its sensors
+  # one at a time instead and is tried again every bulk_retry_s.
+  # off: never write therm_bulk_read at all.
+  bulk_read: auto
+  # The only wait in a read cycle, and it is bounded. The kernel's bulk read
+  # converts inside the write() and is already done when it returns, so this
+  # covers only an implementation that reports the conversion still running:
+  # 750 ms is the slowest 12-bit sensor, the rest is margin.
+  bulk_timeout_s: 2.0
+  bulk_retry_s: 300.0    # a bus that fell back to one-at-a-time reads is re-probed
+                         # this often -- a phantom that took bulk away can go away too
+  poll_interval_s: 0.02  # how often that wait looks, and the reader loop's own floor
   sensors:               # logical name -> DS18B20 ROM id (tools/w1_commission.py --identify)
     inlet_b: 28-000000000001
     prox_b01: 28-000000000002
