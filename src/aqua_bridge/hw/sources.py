@@ -23,7 +23,7 @@ read-only)::
       temp_map: {...}
     onewire:
       sensors: {prox_b01: 28-0316a27a0aff}
-      resolution_bits: 10           # default; 9..12 (PROJECT.md section 8 item 39)
+      resolution_bits: 12           # default; 9..12 (PROJECT.md section 8 item 39)
       max_age_s: 7.5                # default: 1.5 * mpc.dt
 
 Every ``mpc.temps`` name must be bound by exactly one controller ``temp_map``

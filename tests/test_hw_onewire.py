@@ -469,27 +469,43 @@ def test_bulk_read_off_never_touches_the_trigger_attribute(
 
 def test_default_resolution_fits_the_planned_sensor_count(tmp_path: Path) -> None:
     """The arithmetic behind the ``resolution_bits`` default (section 8 item 39),
-    executable: a serial read costs ``conv_time`` plus ~40 ms per sensor
-    (measured), the per-bus budget is ``max_age_s / 2`` so one lost cycle never
-    ages a sensor out, and the plan is 24 sensors on two buses read in parallel.
+    executable: the per-bus budget is ``max_age_s / 2`` so one lost cycle never
+    ages a sensor out, the plan is 24 sensors on two buses read in parallel, and
+    the default is the finest step that fits the two *bus-wide* tiers -- which
+    the netlink tier made available on every bus, including the one the kernel
+    gives no ``therm_bulk_read`` to.
+
+    The serial tier is asserted here too, and asserted *not* to fit: it is the
+    floor a demoted bus lands on, and the day something makes it affordable this
+    assertion is what says to re-derive the default rather than assume it.
     """
-    serial_ms = {12: 800, 11: 416, 10: 228, 9: 132}  # measured on the board, per sensor
-    conv_ms = {12: 750, 11: 375, 10: 190, 9: 95}
-    scratchpad_ms = 19  # measured: a read after a bulk conversion, per sensor
+    # Measured on the board through this module: cycle time per tier, fitted
+    # against the sensor count over n = 2, 4, 6, 8 (section 8 items 38, 39).
+    fixed_ms = {"netlink": {12: 764, 10: 203}, "sysfs_bulk": {12: 759, 10: 211}}
+    per_sensor_ms = {"netlink": 16.6, "sysfs_bulk": 20.5}
+    serial_ms = {12: 800, 11: 416, 10: 228, 9: 132}  # per sensor, conv_time + ~40 ms
     dt, sensors_per_bus = 5.0, 12
     budget_s = (1.5 * dt) / 2  # default max_age_s = 1.5 * dt
 
     src = W1Source({"a": "28-000000000001"}, max_age_s=1.5 * dt, root=tmp_path)
     chosen = src._resolution_bits
-    assert chosen == 10, "the default must be the value section 8 item 39 argues for"
-    # Only one master system-wide ever gets a therm_bulk_read, so the default has
-    # to fit the bus that has to read serially.
-    assert sensors_per_bus * serial_ms[chosen] / 1000 <= budget_s
-    # ... and it is the finest resolution that does: 11 bit does not.
+    assert chosen == 12, "the default must be the value section 8 item 39 argues for"
+    # It is the finest step the sensor has, so "the finest that fits" is only a
+    # claim about the tiers it has to fit: both bus-wide ones, with room to spare.
+    for tier, fixed in fixed_ms.items():
+        cycle_s = (fixed[chosen] + sensors_per_bus * per_sensor_ms[tier]) / 1000
+        assert cycle_s <= budget_s / 2, f"{tier} at {chosen} bit: {cycle_s:.2f} s"
+    # And it does not fit the tier below them: a bus demoted to reading one
+    # sensor at a time cannot keep 12 fresh at 12 bit -- the cycle is longer than
+    # max_age_s itself, so its sensors read as missing part of the time (which
+    # raises cooling and never lowers it) until it is promoted back.
+    demoted_s = sensors_per_bus * serial_ms[chosen] / 1000
+    assert demoted_s > 2 * budget_s
+    assert demoted_s > 1.5 * dt  # ... longer than max_age_s
+    # The coarse alternatives a config can reach for, and what each one buys on
+    # that same demoted bus: 10 bit fits the budget, 11 bit does not.
+    assert sensors_per_bus * serial_ms[10] / 1000 <= budget_s
     assert sensors_per_bus * serial_ms[11] / 1000 > budget_s
-    # A bus that does have the attribute is far cheaper and would fit 12 bit.
-    for bits in (12, chosen):
-        assert (conv_ms[bits] + sensors_per_bus * scratchpad_ms) / 1000 <= budget_s
 
 
 # --- resolution: set once, never rewritten -------------------------------------------
@@ -788,7 +804,7 @@ def test_build_onewire_defaults_the_read_strategy_keys(tmp_path: Path) -> None:
         {"sensors": {"a": "28-1"}, "root": str(tmp_path)}, default_max_age_s=7.5
     )
     assert src is not None
-    assert src._resolution_bits == 10
+    assert src._resolution_bits == 12
     assert src._bulk_read == "auto"
     assert src._bulk_timeout_s == pytest.approx(2.0)
     assert src._bulk_retry_s == pytest.approx(300.0)
@@ -1281,7 +1297,7 @@ READ_PATH_DEFAULTS: dict[str, object] = {
     "bulk_timeout_s": 2.0,
     "bulk_retry_s": 300.0,
     "poll_interval_s": 0.02,
-    "resolution_bits": 10,
+    "resolution_bits": 12,
 }
 
 
@@ -1300,6 +1316,33 @@ def test_the_das_example_shows_every_read_path_key_at_its_default() -> None:
     assert built._read_tier == READ_PATH_DEFAULTS["read_tier"]
     assert built._netlink_timeout_s == pytest.approx(READ_PATH_DEFAULTS["netlink_timeout_s"])
     assert built._netlink_retry_s == pytest.approx(READ_PATH_DEFAULTS["netlink_retry_s"])
+
+
+#: The step one LSB is worth at each resolution -- what ``sensors.<name>.quant_c``
+#: has to say about a DS18B20 the daemon writes that resolution to (PROJECT.md
+#: section 3, the ``onewire:`` block; section 8 item 39).
+QUANT_C_PER_RESOLUTION: dict[int, float] = {12: 0.0625, 11: 0.125, 10: 0.25, 9: 0.5}
+
+
+def test_the_das_example_quantises_its_1_wire_sensors_at_the_resolution_it_asks_for() -> None:
+    """Nothing cross-checks ``onewire.resolution_bits`` against
+    ``mpc.sensors.<name>.quant_c`` at runtime -- the sections are validated apart
+    and a mismatch only mis-sizes ``R`` and the Stuck band -- so the example the
+    owner's enclosure runs on is where the two are held together (PROJECT.md
+    section 8 item 39: whoever moves one moves the other)."""
+    cfg = load_config(EXAMPLE_DAS_CONFIG)
+    bits = cfg.onewire["resolution_bits"]
+    expected = QUANT_C_PER_RESOLUTION[bits]
+    for name in cfg.onewire["sensors"]:
+        params = cfg.mpc.sensors[name]
+        assert params.quant_c == pytest.approx(expected), (
+            f"{name} is a DS18B20 at {bits} bit (one LSB = {expected} C) "
+            f"but quant_c says {params.quant_c}"
+        )
+        # The Stuck band is 1.5 * quant_c: below one LSB it would fire on a
+        # sensor idling on one code instead of being cleared by its own dither.
+        assert params.stuck_eps_c is not None
+        assert params.stuck_eps_c > expected
 
 
 def test_the_legacy_example_names_the_read_path_keys_it_leaves_at_their_defaults() -> None:
