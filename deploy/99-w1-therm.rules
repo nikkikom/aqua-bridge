@@ -1,0 +1,27 @@
+# DS18B20 sensors on the w1-gpio buses (PROJECT.md §9 "udev", §8 item 38).
+#
+# The kernel creates every w1 sysfs attribute root-owned, and the daemon does
+# not run as root (User= in aqua-bridge.service, SupplementaryGroups=plugdev).
+# Three of those attributes are written:
+#   resolution      hw/onewire.py writes it once per sensor (onewire.resolution_bits;
+#                   the default 10 bit is what makes 12 sensors per bus fit the tick)
+#   conv_time       read to report what a cycle costs, writable for an experiment
+#   features        not written today; kept in the grant because bit 2 (poll for
+#                   conversion completion) measured ~7 % faster on the board and
+#                   is the next thing to try there
+# plus, on the bus master, therm_bulk_read: hw/onewire.py writes "trigger" to it
+# once per bus to find out whether this kernel honours a bulk read at all
+# (§8 item 38: the board's does not, and the bus then reads serially). Without
+# this rule that write fails with EACCES, which is handled -- the reader falls
+# back to serial reads -- but then every sensor stays at its power-on 12 bit and
+# a cycle no longer fits dt.
+#
+# Group plugdev, group write; nothing here changes an attribute's value.
+# %p is the device path under /sys. ACTION=="add|change" because the kernel
+# re-scans each bus every w1_master_timeout seconds and re-announces devices,
+# and because install-pi.sh triggers a change event for sensors already
+# attached. therm_bulk_read appears on a master only once its first w1_therm
+# slave has attached, which is why the slave rule fixes the parent's attribute
+# too (/sys%p/../therm_bulk_read) instead of relying on the master rule alone.
+ACTION=="add|change", SUBSYSTEM=="w1", KERNEL=="w1_bus_master*", RUN+="/bin/sh -c 'f=/sys%p/therm_bulk_read; [ -e $f ] && chgrp plugdev $f && chmod g+w $f'"
+ACTION=="add|change", SUBSYSTEM=="w1", KERNEL=="28-*", RUN+="/bin/sh -c 'for f in /sys%p/resolution /sys%p/features /sys%p/conv_time /sys%p/../therm_bulk_read; do [ -e $f ] && chgrp plugdev $f && chmod g+w $f; done'"
