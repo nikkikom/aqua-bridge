@@ -480,12 +480,12 @@ class HostHealthConfig:
     #: measured floor is 1.4 KB and stays well under a megabyte even richer (item
     #: 48) -- under 125 MB together. On the Pi,
     #: ``deploy/install-board-watchdogs.sh``'s ``JOURNAL_MAX_USE`` (200 MB by
-    #: default) also caps the journal, but only when the board keeps a
-    #: *persistent* journal (that script assumes it is, and does not itself
-    #: create ``/var/log/journal``; on a stock image with the default
-    #: ``Storage=auto`` the journal stays volatile and that cap bounds RAM, not
-    #: the card) -- so it is margin on top of this arithmetic, never a term it
-    #: depends on. Even without it, 2 GB leaves more than ten times the
+    #: default) also caps the journal. That script now sets ``Storage=``
+    #: explicitly and verifies it rather than assuming the board keeps a
+    #: *persistent* journal (Raspberry Pi OS ships its own volatile-storage
+    #: drop-in and used to beat this script's, silently, PROJECT.md §9 *Board
+    #: hardening*) -- so the cap is margin on top of this arithmetic, never a
+    #: term it depends on. Even without it, 2 GB leaves more than ten times the
     #: recorder-plus-model-store figure as room to act -- clear old recordings,
     #: shrink the journal -- before a single rotation or write could still fail
     #: for want of space. On the owner's 15 GB SD card (11 GB free) this default

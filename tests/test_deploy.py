@@ -468,6 +468,7 @@ def test_board_script_takes_every_value_from_a_variable_with_a_default():
     knobs = {
         "SOC_WATCHDOG_SEC": "60",
         "REBOOT_WATCHDOG_SEC": "120",
+        "JOURNAL_STORAGE": "persistent",
         "JOURNAL_MAX_USE": "200M",
         "JOURNAL_MAX_FILE_SIZE": "16M",
         "JOURNAL_MAX_RETENTION": "30day",
@@ -481,12 +482,80 @@ def test_board_script_takes_every_value_from_a_variable_with_a_default():
     for directive, name in (
         ("RuntimeWatchdogSec", "SOC_WATCHDOG_SEC"),
         ("RebootWatchdogSec", "REBOOT_WATCHDOG_SEC"),
+        ("Storage", "JOURNAL_STORAGE"),
         ("SystemMaxUse", "JOURNAL_MAX_USE"),
         ("SystemMaxFileSize", "JOURNAL_MAX_FILE_SIZE"),
         ("MaxRetentionSec", "JOURNAL_MAX_RETENTION"),
         ("SyncIntervalSec", "JOURNAL_SYNC_INTERVAL"),
     ):
         assert f"{directive}=${{{name}}}" in text, directive
+
+
+def test_journald_dropin_sorts_after_the_raspberry_pi_os_volatile_storage_dropin():
+    """Raspberry Pi OS ships /usr/lib/systemd/journald.conf.d/40-rpi-volatile-
+    storage.conf (Storage=volatile); systemd merges journald.conf.d fragments in
+    lexical order of filename *across* /usr/lib, /run and /etc, later wins. The
+    old name here, 20-aqua-journal-limits.conf, sorted before the vendor's and
+    lost -- the defect measured on the owner's board on 2026-09-25. 99- is chosen
+    to sort after any conventionally-numbered vendor drop-in: a three-digit
+    prefix such as 100- still sorts *before* 99- as a string, since '1' < '9'."""
+    text = BOARD_SCRIPT.read_text()
+    match = re.search(r'^JOURNALD_DROPIN="([^"]+)"$', text, re.MULTILINE)
+    assert match is not None
+    dropin_name = Path(match.group(1)).name
+    vendor_name = "40-rpi-volatile-storage.conf"
+    assert dropin_name > vendor_name
+    assert dropin_name == "99-aqua-journal-limits.conf"
+    assert dropin_name > "100-a-later-vendor-file.conf"  # the string-sort quirk above
+
+
+def test_journald_dropin_sets_storage_explicitly_from_a_validated_knob():
+    """§9's finding: the caps were meaningless because the drop-in never set
+    Storage= at all, leaving it to systemd's Storage=auto (persistent only when
+    /var/log/journal already exists, which nothing on a stock image creates)."""
+    text = BOARD_SCRIPT.read_text()
+    assert "Storage=${JOURNAL_STORAGE}" in text
+    assert "persistent | volatile | auto" in text
+    assert "JOURNAL_STORAGE must be 'persistent', 'volatile' or 'auto'" in text
+
+
+def test_board_script_cleans_up_the_hand_made_journald_dropins():
+    """A board that already carries the by-hand workaround (10-persistent.conf,
+    99-aqua-persistent.conf) must not end up with three drop-ins saying the same
+    thing once this script installs its own equivalent."""
+    text = BOARD_SCRIPT.read_text()
+    assert '"/etc/systemd/journald.conf.d/10-persistent.conf"' in text
+    assert '"/etc/systemd/journald.conf.d/99-aqua-persistent.conf"' in text
+    assert 'for legacy in "${LEGACY_JOURNALD_DROPINS[@]}"; do' in text
+    assert 'remove_path "$legacy"' in text
+
+
+def test_board_script_verifies_journald_storage_instead_of_trusting_the_write():
+    """Writing the drop-in and declaring victory is what produced the defect:
+    both --check and a real run must report the effective Storage= and whether
+    /var/log/journal is populated, and say plainly when that does not match
+    JOURNAL_STORAGE. The effective-Storage= check delegates to systemd's own
+    systemd-analyze cat-config rather than a second copy of the merge-order rule
+    kept here to drift out of sync with the real one."""
+    text = BOARD_SCRIPT.read_text()
+    assert "systemd-analyze cat-config systemd/journald.conf" in text
+    assert "effective Storage=:" in text
+    assert "/var/log/journal populated:" in text
+    assert 'if [[ "$effective" == "$JOURNAL_STORAGE" ]]; then' in text
+    assert "WARNING: asked for JOURNAL_STORAGE=" in text
+    # Called once for --check (before it reports and exits) and once after a
+    # real apply (after journald has actually been restarted) -- bare call
+    # lines, not the definition (journald_storage_report() {) or the comment
+    # naming it.
+    calls = [m.start() for m in re.finditer(r"^\s*journald_storage_report\s*$", text, re.MULTILINE)]
+    assert len(calls) == 2
+    check_pos, apply_pos = calls
+    def_pos = text.index("journald_storage_report() {")
+    check_exit = text.index("== check: changes pending, nothing was written ==")
+    assert def_pos < check_pos < check_exit
+    restart_line = text.index("as_root systemctl restart systemd-journald")
+    done_marker = text.index("== done ==")
+    assert restart_line < apply_pos < done_marker
 
 
 def test_the_soc_watchdog_sits_above_the_service_watchdog(unit):

@@ -763,7 +763,8 @@ def test_disk_free_min_gb_default_clears_the_bounded_writers_with_room_to_spare(
     rotated backup) and the model store's measured floor, unconditionally -- the
     journal cap deploy/install-board-watchdogs.sh sets is margin *on top* of
     this, not a term the arithmetic depends on, since it only lands on the card
-    when the board keeps a persistent journal
+    when the board keeps a persistent journal -- guaranteed and verified by
+    that script now, not merely assumed
     (health.HostHealthConfig.disk_free_min_gb's docstring says why)."""
     from aqua_bridge.recorder import DEFAULT_BACKUP_COUNT, DEFAULT_MAX_BYTES
 
