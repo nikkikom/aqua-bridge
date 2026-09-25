@@ -558,6 +558,67 @@ def test_board_script_verifies_journald_storage_instead_of_trusting_the_write():
     assert restart_line < apply_pos < done_marker
 
 
+def test_watchdog_dropin_sorts_after_the_raspberry_pi_os_enable_watchdog_dropin():
+    """Raspberry Pi OS ships /usr/lib/systemd/system.conf.d/40-rpi-enable-watchdog.conf
+    (RuntimeWatchdogSec=1m, RebootWatchdogSec=2m); systemd merges system.conf.d
+    fragments in lexical order of filename *across* /usr/lib, /run and /etc, later
+    wins -- the same rule as journald.conf.d. The old name here,
+    10-aqua-watchdog.conf, sorted *before* the vendor's and lost: the vendor's
+    values applied last and were what the board actually ran, invisible only
+    because 60 s/120 s happen to equal the vendor's 1 m/2 m. 99- is chosen for the
+    same reason as the journald drop-in: a three-digit prefix such as 100- still
+    sorts *before* 99- as a string, since '1' < '9'."""
+    text = BOARD_SCRIPT.read_text()
+    match = re.search(r'^SYSTEM_DROPIN="([^"]+)"$', text, re.MULTILINE)
+    assert match is not None
+    dropin_name = Path(match.group(1)).name
+    vendor_name = "40-rpi-enable-watchdog.conf"
+    assert dropin_name > vendor_name
+    assert dropin_name == "99-aqua-watchdog.conf"
+    assert dropin_name > "100-a-later-vendor-file.conf"  # the string-sort quirk above
+
+
+def test_board_script_cleans_up_its_own_old_watchdog_dropin_name():
+    """A board that already carries this script's previous, losing name
+    (10-aqua-watchdog.conf) must not end up with two watchdog drop-ins once a
+    re-run installs the new one."""
+    text = BOARD_SCRIPT.read_text()
+    assert '"/etc/systemd/system.conf.d/10-aqua-watchdog.conf"' in text
+    assert 'for legacy in "${LEGACY_SYSTEM_DROPINS[@]}"; do' in text
+    assert 'remove_path "$legacy"' in text
+
+
+def test_board_script_verifies_the_watchdog_instead_of_trusting_the_write():
+    """Writing the drop-in and declaring victory is what produced the defect: both
+    --check and a real run must report the effective RuntimeWatchdogUSec and
+    RebootWatchdogUSec (from systemctl show) and say plainly when they do not
+    match SOC_WATCHDOG_SEC/REBOOT_WATCHDOG_SEC. Both sides are compared as
+    microseconds (systemd-analyze timespan), not as literal strings, since
+    systemd normalizes a value like "60s" to "1min" on its own."""
+    text = BOARD_SCRIPT.read_text()
+    assert "systemctl show -p RuntimeWatchdogUSec -p RebootWatchdogUSec" in text
+    assert "RuntimeWatchdogUSec: " in text
+    assert "RebootWatchdogUSec:  " in text
+    assert "LC_ALL=C systemd-analyze timespan" in text
+    assert "OK: RuntimeWatchdogSec matches SOC_WATCHDOG_SEC" in text
+    assert "OK: RebootWatchdogSec matches REBOOT_WATCHDOG_SEC" in text
+    assert "WARNING: asked for SOC_WATCHDOG_SEC=" in text
+    assert "WARNING: asked for REBOOT_WATCHDOG_SEC=" in text
+    # Called once for --check (before it reports and exits) and once after a real
+    # apply (after the daemon-reexec that makes RuntimeWatchdogSec take effect) --
+    # bare call lines, not the definition (watchdog_report() {) or the comment
+    # naming it.
+    calls = [m.start() for m in re.finditer(r"^\s*watchdog_report\s*$", text, re.MULTILINE)]
+    assert len(calls) == 2
+    check_pos, apply_pos = calls
+    def_pos = text.index("watchdog_report() {")
+    check_exit = text.index("== check: changes pending, nothing was written ==")
+    assert def_pos < check_pos < check_exit
+    reexec_line = text.index("as_root systemctl daemon-reexec")
+    done_marker = text.index("== done ==")
+    assert reexec_line < apply_pos < done_marker
+
+
 def test_the_soc_watchdog_sits_above_the_service_watchdog(unit):
     """The order is the point (section 2): a slow tick must get a daemon restart, which
     is cheap, before the board gets a reset, which costs a whole boot and spends the

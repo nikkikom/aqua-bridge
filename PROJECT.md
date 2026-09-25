@@ -10882,7 +10882,7 @@ environment (`sudo SOC_WATCHDOG_SEC=90 deploy/install-board-watchdogs.sh`):
 
 | Variable | Default | What it writes |
 |----------|---------|----------------|
-| `SOC_WATCHDOG_SEC` | `60` | `RuntimeWatchdogSec=` in `/etc/systemd/system.conf.d/10-aqua-watchdog.conf` |
+| `SOC_WATCHDOG_SEC` | `60` | `RuntimeWatchdogSec=` in `/etc/systemd/system.conf.d/99-aqua-watchdog.conf` |
 | `REBOOT_WATCHDOG_SEC` | `120` | `RebootWatchdogSec=` in the same file |
 | `JOURNAL_STORAGE` | `persistent` | `Storage=` in `/etc/systemd/journald.conf.d/99-aqua-journal-limits.conf` |
 | `JOURNAL_MAX_USE` | `200M` | `SystemMaxUse=` in the same file |
@@ -10907,10 +10907,21 @@ Notes that only show up on a real board:
   writing an overlay it cannot verify.
 - **Raspberry Pi OS already enables it**, in
   `/usr/lib/systemd/system.conf.d/40-rpi-enable-watchdog.conf`
-  (`RuntimeWatchdogSec=1m`, `RebootWatchdogSec=2m`). The drop-in above is in
-  `/etc`, which wins, so the board runs the value §2 argues for and it does
-  not move when `raspberrypi-sys-mods` is upgraded. The numbers happen to
-  agree today; the point is that they are now ours.
+  (`RuntimeWatchdogSec=1m`, `RebootWatchdogSec=2m`). `system.conf.d` merges
+  the same way `journald.conf.d` does — lexical order of filename *across*
+  `/usr/lib`, `/run` and `/etc`, later wins (the next bullet has the rule in
+  full) — and this script's drop-in used to be named `10-aqua-watchdog.conf`,
+  which sorts *before* `40-rpi-enable-watchdog.conf` and lost: the vendor's
+  `RuntimeWatchdogSec=1m`, `RebootWatchdogSec=2m` applied last and were what
+  the board actually ran. Invisible only because `SOC_WATCHDOG_SEC=60`
+  (`RuntimeWatchdogSec=60s`) and `REBOOT_WATCHDOG_SEC=120` happen to equal the
+  vendor's `1m`/`2m` — an operator who set `SOC_WATCHDOG_SEC=90` would have
+  gotten a script that reported success and a board that stayed at 60 s.
+  Found the same day as the journald defect below, with the same
+  `systemd-analyze cat-config` check. The drop-in is now
+  `99-aqua-watchdog.conf`, for the same reason and with the same string-sort
+  caveat as the journald one, and a re-run removes the old
+  `10-aqua-watchdog.conf` so a board does not end up with two.
 - **Raspberry Pi OS keeps the journal volatile by default**, via
   `/usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf`
   (`Storage=volatile`). systemd merges `*.conf.d` fragments in lexical order
@@ -10932,14 +10943,18 @@ Notes that only show up on a real board:
   removes the hand-made `10-persistent.conf` and `99-aqua-persistent.conf`
   the board carried from working around this by hand before the script did
   it properly, so the three drop-ins do not pile up saying the same thing.
-- **The script checks the result instead of trusting the write.** Both
-  `--check` and a real run print the effective `Storage=` — from
-  `systemd-analyze cat-config systemd/journald.conf`, which resolves the same
-  cross-directory merge systemd itself does, rather than a second copy of
-  that rule kept here to drift out of sync — and whether `/var/log/journal`
-  actually holds anything, and say so plainly when that does not match
-  `JOURNAL_STORAGE`. A script that writes a drop-in and declares victory is
-  what produced the defect above.
+- **The script checks the result instead of trusting the write, for both
+  drop-ins above.** Both `--check` and a real run print the effective
+  `RuntimeWatchdogUSec`/`RebootWatchdogUSec` — from `systemctl show`,
+  compared against `SOC_WATCHDOG_SEC`/`REBOOT_WATCHDOG_SEC` as microseconds
+  (`systemd-analyze timespan`) rather than as literal strings, since systemd
+  normalizes a value like `60s` to `1min` on its own — and the effective
+  `Storage=` — from `systemd-analyze cat-config systemd/journald.conf`, which
+  resolves the same cross-directory merge systemd itself does, rather than a
+  second copy of that rule kept here to drift out of sync — and whether
+  `/var/log/journal` actually holds anything. Both say so plainly when the
+  result does not match what was asked for. A script that writes a drop-in
+  and declares victory is what produced both defects above.
 - **`RuntimeWatchdogSec` is only read when PID 1 re-executes**, so the script
   runs `systemctl daemon-reexec`. That restarts no service and does not
   interrupt the control loop.

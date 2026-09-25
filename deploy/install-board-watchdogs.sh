@@ -22,12 +22,19 @@
 # script with whatever thresholds it was installed with). The watchdog and
 # journald settings are installed either way.
 #
-# The journald section does not stop at writing its drop-in: both --check and a
-# real run also report where journald is actually keeping the journal --
-# Storage= as systemd's own cross-directory merge resolves it, and whether
-# /var/log/journal holds anything -- and say plainly when that does not match
-# JOURNAL_STORAGE. Writing the file and trusting it is what let Raspberry Pi
-# OS's own volatile-storage drop-in win silently before (PROJECT.md §9).
+# Two of the drop-ins below compete with vendor files Raspberry Pi OS ships in
+# the same *.conf.d directories. systemd merges *.conf.d fragments in lexical
+# order of filename ACROSS /usr/lib, /run and /etc -- later wins, the
+# directory a file lives in does not decide it -- so a drop-in that wants to
+# win has to sort after the vendor's, by name, not just live in /etc. The SoC
+# watchdog's competes with /usr/lib/systemd/system.conf.d/40-rpi-enable-
+# watchdog.conf; journald's competes with /usr/lib/systemd/journald.conf.d/
+# 40-rpi-volatile-storage.conf. Both sections below name their drop-in to sort
+# after the vendor's and then VERIFY the effective result instead of trusting
+# the write -- systemctl show for the watchdog, systemd-analyze cat-config for
+# journald -- and say plainly when it does not match what was asked for.
+# Writing a file and declaring victory is what let a vendor drop-in win
+# silently before this fix (PROJECT.md §9).
 #
 # ---------------------------------------------------------------------------
 # Knobs. Every one can be overridden from the environment, e.g.
@@ -53,6 +60,16 @@ SOC_WATCHDOG_SEC="${SOC_WATCHDOG_SEC:-60}"
 # a healthy shutdown here and matches what Raspberry Pi OS ships in
 # /usr/lib/systemd/system.conf.d/40-rpi-enable-watchdog.conf.
 REBOOT_WATCHDOG_SEC="${REBOOT_WATCHDOG_SEC:-120}"
+# That vendor file (RuntimeWatchdogSec=1m, RebootWatchdogSec=2m) is exactly why
+# this script's own drop-in (below) has to sort after it by filename: systemd
+# merges system.conf.d the same way it merges journald.conf.d (lexical order
+# of filename across /usr/lib, /run and /etc, later wins), and this script's
+# drop-in used to be named 10-aqua-watchdog.conf, which sorts BEFORE
+# 40-rpi-enable-watchdog.conf and lost -- invisible only because 60 s/120 s
+# above happen to equal the vendor's 1 m/2 m; an operator who set
+# SOC_WATCHDOG_SEC=90 would have gotten a script that reported success and a
+# board that stayed at 60 s. Found and fixed the same way as the journald
+# drop-in below (PROJECT.md §9).
 # Where journald keeps the journal. Raspberry Pi OS ships its own
 # /usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf (Storage=
 # volatile), so the caps below are meaningless unless something sets Storage=
@@ -93,7 +110,19 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UNIT_SRC="$SCRIPT_DIR/aqua-bridge.service"
-SYSTEM_DROPIN="/etc/systemd/system.conf.d/10-aqua-watchdog.conf"
+# 99- so this sorts after any conventionally-numbered vendor drop-in in
+# systemd's cross-directory merge (later filename wins; a three-digit prefix
+# like "100-" still sorts *before* "99-" as a string, since '1' < '9') --
+# specifically /usr/lib/systemd/system.conf.d/40-rpi-enable-watchdog.conf,
+# which is what beat this file's old name, 10-aqua-watchdog.conf (PROJECT.md
+# §9 "Board hardening").
+SYSTEM_DROPIN="/etc/systemd/system.conf.d/99-aqua-watchdog.conf"
+# This script's own previous name for $SYSTEM_DROPIN; a run that installs the
+# new one removes it so a board does not end up with two drop-ins saying the
+# same thing (and, before this fix, disagreeing about which one systemd uses).
+LEGACY_SYSTEM_DROPINS=(
+  "/etc/systemd/system.conf.d/10-aqua-watchdog.conf"
+)
 # 99- so this sorts after any conventionally-numbered vendor drop-in in
 # systemd's cross-directory merge (later filename wins; a three-digit prefix
 # like "100-" still sorts *before* "99-" as a string, since '1' < '9') --
@@ -222,6 +251,57 @@ install_text() {
   echo "  wrote: $dst"
 }
 
+# watchdog_report. Prints what systemd is actually enforcing, not what was
+# asked for: RuntimeWatchdogUSec and RebootWatchdogUSec from systemctl show --
+# the two questions a writer of $SYSTEM_DROPIN cannot answer by looking at its
+# own write, the same principle as journald_storage_report below. Both sides
+# are normalized to microseconds with systemd-analyze timespan (LC_ALL=C, so
+# the label line reads the ASCII "us:" rather than the locale-dependent "μs:")
+# so a systemd-normalized string like "1min" compares equal to this script's
+# own "60s", not unequal as literal text. Needs no root; --check calls it
+# before anything is written, so it reports the board's *current* state, not a
+# preview of this run. This is the check that was missing when the vendor
+# drop-in won silently.
+watchdog_report() {
+  local show runtime_val reboot_val
+  show="$(systemctl show -p RuntimeWatchdogUSec -p RebootWatchdogUSec 2> /dev/null || true)"
+  runtime_val="$(printf '%s\n' "$show" | sed -n 's/^RuntimeWatchdogUSec=//p')"
+  reboot_val="$(printf '%s\n' "$show" | sed -n 's/^RebootWatchdogUSec=//p')"
+  echo "  RuntimeWatchdogUSec: ${runtime_val:-unknown}"
+  echo "  RebootWatchdogUSec:  ${reboot_val:-unknown}"
+  if ! command -v systemd-analyze > /dev/null 2>&1; then
+    echo "  (systemd-analyze not found, cannot verify against SOC_WATCHDOG_SEC/REBOOT_WATCHDOG_SEC)"
+    return 0
+  fi
+  local runtime_us reboot_us want_runtime_us want_reboot_us
+  runtime_us="$(LC_ALL=C systemd-analyze timespan "${runtime_val:-0}" 2> /dev/null \
+    | sed -n 's/^[[:space:]]*us:[[:space:]]*//p')"
+  reboot_us="$(LC_ALL=C systemd-analyze timespan "${reboot_val:-0}" 2> /dev/null \
+    | sed -n 's/^[[:space:]]*us:[[:space:]]*//p')"
+  want_runtime_us="$(LC_ALL=C systemd-analyze timespan "${SOC_WATCHDOG_SEC}s" 2> /dev/null \
+    | sed -n 's/^[[:space:]]*us:[[:space:]]*//p')"
+  want_reboot_us="$(LC_ALL=C systemd-analyze timespan "${REBOOT_WATCHDOG_SEC}s" 2> /dev/null \
+    | sed -n 's/^[[:space:]]*us:[[:space:]]*//p')"
+  if [[ -n "$runtime_us" && "$runtime_us" == "$want_runtime_us" ]]; then
+    echo "  OK: RuntimeWatchdogSec matches SOC_WATCHDOG_SEC=$SOC_WATCHDOG_SEC"
+  else
+    echo "  WARNING: asked for SOC_WATCHDOG_SEC=$SOC_WATCHDOG_SEC" \
+      "(RuntimeWatchdogSec=${SOC_WATCHDOG_SEC}s), systemd is actually running" \
+      "RuntimeWatchdogUSec=${runtime_val:-unknown} -- some drop-in with a" \
+      "lexically later filename is winning; 'systemd-analyze cat-config" \
+      "systemd/system.conf' shows which one. PROJECT.md §9 'Board hardening'."
+  fi
+  if [[ -n "$reboot_us" && "$reboot_us" == "$want_reboot_us" ]]; then
+    echo "  OK: RebootWatchdogSec matches REBOOT_WATCHDOG_SEC=$REBOOT_WATCHDOG_SEC"
+  else
+    echo "  WARNING: asked for REBOOT_WATCHDOG_SEC=$REBOOT_WATCHDOG_SEC" \
+      "(RebootWatchdogSec=${REBOOT_WATCHDOG_SEC}s), systemd is actually running" \
+      "RebootWatchdogUSec=${reboot_val:-unknown} -- some drop-in with a" \
+      "lexically later filename is winning; 'systemd-analyze cat-config" \
+      "systemd/system.conf' shows which one. PROJECT.md §9 'Board hardening'."
+  fi
+}
+
 # journald_storage_report. Prints what journald is actually doing, not what was
 # asked for: the effective Storage= from the same cross-directory merge systemd
 # itself does (systemd-analyze cat-config, so this script carries no second copy
@@ -267,18 +347,30 @@ if [[ -r /sys/class/watchdog/watchdog0/identity ]]; then
   echo "  device: $(cat /sys/class/watchdog/watchdog0/identity)" \
     "(current timeout $(cat /sys/class/watchdog/watchdog0/timeout) s)"
 fi
-# Raspberry Pi OS already ships RuntimeWatchdogSec in
-# /usr/lib/systemd/system.conf.d/40-rpi-enable-watchdog.conf. This drop-in is in
-# /etc, which wins, so the value the board runs is the one argued above and does
-# not move when raspberrypi-sys-mods is upgraded.
+# Raspberry Pi OS already ships RuntimeWatchdogSec/RebootWatchdogSec in
+# /usr/lib/systemd/system.conf.d/40-rpi-enable-watchdog.conf, and this file is
+# named to sort after it in systemd's cross-directory merge (later filename
+# wins, the directory does not decide it) -- otherwise the vendor's values win
+# and the ones argued above never take effect (PROJECT.md §9 "Board
+# hardening").
 install_text "$SYSTEM_DROPIN" 644 <<EOF
 # Written by deploy/install-board-watchdogs.sh (PROJECT.md §2, §9).
-# Overrides /usr/lib/systemd/system.conf.d/40-rpi-enable-watchdog.conf.
+# Named to sort after /usr/lib/systemd/system.conf.d/40-rpi-enable-watchdog.conf
+# in systemd's cross-directory merge; without that, the vendor's file applies
+# last and wins.
 [Manager]
 RuntimeWatchdogSec=${SOC_WATCHDOG_SEC}s
 RebootWatchdogSec=${REBOOT_WATCHDOG_SEC}s
 EOF
 NEEDS_REEXEC="$LAST_WROTE"
+# This script's own previous, losing name for this drop-in; clean it up so a
+# re-run does not leave two drop-ins saying the same thing.
+for legacy in "${LEGACY_SYSTEM_DROPINS[@]}"; do
+  if [[ -e "$legacy" ]]; then
+    NEEDS_REEXEC=1
+  fi
+  remove_path "$legacy"
+done
 
 echo "== journald limits =="
 # Storage= is set here explicitly rather than left to systemd's "auto"
@@ -362,6 +454,9 @@ fi
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
   echo
+  echo "== SoC watchdog (current board state, before any change) =="
+  watchdog_report
+  echo
   echo "== journald storage (current board state, before any change) =="
   journald_storage_report
   echo
@@ -380,8 +475,8 @@ if [[ "$NEEDS_REEXEC" -eq 1 ]]; then
   # service and does not interrupt the control loop.
   as_root systemctl daemon-reexec
 fi
-echo "  RuntimeWatchdogUSec now: $(systemctl show -p RuntimeWatchdogUSec --value)"
-echo "  RebootWatchdogUSec now:  $(systemctl show -p RebootWatchdogUSec --value)"
+echo "== SoC watchdog =="
+watchdog_report
 if [[ "$NEEDS_JOURNALD_RESTART" -eq 1 ]]; then
   as_root systemctl restart systemd-journald
 fi
