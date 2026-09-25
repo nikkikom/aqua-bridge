@@ -388,10 +388,19 @@ a parked unit never writes the controllers or the heartbeat again.
   margin above `WatchdogSec=45`, and systemd then pings every 30 s — far above
   anything a tick does, and short enough that a hung board does not stay hung.
   `RebootWatchdogSec=120 s` bounds a hung shutdown.
-- The journal is persistent on this board (`Storage=persistent`). Left at
-  systemd's defaults `SystemMaxUse` is 10 % of the filesystem — about 1.5 GB of
-  the owner's 15 GB card — so `install-board-watchdogs.sh` caps it at 200 MB,
-  16 MB per file, 30 days, `SyncIntervalSec=5m`.
+- The journal is persistent on this board (`Storage=persistent`), set
+  explicitly by `install-board-watchdogs.sh` rather than assumed: Raspberry Pi
+  OS ships its own `/usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf`
+  (`Storage=volatile`), and until this fix it beat this script's own drop-in in
+  systemd's cross-directory merge order, keeping the journal in
+  `/run/log/journal` (tmpfs) — found the hard way when a five-day outage
+  (2026-09-20 to 2026-09-25) left nothing to read afterward. §9 *Board
+  hardening* has the merge-order argument and the fix. Left at systemd's
+  defaults `SystemMaxUse` is 10 % of the filesystem — about 1.5 GB of the
+  owner's 15 GB card — so the script caps it at 200 MB, 16 MB per file, 30
+  days, `SyncIntervalSec=5m`, and then reports the effective `Storage=` and
+  whether `/var/log/journal` is actually populated rather than trusting the
+  write.
 
 **The network is outside the cooling path.** The owner's rule: switching off
 the home router must never degrade cooling. Traced, path by path, on
@@ -473,8 +482,11 @@ enabled` in the kernel log at boot, `power save disabled` when it was turned
 off by hand 19 minutes later). Power save is now off through a NetworkManager
 drop-in rather than a connection profile — the profile carries the SSID, which
 stays out of this repository, and a profile written later by the imager
-inherits the drop-in. The journal was made persistent at the same time, which
-is what the size cap above is for.
+inherits the drop-in. The journal was *meant* to become persistent at the same
+time, for the size cap above to mean anything — it did not, until the fix the
+same bullet now describes: Raspberry Pi OS's own volatile-storage drop-in
+outsorted this script's, and the journal stayed in `/run/log/journal`
+regardless.
 
 ### USB spike results (2026-09-14)
 
@@ -4421,11 +4433,11 @@ a model converges only with them.
     measured floor is 1.4 KB and stays well under a megabyte even richer
     (item 48) — under 125 MB together, unconditionally.
     `deploy/install-board-watchdogs.sh` also caps the journal at
-    `JOURNAL_MAX_USE` (200 MB), but only in the persistent-journal case
-    (§9 "Board hardening" above has why that is not guaranteed on a stock
-    image — that script assumes the journal is already persistent and
-    does not itself create `/var/log/journal`); that cap is margin on top
-    of the 125 MB figure, not a term the default depends on.
+    `JOURNAL_MAX_USE` (200 MB) — §9 "Board hardening" has the fix that makes
+    the journal persistent guaranteed rather than assumed (it used to lose
+    to Raspberry Pi OS's own volatile-storage drop-in, silently) — and that
+    cap is margin on top of the 125 MB figure, not a term the default
+    depends on.
     `disk_free_min_gb` (2 GB) leaves more than ten times the unconditional
     figure as room to act. Default `disk_free_fault_s` (60 s) is a short
     debounce against one noisy `statvfs` sample, not a filter for anything
@@ -9018,9 +9030,10 @@ Owner decision (2026-09-16):
     watchdogs.sh` (idempotent, `--check`, every value a documented
     variable at the top) installs the SoC watchdog
     (`RuntimeWatchdogSec=60s`, `RebootWatchdogSec=120s`), journald caps
-    for the now-persistent journal (`SystemMaxUse=200M`,
-    `SystemMaxFileSize=16M`, `MaxRetentionSec=30day`,
-    `SyncIntervalSec=5m` — the default would have been 10 % of the card),
+    (`SystemMaxUse=200M`, `SystemMaxFileSize=16M`, `MaxRetentionSec=30day`,
+    `SyncIntervalSec=5m` — the default would have been 10 % of the card;
+    the journal itself was believed persistent here but was not until a
+    later fix, §9 *Board hardening*),
     Wi-Fi power save off through a NetworkManager drop-in rather than the
     SSID-carrying connection profile, and `deploy/aqua-net-recover.
     {sh,service,timer}`, which may only re-associate the interface: no
@@ -9075,8 +9088,9 @@ Owner decision (2026-09-16):
     case (120 MB, item 79) plus the model store's measured floor (item
     48) is under 125 MB, unconditionally; `deploy/install-board-
     watchdogs.sh`'s `JOURNAL_MAX_USE` (item 134) is margin on top of
-    that, not a term the default depends on, since that script assumes
-    the journal is already persistent rather than making it so. The
+    that, not a term the default depends on; that script now sets and
+    verifies the journal's persistence itself rather than assuming it
+    (§9 *Board hardening*). The
     free-space rule is a **hint**, not a fault, for the same reason the
     divergence rule (item 103) is: a filling card can sit below the
     threshold for days, and latching the daemon-wide `problems` list
@@ -10870,7 +10884,8 @@ environment (`sudo SOC_WATCHDOG_SEC=90 deploy/install-board-watchdogs.sh`):
 |----------|---------|----------------|
 | `SOC_WATCHDOG_SEC` | `60` | `RuntimeWatchdogSec=` in `/etc/systemd/system.conf.d/10-aqua-watchdog.conf` |
 | `REBOOT_WATCHDOG_SEC` | `120` | `RebootWatchdogSec=` in the same file |
-| `JOURNAL_MAX_USE` | `200M` | `SystemMaxUse=` in `/etc/systemd/journald.conf.d/20-aqua-journal-limits.conf` |
+| `JOURNAL_STORAGE` | `persistent` | `Storage=` in `/etc/systemd/journald.conf.d/99-aqua-journal-limits.conf` |
+| `JOURNAL_MAX_USE` | `200M` | `SystemMaxUse=` in the same file |
 | `JOURNAL_MAX_FILE_SIZE` | `16M` | `SystemMaxFileSize=` in the same file |
 | `JOURNAL_MAX_RETENTION` | `30day` | `MaxRetentionSec=` in the same file |
 | `JOURNAL_SYNC_INTERVAL` | `5m` | `SyncIntervalSec=` in the same file |
@@ -10896,6 +10911,35 @@ Notes that only show up on a real board:
   `/etc`, which wins, so the board runs the value §2 argues for and it does
   not move when `raspberrypi-sys-mods` is upgraded. The numbers happen to
   agree today; the point is that they are now ours.
+- **Raspberry Pi OS keeps the journal volatile by default**, via
+  `/usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf`
+  (`Storage=volatile`). systemd merges `*.conf.d` fragments in lexical order
+  of filename *across* `/usr/lib`, `/run` and `/etc` — the directory does not
+  decide precedence, only the filename does, except that a file in `/etc`
+  with the *same* filename as one in `/usr/lib` replaces it outright rather
+  than merging. This script's journald drop-in used to be named
+  `20-aqua-journal-limits.conf`, which sorts *before*
+  `40-rpi-volatile-storage.conf` and so lost: the vendor's `Storage=volatile`
+  applied last, the journal lived in `/run/log/journal` (tmpfs) regardless of
+  the caps written underneath it, and any reboot erased everything before it.
+  Found on the owner's board on 2026-09-25: it went down on 2026-09-20, and
+  the five days in between left nothing to read. The drop-in is now
+  `99-aqua-journal-limits.conf` — chosen to sort after any
+  conventionally-numbered vendor drop-in (a three-digit prefix such as `100-`
+  still sorts *before* `99-` as a string, since `'1' < '9'`) — and it sets
+  `Storage=${JOURNAL_STORAGE}` (`persistent` by default) explicitly rather
+  than leaving it to `Storage=auto`'s directory-existence rule. A re-run also
+  removes the hand-made `10-persistent.conf` and `99-aqua-persistent.conf`
+  the board carried from working around this by hand before the script did
+  it properly, so the three drop-ins do not pile up saying the same thing.
+- **The script checks the result instead of trusting the write.** Both
+  `--check` and a real run print the effective `Storage=` — from
+  `systemd-analyze cat-config systemd/journald.conf`, which resolves the same
+  cross-directory merge systemd itself does, rather than a second copy of
+  that rule kept here to drift out of sync — and whether `/var/log/journal`
+  actually holds anything, and say so plainly when that does not match
+  `JOURNAL_STORAGE`. A script that writes a drop-in and declares victory is
+  what produced the defect above.
 - **`RuntimeWatchdogSec` is only read when PID 1 re-executes**, so the script
   runs `systemctl daemon-reexec`. That restarts no service and does not
   interrupt the control loop.
@@ -10937,16 +10981,12 @@ covers the same setting plus `SystemMaxFileSize`, `MaxRetentionSec` and
 `SyncIntervalSec` from one set of knobs, and a board running both scripts
 must not end up with two drop-ins governing one journal from two different
 defaults. `install-pi.sh` does not touch the journal. Whether this
-script's own drop-in ever lands on the card is itself conditional:
-journald's `Storage=auto` (the Raspberry Pi OS default) keeps the
-journal *persistent* under `/var/log/journal` only when that directory
-exists, and neither this script nor `install-pi.sh` creates it, so on a
-stock image the journal lives *volatile* under `/run/log/journal`
-(tmpfs) and `SystemMaxUse=` bounds nothing on the SD card until an
-operator or a later image makes the journal persistent — which is
-exactly why `health.HostHealthConfig.disk_free_min_gb`'s default treats
-this cap as margin on top of the recorder-plus-model-store arithmetic,
-never a term it depends on.
+script's own drop-in ever landed on the card used to be conditional on more
+than the caps let on — the two bullets above have the finding and the fix.
+`health.HostHealthConfig.disk_free_min_gb`'s default still treats this cap
+as margin on top of the recorder-plus-model-store arithmetic, never a term
+it depends on — now because persistence is guaranteed and verified, not
+because it might not apply.
 
 ### udev
 

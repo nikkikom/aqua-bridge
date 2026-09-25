@@ -22,6 +22,13 @@
 # script with whatever thresholds it was installed with). The watchdog and
 # journald settings are installed either way.
 #
+# The journald section does not stop at writing its drop-in: both --check and a
+# real run also report where journald is actually keeping the journal --
+# Storage= as systemd's own cross-directory merge resolves it, and whether
+# /var/log/journal holds anything -- and say plainly when that does not match
+# JOURNAL_STORAGE. Writing the file and trusting it is what let Raspberry Pi
+# OS's own volatile-storage drop-in win silently before (PROJECT.md §9).
+#
 # ---------------------------------------------------------------------------
 # Knobs. Every one can be overridden from the environment, e.g.
 #   sudo SOC_WATCHDOG_SEC=90 deploy/install-board-watchdogs.sh
@@ -46,8 +53,20 @@ SOC_WATCHDOG_SEC="${SOC_WATCHDOG_SEC:-60}"
 # a healthy shutdown here and matches what Raspberry Pi OS ships in
 # /usr/lib/systemd/system.conf.d/40-rpi-enable-watchdog.conf.
 REBOOT_WATCHDOG_SEC="${REBOOT_WATCHDOG_SEC:-120}"
-# Journald caps. The journal is persistent so a network outage or a watchdog
-# reset can be read afterwards -- which means it now competes for the card.
+# Where journald keeps the journal. Raspberry Pi OS ships its own
+# /usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf (Storage=
+# volatile), so the caps below are meaningless unless something sets Storage=
+# explicitly -- "auto" (systemd's compiled-in default when nothing sets it)
+# only goes persistent if /var/log/journal already exists, which nothing on a
+# stock image creates. Measured on the owner's board (2026-09-25): the vendor
+# file beat this script's old drop-in (below) and the journal stayed in
+# /run/log/journal, in RAM, through a five-day outage that left nothing to
+# read afterward. "persistent" is the only value that makes the rest of this
+# block mean anything; "auto"/"volatile" are accepted for a board that
+# genuinely wants a RAM-only journal, with every cap below then bounding RAM,
+# not the card.
+JOURNAL_STORAGE="${JOURNAL_STORAGE:-persistent}"
+# Journald caps: with the journal persistent, it now competes for the card.
 # Left alone, SystemMaxUse defaults to 10 % of the filesystem (about 1.5 GB of
 # the owner's 15 GB card) and SystemMaxFileSize to an eighth of that. 200M is a
 # fiftieth of the free space and far more than this daemon's steady logging
@@ -75,7 +94,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UNIT_SRC="$SCRIPT_DIR/aqua-bridge.service"
 SYSTEM_DROPIN="/etc/systemd/system.conf.d/10-aqua-watchdog.conf"
-JOURNALD_DROPIN="/etc/systemd/journald.conf.d/20-aqua-journal-limits.conf"
+# 99- so this sorts after any conventionally-numbered vendor drop-in in
+# systemd's cross-directory merge (later filename wins; a three-digit prefix
+# like "100-" still sorts *before* "99-" as a string, since '1' < '9') --
+# specifically /usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf,
+# which is what beat this file's old name, 20-aqua-journal-limits.conf
+# (PROJECT.md §9 "Board hardening").
+JOURNALD_DROPIN="/etc/systemd/journald.conf.d/99-aqua-journal-limits.conf"
+# Hand-made on the board before this script set Storage= itself; a run that
+# installs its own equivalent removes these so three drop-ins never end up
+# saying the same thing.
+LEGACY_JOURNALD_DROPINS=(
+  "/etc/systemd/journald.conf.d/10-persistent.conf"
+  "/etc/systemd/journald.conf.d/99-aqua-persistent.conf"
+)
 NM_DROPIN="/etc/NetworkManager/conf.d/10-aqua-wifi-powersave.conf"
 NET_RECOVER_SRC="$SCRIPT_DIR/aqua-net-recover.sh"
 NET_RECOVER_DST="/usr/local/lib/aqua-bridge/aqua-net-recover.sh"
@@ -121,6 +153,14 @@ case "$WIFI_POWERSAVE" in
   off | keep) ;;
   *)
     echo "error: WIFI_POWERSAVE must be 'off' or 'keep', got '$WIFI_POWERSAVE'" >&2
+    exit 2
+    ;;
+esac
+case "$JOURNAL_STORAGE" in
+  persistent | volatile | auto) ;;
+  *)
+    echo "error: JOURNAL_STORAGE must be 'persistent', 'volatile' or 'auto'," \
+      "got '$JOURNAL_STORAGE'" >&2
     exit 2
     ;;
 esac
@@ -182,6 +222,39 @@ install_text() {
   echo "  wrote: $dst"
 }
 
+# journald_storage_report. Prints what journald is actually doing, not what was
+# asked for: the effective Storage= from the same cross-directory merge systemd
+# itself does (systemd-analyze cat-config, so this script carries no second copy
+# of that ordering rule to drift from the real one), and whether /var/log/journal
+# holds anything -- the two questions a writer of $JOURNALD_DROPIN cannot answer
+# by looking at its own write. Needs no root; --check calls it before anything is
+# written, so it reports the board's *current* state, not a preview of this run.
+# This is the check that was missing when the vendor drop-in won silently.
+journald_storage_report() {
+  local effective cat_config
+  if command -v systemd-analyze > /dev/null 2>&1; then
+    cat_config="$(systemd-analyze cat-config systemd/journald.conf 2> /dev/null || true)"
+    effective="$(printf '%s\n' "$cat_config" | sed -n 's/^[[:space:]]*Storage[[:space:]]*=[[:space:]]*//p' | tail -n 1)"
+    : "${effective:=auto}" # unset anywhere in the merge: systemd's compiled-in default
+  else
+    effective="unknown (systemd-analyze not found)"
+  fi
+  local populated=no
+  if find /var/log/journal -name '*.journal' -print -quit 2> /dev/null | grep -q .; then
+    populated=yes
+  fi
+  echo "  effective Storage=: $effective"
+  echo "  /var/log/journal populated: $populated"
+  if [[ "$effective" == "$JOURNAL_STORAGE" ]]; then
+    echo "  OK: matches JOURNAL_STORAGE=$JOURNAL_STORAGE"
+  else
+    echo "  WARNING: asked for JOURNAL_STORAGE=$JOURNAL_STORAGE, journald is" \
+      "actually running Storage=$effective -- some drop-in with a lexically" \
+      "later filename is winning; 'systemd-analyze cat-config" \
+      "systemd/journald.conf' shows which one. PROJECT.md §9 'Board hardening'."
+  fi
+}
+
 echo "== hardware watchdog =="
 if [[ ! -e /dev/watchdog ]]; then
   echo "error: /dev/watchdog is absent. On Raspberry Pi OS the bcm2835_wdt" \
@@ -208,17 +281,33 @@ EOF
 NEEDS_REEXEC="$LAST_WROTE"
 
 echo "== journald limits =="
+# Storage= is set here explicitly rather than left to systemd's "auto"
+# default, and this file is named to sort after
+# /usr/lib/systemd/journald.conf.d/40-rpi-volatile-storage.conf (Storage=
+# volatile), which otherwise wins and makes every cap below bound RAM, not the
+# card (PROJECT.md §9 "Board hardening").
 install_text "$JOURNALD_DROPIN" 644 <<EOF
 # Written by deploy/install-board-watchdogs.sh (PROJECT.md §2, §9).
-# The journal is persistent on this board; without these caps it would grow to
-# systemd's default of 10 % of the filesystem.
+# Storage= explicit: Raspberry Pi OS's own 40-rpi-volatile-storage.conf sets
+# Storage=volatile, and without an override here that wins and the caps below
+# bound nothing on the SD card. Without them, a persistent journal would grow
+# to systemd's default of 10 % of the filesystem.
 [Journal]
+Storage=${JOURNAL_STORAGE}
 SystemMaxUse=${JOURNAL_MAX_USE}
 SystemMaxFileSize=${JOURNAL_MAX_FILE_SIZE}
 MaxRetentionSec=${JOURNAL_MAX_RETENTION}
 SyncIntervalSec=${JOURNAL_SYNC_INTERVAL}
 EOF
 NEEDS_JOURNALD_RESTART="$LAST_WROTE"
+# Hand-made before this script wrote Storage= itself; clean them up so a
+# re-run does not leave three drop-ins saying the same thing.
+for legacy in "${LEGACY_JOURNALD_DROPINS[@]}"; do
+  if [[ -e "$legacy" ]]; then
+    NEEDS_JOURNALD_RESTART=1
+  fi
+  remove_path "$legacy"
+done
 
 NEEDS_NM_RELOAD=0
 echo "== Wi-Fi power save =="
@@ -273,6 +362,9 @@ fi
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
   echo
+  echo "== journald storage (current board state, before any change) =="
+  journald_storage_report
+  echo
   if [[ "$CHANGED" -eq 1 ]]; then
     echo "== check: changes pending, nothing was written =="
   else
@@ -297,6 +389,8 @@ fi
 # removes archived files, and it is what brings an already bloated one down.
 as_root journalctl --vacuum-size="$JOURNAL_MAX_USE" > /dev/null
 echo "  journal on disk now: $(journalctl --disk-usage)"
+echo "== journald storage =="
+journald_storage_report
 if [[ "$NEEDS_NM_RELOAD" -eq 1 ]] && systemctl is-active --quiet NetworkManager; then
   # Reload, never restart: a restart drops the active connection, and this
   # script has to be safe to run over ssh. The setting takes effect on the next
