@@ -439,6 +439,11 @@ digole:
   baud: 9600
   enabled: false
 
+# DS18B20 on 1-Wire is a DAS feature: this legacy single-controller config has no
+# sensors on it, so nothing is read and the rest of the section defaults
+# (resolution_bits 10, bulk_read auto, bulk_timeout_s 2.0, bulk_retry_s 300.0,
+# poll_interval_s 0.02, max_age_s 1.5 * mpc.dt). config.example-das.yaml has the section filled in and
+# documents every key; PROJECT.md section 3 has the schema.
 onewire:
   enabled: false
   sensors: []
