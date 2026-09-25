@@ -3967,10 +3967,25 @@ a model converges only with them.
       temp_map: {}            # bind Quadro inputs once they are connected
   onewire:
     sensors: {prox_b01: 28-0316a27a0aff, ...}   # logical name -> ROM id
-    resolution_bits: 12       # 9..12
+    resolution_bits: 10       # 9..12; default 10 (§8 item 39)
     max_age_s: 7.5            # default 1.5 * dt
+    bulk_read: auto           # auto (probe each bus) | off; default auto
+    bulk_timeout_s: 2.0       # default; bound on the one wait in a cycle
+    bulk_retry_s: 300.0       # default; before a bus that failed is probed again
+    poll_interval_s: 0.02     # default; how often that wait looks
     root: /sys/bus/w1/devices # default
   ```
+
+  `onewire.resolution_bits` is what the daemon writes to each sensor's
+  `resolution`; `sensors.<name>.quant_c` is what the estimator and the
+  Stuck rule believe about the same sensor, and the two have to agree —
+  0.0625 °C at 12 bit, 0.125 at 11, 0.25 at 10, 0.5 at 9. Nothing
+  cross-checks them (the sections are validated apart, and a mismatch is
+  not fatal: it mis-sizes `R = sensor_noise_c² + quant_c²/12` and
+  `stuck_eps_c = 1.5 * quant_c`, it does not lose a reading).
+  `config.example-das.yaml` ships `resolution_bits: 10` and, for now,
+  `quant_c: 0.0625` on its DS18B20 sensors — the golden trajectories of
+  `tests/test_das_core.py` are fitted to that value.
 
   An `xt6:` section is still accepted as one more device. Every
   `mpc.temps` name must be bound exactly once across all `temp_map`s and
@@ -4508,21 +4523,41 @@ a model converges only with them.
   file-only reader for a caller that wants no process at all. Nothing here
   can change a duty: the board's numbers never enter `PlantObservation` or
   the `diagnostics` the solver reads.
-- `hw/onewire.py`: `W1Source`, DS18B20 over the kernel's `w1_therm`
-  bulk-read ABI (assumed layout, unverified on hardware, kept name-based
-  and rooted at `onewire.root`): `w1_bus_master<N>/therm_bulk_read`
-  (write `trigger`, poll until `1`) and `w1_bus_master<N>/<rom>/temperature`
-  (millidegrees) / `resolution` (written once per sensor). One daemon
-  reader thread per discovered bus master runs trigger → poll → read
-  every present slave and publishes into a lock-protected latest-sample
+- `hw/onewire.py`: `W1Source`, DS18B20 over the kernel's `w1_therm` sysfs
+  ABI (layout confirmed on the board, §8 item 38; kept name-based and
+  rooted at `onewire.root`): `w1_bus_master<N>/therm_bulk_read` and
+  `w1_bus_master<N>/<rom>/temperature` (millidegrees) / `resolution`
+  (written once per sensor) / `conv_time` (read back after that write, so
+  the reader reports what a cycle costs instead of assuming the
+  datasheet). One daemon reader thread per discovered bus master runs one
+  cycle after another and publishes into a lock-protected latest-sample
   dict. `read()` on the loop thread never blocks or touches the
-  filesystem: a CRC failure (EIO or garbage), a stalled bulk read, or a
-  sample older than `max_age_s` is `None` for that sensor, never an
-  exception. With 22 DS18B20 on two buses a cycle is about 1 s (750 ms
-  conversion at 12 bit plus ~12 ms of kernel bit-banging per sensor), well
-  inside `dt = 5 s`; at `dt = 2 s` use 11 bit. `onewire.buses` is
-  documentation only: bus masters are discovered, the overlays are in
-  `config.txt` (§9).
+  filesystem: a CRC failure (EIO or garbage), a failed read, or a sample
+  older than `max_age_s` is `None` for that sensor, never an exception.
+  **Which read path a bus uses is asked, not assumed** (§8 item 38). A
+  cycle reads `therm_bulk_read`, writes the trigger — `"trigger\n"`,
+  **eight bytes**, because the kernel compares the write size against
+  `sizeof("trigger")` with its NUL and ignores a short one silently — and
+  reads the status once, expecting `1`: the kernel's bulk read converts
+  inside the `write()`, so there is nothing to poll for. `-1` (an
+  implementation that returns early, which this one never does) is polled
+  out bounded by `bulk_timeout_s` at `poll_interval_s`. Anything else —
+  `0`, meaning the kernel refused the trigger and said so only in its own
+  log; a missing or unreadable attribute; a failed write; a value outside
+  the ABI; a conversion unfinished inside the timeout — drops **that bus**
+  to serial reads, finishes the same cycle serially so no sample is lost,
+  and probes again after `bulk_retry_s`. Nothing waits on a signal that may
+  never come. Bulk costs one conversion plus ~19 ms per sensor (12 sensors
+  at 10 bit: 0.39 s); serial costs `conv_time` + ~40 ms per sensor (2.7 s),
+  inside `max_age_s / 2 = 3.75 s` at `dt = 5 s`. The default resolution has
+  to fit the serial path because only **one master system-wide** ever gets
+  a `therm_bulk_read` at all, and a phantom slave can take it away from the
+  one that has it (§8 item 38 for both defects, item 39 for the
+  arithmetic). `onewire.buses` is documentation only: bus masters are discovered, the
+  overlays are in `config.txt` (§9), and the `w1_bus_master<N>` numbering
+  does not follow the order of the overlay lines. Undeclared slaves are
+  ignored, which is what keeps the family-`00` phantoms of an unterminated
+  bus out of the readings.
 - `publishers/inputs.py`: `SmartInbox`, the Pi side of the SMART path.
   Fed by MQTT `{node_id}/in/smart/<serial>` (on the existing broker
   connection, `MqttClient.add_topic_handler`) and by `POST /api/in/smart`;
@@ -5368,10 +5403,20 @@ the board.
 - `tests/test_hw_imports.py` — `hw/` never imports `control`, and
   `hw/aquacomputer.py` imports no I/O module.
 - `tests/test_hw_onewire.py` — a fake `w1_bus_master*` tree: discovery,
-  the trigger/poll/read cycle, sensors of another bus ignored, CRC
-  failure and garbage → `None` and counted, a bulk read that never
-  completes or a failing trigger → `None` without raising, resolution
-  written once, stale samples → `None`, missing ROMs.
+  sensors of another bus ignored, CRC failure, garbage and an empty
+  `temperature` → `None` and counted, resolution written once and
+  `conv_time` read back, a refused `resolution` write warned while the
+  sensor still reads, stale samples → `None`, missing ROMs. Then the read
+  path per bus (§8 item 38): a kernel that answers the trigger keeps the
+  bulk path — with the trigger asserted to be the eight bytes the kernel
+  demands, and the status read once, not polled — while one that leaves
+  `therm_bulk_read` at `0`, has no such attribute, reports a value outside
+  the ABI or never finishes the conversion drops to serial reads. In every
+  case a reading, no exception, a wait bounded by `bulk_timeout_s`, no
+  second trigger inside `bulk_retry_s`, and the fast path back once the
+  probe succeeds again. `bulk_read: off` never touches the attribute, and
+  the `resolution_bits` default is checked against the measured per-sensor
+  costs (serial and bulk) and the per-bus budget of item 39.
 - `tests/test_w1_commission.py` — `--list`, `--identify` ranking by
   warming rate, `--check` building the daemon's composite.
 - `tests/test_aquacomputer_probe.py` — the probe on a fake sysfs tree and
@@ -9263,9 +9308,197 @@ Owner decision (2026-09-16):
 38. `w1-gpio` overlays on GPIO 4 and 17; confirm the `w1_therm` sysfs
     layout the reader assumes (`therm_bulk_read`, per-slave `temperature`
     and `resolution`).
+
+    **Done** (2026-09-25), on two externally powered DS18B20 (`ext_power`
+    reads 1) wired to GPIO 4, kernel 6.18.50. The layout is as assumed and
+    then some, and three assumptions were wrong — one of them ours:
+
+    - **The master numbering does not follow the overlay order.** The
+      GPIO 4 bus enumerates as `w1_bus_master2`, the unwired GPIO 17 bus as
+      `w1_bus_master1`. Nothing may map a bus to a GPIO; the reader already
+      discovers masters and finds sensors by ROM id wherever they are, and
+      `onewire.buses` stays documentation only.
+    - Per slave: `temperature` (millidegrees), `resolution`, `conv_time`,
+      `features`, `ext_power`, `alarms`, `eeprom_cmd`, `w1_slave`, `id`.
+      Writing `resolution` makes the driver recompute `conv_time`
+      (12 → 750, 11 → 375, 10 → 190, 9 → 95 ms), so the reader reads it
+      back and reports it rather than trusting the datasheet.
+    - **The bulk trigger has to be exactly eight bytes, and ours was
+      seven.** `therm_bulk_read_store()` guards on
+      `size == sizeof(BULK_TRIGGER_CMD)`, and that `sizeof` counts the
+      literal's terminating NUL, so `echo trigger >` (seven letters and a
+      newline) passes and a bare `write(fd, "trigger", 7)` does not.
+      `hw/onewire.py` wrote seven. The rejection is **silent**: the store
+      function returns `size` regardless, so the write looks successful and
+      the only evidence is a kernel line
+      `therm_bulk_read_store: unable to trigger a bulk read on the bus.
+      err=-22` — there were exactly seven of them on the card, one per
+      seven-byte write this investigation made. Everything the first pass
+      concluded from "the bulk read costs an extra conversion and buys
+      nothing" was an artefact of that one byte, as was the reading of the
+      status values as inverted. The ABI is what it says it is: `0` no bulk
+      conversion pending, `-1` at least one sensor still converting, `1`
+      complete with at least one value unread. The `0` that "never
+      changed" was the correct idle value, because nothing was ever
+      triggered.
+    - **With the eighth byte the bulk read works, and it is worth about
+      ten times.** Measured on **three** sensors (the owner added one
+      mid-investigation, and the whole table was re-taken after a reboot on
+      the three; the two-sensor run it replaces gave the same per-sensor
+      figures, which is the check that these are per-sensor costs and not
+      an artefact of one wiring):
+
+      | resolution | `conv_time` | serial, per sensor | bulk: `write()` | bulk: scratchpad read, per sensor |
+      |---|---|---|---|---|
+      | 12 bit | 750 ms | 800 ms | 773 ms | 19.5 ms |
+      | 11 bit | 375 ms | 415 ms | 389 ms | 19.5 ms |
+      | 10 bit | 190 ms | 227 ms | 201 ms | 16.9 ms |
+      | 9 bit | 95 ms | 131 ms | 109 ms | 18.8 ms |
+
+      A serial read is `conv_time` + 36…50 ms; a bulk cycle is one
+      `conv_time` in the `write()` plus ~19 ms per sensor. For three sensors
+      at 12 bit that is 2400 ms serial against 831 ms. Projected to 12
+      sensors on one bus: serial 9.6 / 5.0 / 2.7 / 1.6 s against bulk
+      0.98 / 0.61 / 0.39 / 0.32 s at 12 / 11 / 10 / 9 bit.
+    - **The kernel's bulk read is synchronous, so there is nothing to poll
+      for.** `trigger_bulk_read()` resets the bus, sends Skip ROM +
+      Convert T, sleeps the conversion out *inside the write syscall* and
+      flags every slave before returning: the 773 ms above is time spent in
+      `write()`, and the status is already `1` when it returns. A
+      single-threaded caller can never see `-1`. So the reader checks the
+      status **once** after the write. The poll loop that waited for `1` is
+      gone; what is left is a bounded wait for the `-1` the ABI allows and
+      this implementation never produces, and its bound is
+      `onewire.bulk_timeout_s`.
+    - **Two upstream defects to design around**, both reported only to the
+      kernel's own log:
+
+      (a) `bulk_read_device_counter` is a file-scope global, so
+      `therm_bulk_read` is created on **one master system-wide** — whichever
+      owns the first bulk-capable slave to attach anywhere. Confirmed:
+      `w1_bus_master2` has the file, `w1_bus_master1` does not. The owner's
+      second bus will have no bulk control at all. (The attribute's
+      appearing only once the first `w1_therm` slave attaches is the same
+      mechanism, and is why the udev rule has to fix the master's attribute
+      from the *slave* event.)
+
+      (b) One slave with `family_data == NULL` on a master makes every
+      trigger a no-op returning `-ENODEV`. The family-`00` phantoms an
+      unterminated bit-banged bus manufactures on every kernel search are
+      exactly such slaves — 73 of them on the unwired GPIO 17 bus in under
+      an hour, `Family 0 for 00.xxxxxxxxxxxx is not registered` in the log
+      — so a wired bus that grows one loses bulk until it goes away.
+
+    - **Decision: trigger, check once, fall back for a while.** A cycle
+      reads `therm_bulk_read`, writes the eight-byte trigger, reads the
+      status once and expects `1`. Anything else — `0` (the kernel refused
+      it: defect (b), or a short write), a missing or unreadable attribute
+      (defect (a), or `EACCES`), a value outside the ABI, or the `-1` that
+      outlives `bulk_timeout_s` — drops **that bus** to serial reads and
+      finishes the same cycle serially, so no sample is lost, and probes
+      again after `onewire.bulk_retry_s` (default 300 s), because defect
+      (b) is transient. A failed probe costs one write that returns at once
+      and two reads. This turns both defects into "slow", never into "no
+      data". `onewire.bulk_read: off` skips even the probe.
+    - **A udev rule is required** and is now in the repository
+      (`deploy/99-w1-therm.rules`, §9 "udev"): every w1 attribute is
+      created root-owned and the service user is not root. Without it the
+      `resolution` write fails with `EACCES` — handled, warned, and the
+      sensors stay at their power-on 12 bit — and the trigger fails too, so
+      every bus reads serially.
+    - `features=3` (bit 1 check the conversion result, bit 2 poll for
+      completion) was worth about 7 % on the serial path (456 → 424 ms for
+      two sensors at 10 bit). The daemon does not write it; the udev rule
+      grants it so it can be tried.
+
+    The reader as it now stands was run against the real bus (the module
+    built from config, not a fake tree), both ways. With the seven-byte
+    trigger it dropped `w1_bus_master2` to serial reads on the first cycle,
+    logged the reason, and turned 456 ms cycles for two sensors — the
+    fallback path, working as designed. With the eight-byte one, on three
+    sensors, it chose the bulk path and turned **308 ms** cycles at 10 bit
+    against 688 ms serial for the same three, no failed read, `conv_time`
+    read back as 190 ms. (The 308 ms is 201 ms in the trigger write, 51 ms
+    of scratchpad reads and ~55 ms of the reader's own per-cycle work: the
+    slave-directory check and the two status reads.) The unwired master
+    costs nothing either way: no declared ROM id lives under it, so its
+    cycle returns empty in about 1 ms without touching the bus.
+
+    Not settled by this: anything that needs a full bus. The per-sensor
+    cost model of item 39 is measured on two and three sensors, the CRC
+    error rate at 12 per bus is unmeasured (no failed read in ~50 reads
+    here, which says nothing about a 5 m chain), the second bus is not
+    wired — so defect (a) is observed as "the unwired master has no
+    attribute", not yet as "the wired second bus cannot bulk-read" — and
+    defect (b) has not been reproduced deliberately by putting a phantom on
+    a wired master.
 39. Wire the DS18B20 buses (3-wire, 4.7 kΩ), bind every ROM id with
     `tools/w1_commission.py --identify`, measure cycle time and CRC error
-    rate with `--check` (< 1 %; 11 bit if a cycle exceeds `0.4 dt`).
+    rate with `--check` (< 1 %).
+
+    **Partly done** (2026-09-25): `onewire.resolution_bits` is re-derived
+    from the measurement, and the old rule of thumb it replaces ("11 bit if
+    a cycle exceeds `0.4 dt`") is wrong twice over — on the serial path 11
+    bit is *slower* than 10, and the knob to reach for is fewer bits, not
+    more.
+
+A **serial** read costs the sensor's own conversion plus about 40 ms of
+    kernel bit-banging and sysfs overhead: 800 / 415 / 227 / 131 ms per
+    sensor at 12 / 11 / 10 / 9 bit (item 38, measured on three sensors). A
+    **bulk** cycle costs one conversion for the whole bus plus ~19 ms of
+    scratchpad read per sensor.
+
+    The budget is `max_age_s / 2` per bus, `0.75 dt` = **3.75 s** at the
+    default `max_age_s = 1.5 dt` and `dt = 5 s`: a cycle that fits it
+    refreshes every sensor twice inside `max_age_s`, so one lost cycle
+    never ages a sensor out of `read()` and into an untrusted group. For
+    the planned 24 sensors on two buses — 12 per bus, the buses read in
+    parallel by their own threads on a 4-core board:
+
+    | resolution | bulk-capable bus | serial bus |
+    |---|---|---|
+    | 12 bit | 0.98 s | 9.6 s |
+    | 11 bit | 0.61 s | 5.0 s |
+    | 10 bit | 0.39 s | 2.7 s |
+    | 9 bit | 0.32 s | 1.6 s |
+
+    **Only one master system-wide ever gets a `therm_bulk_read`** (item 38,
+    defect (a)), so with two buses one of them reads serially always, and
+    the default has to be a value that fits *that* bus. 12 bit does not
+    (9.6 s, nearly two whole ticks); 11 bit does not (5.0 s, over a tick
+    and 1.33 × the budget); 10 bit does, at 0.73 of the budget and 0.55 dt.
+    Note how little the choice matters on the bulk-capable bus — 0.98 s
+    against 0.39 s — and how much on the other.
+    A bus that grows a phantom (defect (b)) falls onto the same serial path
+    for `bulk_retry_s`, which is the other reason the default must survive
+    it.
+
+    **Default: 10 bit.** It leaves room for 16 sensors on a serial bus at
+    `dt = 5 s` (6 at `dt = 2 s`, where `max_age_s` is 3 s). 9 bit would fit
+    more and is not worth it: its 0.5 °C step is exactly the estimator's
+    `jump_min_c`, it is 1.5 × the Stuck band the 12-bit default assumes,
+    and its worst-case standing error on a sensor sitting on one code is
+    0.25 °C — 2.5 × the 0.1 °C of *offset* item 40 says biases `E` by
+    15–35 %. At 10 bit that standing error is 0.125 °C and the noise the
+    estimator carries is `quant_c²/12`, σ = 0.072 °C: a seventh of the
+    DS18B20's own ±0.5 °C accuracy, which is the systematic term §2 cares
+    about and the one item 40's commissioning cross-check exists for.
+    Quantisation is not why this sensor is imprecise.
+
+    An installation that puts every sensor on the one bulk-capable bus can
+    run 12 bit (0.98 s for 12 sensors, 1.2 s for 24) — `resolution_bits` is
+    a config key and `--check` prints which path each bus got. Splitting by
+    zone pairs is what §2 asks for, though, and that costs the second bus
+    its bulk.
+
+    Whoever changes `resolution_bits` moves `sensors.<name>.quant_c` with
+    it (§3, the `onewire:` block): 0.0625 at 12 bit, 0.125 at 11, 0.25 at
+    10, 0.5 at 9.
+
+    Still open, and what the wiring is for: the cycle time and CRC error
+    rate at 12 sensors per bus (`--check` reports the read path, the
+    driver's `conv_time` and ms/cycle per bus), the second bus, and every
+    ROM id bound with `--identify`.
 40. Cross-check zone-air against inlet sensor offsets at commissioning
     (0.1 °C of offset biases `E` by 15–35 %).
 41. Run the SMART agent on the PC against the real drives (smartctl
@@ -10491,7 +10724,7 @@ Owner decision (2026-09-16):
 
 #### Track B2 — 1-Wire and SMART (fake sysfs and fixtures anywhere; hardware on the Pi / PC)
 
-- [x] `hw/onewire.py`: `w1_therm` bulk-read reader threads, CRC / stall / age → `None`, resolution written once
+- [x] `hw/onewire.py`: `w1_therm` reader threads, the bulk trigger the kernel actually accepts (eight bytes) with a per-bus fall back to serial reads and a retry where it is refused (§8 item 38), CRC / bounded timeout / age → `None`, resolution written once and `conv_time` read back
 - [x] `tools/w1_commission.py`: `--list`, `--identify`, `--check`
 - [x] `tools/smart_agent.py` (`smartctl -j -n standby`), `deploy/aqua-bridge-smart-agent.service`, `publishers/inputs.py` (`SmartInbox`), MQTT `in/smart/<serial>`, `POST /api/in/smart`
 
@@ -10629,13 +10862,47 @@ dtoverlay=w1-gpio,gpiopin=17
 
 A third bus on `gpiopin=27` only if one bus carries more than about 12
 sensors. The kernel creates one `w1_bus_master<N>` per overlay under
-`/sys/bus/w1/devices`; `hw/onewire.py` discovers them and never needs the
-GPIO numbers. **CPU note:** 1-Wire is bit-banged by the kernel with
-busy-waits (about 12 ms per sensor read); 12–22 DS18B20 cost roughly
-0.15–0.3 s of the single core per bulk cycle. At `dt = 5 s` and 12-bit
-resolution that is a few percent of the CPU; measure with
-`tools/w1_commission.py --check` and drop to 11 bit if a cycle exceeds
-`0.4 × dt`.
+`/sys/bus/w1/devices`, **in an order that is not the order of these lines**
+(§8 item 38: GPIO 4 came up as `w1_bus_master2`); `hw/onewire.py` discovers
+them, finds sensors by ROM id, and never needs the GPIO numbers.
+
+**Enable an overlay only for a bus that is actually wired and terminated.**
+The kernel re-searches every bus every `w1_master_timeout` seconds (10 by
+default, and `w1_master_search` = −1 means for ever — both measured on the
+board at 4 searches per bus per 36 s). On an unterminated bus each search
+reads a different family-`00` phantom off the floating line: three of them
+at a time on the board's unwired GPIO 17 bus, a completely different set
+between two searches, each one a device the kernel and udev add and remove
+again. They cost nothing in readings — `hw/onewire.py` only looks at
+declared ROM ids, and `tools/w1_commission.py --list` reports other
+families apart from the DS18B20 it offers to bind — but a phantom is a
+slave with no `family_data`, and **one of those anywhere on a master makes
+every bulk trigger on that master a no-op** (§8 item 38, defect (b)): a
+wired bus that grows one drops to serial reads, ten times slower, until it
+goes away. The fix is the wiring, not a knob.
+
+**The search is deliberately left alone, by the daemon and by
+`install-pi.sh` both.** `w1_master_search` and `w1_master_timeout` are
+master attributes, root-owned like everything else in this tree; granting
+the service user write on them would hand the daemon the power to stop
+discovery altogether, and discovery is load-bearing: `W1Source` re-checks
+every cycle whether a declared ROM id has a directory, so a sensor that
+comes back with its drive (§2 "Failure and redundancy") reappears only
+because the kernel keeps searching. A bus that never searches never
+notices it. The cost of searching is small next to the reads it competes
+with — a cycle is 2.7 s of conversions for 12 sensors at 10 bit, a search
+a few ms per device every 10 s — and nothing measured says otherwise, so
+nothing is changed. If the interval ever has to grow it is
+`options wire timeout=<seconds>` in `/etc/modprobe.d/`, board-wide and an
+operator's decision, and it is paid for in how long a re-attached sensor
+stays missing.
+
+**CPU note:** 1-Wire is bit-banged by the kernel with busy-waits; the
+~40 ms a serial read spends above `conv_time` is roughly that, so 12
+sensors cost about 0.5 s of one core per 2.7 s cycle, ~18 % of a core per
+bus, two buses ~9 % of the 4-core Zero 2 W. The conversion itself is a
+sleep, not a spin. Measure with `tools/w1_commission.py --check`, which
+prints the read path, the driver's `conv_time` and ms/cycle per bus.
 
 I2C userspace module: `/etc/modules-load.d/i2c-dev.conf` → `i2c-dev`.
 
@@ -11006,9 +11273,12 @@ because it might not apply.
 
 ### udev
 
-`deploy/99-aquacomputer.rules` → `/etc/udev/rules.d/` (`install-pi.sh`
-reloads the rules and re-triggers `hidraw` and the `0c70` USB devices so
-an attached device gets them without a re-plug):
+Two files, both installed by `install-pi.sh` into `/etc/udev/rules.d/`,
+which then reloads the rules and re-triggers `hidraw`, the `0c70` USB
+devices and the `w1` subsystem so devices already attached get them without
+a re-plug.
+
+`deploy/99-aquacomputer.rules`:
 
 ```text
 SUBSYSTEM=="usb", ATTR{idVendor}=="0c70", MODE="0660", GROUP="plugdev"
@@ -11022,6 +11292,38 @@ liquidctl and `lsusb -v`. The `hwmon` rule only matters for the optional
 `aquacomputer_d5next` driver (not installed by `install-pi.sh`): it hands
 the driver's `pwm*` attributes to `plugdev` with group write. Unverified
 on a real device (§8 item 35).
+
+`deploy/99-w1-therm.rules` — the DS18B20 buses (§8 item 38; verified on the
+board across a reboot):
+
+```text
+ACTION=="add|change", SUBSYSTEM=="w1", KERNEL=="w1_bus_master*", RUN+="/bin/sh -c 'f=/sys%p/therm_bulk_read; [ -e $f ] && chgrp plugdev $f && chmod g+w $f'"
+ACTION=="add|change", SUBSYSTEM=="w1", KERNEL=="28-*", RUN+="/bin/sh -c 'for f in /sys%p/resolution /sys%p/features /sys%p/conv_time /sys%p/../therm_bulk_read; do [ -e $f ] && chgrp plugdev $f && chmod g+w $f; done'"
+```
+
+What it grants and why: the kernel creates every w1 sysfs attribute
+root-owned, and the daemon runs as the service user (`plugdev` through the
+unit's `SupplementaryGroups=`). It **writes** each sensor's `resolution`
+once — the 10-bit default is what makes 12 sensors per bus fit the tick
+(§8 item 39), and without the grant every sensor stays at its power-on 12
+bit, where a serial cycle no longer fits — and it writes the eight-byte
+`"trigger\n"` to the bus master's `therm_bulk_read` once per cycle, which
+is what makes a bulk read ten times cheaper than reading the sensors one
+at a time (§8 item 38). Without this rule that write fails with `EACCES`,
+which is handled — the bus reads serially — but then nothing on the board
+is at the resolution the tick budget assumes either. `conv_time` is read
+(it is granted because it is writable and an experiment may want it) and
+`features` is not written today, only measured (§8 item 38). Nothing here
+changes a value; group `plugdev`, group write, on four attributes.
+
+`ACTION=="add|change"` because the kernel re-announces devices on every bus
+search and because `install-pi.sh` triggers a `change` event for sensors it
+finds already attached. The slave rule reaches the **master's**
+`therm_bulk_read` through `/sys%p/../` on purpose: that attribute appears
+on a master only once its first `w1_therm` slave has attached, so the
+master rule alone can fire before the file exists. An `EACCES` on any of
+this is handled — the reader warns and falls back to serial reads — never
+fatal (§2: a permission problem must not cost cooling).
 
 ---
 
@@ -11133,9 +11435,11 @@ on a Zero W; the hardware steps are waiting for the aquaero.
      in `onewire.sensors`; repeat per sensor;
    - `.venv/bin/python tools/w1_commission.py --check --config
      /etc/aqua-bridge/config.yaml` builds the exact composite the daemon
-     would (every name bound once, every ROM present) and reports the
-     bulk-read cycle time per bus and the CRC error rate per sensor over
-     20 cycles: aim for < 1 % and a cycle under `0.4 × dt`.
+     would (every name bound once, every ROM present) and reports, per
+     bus, the read path the driver gave it (bulk or serial, §8 item 38),
+     the `conv_time` it reports and the cycle time, plus the CRC error rate
+     per sensor over 20 cycles: aim for < 1 % and a cycle under
+     `max_age_s / 2` (§8 item 39).
 10. One diagnostic tick as the service user:
     `.venv/bin/python -m aqua_bridge --config /etc/aqua-bridge/config.yaml --source composite --once`
     (legacy: without `--source`, which defaults to `xt6`) reads every
@@ -11416,9 +11720,10 @@ blob in the log.
 3. Hardware adapters once the spike answers the Quadro PWM **and** revert
    questions. **Written**: the controllers over hidraw against captured
    reports (`hw/aquacomputer.py`, `hw/hidraw.py`,
-   `hw/aquacomputer_adapter.py`, `hw/sources.py`), 1-Wire against the
-   assumed `w1_therm` ABI and fake trees (`hw/onewire.py`); confirm on the
-   devices, adjust the bindings or the adapters if the spike disagrees.
+   `hw/aquacomputer_adapter.py`, `hw/sources.py`), 1-Wire against fake
+   trees and, since §8 items 38/39, against the `w1_therm` ABI as the board
+   really implements it (`hw/onewire.py`); confirm on the devices, adjust
+   the bindings or the adapters if the spike disagrees.
 4. Glue loop, MQTT. **Code done**; Pi provisioned with `install-pi.sh`,
    sim smoke run and benchmark on the Zero W; service left disabled; no
    live broker yet.

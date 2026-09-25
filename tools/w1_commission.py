@@ -7,17 +7,24 @@ Run on the Pi, once, before the daemon starts::
     tools/w1_commission.py --identify
     tools/w1_commission.py --check --config /etc/aqua-bridge/config.yaml
 
-``--list`` prints every ROM id found on every bus master with its current
-reading, for copying into ``onewire.sensors``. ``--identify`` samples every
+``--list`` prints every DS18B20 (family ``28``) ROM id found on every bus
+master with its current reading, for copying into ``onewire.sensors``, and
+names any device of another family separately: an unterminated bus
+manufactures a fresh family-``00`` phantom on every kernel search (PROJECT.md
+section 9 "Overlays and modules"), so a list of those is a wiring report, not
+a sensor list. ``--identify`` samples every
 discovered sensor repeatedly while you warm one with a finger and reports
 the sensors ranked by how fast their reading rose, so a ROM id can be bound
 to a name (``prox_b01``, ``air_z0``, ...) with confidence. ``--check
 --config ...`` builds the exact composite hardware source the daemon would
 build (:func:`aqua_bridge.hw.sources.build_composite_from_config`), so every
 startup binding error (a name not bound exactly once across
-controllers/onewire) is caught here first, then runs a few dozen bulk-read cycles
-per bus and prints the measured cycle time and the CRC error rate per
-sensor (plan section 12 risk 5: "measure with w1_commission.py --check").
+controllers/onewire) is caught here first, then runs a few dozen read cycles
+per bus and prints, per bus, which read path the driver gave it (bulk or
+serial -- ``hw/onewire.py``, "Reading strategy"), the conversion time the
+driver reports for the configured resolution, the measured cycle time and
+the CRC error rate per sensor (plan section 12 risk 5: "measure with
+w1_commission.py --check").
 
 This tool imports :mod:`aqua_bridge.config` / :mod:`aqua_bridge.hw` only,
 never :mod:`aqua_bridge.control`: commissioning runs stand-alone, before an
@@ -39,19 +46,21 @@ __all__ = [
     "cmd_check",
     "cmd_identify",
     "cmd_list",
+    "discover_all",
+    "discover_other_families",
     "main",
     "rank_by_warming_rate",
 ]
 
 _ROM_PATTERN = re.compile(r"^[0-9a-f]{2}-[0-9a-f]{12}$")
+#: DS18B20 family. Every other ROM-shaped directory on a bus is reported apart:
+#: on an unwired bus the kernel's periodic search invents family-``00`` devices
+#: (PROJECT.md section 8 item 38), and listing those as sensors to bind would be
+#: an invitation to bind a phantom.
+_DS18B20_PATTERN = re.compile(r"^28-[0-9a-f]{12}$")
 
 
-def discover_all(root: Path) -> dict[str, list[str]]:
-    """Bus master name -> sorted ROM ids currently found under it.
-
-    Discovery, not binding: every ROM-shaped subdirectory is listed, not
-    only ones a config declares (there is no config yet at this point).
-    """
+def _discover(root: Path, *, ds18b20: bool) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
     if not root.is_dir():
         return out
@@ -59,10 +68,33 @@ def discover_all(root: Path) -> dict[str, list[str]]:
         if not bus_dir.is_dir():
             continue
         roms = sorted(
-            p.name for p in bus_dir.iterdir() if p.is_dir() and _ROM_PATTERN.match(p.name)
+            p.name
+            for p in bus_dir.iterdir()
+            if p.is_dir()
+            and _ROM_PATTERN.match(p.name)
+            and bool(_DS18B20_PATTERN.match(p.name)) is ds18b20
         )
         out[bus_dir.name] = roms
     return out
+
+
+def discover_all(root: Path) -> dict[str, list[str]]:
+    """Bus master name -> sorted DS18B20 ROM ids currently found under it.
+
+    Discovery, not binding: every family-``28`` subdirectory is listed, not
+    only ones a config declares (there is no config yet at this point).
+    Devices of other families are :func:`discover_other_families`' business.
+    """
+    return _discover(root, ds18b20=True)
+
+
+def discover_other_families(root: Path) -> dict[str, list[str]]:
+    """Bus master name -> sorted ROM ids that are not DS18B20, buses without any omitted.
+
+    Anything here is either a 1-Wire device this project has no use for or,
+    family ``00``, the phantom an unterminated bus produces on every search.
+    """
+    return {bus: roms for bus, roms in _discover(root, ds18b20=False).items() if roms}
 
 
 def _flatten_roms(roms_by_bus: dict[str, list[str]]) -> dict[str, str]:
@@ -78,12 +110,14 @@ def _probe_source(root: Path, sensors: dict[str, str]) -> W1Source:
 
 def cmd_list(root: Path) -> int:
     roms_by_bus = discover_all(root)
+    others = discover_other_families(root)
     if not roms_by_bus:
         print(f"no w1 bus master found under {root}")
         return 1
     sensors = _flatten_roms(roms_by_bus)
     if not sensors:
-        print("no ROM ids found on any bus")
+        _print_other_families(others)
+        print("no DS18B20 (family 28) found on any bus")
         return 1
     src = _probe_source(root, sensors)
     for bus_name, roms in roms_by_bus.items():
@@ -93,7 +127,19 @@ def cmd_list(root: Path) -> int:
             value = readings.get(rom)
             shown = f"{value:.3f} C" if value is not None else "(no reading)"
             print(f"  {rom}  {shown}")
+    _print_other_families(others)
     return 0
+
+
+def _print_other_families(others: dict[str, list[str]]) -> None:
+    for bus_name, roms in others.items():
+        print(f"{bus_name}: {len(roms)} device(s) of another family, not DS18B20: {roms}")
+        if any(rom.startswith("00-") for rom in roms):
+            print(
+                "  family 00 is what the kernel's periodic search reads off an "
+                "unterminated bus; wire and terminate it (4.7 kOhm), or drop its "
+                "w1-gpio overlay (PROJECT.md section 9)"
+            )
 
 
 def rank_by_warming_rate(series: dict[str, list[float | None]]) -> list[tuple[str, float]]:
@@ -183,7 +229,16 @@ def cmd_check(config_path: str, *, cycles: int = 20) -> int:
         for _ in range(cycles):
             onewire.run_bus_cycle(bus_dir)
         elapsed = time.monotonic() - t0
-        print(f"{bus_dir.name}: {elapsed / cycles * 1000:.0f} ms/cycle over {cycles} cycles")
+        mode = onewire.bulk_read_modes().get(bus_dir.name, "unprobed")
+        print(
+            f"{bus_dir.name}: {elapsed / cycles * 1000:.0f} ms/cycle over {cycles} cycles "
+            f"({mode} reads)"
+        )
+    conv_times = sorted(set(onewire.conv_time_ms().values()))
+    if conv_times:
+        print(f"conversion time the driver reports at the configured resolution: {conv_times} ms")
+    for bus_name, roms in discover_other_families(onewire.root).items():
+        print(f"WARNING: {bus_name} carries {len(roms)} non-DS18B20 device(s): {roms}")
 
     total_reads = cycles * len(buses)
     if total_reads:
@@ -216,7 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--interval", type=float, default=2.0, help="--identify: seconds between samples"
     )
     p.add_argument(
-        "--cycles", type=int, default=20, help="--check: bulk-read cycles per bus (default 20)"
+        "--cycles", type=int, default=20, help="--check: read cycles per bus (default 20)"
     )
     return p
 

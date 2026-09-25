@@ -52,7 +52,10 @@ is not yet confirmed on real hardware, on either board.
    ```
 
    (a third `dtoverlay=w1-gpio,gpiopin=27` only if one bus ends up
-   carrying more than ~12 DS18B20 sensors). Load the I2C userspace
+   carrying more than ~12 DS18B20 sensors; add an overlay only for a bus
+   you have actually wired and terminated — an unterminated one
+   manufactures phantom devices on every kernel search, PROJECT.md §9).
+   Load the I2C userspace
    module: `echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf`.
    Drop `console=serial0,115200` from `/boot/firmware/cmdline.txt` if
    present (leaves the UART free for a Digole display). Then, for the
@@ -100,15 +103,17 @@ is not yet confirmed on real hardware, on either board.
    `/etc/aqua-bridge/tls/cert.pem` (mode `644 root:root`) with key
    `key.pem` (mode `640 root:<user>`, valid for `--tls-days` days,
    default 3650) **only if neither file exists**, installs the
-   udev rule (group `plugdev` read/write on the controllers' hidraw
-   nodes) and re-triggers it, and installs the systemd unit with
+   two udev rules (group `plugdev` read/write on the controllers' hidraw
+   nodes, and group write on the 1-Wire attributes the daemon writes:
+   each sensor's `resolution` and the bus master's `therm_bulk_read`) and
+   re-triggers them, and installs the systemd unit with
    `User=` substituted — with `--das`, plus `deploy/aqua-bridge-das.conf`
    as the `aqua-bridge.service.d/das.conf` drop-in (adds `--source
    composite`). It reloads systemd and runs `systemd-analyze verify`, but
    does **not** enable, start, or create any HTTPS user — it prints the
    `tools/http_user.py` command to run next. If `/opt/aqua-bridge` has
    no `pyproject.toml` yet, the pip step is skipped with a warning
-   (everything else — config, certificate, udev rule, unit — still
+   (everything else — config, certificate, udev rules, unit — still
    runs); rerun the same command once the code is in place to pick up
    the pip install.
 
@@ -260,9 +265,16 @@ is not yet confirmed on real hardware, on either board.
    `--identify` is how each ROM id gets a name (`prox_b01`, `inlet_b`,
    …) in `onewire.sensors` — repeat per sensor. `--check` builds the
    exact composite the daemon would (every name bound once, every ROM
-   present) and reports the bulk-read cycle time per bus and the CRC
-   error rate per sensor over 20 cycles: aim for < 1 % and a cycle under
-   `0.4 × dt`.
+   present) and reports, per bus, which read path the kernel gave it (the
+   bulk read is triggered per bus and checked; a bus the kernel refuses it
+   on — only one master system-wide gets the attribute at all — reads its
+   sensors one at a time instead, PROJECT.md §8 item 38), the conversion
+   time the driver reports, the cycle time, and the CRC error rate per
+   sensor over 20 cycles: aim for < 1 % and a cycle under `max_age_s / 2`.
+   At the default `onewire.resolution_bits: 10` that is 0.23 s per sensor
+   read one at a time, so such a bus takes 16 sensors inside the budget at
+   `dt = 5 s`, against ~0.19 s for a whole bulk-read bus (PROJECT.md §8
+   item 39).
 
 9. **Diagnostic tick**, as the service user:
 

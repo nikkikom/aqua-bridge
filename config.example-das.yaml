@@ -842,7 +842,7 @@ onewire:
   # 9..12 bits. A bulk read costs one conversion for the whole bus plus ~19 ms
   # per sensor, so 12 sensors on a bus take 0.98 s at 12 bit; read one sensor at
   # a time (conversion + ~40 ms each) the same 12 take 9.6 s at 12 bit, 5.0 s at
-  # 11, 2.74 s at 10, 1.58 s at 9. Only ONE bus master system-wide ever gets a
+  # 11, 2.7 s at 10, 1.6 s at 9. Only ONE bus master system-wide ever gets a
   # therm_bulk_read from the kernel, so with two buses one of them always reads
   # one sensor at a time -- and the default has to fit that one: 10 bit, 0.55 of
   # dt = 5 s (PROJECT.md section 8 items 38, 39). An installation whose sensors

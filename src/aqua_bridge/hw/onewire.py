@@ -36,8 +36,9 @@ asked, never assumed, which one it gives for a given bus:
   T and sleeps the conversion out inside the syscall, so by the time it
   returns the status is already ``1``. One conversion per cycle regardless
   of sensor count, plus ~19 ms of scratchpad read per sensor. Measured, two
-  sensors at 12 bit: 780 ms in the write, 38 ms of reads, 818 ms total
-  against 1600 ms serial.
+  sensors at 12 bit: 773 ms in the write, 58 ms of reads, 831 ms total
+  against 2400 ms serial; the whole cycle through this module is 308 ms at
+  10 bit against 682 ms serial.
 * *serial* -- read every slave's ``temperature`` with no trigger at all.
   Each read starts, and blocks in the kernel for, its own conversion:
   ``conv_time`` plus about 40 ms of bit-banging and sysfs overhead per
@@ -135,16 +136,16 @@ _BULK_STATES = (_BULK_IDLE, _BULK_RUNNING, _BULK_DONE)
 _BULK_TRIGGER = b"trigger\n"
 
 _VALID_RESOLUTIONS = (9, 10, 11, 12)
-#: Measured on the board, two sensors, per sensor:
+#: Measured on the board, three sensors, per sensor:
 #:
-#: ============  =========  =============  ===================
+#: ============  =========  =============  ====================
 #: resolution    conv_time  serial / sens  bulk scratchpad read
-#: ============  =========  =============  ===================
-#: 12 bit        750 ms     800 ms         19 ms
-#: 11 bit        375 ms     416 ms         --
-#: 10 bit        190 ms     228 ms         17 ms
-#: 9 bit          95 ms     132 ms         --
-#: ============  =========  =============  ===================
+#: ============  =========  =============  ====================
+#: 12 bit        750 ms     800 ms         19.5 ms
+#: 11 bit        375 ms     415 ms         19.5 ms
+#: 10 bit        190 ms     227 ms         16.9 ms
+#: 9 bit          95 ms     131 ms         18.8 ms
+#: ============  =========  =============  ====================
 #:
 #: A serial cycle is ``n * (conv_time + ~40 ms)``; a bulk cycle is
 #: ``conv_time + n * ~19 ms``, one conversion for the whole bus.
@@ -156,8 +157,8 @@ _VALID_RESOLUTIONS = (9, 10, 11, 12)
 #: their own threads -- and given that only one master system-wide ever gets a
 #: ``therm_bulk_read`` (module docstring), the default has to fit the bus that
 #: cannot have it: serially, 12 sensors cost 9.6 s at 12 bit and 5.0 s at 11,
-#: both over the budget and both over a whole tick, against 2.74 s at 10 bit
-#: (0.55 dt, 27 % of margin) and 1.58 s at 9. So 10 bit, the finest resolution
+#: both over the budget and both over a whole tick, against 2.7 s at 10 bit
+#: (0.55 dt, 27 % of margin) and 1.6 s at 9. So 10 bit, the finest resolution
 #: that fits the serial bus; the bulk-capable bus then costs 0.39 s and would
 #: fit 12 bit (0.98 s) on its own.
 #:
@@ -517,7 +518,7 @@ class W1Source:
                 self._publish(result)
                 self._cycle_counts[bus_dir.name] += 1
             # The conversions pace this loop on their own (12 sensors at the
-            # default 10 bit: 2.74 s read serially, 0.39 s in bulk); this floor
+            # default 10 bit: 2.7 s read serially, 0.39 s in bulk); this floor
             # only guards the pathological/test case of a bus with no declared
             # sensor on it, or a fake that answers instantly, so the thread
             # never busy-spins a core.
