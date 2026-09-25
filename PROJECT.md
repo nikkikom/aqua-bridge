@@ -4534,7 +4534,50 @@ a model converges only with them.
   dict. `read()` on the loop thread never blocks or touches the
   filesystem: a CRC failure (EIO or garbage), a failed read, or a sample
   older than `max_age_s` is `None` for that sensor, never an exception.
-  **Which read path a bus uses is asked, not assumed** (§8 item 38). A
+  **Which read path a bus uses is asked, not assumed** (§8 item 38), and
+  there are three of them, tried in this order per bus:
+  1. **netlink** — one bus-wide conversion and one scratchpad read per
+     sensor over the kernel's netlink connector (`hw/w1_netlink.py`,
+     `hw/w1_therm_netlink.py`). Same cost as the kernel's own bulk read,
+     but it addresses a master by **id**, so it works on the bus that never
+     gets a `therm_bulk_read` and on a master carrying family-`00`
+     phantoms, which silence that trigger; it needs no root and no kernel
+     patch. A bus takes this tier when the connector answers
+     `W1_LIST_MASTERS` with this master's id in it, every present sensor's
+     8-byte identifier is readable (its own `id` attribute, else the ROM
+     name plus its CRC-8) and every present sensor has a `conv_time`. It
+     keeps it while the conversion command and at least one scratchpad
+     succeed. Anything else drops the bus one tier for
+     `onewire.netlink_retry_s` (300 s) and **the same cycle finishes on the
+     tier below, so no sample is lost**. Measured on the board, seven
+     sensors on one bus (the owner swaps sensors in and out, so the count is
+     recorded with the numbers), per cycle: 876 ms at 12 bit and 316 ms at
+     10 against 904 / 324 ms for the kernel's bulk read and 5664 / 1604 ms
+     read one at a time; at five sensors it was 844 / 288 against 860 / 288
+     and 4004 / 1140. A netlink cycle is 6 ms for the conversion command,
+     the conversion itself, then 16 ms per scratchpad, and the liveness
+     probe that confirms the master costs 0.13 ms. Every wait on that socket is bounded by
+     `onewire.netlink_timeout_s` (1 s) and a request that goes unanswered
+     ends the cycle, so a wedged bus costs about two of those rather than
+     one per sensor. The CRC-8 of each scratchpad is checked **here**: a
+     netlink read is raw bus bytes and the driver has not looked at them,
+     and an all-zero scratchpad — which passes CRC-8, and is what a phantom
+     answers with on the board — is refused rather than decoded as a
+     plausible 0.0 °C that would quietly ask for less cooling.
+  2. **the kernel's bulk read**, below.
+  3. **one sensor at a time**, below; always available.
+
+  `onewire.read_tier` (default `auto`) pins one tier and forbids the rest
+  for debugging; a bus pinned to a tier it cannot run publishes nothing,
+  which reads as missing and so raises cooling rather than lowering it.
+  `W1Source.read_tiers()` reports the tier each bus's last numbers came
+  from and `tools/w1_commission.py --check` prints it beside the measured
+  cycle time, because a cycle time read against the wrong tier is worse
+  than no number. With the netlink tier available every bus can have a
+  bulk path, which is the premise the 10-bit default was chosen against
+  (§8 item 39: the default had to fit the bus that could never have one);
+  revisiting `resolution_bits` is a change of its own and not part of the
+  tier work. Now the sysfs tiers. A
   cycle reads `therm_bulk_read`, writes the trigger — `"trigger\n"`,
   **eight bytes**, because the kernel compares the write size against
   `sizeof("trigger")` with its NUL and ignores a short one silently — and
@@ -4558,6 +4601,48 @@ a model converges only with them.
   does not follow the order of the overlay lines. Undeclared slaves are
   ignored, which is what keeps the family-`00` phantoms of an unterminated
   bus out of the readings.
+- `hw/w1_netlink.py`: the 1-Wire transport over `AF_NETLINK` /
+  `NETLINK_CONNECTOR` with `CN_W1_IDX`/`CN_W1_VAL` — sockets and byte
+  layouts, no thermometers. `W1Netlink` opens and binds (`groups=0`, so
+  `cn_bind`'s `CAP_NET_ADMIN` check is never reached; port id 0, so two
+  reader threads can each have their own), sends one
+  `W1_LIST_MASTERS` / `W1_MASTER_CMD` / `W1_SLAVE_CMD` and collects its
+  reply inside a bound, then closes. `pack_request()` and
+  `parse_datagram()` are pure functions, so the framing is tested against
+  bytes captured on the board. A status record comes back with the
+  request's `ack` and read data with `ack == seq + 1`; both carry the
+  request's `seq`, which is how a late reply to a request that already
+  timed out is dropped instead of being mistaken for this one's. A
+  `W1_LIST_MASTERS` reply is the exception that carries neither: bare
+  `u32` ids at `msg->data`, in a record whose `id[8]` and `cn_msg.flags`
+  are uninitialised kernel bytes, so nothing may read those two fields.
+  Every failure is an exception the caller can act on:
+  `W1NetlinkUnavailable` (no netlink, no connector, bind refused),
+  `W1NetlinkTimeout` (nothing answered inside the bound — also what a
+  kernel with no `w1` connector looks like, since `cn_rx_skb` just drops
+  the request), `W1NetlinkStatusError` (the kernel's `(u8)-errno`; 255
+  where it returned a positive value instead, which for `W1_CMD_RESET`
+  means no presence pulse on the bus) and `W1NetlinkProtocolError` (a
+  reply that does not parse). Read for the ABI: the board's own
+  `/usr/include/linux/connector.h`, and `drivers/w1/w1_netlink.{h,c}`,
+  `drivers/w1/w1.c`, `drivers/w1/w1_int.c`, `drivers/connector/connector.c`
+  from `raspberrypi/linux` `rpi-6.18.y`.
+- `hw/w1_therm_netlink.py`: DS18B20 on top of that transport. `W1Therm`
+  does Skip ROM + Convert T for a whole bus (`W1_CMD_RESET` then
+  `W1_CMD_WRITE` of `{0xCC, 0x44}`), waits the caller's conversion time,
+  then reads each scratchpad (`W1_CMD_WRITE` of `{0xBE}` plus
+  `W1_CMD_READ` of 9 — the kernel sends Match ROM itself, so userspace
+  never addresses a ROM by hand). `decode_scratchpad()` verifies the
+  Maxim/Dallas CRC-8, refuses an all-zero scratchpad, and decodes by the
+  resolution the sensor reports in its own config register (with the
+  GX20MH01 13/14-bit branch the kernel's `w1_DS18B20_convert_temp()` has,
+  so a clone in that mode is not misread by a factor of four) rather than
+  by what config asked for. `reg_num_from_rom_name()` rebuilds a slave
+  identifier from a sysfs ROM name, since the name's missing eighth byte
+  is just the CRC-8 of the seven before it. A failed conversion or a reply
+  that never comes is the bus's failure and propagates; a bad CRC or a
+  Match ROM nothing answers is that one sensor's and is reported per
+  sensor, so one lying sensor cannot blind a zone that has others.
 - `publishers/inputs.py`: `SmartInbox`, the Pi side of the SMART path.
   Fed by MQTT `{node_id}/in/smart/<serial>` (on the existing broker
   connection, `MqttClient.add_topic_handler`) and by `POST /api/in/smart`;
@@ -4744,7 +4829,9 @@ aqua-bridge/
     hw/hidraw.py             # hidraw discovery, input reports, feature report ioctls
     hw/aquacomputer_adapter.py  # AquacomputerAdapter (read/apply/release/save), device entry config
     hw/sources.py            # composite of several controllers + 1-Wire + SMART inputs
-    hw/onewire.py            # DS18B20 w1_therm bulk-read reader threads
+    hw/onewire.py            # DS18B20 reader threads, the tier ladder per bus
+    hw/w1_netlink.py         # 1-Wire over NETLINK_CONNECTOR: socket + framing
+    hw/w1_therm_netlink.py   # DS18B20 over that: Convert T, scratchpad, CRC-8
     sim/plant.py             # legacy RC plant (inside the package so `pip install -e .` sees it)
     sim/das.py               # DAS truth plant, run_das_closed_loop
     sdnotify.py              # stdlib sd_notify
@@ -4829,7 +4916,10 @@ aqua-bridge/
     test_hw_imports.py       # static no-control-import check
     test_hw_sources.py
     test_aquacomputer_probe.py
-    test_hw_onewire.py       # fake w1 tree
+    test_hw_onewire.py       # fake w1 tree, the tier ladder
+    test_hw_w1_netlink.py    # netlink framing against captured bytes
+    test_hw_w1_therm_netlink.py  # CRC-8, the decode, one cycle
+    w1_netlink_fakes.py      # those captured bytes and a fake socket
     test_w1_commission.py
     test_deploy.py           # units, udev rules, install script, shellcheck
 ```
@@ -5417,8 +5507,45 @@ the board.
   probe succeeds again. `bulk_read: off` never touches the attribute, and
   the `resolution_bits` default is checked against the measured per-sensor
   costs (serial and bulk) and the per-bus budget of item 39.
+  Then the tier ladder: a bus whose connector answers reads over netlink
+  (and the readings prove it — the fake tree's `temperature` files and its
+  scratchpads carry different values on purpose), a master the connector
+  does not list is not addressed at all, a timeout falls to the kernel's
+  bulk read and a refused trigger falls again to one sensor at a time,
+  each with a reading in the same cycle; one sensor with a bad CRC loses
+  only its own reading and is counted, every sensor failing drops the bus
+  a tier, a bus that lost the tier is not probed again inside
+  `netlink_retry_s`, a pinned tier is really the only one used, the
+  conversion wait is the slowest sensor's and grows if a sensor reports a
+  finer resolution than the driver believes, and `stop()` closes the
+  sockets. Also that both example configs account for every read-path key
+  at its one default.
+- `tests/test_hw_w1_netlink.py` — the netlink framing against byte
+  sequences captured on the board (`tests/w1_netlink_fakes.py`, ROM id
+  replaced by a placeholder): each request is rebuilt byte for byte, the
+  three nested lengths agree, a read reserves the space the kernel writes
+  into, the master list is read from the record body and not as command
+  records, status and data are told apart by `ack`, bundled records are
+  both read, a truncated datagram and an `NLMSG_ERROR` raise, another
+  connector user's message is ignored, a master that answers nothing times
+  out inside the bound, a half-arrived reply times out, a stale reply does
+  not hold the deadline open, `ENODEV` and the 255 of a bus with no
+  presence pulse raise, and the sequence numbers never wrap onto the ack
+  that marks read data. Nothing in the suite opens a netlink socket: the
+  transport takes a socket factory and `tests/conftest.py` takes the
+  address family away from the module as well.
+- `tests/test_hw_w1_therm_netlink.py` — the CRC-8 against a ROM id's own
+  checksum and against the captured scratchpad, one flipped bit in every
+  byte position caught, the all-zero scratchpad refused although it passes
+  CRC-8, the decode at 9 to 12 bit including the undefined low bits and
+  both datasheet extremes, the 13/14-bit clone branch, and one cycle: one
+  conversion for the whole bus, a bad CRC or a `-ENODEV` charged to one
+  sensor, every sensor failing reported as the bus's symptom, a reply that
+  never arrives ending the cycle instead of costing `timeout_s` per
+  sensor, and a failed conversion reading nothing at all.
 - `tests/test_w1_commission.py` — `--list`, `--identify` ranking by
-  warming rate, `--check` building the daemon's composite.
+  warming rate, `--check` building the daemon's composite and naming the
+  tier its cycle time was measured on.
 - `tests/test_aquacomputer_probe.py` — the probe on a fake sysfs tree and
   fake controllers: listing, decoded output including the temperature
   groups, the aquaero output mode, the active profile, aquabus outputs with

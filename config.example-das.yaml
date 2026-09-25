@@ -869,6 +869,36 @@ onewire:
   bulk_retry_s: 300.0    # a bus that fell back to one-at-a-time reads is re-probed
                          # this often -- a phantom that took bulk away can go away too
   poll_interval_s: 0.02  # how often that wait looks, and the reader loop's own floor
+  # Which read path a bus may use. auto walks the ladder and picks per bus, from
+  # what the kernel actually answers:
+  #   netlink     one conversion for the whole bus and one scratchpad read per
+  #               sensor over the kernel's netlink connector. Same cost as the
+  #               bulk read below and available on EVERY bus, including the one
+  #               that never gets a therm_bulk_read and one carrying family-00
+  #               phantoms, which silence that trigger. Needs no root.
+  #   sysfs_bulk  the kernel's own therm_bulk_read, where it exists and works.
+  #   serial      one sensor at a time; always available.
+  # Measured on the board, 7 sensors on one bus, per cycle: at 12 bit 876 ms
+  # netlink, 904 ms sysfs bulk, 5664 ms one at a time; at 10 bit 316 / 324 /
+  # 1604 ms. A netlink cycle is 6 ms for the conversion command, the conversion
+  # itself, then 16 ms per sensor, so it scales with sensor count the way the
+  # kernel's bulk read does and not the way one-at-a-time does (PROJECT.md
+  # section 8 item 38).
+  # The other three values pin one tier and forbid the rest, for debugging only:
+  # a bus that cannot run the tier it is pinned to reports no samples at all,
+  # which reads as missing -- safe (missing raises cooling, never lowers it) but
+  # not what you want running. bulk_read: off still forbids the sysfs trigger,
+  # which under auto leaves netlink and then one sensor at a time.
+  read_tier: auto        # auto | netlink | sysfs_bulk | serial
+  # Bound on one netlink request, and every wait on that socket is bounded by it.
+  # Ours cost the bus 6 ms (a conversion command) to 16 ms (a scratchpad), but
+  # every read path shares the master's bus_mutex, so one that got there first
+  # can hold it for a whole conversion -- 750 ms at 12 bit. A request that goes
+  # unanswered ends the cycle, so a wedged bus costs about two of these rather
+  # than one per sensor.
+  netlink_timeout_s: 1.0
+  netlink_retry_s: 300.0 # a bus that dropped off the netlink tier is tried again
+                         # this often -- same argument as bulk_retry_s
   sensors:               # logical name -> DS18B20 ROM id (tools/w1_commission.py --identify)
     inlet_b: 28-000000000001
     prox_b01: 28-000000000002

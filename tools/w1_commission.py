@@ -20,8 +20,9 @@ to a name (``prox_b01``, ``air_z0``, ...) with confidence. ``--check
 build (:func:`aqua_bridge.hw.sources.build_composite_from_config`), so every
 startup binding error (a name not bound exactly once across
 controllers/onewire) is caught here first, then runs a few dozen read cycles
-per bus and prints, per bus, which read path the driver gave it (bulk or
-serial -- ``hw/onewire.py``, "Reading strategy"), the conversion time the
+per bus and prints, per bus, which read path it ended up on (netlink, the
+kernel's bulk read, or one sensor at a time -- ``hw/onewire.py``, "Reading
+strategy"), the conversion time the
 driver reports for the configured resolution, the measured cycle time and
 the CRC error rate per sensor (plan section 12 risk 5: "measure with
 w1_commission.py --check").
@@ -229,10 +230,14 @@ def cmd_check(config_path: str, *, cycles: int = 20) -> int:
         for _ in range(cycles):
             onewire.run_bus_cycle(bus_dir)
         elapsed = time.monotonic() - t0
-        mode = onewire.bulk_read_modes().get(bus_dir.name, "unprobed")
+        # Which tier produced that number. A cycle time read against the wrong
+        # tier is worse than no number: netlink and the kernel's bulk read each
+        # cost one conversion for the whole bus, one sensor at a time costs one
+        # conversion each (PROJECT.md section 8 item 38).
+        tier = onewire.read_tiers().get(bus_dir.name, "unprobed")
         print(
             f"{bus_dir.name}: {elapsed / cycles * 1000:.0f} ms/cycle over {cycles} cycles "
-            f"({mode} reads)"
+            f"({tier} reads)"
         )
     conv_times = sorted(set(onewire.conv_time_ms().values()))
     if conv_times:
