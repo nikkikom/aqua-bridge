@@ -130,6 +130,35 @@ the filesystem and never blocks: it returns the latest published sample for
 every declared sensor, or ``None`` when the sensor has never reported, its
 last read failed, or the sample is older than ``max_age_s``.
 
+**Shutdown.** :meth:`W1Source.stop` sets a stop event and joins each reader
+thread with a 5 s bound. A netlink cycle already notices the event during
+its one conversion wait, the ``sleeper`` it hands
+:class:`~aqua_bridge.hw.w1_therm_netlink.W1Therm`; the sysfs tiers check it
+before starting a new bus-wide bulk conversion and again between every
+per-sensor serial read, so :meth:`run_bus_cycle` abandons whatever sensors
+are left rather than read through them. None of these checks can interrupt
+a read or a bulk trigger already in flight -- each is one blocking sysfs
+call the kernel finishes in its own time -- so the worst a stop has to ride
+out is whichever one was already running when it landed: one sensor's
+conversion (about 800 ms at the 12-bit default) or the bulk trigger's, never
+the rest of the bus behind it. An abandoned cycle publishes nothing --
+same contract a netlink cycle interrupted by :meth:`stop` already has: the
+sensors it did not reach keep the sample and timestamp they already had
+rather than being silently left out of an otherwise-published partial
+result, and what it did read this cycle is discarded too rather than kept
+half of the bus. The 5 s join is now a backstop against a misconfigured
+timeout, not the common case.
+
+**A cycle over budget.** The budget is ``max_age_s / 2`` per bus (module
+docstring below): a cycle that fits it refreshes every sensor twice inside
+``max_age_s``, so one slow cycle never ages a sensor out of :meth:`read`.
+Past it, every sensor on that bus starts reading as missing on some ticks
+with no other symptom (PROJECT.md section 8 item 39) -- a cycle that runs to
+completion (not one :meth:`stop` cut short) and takes longer than the budget
+logs a warning naming the measured cycle, the budget, the sensor count and
+the tier it ran on, at most once per ``onewire.slow_cycle_log_interval_s``
+(default 60 s) so a permanently slow bus does not flood the log.
+
 This module must not import :mod:`aqua_bridge.control` (or anything MPC) --
 see the static AST check in ``tests/test_hw_imports.py``. It imports only
 :mod:`aqua_bridge.model` (for :class:`~aqua_bridge.model.ConfigError`), per
@@ -290,6 +319,12 @@ _DEFAULT_NETLINK_TIMEOUT_S = 1.0
 # (a sensor pulled out mid-cycle, a kernel busy elsewhere) can go away again,
 # and a failed probe costs one command that returns in milliseconds.
 _DEFAULT_NETLINK_RETRY_S = 300.0
+# How often the slow-cycle warning (module docstring, "A cycle over budget")
+# may repeat for one bus once it is past its budget. Same default and the
+# same argument as control/loop.py's mpc.budget_log_interval_s: frequent
+# enough that an operator watching the log sees it soon, rare enough that a
+# bus that stays over budget for the life of the daemon does not flood it.
+_DEFAULT_SLOW_CYCLE_LOG_INTERVAL_S = 60.0
 
 
 @dataclass
@@ -346,6 +381,9 @@ class W1Source:
     netlink_retry_s:
         How long a bus that failed the netlink tier stays on the tier below
         before it is tried again.
+    slow_cycle_log_interval_s:
+        At most one "cycle over budget" warning per bus in this many seconds
+        (module docstring); the first exceedance for a bus always logs.
     netlink_factory:
         Called with no arguments to build one
         :class:`~aqua_bridge.hw.w1_netlink.W1Netlink` per bus master. Injected
@@ -367,6 +405,7 @@ class W1Source:
         read_tier: str = _DEFAULT_READ_TIER,
         netlink_timeout_s: float = _DEFAULT_NETLINK_TIMEOUT_S,
         netlink_retry_s: float = _DEFAULT_NETLINK_RETRY_S,
+        slow_cycle_log_interval_s: float = _DEFAULT_SLOW_CYCLE_LOG_INTERVAL_S,
         netlink_factory: Callable[[], W1Netlink] | None = None,
     ) -> None:
         if not sensors:
@@ -394,6 +433,10 @@ class W1Source:
             raise ConfigError(f"onewire netlink_timeout_s must be > 0, got {netlink_timeout_s}")
         if not netlink_retry_s > 0:
             raise ConfigError(f"onewire netlink_retry_s must be > 0, got {netlink_retry_s}")
+        if not slow_cycle_log_interval_s > 0:
+            raise ConfigError(
+                f"onewire slow_cycle_log_interval_s must be > 0, got {slow_cycle_log_interval_s}"
+            )
 
         self.sensors: dict[str, str] = dict(sensors)
         self._rom_to_names: dict[str, list[str]] = {}
@@ -410,6 +453,7 @@ class W1Source:
         self._read_tier = read_tier
         self._netlink_timeout_s = float(netlink_timeout_s)
         self._netlink_retry_s = float(netlink_retry_s)
+        self._slow_cycle_log_interval_s = float(slow_cycle_log_interval_s)
         self._netlink_factory = netlink_factory
 
         self._lock = threading.Lock()
@@ -418,6 +462,12 @@ class W1Source:
         self._conv_time_ms: dict[str, int] = {}
         self._crc_errors: dict[str, int] = dict.fromkeys(self._rom_to_names, 0)
         self._cycle_counts: dict[str, int] = {}
+        # Bus master name -> when a slow-cycle warning was last logged for it,
+        # and how many exceedances have happened since (module docstring, "A
+        # cycle over budget"; same bookkeeping shape as control/loop.py's step
+        # budget alarm).
+        self._slow_cycle_logged_at: dict[str, float] = {}
+        self._slow_cycle_since_log: dict[str, int] = {}
         # Bus master name -> whether the bulk path is in use on it (absent: not
         # probed yet), and when a bus that failed may be probed again.
         self._bulk_ok: dict[str, bool] = {}
@@ -461,24 +511,39 @@ class W1Source:
         Returns ``{name: value_or_None}`` for every declared sensor name
         currently found under ``bus_dir`` (empty if none of the declared ROM
         ids live there, if the bus is pinned to a tier it cannot run, or if
-        :meth:`stop` arrived mid-conversion). Never raises: every failure mode
-        narrows to ``None`` for the sensor(s) it affects or to a tier below,
-        per the module docstring.
+        :meth:`stop` arrived mid-cycle, on any tier -- module docstring,
+        "Shutdown"). Never raises: every failure mode narrows to ``None`` for
+        the sensor(s) it affects or to a tier below, per the module
+        docstring. A cycle that runs to completion and took longer than the
+        bus's budget logs a rate-limited warning (module docstring, "A cycle
+        over budget").
         """
         present = {rom: bus_dir / rom for rom in self._rom_to_names if (bus_dir / rom).is_dir()}
         if not present:
             self._tier[bus_dir.name] = _TIER_NONE
             return {}
         self._ensure_resolution(present)
+        start = self._clock()
         if self._netlink_due(bus_dir.name):
             netlink_result = self._netlink_cycle(bus_dir, present)
             if netlink_result is not None:
+                if netlink_result:
+                    # Non-empty: a cycle that ran to completion, not one stop()
+                    # cut short (which publishes {}, same as every path below).
+                    self._check_slow_cycle(bus_dir.name, start, len(present), _TIER_NETLINK)
                 return netlink_result
         if self._read_tier == _TIER_NETLINK:
             # Pinned to netlink and this bus cannot run it: publish nothing
             # rather than quietly reading it another way. Missing samples read
             # as missing, which raises cooling and never lowers it.
             self._tier[bus_dir.name] = _TIER_NONE
+            return {}
+        if self._stop.is_set():
+            # Nothing on this tier has touched the bus yet: the bulk trigger
+            # below is one blocking write the kernel sleeps a whole conversion
+            # out inside (module docstring), so the only place to act on a
+            # stop request is before writing it, not during. Same "abandoned
+            # cycle publishes nothing" contract as the netlink tier above.
             return {}
         if (
             self._bulk_read != "off"
@@ -488,11 +553,60 @@ class W1Source:
             self._bulk_convert(bus_dir)
         result: dict[str, float | None] = {}
         for rom, slave_dir in present.items():
+            if self._stop.is_set():
+                # Abandon the rest: each read is its own blocking conversion
+                # (module docstring), so the check runs between sensors, not
+                # inside one. What was already read this cycle is discarded
+                # too, for the same reason the netlink tier discards a
+                # conversion stop() cut short -- consistent beats partial, and
+                # the sensors not reached keep their previous sample and its
+                # real timestamp rather than being silently missing from an
+                # otherwise-published result.
+                return {}
             value = self._read_temperature(slave_dir, rom)
             for name in self._rom_to_names[rom]:
                 result[name] = value
-        self._tier[bus_dir.name] = self._sysfs_tier(bus_dir.name)
+        tier = self._sysfs_tier(bus_dir.name)
+        self._tier[bus_dir.name] = tier
+        self._check_slow_cycle(bus_dir.name, start, len(present), tier)
         return result
+
+    def _check_slow_cycle(self, bus_name: str, start: float, sensor_count: int, tier: str) -> None:
+        """Warns, rate limited, when this cycle ran longer than ``bus_name``'s budget.
+
+        The budget is ``max_age_s / 2`` (module docstring, "A cycle over
+        budget"): a cycle that fits it refreshes every sensor twice inside
+        ``max_age_s``, so one slow cycle never ages a sensor out of
+        :meth:`read`. Past it, every sensor on this bus starts reading as
+        missing on some ticks with no other symptom (PROJECT.md section 8
+        item 39) -- this is the one place that says so, at most once per
+        ``onewire.slow_cycle_log_interval_s`` per bus, naming every number a
+        person needs to tell a permanently too-slow bus from one tick that
+        ran long.
+        """
+        now = self._clock()
+        elapsed = now - start
+        budget = self._max_age_s / 2.0
+        if elapsed <= budget:
+            return
+        since = self._slow_cycle_since_log.get(bus_name, 0) + 1
+        logged_at = self._slow_cycle_logged_at.get(bus_name)
+        if logged_at is not None and now - logged_at < self._slow_cycle_log_interval_s:
+            self._slow_cycle_since_log[bus_name] = since
+            return
+        _LOG.warning(
+            "onewire: %s cycle took %.2f s, over its budget of %.2f s (max_age_s / 2) with "
+            "%d sensor(s) on the %s tier (%d exceedance(s) since the last line); "
+            "PROJECT.md item 39",
+            bus_name,
+            elapsed,
+            budget,
+            sensor_count,
+            tier,
+            since,
+        )
+        self._slow_cycle_logged_at[bus_name] = now
+        self._slow_cycle_since_log[bus_name] = 0
 
     # -- the netlink tier -------------------------------------------------------
 
@@ -882,7 +996,11 @@ class W1Source:
     def stop(self) -> None:
         """Stops every reader thread and closes every netlink socket.
 
-        Idempotent; safe to call if never started.
+        Idempotent; safe to call if never started. Each reader thread notices
+        the stop request within one bus-wide conversion or one sensor's
+        (module docstring, "Shutdown"), so the join below returns promptly;
+        its 5 s bound is a backstop against a misconfigured timeout, not the
+        common case.
         """
         self._stop.set()
         for thread in self._threads:
@@ -1000,6 +1118,16 @@ def build_onewire_from_config(
         raise ConfigError(
             f"onewire.netlink_retry_s must be a number, got {type(netlink_retry_s).__name__}"
         )
+    slow_cycle_log_interval_s = section.get(
+        "slow_cycle_log_interval_s", _DEFAULT_SLOW_CYCLE_LOG_INTERVAL_S
+    )
+    if not isinstance(slow_cycle_log_interval_s, int | float) or isinstance(
+        slow_cycle_log_interval_s, bool
+    ):
+        raise ConfigError(
+            "onewire.slow_cycle_log_interval_s must be a number, got "
+            f"{type(slow_cycle_log_interval_s).__name__}"
+        )
     root = section.get("root", DEFAULT_ROOT)
 
     try:
@@ -1016,6 +1144,7 @@ def build_onewire_from_config(
             read_tier=read_tier,
             netlink_timeout_s=float(netlink_timeout_s),
             netlink_retry_s=float(netlink_retry_s),
+            slow_cycle_log_interval_s=float(slow_cycle_log_interval_s),
         )
     except ConfigError as exc:
         raise ConfigError(f"onewire: {exc}") from exc

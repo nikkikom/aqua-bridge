@@ -4609,6 +4609,21 @@ a model converges only with them.
   does not follow the order of the overlay lines. Undeclared slaves are
   ignored, which is what keeps the family-`00` phantoms of an unterminated
   bus out of the readings.
+  `W1Source.stop()` sets a stop event and joins each reader thread with a
+  5 s bound; `run_bus_cycle` checks the event between every per-sensor
+  serial read and again before starting a new bulk conversion (a netlink
+  cycle already checks it during its one conversion wait), so a stop
+  request abandons the sensors it has not reached rather than reading
+  through them — the join is a backstop against a misconfigured timeout
+  now, not the common case (§8 item 39, the stop() consequence of the
+  longer cycle). An abandoned cycle publishes nothing, same as a netlink
+  cycle `stop()` interrupts. A cycle that runs to completion and took
+  longer than its bus's budget (`max_age_s / 2`) logs a warning naming the
+  measured cycle, the budget, the sensor count and the tier, rate limited
+  to at most one line per `onewire.slow_cycle_log_interval_s` (default
+  60 s) — past that budget a bus starts aging sensors out of `read()` on
+  some ticks with no other symptom, so this is the one place that says so
+  (§8 item 39).
 - `hw/w1_netlink.py`: the 1-Wire transport over `AF_NETLINK` /
   `NETLINK_CONNECTOR` with `CN_W1_IDX`/`CN_W1_VAL` — sockets and byte
   layouts, no thermometers. `W1Netlink` opens and binds (`groups=0`, so
@@ -9682,16 +9697,23 @@ Owner decision (2026-09-16):
     7.5 s, so every sample is older than `read()` will accept for 2.1 s out
     of each 9.6 s: the whole bus reads as missing on roughly a fifth of the
     ticks, and one failed cycle stretches the gap to 19.2 s, over two ticks
-    dark. Nothing unsafe happens — `read()` never blocks, so the tick is
-    never held up, and a missing reading raises cooling and never lowers it
-    (§2) — but the *model* is lost for up to five minutes: those bays go
-    unobserved, σ grows, the trust gate falls back. At 10 bit the same
-    demotion costs 2.74 s, inside the budget, and nothing is lost at all.
-    One more consequence of the longer cycle: `stop()` joins each reader
-    thread with a 5 s bound and `run_bus_cycle` has no stop check between
-    serial reads, so a 12-bit serial cycle outlives that join — the threads
-    are daemons, so the process still exits, but shutdown no longer waits
-    the bus out the way a 2.7 s cycle did.
+    dark — logged now rather than only felt: a cycle that runs to completion
+    past its `max_age_s / 2` budget warns, rate limited by
+    `onewire.slow_cycle_log_interval_s` (default 60 s) so a bus stuck there
+    does not flood the log, naming the measured cycle, the budget, the
+    sensor count and the tier it ran on. Nothing unsafe happens — `read()`
+    never blocks, so the tick is never held up, and a missing reading raises
+    cooling and never lowers it (§2) — but the *model* is lost for up to
+    five minutes: those bays go unobserved, σ grows, the trust gate falls
+    back. At 10 bit the same demotion costs 2.74 s, inside the budget, and
+    nothing is lost at all. One more consequence of the longer cycle no
+    longer holds: `stop()` joins each reader thread with a 5 s bound, and
+    `run_bus_cycle` now checks between every serial read and again before
+    starting a new bulk conversion, so a stop request abandons the sensors
+    it has not reached instead of reading through them — a 12-bit serial
+    cycle is bounded to about one sensor's conversion (≈ 800 ms), not the
+    full 9.6 s, and the 5 s join is a backstop again, the way it was against
+    a 2.7 s cycle.
 
     That trade is stated rather than designed around, deliberately. The
     reader keeps the configured resolution while it is demoted (`resolution`

@@ -907,6 +907,13 @@ onewire:
   netlink_timeout_s: 1.0
   netlink_retry_s: 300.0 # a bus that dropped off the netlink tier is tried again
                          # this often -- same argument as bulk_retry_s
+  # A cycle that runs to completion and takes longer than max_age_s / 2 (the
+  # per-bus budget: PROJECT.md section 8 item 39) starts aging sensors out of
+  # read() on some ticks with no other symptom, so it logs a warning naming
+  # the measured cycle, the budget, the sensor count and the tier -- at most
+  # one line per bus in this many seconds, so a bus that stays over budget
+  # does not flood the log.
+  slow_cycle_log_interval_s: 60.0
   sensors:               # logical name -> DS18B20 ROM id (tools/w1_commission.py --identify)
     inlet_b: 28-000000000001
     prox_b01: 28-000000000002

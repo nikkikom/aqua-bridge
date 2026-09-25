@@ -812,6 +812,7 @@ def test_build_onewire_defaults_the_read_strategy_keys(tmp_path: Path) -> None:
     assert src._read_tier == "auto"
     assert src._netlink_timeout_s == pytest.approx(1.0)
     assert src._netlink_retry_s == pytest.approx(300.0)
+    assert src._slow_cycle_log_interval_s == pytest.approx(60.0)
 
 
 def test_build_onewire_passes_the_read_strategy_keys_through(tmp_path: Path) -> None:
@@ -826,6 +827,7 @@ def test_build_onewire_passes_the_read_strategy_keys_through(tmp_path: Path) -> 
             "read_tier": "sysfs_bulk",
             "netlink_timeout_s": 0.25,
             "netlink_retry_s": 60.0,
+            "slow_cycle_log_interval_s": 15.0,
         },
         default_max_age_s=7.5,
     )
@@ -837,6 +839,7 @@ def test_build_onewire_passes_the_read_strategy_keys_through(tmp_path: Path) -> 
     assert src._read_tier == "sysfs_bulk"
     assert src._netlink_timeout_s == pytest.approx(0.25)
     assert src._netlink_retry_s == pytest.approx(60.0)
+    assert src._slow_cycle_log_interval_s == pytest.approx(15.0)
 
 
 def test_build_onewire_uses_default_max_age_when_absent(tmp_path: Path) -> None:
@@ -878,6 +881,14 @@ def test_build_onewire_explicit_max_age_overrides_default(tmp_path: Path) -> Non
         ({"sensors": {"a": "28-1"}, "netlink_timeout_s": 0}, "netlink_timeout_s must be > 0"),
         ({"sensors": {"a": "28-1"}, "netlink_retry_s": "x"}, "netlink_retry_s must be a number"),
         ({"sensors": {"a": "28-1"}, "netlink_retry_s": -1}, "netlink_retry_s must be > 0"),
+        (
+            {"sensors": {"a": "28-1"}, "slow_cycle_log_interval_s": "x"},
+            "slow_cycle_log_interval_s must be a number",
+        ),
+        (
+            {"sensors": {"a": "28-1"}, "slow_cycle_log_interval_s": 0},
+            "slow_cycle_log_interval_s must be > 0",
+        ),
         ({"sensors": {"a": "28-1"}, "enabled": "true"}, "onewire.enabled must be true or false"),
         # item 57: the check runs even when it would otherwise return None (no sensors) --
         # a mistyped enabled: is a config mistake regardless of whether anything reads it.
@@ -1282,6 +1293,218 @@ def test_a_cycle_abandoned_by_stop_publishes_nothing(
     assert src.read() == {"a": None}
 
 
+# -- stop() reaching a serial or bulk cycle, not just a netlink one -----------------
+#
+# PR #73's proposed item: a 12-bit serial cycle (9.6 s for 12 sensors) outlives
+# stop()'s 5 s join because run_bus_cycle had no stop check between serial reads.
+# These cover the fix: the check between per-sensor reads, the check before a new
+# bulk-wide conversion is started, and that the real reader thread's join returns
+# promptly rather than riding a slow cycle out.
+
+
+def test_stop_before_the_sysfs_tiers_skips_starting_a_new_bulk_conversion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bulk trigger is one blocking write the kernel sleeps a whole
+    conversion out inside (module docstring, "Shutdown"), so the only place to
+    act on a stop request already set is before writing it, not during."""
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    _make_slave(bus, "28-000000000001", "20000")
+    log = _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
+
+    src = W1Source({"a": "28-000000000001"}, max_age_s=10.0, root=root, clock=_FakeClock())
+    src._stop.set()
+
+    assert src.run_bus_cycle(bus) == {}
+    assert log.writes == [], "no new bus-wide conversion was started after stop()"
+
+
+def test_stop_during_a_serial_cycle_abandons_the_remaining_sensors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check runs between sensors, not inside one (module docstring,
+    "Shutdown"): the sensor already being read finishes, the rest do not, and
+    the cycle publishes nothing -- the same contract an interrupted netlink
+    cycle already has, not a partial result."""
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    _make_slave(bus, "28-000000000001", "20000")
+    _make_slave(bus, "28-000000000002", "21000")
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "0"])  # refused -> serial
+
+    src = W1Source(
+        {"a": "28-000000000001", "b": "28-000000000002"},
+        max_age_s=10.0,
+        root=root,
+        clock=_FakeClock(),
+    )
+    read_order: list[str] = []
+    original = src._read_temperature
+
+    def recording(slave_dir: Path, rom: str) -> float | None:
+        read_order.append(rom)
+        src._stop.set()  # stop() lands right after this sensor's own read
+        return original(slave_dir, rom)
+
+    monkeypatch.setattr(src, "_read_temperature", recording)
+
+    assert src.run_bus_cycle(bus) == {}
+    assert read_order == ["28-000000000001"], "the second sensor was never read"
+    assert src.read() == {"a": None, "b": None}, "an abandoned cycle publishes nothing"
+
+
+def test_stop_during_a_serial_cycle_returns_promptly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A serial cycle that would take several seconds is abandoned within
+    about one sensor's read, not ridden out to completion or to the 5 s join
+    bound -- real reader thread, real clock, real (short) sleeps standing in
+    for a sensor's conversion."""
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    roms = [f"28-0000000000{i:02x}" for i in range(1, 9)]  # 8 sensors
+    for rom in roms:
+        _make_slave(bus, rom, "20000")
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "0"])  # refused -> serial
+
+    per_sensor = 0.4
+    presleep = 1.5 * per_sensor  # midway into the second sensor's read
+    src = W1Source(
+        {f"s{i}": rom for i, rom in enumerate(roms)},
+        max_age_s=100.0,  # budget well out of the way; this test is about timing
+        root=root,
+        poll_interval_s=0.01,
+    )
+    original = src._read_temperature
+
+    def slow(slave_dir: Path, rom: str) -> float | None:
+        time.sleep(per_sensor)  # stand-in for a real conversion
+        return original(slave_dir, rom)
+
+    monkeypatch.setattr(src, "_read_temperature", slow)
+
+    src.start()
+    time.sleep(presleep)
+    started = time.monotonic()
+    try:
+        src.stop()
+    finally:
+        elapsed = time.monotonic() - started
+
+    uninterrupted = per_sensor * len(roms)
+    remaining = uninterrupted - presleep  # riding the cycle out from here would cost this much
+    # Comfortably above the ~0.5 * per_sensor this should actually take (finishing the
+    # sensor already in flight, plus scheduling slack on a loaded CI runner) and
+    # comfortably below `remaining`, so this only passes if the cycle was abandoned.
+    threshold = 1.5
+    assert threshold < remaining, "test numbers must actually separate fixed from unfixed"
+    assert elapsed < threshold, (
+        f"stop() took {elapsed:.2f} s; finishing the cycle from here would still take "
+        f"about {remaining:.1f} s (of {uninterrupted:.1f} s total) and the join bound is 5 s"
+    )
+    assert all(not t.is_alive() for t in src._threads) or src._threads == []
+
+
+# -- the slow-cycle warning: item 39's "a bus that silently reads as missing" ------
+
+
+def test_a_slow_cycle_logs_a_rate_limited_warning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Past the budget, a cycle that ran to completion logs once immediately,
+    stays quiet inside ``slow_cycle_log_interval_s``, and logs again once past
+    it, naming the measured cycle, the budget, the sensor count and the tier."""
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    _make_slave(bus, "28-000000000001", "20000")
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "0"])  # refused -> serial
+
+    clock = _FakeClock(1000.0)
+    src = W1Source(
+        {"a": "28-000000000001"},
+        max_age_s=2.0,  # budget = max_age_s / 2 = 1.0 s
+        root=root,
+        clock=clock,
+        slow_cycle_log_interval_s=30.0,
+    )
+    original = src._read_temperature
+
+    def slow(slave_dir: Path, rom: str) -> float | None:
+        clock.t += 1.5  # over the 1.0 s budget
+        return original(slave_dir, rom)
+
+    monkeypatch.setattr(src, "_read_temperature", slow)
+
+    with caplog.at_level("WARNING"):
+        assert src.run_bus_cycle(bus) == {"a": pytest.approx(20.0)}
+    assert "w1_bus_master1 cycle took 1.50 s" in caplog.text
+    assert "budget of 1.00 s" in caplog.text
+    assert "1 sensor(s)" in caplog.text
+    assert "serial tier" in caplog.text
+    caplog.clear()
+
+    clock.t += 5.0  # well inside slow_cycle_log_interval_s
+    with caplog.at_level("WARNING"):
+        src.run_bus_cycle(bus)
+    assert "cycle took" not in caplog.text, "rate limited: no second line yet"
+    caplog.clear()
+
+    clock.t += 30.0  # past slow_cycle_log_interval_s since the first line
+    with caplog.at_level("WARNING"):
+        src.run_bus_cycle(bus)
+    assert "cycle took 1.50 s" in caplog.text
+    assert "2 exceedance(s) since the last line" in caplog.text
+
+
+def test_a_cycle_inside_budget_does_not_warn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    _make_slave(bus, "28-000000000001", "20000")
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["1"])
+
+    src = W1Source({"a": "28-000000000001"}, max_age_s=2.0, root=root, clock=_FakeClock(1000.0))
+
+    with caplog.at_level("WARNING"):
+        result = src.run_bus_cycle(bus)
+    assert result == {"a": pytest.approx(20.0)}
+    assert "cycle took" not in caplog.text
+
+
+def test_a_cycle_abandoned_by_stop_does_not_warn_even_if_slow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A cycle stop() cut short is shutdown, not a slow bus -- warning about it
+    on the way out would only be log noise at the moment it matters least."""
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    _make_slave(bus, "28-000000000001", "20000")
+    _make_slave(bus, "28-000000000002", "21000")
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "0"])  # refused -> serial
+
+    clock = _FakeClock(1000.0)
+    src = W1Source(
+        {"a": "28-000000000001", "b": "28-000000000002"},
+        max_age_s=2.0,  # budget = 1.0 s
+        root=root,
+        clock=clock,
+    )
+    original = src._read_temperature
+
+    def recording(slave_dir: Path, rom: str) -> float | None:
+        clock.t += 1.5  # over budget on its own, if it were ever checked
+        src._stop.set()
+        return original(slave_dir, rom)
+
+    monkeypatch.setattr(src, "_read_temperature", recording)
+
+    with caplog.at_level("WARNING"):
+        assert src.run_bus_cycle(bus) == {}
+    assert "cycle took" not in caplog.text
+
+
 # -- the read path's keys, in both example configs ----------------------------------
 
 #: Every ``onewire:`` key that chooses a read path, with the one default the code
@@ -1298,6 +1521,7 @@ READ_PATH_DEFAULTS: dict[str, object] = {
     "bulk_retry_s": 300.0,
     "poll_interval_s": 0.02,
     "resolution_bits": 12,
+    "slow_cycle_log_interval_s": 60.0,
 }
 
 
