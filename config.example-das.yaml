@@ -907,6 +907,20 @@ onewire:
   netlink_timeout_s: 1.0
   netlink_retry_s: 300.0 # a bus that dropped off the netlink tier is tried again
                          # this often -- same argument as bulk_retry_s
+  # How many cycles in a row must fail on a tier before the bus is dropped off it
+  # for the retry window above. A tier is worth keeping: a failed probe costs one
+  # command and the cycle still finishes on the tier below, so nothing is lost
+  # while the evidence is collected, while a demotion costs the fastest tier for
+  # five minutes -- and on a bus whose floor is one-sensor-at-a-time reads, that is
+  # measured in samples the control loop never sees. Three consecutive failures is
+  # about 15 s of evidence at dt = 5 s. A success resets the count, and evidence
+  # that cannot change by asking again (this kernel has no w1 connector, this
+  # master is not in its list, this bus has no therm_bulk_read) drops the tier at
+  # once whatever this says. 1 restores "one bad cycle is enough".
+  # One unreadable attribute on one sensor is not a tier failure at all: a sensor
+  # with no readable conv_time waits the configured resolution's conversion time
+  # (an upper bound) and the read-back is retried every cycle (PROJECT.md item 39).
+  tier_failures_before_demote: 3
   # A cycle that runs to completion and takes longer than max_age_s / 2 (the
   # per-bus budget: PROJECT.md section 8 item 39) starts aging sensors out of
   # read() on some ticks with no other symptom, so it logs a warning naming

@@ -5,6 +5,7 @@ PROJECT.md section 3 (Track B) / the DAS plan section 1 "Read timing vs dt".
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
@@ -210,10 +211,10 @@ def test_redundant_sensors_share_one_rom_and_both_get_the_reading(
     assert result == {"prox_b01": pytest.approx(22.0), "prox_b01b": pytest.approx(22.0)}
 
 
-# --- CRC failure -> None -------------------------------------------------------------
+# --- a read that produces no value -> None, counted by why ---------------------------
 
 
-def test_bad_temperature_content_is_none_and_counted_as_crc_error(
+def test_bad_temperature_content_is_none_and_counted_as_rejected(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root = tmp_path / "w1"
@@ -225,15 +226,22 @@ def test_bad_temperature_content_is_none_and_counted_as_crc_error(
     result = src.run_bus_cycle(bus)
 
     assert result == {"a": None}
-    assert src.crc_error_counts() == {"28-000000000001": 1}
+    stats = src.read_stats()["28-000000000001"]
+    assert (stats.attempts, stats.rejected, stats.failed) == (1, 1, 1)
+    assert (stats.errors, stats.empty) == (0, 0)
 
 
-def test_empty_temperature_is_none_and_counted_as_crc_error(
+def test_empty_temperature_is_none_and_counted_apart_from_an_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A slave that answers with nothing at all: ``int("")`` is the same
-    ValueError a garbage reading gives, so the sensor reads ``None`` for this
-    cycle and its siblings on the bus are unaffected."""
+    """A slave that answers with nothing at all is its own category.
+
+    The kernel does that while a bulk conversion it started is still in flight,
+    i.e. when a second reader is on this bus master -- not a bad sensor and not
+    a bad value (``hw/onewire.py``, "One cycle at a time per bus master";
+    PROJECT.md item 39). The sensor reads ``None`` for this cycle either way and
+    its siblings on the bus are unaffected.
+    """
     root = tmp_path / "w1"
     bus = _make_bus(root, "w1_bus_master1")
     _make_slave(bus, "28-000000000001", "")  # empty temperature attribute
@@ -247,10 +255,15 @@ def test_empty_temperature_is_none_and_counted_as_crc_error(
         clock=_FakeClock(),
     )
     assert src.run_bus_cycle(bus) == {"a": None, "b": pytest.approx(21.5)}
-    assert src.crc_error_counts() == {"28-000000000001": 1, "28-000000000002": 0}
+    stats = src.read_stats()
+    empty = stats["28-000000000001"]
+    assert (empty.attempts, empty.empty, empty.failed) == (1, 1, 1)
+    assert (empty.errors, empty.rejected) == (0, 0)
+    good = stats["28-000000000002"]
+    assert (good.attempts, good.failed) == (1, 0)
 
 
-def test_missing_temperature_file_is_none_crc_error(
+def test_missing_temperature_file_is_none_and_counted_as_an_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root = tmp_path / "w1"
@@ -262,7 +275,35 @@ def test_missing_temperature_file_is_none_crc_error(
     result = src.run_bus_cycle(bus)
 
     assert result == {"a": None}
-    assert src.crc_error_counts()["28-000000000001"] == 1
+    stats = src.read_stats()["28-000000000001"]
+    assert (stats.attempts, stats.errors, stats.failed) == (1, 1, 1)
+    assert (stats.empty, stats.rejected) == (0, 0)
+
+
+def test_a_sensor_no_cycle_reached_has_no_attempts_and_so_no_rate(tmp_path: Path) -> None:
+    """A declared ROM id that is not under any bus master must not read as 0 % failed.
+
+    It is a binding or wiring report and nothing was ever asked of it; the
+    denominator that used to be printed for it (``cycles * len(buses)``) belonged
+    to no sensor at all (PROJECT.md item 39).
+    """
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    _make_slave(bus, "28-000000000001", "22000")
+
+    src = W1Source(
+        {"here": "28-000000000001", "nowhere": "28-00000000ffff"},
+        max_age_s=10.0,
+        root=root,
+        clock=_FakeClock(),
+    )
+    src.run_bus_cycle(bus)
+
+    stats = src.read_stats()
+    assert stats["28-000000000001"].attempts == 1
+    absent = stats["28-00000000ffff"]
+    assert (absent.attempts, absent.failed) == (0, 0)
+    assert src.missing_roms() == ["28-00000000ffff"]
 
 
 def test_bulk_read_never_completing_is_bounded_and_falls_back_to_serial(
@@ -289,6 +330,10 @@ def test_bulk_read_never_completing_is_bounded_and_falls_back_to_serial(
         clock=time.monotonic,  # a real, advancing clock so the deadline is actually reached
         poll_interval_s=0.005,
         bulk_timeout_s=0.05,
+        # One failing cycle gives the tier up here, so this test stays about the
+        # bounded wait; how much evidence a demotion needs by default has its
+        # own tests below ("giving up a tier").
+        tier_failures_before_demote=1,
     )
     t0 = time.monotonic()
     result = src.run_bus_cycle(bus)
@@ -315,8 +360,15 @@ def test_unreadable_trigger_file_falls_back_to_serial_without_raising(tmp_path: 
     (bus / "therm_bulk_read").unlink()
     (bus / "therm_bulk_read").mkdir()  # reading/writing it now raises IsADirectoryError
 
-    src = W1Source({"a": "28-000000000001"}, max_age_s=10.0, root=root, clock=_FakeClock())
+    src = W1Source(
+        {"a": "28-000000000001"},
+        max_age_s=10.0,
+        root=root,
+        clock=_FakeClock(),
+        tier_failures_before_demote=1,  # see the note in the bounded-wait test above
+    )
     assert src.run_bus_cycle(bus) == {"a": pytest.approx(20.0)}
+    assert src.read_tiers() == {"w1_bus_master1": "serial"}
     assert src.bulk_read_modes() == {"w1_bus_master1": "serial"}
 
 
@@ -381,8 +433,12 @@ def test_a_trigger_that_registers_nothing_is_detected_on_the_first_cycle(
         clock=clock,
         bulk_timeout_s=30.0,
         bulk_retry_s=300.0,
+        tier_failures_before_demote=1,  # see the note in the bounded-wait test above
     )
     assert src.run_bus_cycle(bus) == {"a": pytest.approx(20.0)}
+    assert src.read_tiers() == {"w1_bus_master1": "serial"}, (
+        "a refused trigger means this cycle converted per sensor, whatever the tier's standing"
+    )
     assert src.bulk_read_modes() == {"w1_bus_master1": "serial"}
     assert log.writes == [b"trigger\n"]
 
@@ -409,7 +465,12 @@ def test_a_bus_that_honours_the_trigger_again_gets_the_fast_path_back(
 
     clock = _FakeClock()
     src = W1Source(
-        {"a": "28-000000000001"}, max_age_s=10.0, root=root, clock=clock, bulk_retry_s=60.0
+        {"a": "28-000000000001"},
+        max_age_s=10.0,
+        root=root,
+        clock=clock,
+        bulk_retry_s=60.0,
+        tier_failures_before_demote=1,  # see the note in the bounded-wait test above
     )
     src.run_bus_cycle(bus)
     assert src.bulk_read_modes() == {"w1_bus_master1": "serial"}
@@ -441,7 +502,13 @@ def test_a_value_outside_the_abi_falls_back_to_serial(
     _make_slave(bus, "28-000000000001", "20000")
     log = _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["trigger"])
 
-    src = W1Source({"a": "28-000000000001"}, max_age_s=10.0, root=root, clock=_FakeClock())
+    src = W1Source(
+        {"a": "28-000000000001"},
+        max_age_s=10.0,
+        root=root,
+        clock=_FakeClock(),
+        tier_failures_before_demote=1,  # see the note in the bounded-wait test above
+    )
     assert src.run_bus_cycle(bus) == {"a": pytest.approx(20.0)}
     assert src.bulk_read_modes() == {"w1_bus_master1": "serial"}
     assert log.writes == [], "an attribute that is not a w1_therm state must not be written"
@@ -812,6 +879,7 @@ def test_build_onewire_defaults_the_read_strategy_keys(tmp_path: Path) -> None:
     assert src._read_tier == "auto"
     assert src._netlink_timeout_s == pytest.approx(1.0)
     assert src._netlink_retry_s == pytest.approx(300.0)
+    assert src._tier_failures_before_demote == 3
     assert src._slow_cycle_log_interval_s == pytest.approx(60.0)
 
 
@@ -827,6 +895,7 @@ def test_build_onewire_passes_the_read_strategy_keys_through(tmp_path: Path) -> 
             "read_tier": "sysfs_bulk",
             "netlink_timeout_s": 0.25,
             "netlink_retry_s": 60.0,
+            "tier_failures_before_demote": 1,
             "slow_cycle_log_interval_s": 15.0,
         },
         default_max_age_s=7.5,
@@ -839,6 +908,7 @@ def test_build_onewire_passes_the_read_strategy_keys_through(tmp_path: Path) -> 
     assert src._read_tier == "sysfs_bulk"
     assert src._netlink_timeout_s == pytest.approx(0.25)
     assert src._netlink_retry_s == pytest.approx(60.0)
+    assert src._tier_failures_before_demote == 1
     assert src._slow_cycle_log_interval_s == pytest.approx(15.0)
 
 
@@ -881,6 +951,14 @@ def test_build_onewire_explicit_max_age_overrides_default(tmp_path: Path) -> Non
         ({"sensors": {"a": "28-1"}, "netlink_timeout_s": 0}, "netlink_timeout_s must be > 0"),
         ({"sensors": {"a": "28-1"}, "netlink_retry_s": "x"}, "netlink_retry_s must be a number"),
         ({"sensors": {"a": "28-1"}, "netlink_retry_s": -1}, "netlink_retry_s must be > 0"),
+        (
+            {"sensors": {"a": "28-1"}, "tier_failures_before_demote": 1.5},
+            "tier_failures_before_demote must be an int",
+        ),
+        (
+            {"sensors": {"a": "28-1"}, "tier_failures_before_demote": 0},
+            "tier_failures_before_demote must be >= 1",
+        ),
         (
             {"sensors": {"a": "28-1"}, "slow_cycle_log_interval_s": "x"},
             "slow_cycle_log_interval_s must be a number",
@@ -980,7 +1058,8 @@ def test_a_bus_reads_over_netlink_when_the_connector_answers(
     assert src.read_tiers() == {"w1_bus_master1": "netlink"}
     assert log.writes == [], "the kernel's bulk trigger was not written at all"
     assert _probe_count(sock) == 1
-    assert src.crc_error_counts() == {"28-000000000001": 0, "28-000000000002": 0}
+    stats = src.read_stats()
+    assert [(s.attempts, s.failed) for s in stats.values()] == [(1, 0), (1, 0)]
 
 
 def test_a_bus_the_connector_does_not_answer_falls_to_the_kernels_bulk_read(
@@ -992,7 +1071,9 @@ def test_a_bus_the_connector_does_not_answer_falls_to_the_kernels_bulk_read(
     bus, _ids = _netlink_bus(root, ["28-000000000001"])
     log = _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
     sock = FakeSocket([])  # every recv times out
-    src = _source(root, {"a": "28-000000000001"}, sock)
+    # One timeout is enough to give the tier up here; that a timeout on its own is
+    # not, by default, is the counting policy's own test below.
+    src = _source(root, {"a": "28-000000000001"}, sock, tier_failures_before_demote=1)
 
     with caplog.at_level("WARNING"):
         result = src.run_bus_cycle(bus)
@@ -1046,7 +1127,14 @@ def test_a_bus_that_lost_netlink_is_left_alone_until_netlink_retry_s(
     _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
     clock = _FakeClock()
     sock = FakeSocket([])
-    src = _source(root, {"a": "28-000000000001"}, sock, clock=clock, netlink_retry_s=300.0)
+    src = _source(
+        root,
+        {"a": "28-000000000001"},
+        sock,
+        clock=clock,
+        netlink_retry_s=300.0,
+        tier_failures_before_demote=1,
+    )
 
     src.run_bus_cycle(bus)
     assert _probe_count(sock) == 1
@@ -1134,7 +1222,12 @@ def test_one_sensor_with_a_bad_crc_loses_its_reading_and_the_bus_keeps_the_tier(
 
     assert result == {"a": None, "b": pytest.approx(_NETLINK_C)}
     assert src.read_tiers() == {"w1_bus_master1": "netlink"}
-    assert src.crc_error_counts() == {"28-000000000001": 1, "28-000000000002": 0}
+    stats = src.read_stats()
+    bad = stats["28-000000000001"]
+    assert (bad.attempts, bad.errors, bad.failed) == (1, 1, 1)
+    # No "empty" on this tier: a netlink read carries nine bytes or raises.
+    assert (bad.empty, bad.rejected) == (0, 0)
+    assert (stats["28-000000000002"].attempts, stats["28-000000000002"].failed) == (1, 0)
 
 
 def test_a_bus_where_every_scratchpad_is_zeros_drops_a_tier_and_still_reads(
@@ -1177,24 +1270,6 @@ def test_the_identifier_comes_from_the_id_attribute_and_falls_back_to_the_name(
     }
     addressed = [packet[40:48] for packet in sock.sent if packet[36] == 5]
     assert addressed == [with_id, derived]
-
-
-def test_a_sensor_with_no_conv_time_is_not_a_bus_to_run_this_tier_on(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The wait has to come from a fact. A sensor the driver has not answered about
-    has no ``conv_time``, so the bus reads a tier down instead of guessing one."""
-    root = tmp_path / "w1"
-    bus = _make_bus(root, "w1_bus_master1")
-    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
-    identifier = reg_num_from_rom_name("28-000000000001")
-    _make_slave(bus, "28-000000000001", _SYSFS_MILLI, identifier=identifier)  # no conv_time
-    sock = FakeSocket(_cycle_replies(1, {identifier: CAPTURED_SCRATCHPAD}))
-    src = _source(root, {"a": "28-000000000001"}, sock)
-
-    assert src.run_bus_cycle(bus) == {"a": pytest.approx(20.0)}
-    assert src.read_tiers() == {"w1_bus_master1": "bulk"}
-    assert sock.sent == [], "no conv_time, no commands"
 
 
 class _RecordingStop:
@@ -1257,6 +1332,185 @@ def test_a_sensor_that_reports_a_finer_resolution_than_the_driver_lengthens_the_
     src.run_bus_cycle(bus)
 
     assert stop.waits == [0.190, 0.750], "the second cycle waits for what the sensor reported"
+
+
+def test_a_sensor_with_no_conv_time_keeps_the_bus_on_the_netlink_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One unreadable attribute on one sensor is not evidence about the bus.
+
+    It used to be: the wait "had to come from a fact", so a sensor with no
+    ``conv_time`` dropped the whole bus off its fastest tier for
+    ``netlink_retry_s`` -- which is what cost the owner's 14-sensor bus its top
+    tier, on a sensor that answers ``conv_time=750`` when asked directly
+    (PROJECT.md item 39). There *is* a fact to fall back on: the conversion time
+    of the resolution this reader configured, which is an upper bound for any
+    sensor at or below it.
+    """
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    log = _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
+    identifier = reg_num_from_rom_name("28-000000000001")
+    _make_slave(bus, "28-000000000001", _SYSFS_MILLI, identifier=identifier)  # no conv_time
+    sock = FakeSocket(_cycle_replies(1, {identifier: CAPTURED_SCRATCHPAD}))
+    src = _source(root, {"a": "28-000000000001"}, sock)
+    stop = _RecordingStop()
+    monkeypatch.setattr(src, "_stop", stop)
+
+    with caplog.at_level("INFO"):
+        result = src.run_bus_cycle(bus)
+
+    assert result == {"a": pytest.approx(_NETLINK_C)}, "read over netlink, not a tier down"
+    assert src.read_tiers() == {"w1_bus_master1": "netlink"}
+    assert log.writes == [], "the kernel's bulk trigger was not needed"
+    assert stop.waits == [0.750], "the configured 12-bit conversion time, the safe upper bound"
+    assert "has not reported conv_time yet" in caplog.text
+    assert "does not read over netlink" not in caplog.text
+
+
+def test_an_unreadable_conv_time_is_asked_again_on_the_next_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient failure to read an attribute must not be cached as "absent".
+
+    ``resolution`` is written once per sensor because that is scratchpad traffic;
+    ``conv_time`` is a value the driver already holds, so it is asked again every
+    cycle until it answers -- and once it does, the wait is the sensor's own
+    again (PROJECT.md item 39).
+    """
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
+    identifier = reg_num_from_rom_name("28-000000000001")
+    slave = _make_slave(bus, "28-000000000001", _SYSFS_MILLI, identifier=identifier)
+    nine_bit = scratchpad(0x0180, 0x1F)  # config register: 9 bit, so 95 ms of its own
+    sock = FakeSocket(
+        _cycle_replies(1, {identifier: nine_bit}) + _cycle_replies(4, {identifier: nine_bit})
+    )
+    src = _source(root, {"a": "28-000000000001"}, sock)
+    stop = _RecordingStop()
+    monkeypatch.setattr(src, "_stop", stop)
+
+    src.run_bus_cycle(bus)
+    assert src.conv_time_ms() == {}, "nothing to report yet"
+
+    (slave / "conv_time").write_text("190")  # the attribute answers this time
+    src.run_bus_cycle(bus)
+
+    assert stop.waits == [0.750, 0.190], "the retried read-back replaced the configured bound"
+    assert src.conv_time_ms() == {"28-000000000001": 190}
+    assert src.read_tiers() == {"w1_bus_master1": "netlink"}
+
+
+# -- giving up a tier: whose failure, and how many (PROJECT.md item 39) --------------
+
+
+def test_one_failing_cycle_does_not_cost_the_bus_its_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A tier costs five minutes to give up and one command to retry, so the
+    evidence is ``tier_failures_before_demote`` consecutive failing cycles -- and
+    every one of those cycles still finishes on the tier below, so no sample is
+    lost while the evidence is collected."""
+    root = tmp_path / "w1"
+    bus, _ids = _netlink_bus(root, ["28-000000000001"])
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
+    sock = FakeSocket([])  # every recv times out: a kernel that answers nothing
+    clock = _FakeClock()
+    src = _source(root, {"a": "28-000000000001"}, sock, clock=clock, netlink_retry_s=300.0)
+    assert src._tier_failures_before_demote == 3
+
+    with caplog.at_level("WARNING"):
+        for cycle in (1, 2):
+            assert src.run_bus_cycle(bus) == {"a": pytest.approx(20.0)}
+            assert _probe_count(sock) == cycle, "the tier was given up too early"
+            assert "does not read over netlink" not in caplog.text
+
+    assert src.run_bus_cycle(bus) == {"a": pytest.approx(20.0)}
+    assert _probe_count(sock) == 3
+    assert "does not read over netlink" in caplog.text
+
+    # And now it is left alone: the demotion window is what keeps the probe from
+    # costing every cycle.
+    clock.t += 299.0
+    src.run_bus_cycle(bus)
+    assert _probe_count(sock) == 3
+
+
+def test_a_tier_this_kernel_cannot_have_is_given_up_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Counting is for evidence that can change. A kernel with no netlink at all
+    (which is how the whole suite runs -- ``tests/conftest.py`` takes the family
+    away) cannot answer differently next cycle, so it is not asked twice more."""
+    root = tmp_path / "w1"
+    bus, _ids = _netlink_bus(root, ["28-000000000001"])
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
+    src = _source(root, {"a": "28-000000000001"}, None)  # the real transport, no family
+
+    with caplog.at_level("WARNING"):
+        assert src.run_bus_cycle(bus) == {"a": pytest.approx(20.0)}
+
+    assert "does not read over netlink" in caplog.text
+    assert "no AF_NETLINK" in caplog.text
+    assert src.read_tiers() == {"w1_bus_master1": "bulk"}
+
+
+def test_a_refused_trigger_is_retried_before_the_bus_loses_the_bulk_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same policy on the kernel's bulk read, and the same cheap retry: a phantom
+    slave silences the trigger and phantoms come and go (section 8 item 38), so
+    two more cycles are asked for before the tier is given up. Every one of them
+    still reads every sensor -- and reports itself as the serial cycle it was,
+    because a refused trigger leaves each read converting on its own."""
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    _make_slave(bus, "28-000000000001", "20000")
+    log = _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0"])  # "0" forever: refused
+    clock = _FakeClock()
+    src = W1Source(
+        {"a": "28-000000000001"}, max_age_s=10.0, root=root, clock=clock, bulk_retry_s=300.0
+    )
+
+    for cycle in (1, 2, 3):
+        assert src.run_bus_cycle(bus) == {"a": pytest.approx(20.0)}
+        assert len(log.writes) == cycle, "a trigger that may yet work was not tried again"
+        assert src.read_tiers() == {"w1_bus_master1": "serial"}
+    assert src.bulk_read_modes() == {"w1_bus_master1": "serial"}
+
+    clock.t += 299.0
+    assert src.run_bus_cycle(bus) == {"a": pytest.approx(20.0)}
+    assert len(log.writes) == 3, "triggered again inside bulk_retry_s"
+
+
+def test_a_cycle_that_works_again_forgets_the_failures_before_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The count is *consecutive* failures. Two bad cycles and a good one leave no
+    credit toward a demotion, or a bus that fails every other cycle would lose its
+    tier on a fault that never actually stopped it working."""
+    root = tmp_path / "w1"
+    bus, ids = _netlink_bus(root, ["28-000000000001"])
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
+    good = _cycle_replies(1, {ids[0]: CAPTURED_SCRATCHPAD})
+    sock = FakeSocket([])
+    src = _source(root, {"a": "28-000000000001"}, sock)
+    stop = _RecordingStop()
+    monkeypatch.setattr(src, "_stop", stop)
+
+    src.run_bus_cycle(bus)
+    src.run_bus_cycle(bus)  # two failures: one short of the default
+    sock.replies = list(good)
+    assert src.run_bus_cycle(bus) == {"a": pytest.approx(_NETLINK_C)}
+
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            sock.replies = []
+            src.run_bus_cycle(bus)
+        assert "does not read over netlink" not in caplog.text, (
+            "the failures before the good cycle were still being counted"
+        )
 
 
 def test_stop_closes_every_netlink_socket(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1505,6 +1759,138 @@ def test_a_cycle_abandoned_by_stop_does_not_warn_even_if_slow(
     assert "cycle took" not in caplog.text
 
 
+# -- one cycle at a time per bus master (PROJECT.md item 39) -------------------------
+
+
+def _hold_one_read(
+    src: W1Source, monkeypatch: pytest.MonkeyPatch, rom_to_hold: str
+) -> tuple[threading.Event, threading.Event, list[str]]:
+    """Makes every read of ``rom_to_hold`` block until released, recording the order.
+
+    A cycle's reads are where two overlapping cycles do their damage on the real
+    bus, so that is where a cycle is held open here. Reads of any other sensor
+    pass straight through, so a cycle on another bus master is not held with it.
+    """
+    inside, release = threading.Event(), threading.Event()
+    order: list[str] = []
+    original = src._read_temperature
+
+    def blocking(slave_dir: Path, rom: str) -> float | None:
+        if rom != rom_to_hold:
+            return original(slave_dir, rom)
+        order.append(f"enter {rom}")
+        inside.set()
+        assert release.wait(5.0), "the test never released the held cycle"
+        order.append(f"leave {rom}")
+        return original(slave_dir, rom)
+
+    monkeypatch.setattr(src, "_read_temperature", blocking)
+    return inside, release, order
+
+
+def test_two_cycles_on_one_bus_master_never_overlap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The defect of PROJECT.md item 39, as a test.
+
+    A cycle owns its bus master from the conversion to the last scratchpad: the
+    kernel marks each slave "value not read yet" and the first read consumes it,
+    so a second cycle in the middle of the first one takes readings away from it
+    (800 ms of its own conversion each) and its own reads come back empty while
+    the other conversion is in flight -- measured on the board at 6.4 s per cycle
+    and a third of the reads lost. Two cycles therefore queue, and the second one
+    says so.
+    """
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    _make_slave(bus, "28-000000000001", "20000")
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
+    src = W1Source({"a": "28-000000000001"}, max_age_s=10.0, root=root, clock=_FakeClock())
+    inside, release, order = _hold_one_read(src, monkeypatch, "28-000000000001")
+    contended = threading.Event()
+    original_log = src._log_contention
+
+    def note_contention(bus_name: str) -> None:
+        original_log(bus_name)
+        contended.set()
+
+    monkeypatch.setattr(src, "_log_contention", note_contention)
+
+    results: dict[str, dict[str, float | None]] = {}
+    first = threading.Thread(target=lambda: results.__setitem__("first", src.run_bus_cycle(bus)))
+    first.start()
+    assert inside.wait(5.0), "the first cycle never reached a read"
+    second = threading.Thread(target=lambda: results.__setitem__("second", src.run_bus_cycle(bus)))
+    second.start()
+
+    assert contended.wait(5.0), "the second cycle did not find the bus busy"
+    assert order == ["enter 28-000000000001"], "the second cycle read while the first was inside"
+    release.set()
+    first.join(timeout=5.0)
+    second.join(timeout=5.0)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert order == ["enter 28-000000000001", "leave 28-000000000001"] * 2
+    assert results["first"] == results["second"] == {"a": pytest.approx(20.0)}
+    stats = src.read_stats()["28-000000000001"]
+    assert (stats.attempts, stats.failed) == (2, 0), "both cycles got their reading"
+
+
+def test_two_cycles_on_one_bus_master_are_logged_once_for_that_bus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Two readers on one bus is a programming mistake whose symptom looks exactly
+    like bad wiring, so it is named -- once per bus, not once per cycle, because a
+    tool run against a live daemon would otherwise fill the log."""
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    _make_slave(bus, "28-000000000001", "20000")
+    _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["0", "1"])
+    src = W1Source({"a": "28-000000000001"}, max_age_s=10.0, root=root, clock=_FakeClock())
+
+    with caplog.at_level("WARNING"):
+        src._log_contention("w1_bus_master1")
+        src._log_contention("w1_bus_master1")
+
+    assert caplog.text.count("two read cycles overlapped") == 1
+    assert "w1_bus_master1" in caplog.text
+
+
+def test_two_bus_masters_run_their_cycles_at_the_same_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lock is per bus master, which is the whole point of a thread per bus: two
+    buses are two independent 1-Wire wires and the kernel serialises each on its
+    own ``bus_mutex``. A global lock would halve the throughput of a two-bus board
+    for nothing."""
+    root = tmp_path / "w1"
+    bus1 = _make_bus(root, "w1_bus_master1")
+    bus2 = _make_bus(root, "w1_bus_master2")
+    _make_slave(bus1, "28-000000000001", "20000")
+    _make_slave(bus2, "28-000000000002", "21000")
+    _patch_trigger(monkeypatch, bus1 / "therm_bulk_read", ["0", "1"])
+    src = W1Source(
+        {"a": "28-000000000001", "b": "28-000000000002"},
+        max_age_s=10.0,
+        root=root,
+        clock=_FakeClock(),
+    )
+    inside, release, _order = _hold_one_read(src, monkeypatch, "28-000000000001")
+
+    held = threading.Thread(target=lambda: src.run_bus_cycle(bus1))
+    held.start()
+    assert inside.wait(5.0)
+    try:
+        # bus2's cycle runs to completion here, with bus1's cycle held open.
+        assert src.run_bus_cycle(bus2) == {"b": pytest.approx(21.0)}, (
+            "a cycle on one bus master waited for a cycle on another one"
+        )
+    finally:
+        release.set()
+        held.join(timeout=5.0)
+    assert not held.is_alive()
+
+
 # -- the read path's keys, in both example configs ----------------------------------
 
 #: Every ``onewire:`` key that chooses a read path, with the one default the code
@@ -1516,6 +1902,7 @@ READ_PATH_DEFAULTS: dict[str, object] = {
     "read_tier": "auto",
     "netlink_timeout_s": 1.0,
     "netlink_retry_s": 300.0,
+    "tier_failures_before_demote": 3,
     "bulk_read": "auto",
     "bulk_timeout_s": 2.0,
     "bulk_retry_s": 300.0,
