@@ -33,9 +33,18 @@ the cycles itself, because two cycles overlapping on one bus master consume
 each other's readings -- 6.4 s per cycle instead of 1.0 and a third of the
 reads lost, which is how this was found (PROJECT.md section 8 item 39,
 ``hw/onewire.py`` "One cycle at a time per bus master"). A *running daemon* is
-a second reader this cannot lock out, so stop ``aqua-bridge.service`` before
-measuring; reads that answer nothing at all are counted and named, which is
-what that looks like from here.
+a second reader in a different process, which the in-process lock above
+cannot reach, so before driving a single cycle ``--check`` tries to take the
+same cross-process ``onewire.lock_path`` lock the daemon holds while its
+reader threads run (:class:`~aqua_bridge.hw.onewire.ReaderLock`) and refuses
+to measure if it cannot: reporting a cycle time or a failure rate while
+something else is converting on the bus would print exactly the corruption
+above, credibly, as if it were the hardware's fault. Three outcomes: the lock
+is free (nothing else is reading -- measures normally), it is held (refuses,
+and says why), or it cannot be told either way (refuses the same as held,
+since a wrong guess here is a wrong measurement, not a wrong warning).
+``--force`` measures anyway in the last two cases; see its ``--help`` text
+for what that costs.
 
 This tool imports :mod:`aqua_bridge.config` / :mod:`aqua_bridge.hw` only,
 never :mod:`aqua_bridge.control`: commissioning runs stand-alone, before an
@@ -48,10 +57,10 @@ import argparse
 import re
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
-from aqua_bridge.hw.onewire import DEFAULT_ROOT, ReadStats, W1Source
+from aqua_bridge.hw.onewire import DEFAULT_ROOT, ReaderLockOutcome, ReadStats, W1Source
 
 __all__ = [
     "build_parser",
@@ -63,6 +72,14 @@ __all__ = [
     "main",
     "rank_by_warming_rate",
 ]
+
+#: Default ``--check`` detector: try to take the same cross-process lock the
+#: daemon holds while its reader threads run (``hw/onewire.py``,
+#: :class:`~aqua_bridge.hw.onewire.ReaderLock`). Injected so tests exercise
+#: the refusal / override / "cannot tell" branches with a fake outcome and
+#: never touch a real lock file or systemd (see ``tests/test_w1_commission.py``).
+DetectRunningDaemon = Callable[[W1Source], ReaderLockOutcome]
+_default_detect: DetectRunningDaemon = W1Source.acquire_reader_lock
 
 _ROM_PATTERN = re.compile(r"^[0-9a-f]{2}-[0-9a-f]{12}$")
 #: DS18B20 family. Every other ROM-shaped directory on a bus is reported apart:
@@ -198,7 +215,21 @@ def cmd_identify(root: Path, *, samples: int = 10, interval_s: float = 2.0) -> i
     return 0
 
 
-def cmd_check(config_path: str, *, cycles: int = 20) -> int:
+#: ``cmd_check``'s exit code when it refuses to measure: the daemon (or
+#: another reader) was detected, or could not be ruled out, and ``--force``
+#: was not given. Distinct from 2 (a config error) so a script can tell "the
+#: config is fine, something else is on the bus" apart from "the config is
+#: wrong".
+EXIT_DAEMON_DETECTED = 3
+
+
+def cmd_check(
+    config_path: str,
+    *,
+    cycles: int = 20,
+    force: bool = False,
+    detect: DetectRunningDaemon = _default_detect,
+) -> int:
     from aqua_bridge.config import ConfigError, load_config
     from aqua_bridge.hw.sources import build_composite_from_config
 
@@ -237,38 +268,89 @@ def cmd_check(config_path: str, *, cycles: int = 20) -> int:
             release()
         return 0
 
-    missing = onewire.missing_roms()
-    if missing:
-        print(f"WARNING: ROM id(s) declared in config but not found on any bus: {missing}")
+    try:
+        outcome = detect(onewire)
+        if outcome is not ReaderLockOutcome.ACQUIRED:
+            _print_daemon_detected(outcome, onewire.lock_path)
+            if not force:
+                return EXIT_DAEMON_DETECTED
+            print(
+                "--force: measuring anyway. The numbers below will be exactly this wrong if "
+                "something really is reading these buses -- inflated cycle time, reads lost to "
+                "a stolen conversion, not a hardware fault."
+            )
 
-    buses = onewire.discover_buses()
-    if not buses:
-        print(f"WARNING: no w1 bus master found under {onewire.root}")
-    for bus_dir in buses:
-        t0 = time.monotonic()
-        for _ in range(cycles):
-            onewire.run_bus_cycle(bus_dir)
-        elapsed = time.monotonic() - t0
-        # Which tier produced that number. A cycle time read against the wrong
-        # tier is worse than no number: netlink and the kernel's bulk read each
-        # cost one conversion for the whole bus, one sensor at a time costs one
-        # conversion each (PROJECT.md section 8 item 38).
-        tier = onewire.read_tiers().get(bus_dir.name, "unprobed")
+        missing = onewire.missing_roms()
+        if missing:
+            print(f"WARNING: ROM id(s) declared in config but not found on any bus: {missing}")
+
+        buses = onewire.discover_buses()
+        if not buses:
+            print(f"WARNING: no w1 bus master found under {onewire.root}")
+        for bus_dir in buses:
+            t0 = time.monotonic()
+            for _ in range(cycles):
+                onewire.run_bus_cycle(bus_dir)
+            elapsed = time.monotonic() - t0
+            # Which tier produced that number. A cycle time read against the wrong
+            # tier is worse than no number: netlink and the kernel's bulk read each
+            # cost one conversion for the whole bus, one sensor at a time costs one
+            # conversion each (PROJECT.md section 8 item 38).
+            tier = onewire.read_tiers().get(bus_dir.name, "unprobed")
+            print(
+                f"{bus_dir.name}: {elapsed / cycles * 1000:.0f} ms/cycle over {cycles} cycles "
+                f"({tier} reads)"
+            )
+        conv_times = sorted(set(onewire.conv_time_ms().values()))
+        if conv_times:
+            print(
+                f"conversion time the driver reports at the configured resolution: {conv_times} ms"
+            )
+        for bus_name, roms in discover_other_families(onewire.root).items():
+            print(f"WARNING: {bus_name} carries {len(roms)} non-DS18B20 device(s): {roms}")
+
+        _print_read_stats(onewire.read_stats(), declared_but_absent=set(missing))
+        return 0
+    finally:
+        onewire.release_reader_lock()
+        if release is not None:
+            release()
+
+
+def _print_daemon_detected(outcome: ReaderLockOutcome, lock_path: Path) -> None:
+    """Explains *why* the measurement would be wrong, not merely that
+    something is running: two cycles overlapping on one bus master consume
+    each other's kernel "value ready" marks, so a cycle pays a fresh
+    conversion per sensor the other cycle claimed first, and a read that
+    lands inside the other cycle's conversion comes back empty -- measured at
+    6377 ms/cycle and a third of the reads lost against 1044 ms/cycle and
+    none, on the same board, same sensors (PROJECT.md item 39). Printed to
+    stderr like the other refusals in this tool.
+    """
+    corruption = (
+        'Two cycles overlapping on one bus master consume each other\'s kernel "value ready" '
+        "marks: a cycle pays a fresh conversion for every sensor the other cycle claimed "
+        "first, and a read landing inside that conversion comes back empty. Measured "
+        "this way: 6377 ms/cycle and up to a third of the reads lost, against 1044 ms/cycle "
+        "and none once there was only one reader (PROJECT.md item 39). This is not a hardware "
+        "fault, and the numbers below would report it as one."
+    )
+    if outcome is ReaderLockOutcome.HELD:
         print(
-            f"{bus_dir.name}: {elapsed / cycles * 1000:.0f} ms/cycle over {cycles} cycles "
-            f"({tier} reads)"
+            f"refusing to measure: {lock_path} is held by another reader of these buses -- "
+            f"most likely aqua-bridge.service. {corruption}\n"
+            "Stop the daemon and run this again, or pass --force if you accept the numbers "
+            "will be wrong.",
+            file=sys.stderr,
         )
-    conv_times = sorted(set(onewire.conv_time_ms().values()))
-    if conv_times:
-        print(f"conversion time the driver reports at the configured resolution: {conv_times} ms")
-    for bus_name, roms in discover_other_families(onewire.root).items():
-        print(f"WARNING: {bus_name} carries {len(roms)} non-DS18B20 device(s): {roms}")
-
-    _print_read_stats(onewire.read_stats(), declared_but_absent=set(missing))
-
-    if release is not None:
-        release()
-    return 0
+    else:
+        print(
+            f"refusing to measure: cannot tell whether another reader has {lock_path} -- the "
+            "lock directory does not exist and could not be created, a permission error, or a "
+            f"filesystem without flock(2) support (see the log for which). {corruption}\n"
+            "Confirm nothing else is reading these buses, then pass --force.",
+            file=sys.stderr,
+        )
 
 
 def _print_read_stats(stats: Mapping[str, ReadStats], *, declared_but_absent: set[str]) -> None:
@@ -333,7 +415,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--identify", action="store_true", help="find which ROM id is the sensor you are warming"
     )
     group.add_argument(
-        "--check", action="store_true", help="verify bindings, cycle time and CRC error rate"
+        "--check",
+        action="store_true",
+        help=(
+            "verify bindings, cycle time and CRC error rate; refuses to measure if another "
+            "reader of these buses is detected, or cannot be ruled out (see --force)"
+        ),
     )
     p.add_argument("--config", help="config.yaml path (required with --check)")
     p.add_argument("--root", default=DEFAULT_ROOT, help=f"w1 sysfs root (default {DEFAULT_ROOT})")
@@ -343,6 +430,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--cycles", type=int, default=20, help="--check: read cycles per bus (default 20)"
+    )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "--check: measure even though another reader of these buses was detected, or "
+            "could not be ruled out. The numbers will be wrong in exactly the way PROJECT.md "
+            "item 39 describes if the daemon (or anything else) really is reading these buses "
+            "-- inflated cycle time, reads lost to a stolen conversion, reported as if it were "
+            "a hardware fault. Use only once you understand why the detection said what it did."
+        ),
     )
     return p
 
@@ -357,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.config:
         print("--check requires --config", file=sys.stderr)
         return 2
-    return cmd_check(args.config, cycles=args.cycles)
+    return cmd_check(args.config, cycles=args.cycles, force=args.force)
 
 
 if __name__ == "__main__":

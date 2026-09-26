@@ -4733,7 +4733,16 @@ a model converges only with them.
   unstarted, so the tool is the only reader on the bus while it measures
   (§8 item 39) — then reports the cycle time and read path per bus and,
   per sensor, how its reads turned out against its own `attempts`, with an
-  errno, an empty answer and an unusable value counted apart).
+  errno, an empty answer and an unusable value counted apart). Before
+  driving a single cycle, `--check` tries to take the same cross-process
+  `onewire.lock_path` lock (`hw/onewire.py`'s `ReaderLock`, `flock(2)`) the
+  daemon holds for as long as its reader threads run, and **refuses to
+  measure, saying why, if it cannot**: held (the daemon, most likely) or
+  simply unknown either way, both left to the operator rather than
+  measured through. `--force` overrides either refusal. `--list` /
+  `--identify` carry no such guard: their numbers are readings, not a rate
+  or a timing a concurrent daemon could make look like a hardware fault,
+  so a stray `(no reading)` is all a second reader costs them there.
 - `tools/aquacomputer_probe.py` (Pi, bring-up; replaces `sensors`): lists
   every discovered aquaero and Quadro (kind, serial, USB interface, node),
   then prints each one's status report (temperatures by group under their
@@ -5591,7 +5600,12 @@ the board.
   conversion wait is the slowest sensor's and grows if a sensor reports a
   finer resolution than the driver believes, and `stop()` closes the
   sockets. Also that both example configs account for every read-path key
-  at its one default.
+  at its one default. `ReaderLock`: acquired, then held for another
+  instance on the same path, free again after release, idempotent while
+  already ours, a no-op release without ever acquiring, "unknown" both when
+  the lock directory cannot be created and with `fcntl` itself patched out;
+  `start`/`stop` take and release it around the reader threads without
+  refusing to start when it is already held, only logging.
 - `tests/test_hw_w1_netlink.py` — the netlink framing against byte
   sequences captured on the board (`tests/w1_netlink_fakes.py`, ROM id
   replaced by a placeholder): each request is rebuilt byte for byte, the
@@ -5617,7 +5631,10 @@ the board.
   sensor, and a failed conversion reading nothing at all.
 - `tests/test_w1_commission.py` — `--list`, `--identify` ranking by
   warming rate, `--check` building the daemon's composite and naming the
-  tier its cycle time was measured on.
+  tier its cycle time was measured on; the reader-lock guard refuses when
+  the lock is held or unknown (an injected detector, and a real `flock(2)`
+  contention/unusable-path case), `--force` overrides, and the ordinary
+  path (nothing else reading) measures unchanged.
 - `tests/test_aquacomputer_probe.py` — the probe on a fake sysfs tree and
   fake controllers: listing, decoded output including the temperature
   groups, the aquaero output mode, the active profile, aquabus outputs with
@@ -9909,6 +9926,33 @@ Owner decision (2026-09-16):
     this bus, and a value that will not parse is neither — and a sensor with no
     attempts is printed as `no read attempted (not under any bus master)`.
 
+    **The second process, closed** (2026-09-26). The fix above makes
+    `--check` the only reader *in its own process*; a running
+    `aqua-bridge.service` is a second reader it could not see, and would
+    reproduce the same corruption reported as if it were the hardware's
+    fault. `hw/onewire.py` gained a `ReaderLock`: an advisory `flock(2)` on
+    `onewire.lock_path` (default `/run/aqua-bridge/onewire.lock`,
+    `deploy/aqua-bridge.service`'s `RuntimeDirectory=aqua-bridge` makes it
+    writable by `User=` without root), held by `W1Source.start` for as long
+    as its reader threads run and released by `stop`. `--check` tries to
+    take the same lock before it drives a single cycle and now refuses to
+    measure — saying why, not merely that something is running — when it
+    is held, and treats "cannot tell" (the lock directory does not exist and
+    could not be created, a permission error, a filesystem with no `flock`
+    support) the same way rather than guessing free; `--force` measures
+    anyway. This was preferred over asking `systemctl is-active
+    aqua-bridge.service` (the alternative this item's own proposals raised):
+    a unit lookup only ever answers for the one name it asks about, needs
+    systemd reachable, and says nothing about a foreground run, a renamed
+    unit or a container sharing this root, where an `flock` on a path every
+    reader opens does not care what called it or how. The daemon never
+    refuses to *start* over this lock — a diagnostic tool's lock must not
+    cost a zone its cooling (plan section 1 priority 1) — it only logs if it
+    could not be taken. `--list` / `--identify` were left unguarded: they
+    read the bus but publish readings, not a rate or a cycle time a
+    concurrent daemon could make look like a hardware fault, so a stray
+    `(no reading)` is the whole cost of a second reader there.
+
     Still open: the second bus carrying real sensors (it is still
     unterminated, with phantoms), the 12-per-bus split by zone pairs §2 asks
     for, and every ROM id bound with `--identify` rather than by position.
@@ -11871,10 +11915,16 @@ on a Zero W; the hardware steps are waiting for the aquaero.
      bus, the read path the driver gave it (netlink, bulk or serial,
      §8 item 38), the `conv_time` it reports and the cycle time, plus each
      sensor's failed reads against its own attempts over 20 cycles: aim for
-     < 1 % and a cycle under `max_age_s / 2` (§8 item 39). **Stop the
-     daemon first** if it is running: two readers on one bus master lose
-     about a third of the readings and cost six times the cycle time, and
-     reads that answer nothing at all are how that shows up here.
+     < 1 % and a cycle under `max_age_s / 2` (§8 item 39). It refuses to
+     measure — and says why — if the daemon (or anything else) appears to
+     be reading these buses, or if it cannot tell either way: it tries to
+     take the same `onewire.lock_path` lock the daemon holds while its
+     reader threads run, and two readers on one bus master lose about a
+     third of the readings and cost six times the cycle time, which is
+     exactly the wrong number this guard exists to keep `--check` from
+     reporting as a hardware fault. Run it as the same user as the daemon
+     (or root) so it can see that lock, same as step 8's
+     `aquacomputer_probe.py`; `--force` measures anyway if you are sure.
 10. One diagnostic tick as the service user:
     `.venv/bin/python -m aqua_bridge --config /etc/aqua-bridge/config.yaml --source composite --once`
     (legacy: without `--source`, which defaults to `xt6`) reads every

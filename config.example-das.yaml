@@ -928,6 +928,19 @@ onewire:
   # one line per bus in this many seconds, so a bus that stays over budget
   # does not flood the log.
   slow_cycle_log_interval_s: 60.0
+  # Where tools/w1_commission.py --check tries to take the same cross-process
+  # lock this daemon holds (hw/onewire.py ReaderLock, flock(2)) for as long as
+  # its reader threads run: --check refuses to measure if it cannot take this
+  # lock, because two cycles overlapping on one bus master consume each
+  # other's readings and the report would look like a hardware fault instead
+  # of what it is (PROJECT.md item 39). Preferred over asking systemd whether
+  # aqua-bridge.service is active -- an flock on a path every reader opens
+  # does not care what called it, a foreground run, a renamed unit or a
+  # container included, and needs no systemd reachable. deploy/aqua-bridge.
+  # service's RuntimeDirectory=aqua-bridge makes this default path writable by
+  # the daemon's User= without root; --check must run as that same user (or
+  # root) to see it, the same as tools/aquacomputer_probe.py.
+  lock_path: /run/aqua-bridge/onewire.lock
   sensors:               # logical name -> DS18B20 ROM id (tools/w1_commission.py --identify)
     inlet_b: 28-000000000001
     prox_b01: 28-000000000002

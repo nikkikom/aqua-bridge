@@ -444,7 +444,7 @@ digole:
 # (resolution_bits 12, read_tier auto, netlink_timeout_s 1.0, netlink_retry_s
 # 300.0, tier_failures_before_demote 3, bulk_read auto, bulk_timeout_s 2.0,
 # bulk_retry_s 300.0, poll_interval_s 0.02, slow_cycle_log_interval_s 60.0,
-# max_age_s 1.5 * mpc.dt).
+# max_age_s 1.5 * mpc.dt, lock_path /run/aqua-bridge/onewire.lock).
 # config.example-das.yaml has the section filled in and
 # documents every key; PROJECT.md section 3 has the schema.
 onewire:
