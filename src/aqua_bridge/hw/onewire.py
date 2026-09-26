@@ -37,11 +37,11 @@ kernel just did*, never a guess from config:
    kernel never gave a ``therm_bulk_read`` to, and on a master carrying
    family-``00`` phantoms that make the sysfs trigger a silent no-op. A bus
    takes this tier when the connector answers ``W1_LIST_MASTERS`` with this
-   master's id in it, every present sensor's 8-byte identifier is readable, and
-   every present sensor has a known ``conv_time``; it keeps it as long as the
-   conversion command and at least one scratchpad succeed. Anything else drops
-   it one tier for ``netlink_retry_s``, **and the same cycle still finishes on
-   the tier below, so no sample is lost**. Measured on the board, 7 sensors at
+   master's id in it and every present sensor's 8-byte identifier is readable;
+   it keeps it as long as the conversion command and at least one scratchpad
+   succeed. What takes it away is described under "Giving up a tier" below,
+   **and the same cycle still finishes on the tier below, so no sample is
+   lost**. Measured on the board, 7 sensors at
    12 bit (the owner swaps sensors in and out, so the count belongs with the
    numbers): 6 ms for the conversion command, 16 ms per scratchpad, 876 ms per
    cycle against 904 ms for sysfs bulk and 5664 ms read one at a time; at 10
@@ -101,6 +101,36 @@ reason, and **the same cycle finishes with serial reads so no sample is
 lost**. Nothing here waits on a signal that may never come, and the one
 bounded wait's timeout is a config key.
 
+**Giving up a tier: what counts as evidence (section 8 item 39).** A tier is
+worth keeping, so it is not surrendered on one bad cycle. Two things decide
+it, and both are about *granularity*:
+
+* **Whose failure is it?** One sensor's is that sensor's. A scratchpad that
+  does not come back, or an attribute that cannot be read, is ``None`` (or a
+  documented fallback) for that sensor and nothing at all for the fifteen
+  beside it. Only a failure of the *bus* -- no connector on this kernel, a
+  master the connector does not list, a conversion command that failed, a
+  socket error, or **every** sensor on the bus failing at once -- is evidence
+  about the bus, and only that may move the whole bus down a tier. In
+  particular a sensor with no readable ``conv_time`` does **not** cost the bus
+  its tier: the bus-wide wait falls back to the conversion time of the
+  configured ``resolution_bits``, which is an upper bound for anything at or
+  below that resolution, and the read-back is retried on later cycles instead
+  of the absence being cached for the life of the process. (It was the other
+  way round until section 8 item 39, and it cost the owner's 14-sensor bus its
+  top tier on a sensor that reports ``conv_time=750`` when asked directly.)
+* **How many times?** ``tier_failures_before_demote`` (default 3) consecutive
+  cycles must fail on a tier before the bus drops off it for its retry window;
+  a success resets the count. A failing probe costs one command and the cycle
+  still finishes below, so trying twice more is cheap -- while a demotion
+  costs the *fastest* tier for five minutes, and on a bus whose floor is
+  serial reads that is measured in samples the control loop never sees
+  (section 8 item 39, "What a demoted bus costs"). The exception is evidence
+  that cannot change by being asked again -- this kernel has no ``w1``
+  connector, this master is not in its list, this bus master has no
+  ``therm_bulk_read`` file -- which demotes at once and is retried on the
+  usual window like anything else.
+
 That fallback also covers two upstream defects the kernel reports only to
 its own log (section 8 item 38):
 
@@ -120,10 +150,46 @@ its own log (section 8 item 38):
   failed probe costs one write that returns immediately and two reads.
 
 One reader thread per bus master runs :meth:`W1Source.run_bus_cycle` in a
-loop. A read that raises ``OSError`` (the kernel reports EIO for a failed
-CRC) or does not parse as an integer becomes ``None`` for that sensor this
-cycle, counted in :meth:`crc_error_counts` for
-``tools/w1_commission.py --check``.
+loop. A read that fails becomes ``None`` for that sensor this cycle and is
+counted, by *why* it failed, in :meth:`W1Source.read_stats` for
+``tools/w1_commission.py --check``: ``errors`` is an ``OSError`` from the
+read (the kernel reports EIO for a failed CRC) or a netlink scratchpad that
+did not come back, ``empty`` is a ``temperature`` attribute that answered
+with **nothing at all**, and ``rejected`` is an answer that is not a number
+this module will publish. ``attempts`` is counted with them, so a rate has
+the denominator that belongs to it: a sensor no cycle ever reached (it is
+not under any bus master) has none, which is a different report from a
+sensor that was read and answered every time.
+
+**One cycle at a time per bus master (section 8 item 39).** A bus-wide cycle
+*owns* its bus master from the conversion it starts to the last scratchpad it
+reads, and the kernel keeps that ownership in one flag per slave: a bulk
+trigger sets "converting" on every slave on the master, the conversion sets
+"a value nobody has read yet", and the **first** read of that slave's
+``temperature`` consumes it. So two cycles overlapping on one bus master do
+not merely compete for the wire, they eat each other's readings, and both
+halves of that were measured on the board (14 sensors, one bit-banged bus,
+12 bit):
+
+* whichever cycle reads a slave first gets its scratchpad in 18 ms; the other
+  finds the flag consumed and its read starts **its own** conversion, 800 ms
+  (measured: 18 ms for the first read after a trigger, 800 ms for the second
+  and third). Enough of those and a cycle that should cost 1.0 s costs 6.4 s.
+* a read that lands while the *other* cycle's Convert T is in flight gets an
+  **empty** string back, not an error and not a number -- and since that
+  conversion holds the bus for 765 ms, so does every read left in this cycle:
+  the whole tail of the cycle is lost at once (measured: two sensors read,
+  twelve empty, from one trigger by a second reader).
+
+That is what :meth:`run_bus_cycle` is serialised against: it takes a lock per
+bus master name for the whole cycle, so a second caller **waits** instead of
+reading into the middle of a cycle, and says so once per bus in the log --
+two readers on one bus is a programming mistake, not a bus fault, and the
+symptom (a third of the readings gone, six times the cycle time) looks
+exactly like bad wiring. The lock covers this process only; a second *process*
+reading the same bus -- ``tools/w1_commission.py`` against a running daemon --
+cannot be locked out, which is why ``empty`` is counted and named apart.
+``read()`` never takes this lock, so nothing here can hold up a tick.
 
 :meth:`W1Source.read` (called from the control loop thread) never touches
 the filesystem and never blocks: it returns the latest published sample for
@@ -172,11 +238,11 @@ import math
 import threading
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from aqua_bridge.hw.w1_netlink import W1Netlink, W1NetlinkError
+from aqua_bridge.hw.w1_netlink import W1Netlink, W1NetlinkError, W1NetlinkUnavailable
 from aqua_bridge.hw.w1_therm_netlink import (
     CONVERSION_TIME_S,
     ScratchpadError,
@@ -186,7 +252,7 @@ from aqua_bridge.hw.w1_therm_netlink import (
 )
 from aqua_bridge.model import ConfigError
 
-__all__ = ["W1Source", "build_onewire_from_config"]
+__all__ = ["ReadStats", "W1Source", "build_onewire_from_config"]
 
 _LOG = logging.getLogger("aqua_bridge.hw.onewire")
 
@@ -319,6 +385,18 @@ _DEFAULT_NETLINK_TIMEOUT_S = 1.0
 # (a sensor pulled out mid-cycle, a kernel busy elsewhere) can go away again,
 # and a failed probe costs one command that returns in milliseconds.
 _DEFAULT_NETLINK_RETRY_S = 300.0
+#: How many consecutive cycles must fail on a tier before the bus is dropped off
+#: it for that tier's retry window (module docstring, "Giving up a tier"). One
+#: failed cycle is not evidence about a tier: it can be a kernel busy elsewhere,
+#: a sensor pulled out mid-cycle, or a second reader of the same bus in another
+#: process. Retrying is cheap -- a failed probe is one command and the same cycle
+#: still finishes on the tier below -- and a demotion is expensive: five minutes
+#: (``netlink_retry_s`` / ``bulk_retry_s``) on a slower tier, which on a bus whose
+#: floor is serial reads means sensors reading as missing on some ticks (section 8
+#: item 39). Three consecutive failures is about 15 s of evidence at ``dt = 5 s``,
+#: and evidence that cannot change by asking again (no connector, no such master,
+#: no ``therm_bulk_read``) demotes at once regardless.
+_DEFAULT_TIER_FAILURES_BEFORE_DEMOTE = 3
 # How often the slow-cycle warning (module docstring, "A cycle over budget")
 # may repeat for one bus once it is past its budget. Same default and the
 # same argument as control/loop.py's mpc.budget_log_interval_s: frequent
@@ -331,6 +409,47 @@ _DEFAULT_SLOW_CYCLE_LOG_INTERVAL_S = 60.0
 class _Sample:
     value: float | None
     ts: float
+
+
+@dataclass
+class ReadStats:
+    """One sensor's read outcomes since construction (:meth:`W1Source.read_stats`).
+
+    Counted apart because they are different faults with different owners, and
+    a single "failed reads" number hides which one is happening (section 8
+    item 39):
+
+    attempts:
+        Reads this module actually issued for this ROM id. Zero means no cycle
+        ever reached the sensor -- it is declared in config but not under any
+        bus master -- which is a *binding* report, not a reliability one, and
+        must never be shown as a 0 % failure rate.
+    errors:
+        The read raised ``OSError`` (``w1_therm`` reports EIO when the
+        scratchpad fails its CRC in the kernel), or, on the netlink tier, the
+        scratchpad did not come back or failed the CRC check this module does
+        itself. The sensor or its wiring.
+    empty:
+        The ``temperature`` attribute answered with nothing at all. The kernel
+        does that while a bulk conversion it started is still in flight, so
+        this is the signature of a *second reader* on the same bus master --
+        another process, since one process serialises its own cycles (module
+        docstring, "One cycle at a time per bus master").
+    rejected:
+        The read answered, and the answer is not a temperature this module will
+        publish (it does not parse as an integer, or does not survive being
+        turned into a finite number of degrees).
+    """
+
+    attempts: int = 0
+    errors: int = 0
+    empty: int = 0
+    rejected: int = 0
+
+    @property
+    def failed(self) -> int:
+        """Reads that produced no value, whatever the reason."""
+        return self.errors + self.empty + self.rejected
 
 
 class W1Source:
@@ -350,8 +469,9 @@ class W1Source:
         that -- not every cycle: a scratchpad write is not free and the value
         does not change on its own), so it is also the resolution a bus keeps
         while it is demoted down the tier ladder. The driver's own
-        ``conv_time`` is read back afterwards and reported by
-        :meth:`conv_time_ms`.
+        ``conv_time`` is read back afterwards -- and asked again on later
+        cycles while it has not answered, since that read costs no bus
+        traffic -- and reported by :meth:`conv_time_ms`.
     max_age_s:
         :meth:`read` reports ``None`` for a sensor whose latest sample is
         older than this.
@@ -381,6 +501,12 @@ class W1Source:
     netlink_retry_s:
         How long a bus that failed the netlink tier stays on the tier below
         before it is tried again.
+    tier_failures_before_demote:
+        How many consecutive cycles must fail on a tier before the bus is
+        dropped off it (module docstring, "Giving up a tier";
+        :data:`_DEFAULT_TIER_FAILURES_BEFORE_DEMOTE` for the argument). 1
+        restores the old "one bad cycle is enough". Evidence that cannot
+        change by asking again demotes on the first cycle whatever this says.
     slow_cycle_log_interval_s:
         At most one "cycle over budget" warning per bus in this many seconds
         (module docstring); the first exceedance for a bus always logs.
@@ -405,6 +531,7 @@ class W1Source:
         read_tier: str = _DEFAULT_READ_TIER,
         netlink_timeout_s: float = _DEFAULT_NETLINK_TIMEOUT_S,
         netlink_retry_s: float = _DEFAULT_NETLINK_RETRY_S,
+        tier_failures_before_demote: int = _DEFAULT_TIER_FAILURES_BEFORE_DEMOTE,
         slow_cycle_log_interval_s: float = _DEFAULT_SLOW_CYCLE_LOG_INTERVAL_S,
         netlink_factory: Callable[[], W1Netlink] | None = None,
     ) -> None:
@@ -433,6 +560,11 @@ class W1Source:
             raise ConfigError(f"onewire netlink_timeout_s must be > 0, got {netlink_timeout_s}")
         if not netlink_retry_s > 0:
             raise ConfigError(f"onewire netlink_retry_s must be > 0, got {netlink_retry_s}")
+        if not tier_failures_before_demote >= 1:
+            raise ConfigError(
+                "onewire tier_failures_before_demote must be >= 1, got "
+                f"{tier_failures_before_demote}"
+            )
         if not slow_cycle_log_interval_s > 0:
             raise ConfigError(
                 f"onewire slow_cycle_log_interval_s must be > 0, got {slow_cycle_log_interval_s}"
@@ -453,6 +585,7 @@ class W1Source:
         self._read_tier = read_tier
         self._netlink_timeout_s = float(netlink_timeout_s)
         self._netlink_retry_s = float(netlink_retry_s)
+        self._tier_failures_before_demote = int(tier_failures_before_demote)
         self._slow_cycle_log_interval_s = float(slow_cycle_log_interval_s)
         self._netlink_factory = netlink_factory
 
@@ -460,8 +593,22 @@ class W1Source:
         self._latest: dict[str, _Sample] = {}
         self._configured_resolution: set[str] = set()
         self._conv_time_ms: dict[str, int] = {}
-        self._crc_errors: dict[str, int] = dict.fromkeys(self._rom_to_names, 0)
+        # ROM ids whose conv_time could not be read yet and so run on the
+        # configured resolution's conversion time (logged once each, not per
+        # cycle: the read-back is retried every cycle until it answers).
+        self._conv_time_fallback_logged: set[str] = set()
+        self._read_stats: dict[str, ReadStats] = {rom: ReadStats() for rom in self._rom_to_names}
         self._cycle_counts: dict[str, int] = {}
+        # One cycle at a time per bus master (module docstring, "One cycle at a
+        # time per bus master"): a bus-wide cycle owns its master from the
+        # conversion to the last scratchpad, so a second caller waits here
+        # rather than reading into the middle of one. Created on demand under
+        # _cycle_locks_guard because buses are discovered, not declared, and
+        # logged once per bus when it is actually contended -- two readers on
+        # one bus is a programming mistake worth a line, not a bus fault.
+        self._cycle_locks_guard = threading.Lock()
+        self._cycle_locks: dict[str, threading.Lock] = {}
+        self._contention_logged: set[str] = set()
         # Bus master name -> when a slow-cycle warning was last logged for it,
         # and how many exceedances have happened since (module docstring, "A
         # cycle over budget"; same bookkeeping shape as control/loop.py's step
@@ -469,9 +616,12 @@ class W1Source:
         self._slow_cycle_logged_at: dict[str, float] = {}
         self._slow_cycle_since_log: dict[str, int] = {}
         # Bus master name -> whether the bulk path is in use on it (absent: not
-        # probed yet), and when a bus that failed may be probed again.
+        # probed yet), when a bus that failed may be probed again, and how many
+        # cycles in a row have failed on it without a demotion yet (module
+        # docstring, "Giving up a tier").
         self._bulk_ok: dict[str, bool] = {}
         self._bulk_retry_at: dict[str, float] = {}
+        self._bulk_failures: dict[str, int] = {}
         # The same, for the netlink tier, plus the socket each bus reads over
         # (one per reader thread: a netlink socket carries one exchange at a
         # time), the identifiers slaves are addressed by, the resolution each
@@ -479,6 +629,7 @@ class W1Source:
         # numbers came from.
         self._netlink_ok: dict[str, bool] = {}
         self._netlink_retry_at: dict[str, float] = {}
+        self._netlink_failures: dict[str, int] = {}
         self._transports: dict[str, W1Netlink] = {}
         self._slave_ids: dict[str, bytes] = {}
         self._observed_bits: dict[str, int] = {}
@@ -517,7 +668,50 @@ class W1Source:
         docstring. A cycle that runs to completion and took longer than the
         bus's budget logs a rate-limited warning (module docstring, "A cycle
         over budget").
+
+        **One cycle at a time per bus master.** A cycle owns its bus master
+        from the conversion it starts to the last scratchpad it reads (module
+        docstring, "One cycle at a time per bus master"), so a call that
+        arrives while another cycle is running on the same bus *waits* for it
+        instead of reading into the middle of it. Two cycles that do overlap
+        consume each other's readings and multiply the cycle time, which is
+        what section 8 item 39 measured, so the wait is the point -- and it is
+        bounded by one cycle on that bus. :meth:`read` takes no part in this
+        and never blocks.
         """
+        lock = self._cycle_lock(bus_dir.name)
+        if not lock.acquire(blocking=False):
+            self._log_contention(bus_dir.name)
+            lock.acquire()
+        try:
+            return self._run_one_cycle(bus_dir)
+        finally:
+            lock.release()
+
+    def _cycle_lock(self, bus_name: str) -> threading.Lock:
+        """The one lock that serialises cycles on ``bus_name``, created on demand."""
+        with self._cycle_locks_guard:
+            lock = self._cycle_locks.get(bus_name)
+            if lock is None:
+                lock = threading.Lock()
+                self._cycle_locks[bus_name] = lock
+            return lock
+
+    def _log_contention(self, bus_name: str) -> None:
+        """Says once per bus that two cycles overlapped on it."""
+        if bus_name in self._contention_logged:
+            return
+        self._contention_logged.add(bus_name)
+        _LOG.warning(
+            "onewire: two read cycles overlapped on %s; they are serialised, but one reader "
+            "per bus is the contract -- a second reader in another process (a commissioning "
+            "tool against a running daemon) loses about a third of the readings and costs six "
+            "times the cycle time; PROJECT.md item 39",
+            bus_name,
+        )
+
+    def _run_one_cycle(self, bus_dir: Path) -> dict[str, float | None]:
+        """One cycle on ``bus_dir``, with this bus master's cycle lock held."""
         present = {rom: bus_dir / rom for rom in self._rom_to_names if (bus_dir / rom).is_dir()}
         if not present:
             self._tier[bus_dir.name] = _TIER_NONE
@@ -545,12 +739,13 @@ class W1Source:
             # stop request is before writing it, not during. Same "abandoned
             # cycle publishes nothing" contract as the netlink tier above.
             return {}
+        triggered = False
         if (
             self._bulk_read != "off"
             and self._read_tier != _TIER_SERIAL
             and self._bulk_probe_due(bus_dir.name)
         ):
-            self._bulk_convert(bus_dir)
+            triggered = self._bulk_convert(bus_dir)
         result: dict[str, float | None] = {}
         for rom, slave_dir in present.items():
             if self._stop.is_set():
@@ -566,7 +761,7 @@ class W1Source:
             value = self._read_temperature(slave_dir, rom)
             for name in self._rom_to_names[rom]:
                 result[name] = value
-        tier = self._sysfs_tier(bus_dir.name)
+        tier = self._sysfs_tier(triggered=triggered)
         self._tier[bus_dir.name] = tier
         self._check_slow_cycle(bus_dir.name, start, len(present), tier)
         return result
@@ -618,10 +813,17 @@ class W1Source:
             return True
         return self._clock() >= self._netlink_retry_at.get(bus_name, 0.0)
 
-    def _sysfs_tier(self, bus_name: str) -> str:
-        if self._bulk_read == "off" or self._read_tier == _TIER_SERIAL:
-            return _TIER_SERIAL
-        return _TIER_BULK if self._bulk_ok.get(bus_name) else _TIER_SERIAL
+    def _sysfs_tier(self, *, triggered: bool) -> str:
+        """Which sysfs tier this cycle actually ran on.
+
+        The bus-wide conversion of *this* cycle, not whether the tier is still
+        allowed: a trigger the kernel refused leaves every following read
+        converting on its own, which is a serial cycle whatever
+        ``tier_failures_before_demote`` has decided about the tier. A cycle time
+        reported against the wrong tier is worse than no number
+        (``tools/w1_commission.py --check``).
+        """
+        return _TIER_BULK if triggered else _TIER_SERIAL
 
     def _netlink_cycle(
         self, bus_dir: Path, present: Mapping[str, Path]
@@ -649,7 +851,19 @@ class W1Source:
             read = therm.read_bus(
                 master_id, targets, conversion_s=conversion_s, timeout_s=self._netlink_timeout_s
             )
-        except (W1NetlinkError, ScratchpadError, OSError, ValueError) as exc:
+        except (W1NetlinkUnavailable, ValueError) as exc:
+            # The tier is not there to be had on this bus: this kernel has no w1
+            # connector (W1NetlinkUnavailable), or the connector does not list
+            # this master at all (ValueError, the only source of one here now
+            # that a missing conv_time no longer raises). Asking again in the
+            # same minute cannot change either, so this does not wait for a
+            # count; the usual retry window still re-probes it.
+            self._close_transport(bus_name)
+            self._demote_netlink(bus_dir, str(exc), structural=True)
+            return None
+        except (W1NetlinkError, ScratchpadError, OSError) as exc:
+            # A timeout, a status, a malformed reply, a socket that erred: all
+            # things a busy kernel or a sensor pulled out mid-cycle can do once.
             # A fresh socket next time: one that erred may have a reply to this
             # cycle still queued behind it, and a new port id has no backlog.
             self._close_transport(bus_name)
@@ -672,17 +886,25 @@ class W1Source:
                 conversion_s,
             )
         self._netlink_ok[bus_name] = True
+        self._netlink_failures[bus_name] = 0
         self._tier[bus_name] = _TIER_NETLINK
         result: dict[str, float | None] = {}
         for rom, reading in read.readings.items():
+            stats = self._stats_of(rom)
+            stats.attempts += 1
             if reading is None:
-                self._crc_errors[rom] = self._crc_errors.get(rom, 0) + 1
+                # A scratchpad that did not come back or failed its CRC: this
+                # sensor's fault, counted as an error like an EIO from sysfs.
+                # There is no "empty" on this tier -- a netlink read either
+                # carries nine bytes or raises.
+                stats.errors += 1
                 _LOG.debug("onewire: %s over netlink: %s", rom, read.failures.get(rom))
                 value: float | None = None
             else:
                 self._observed_bits[rom] = reading.resolution_bits
                 value = reading.temperature_c
                 if not math.isfinite(value):
+                    stats.rejected += 1
                     value = None
             for name in self._rom_to_names[rom]:
                 result[name] = value
@@ -758,19 +980,71 @@ class W1Source:
         sensor that has already been read this way -- the conversion time of
         the resolution it reported about *itself*, whichever is longer: a
         ``resolution`` write that silently failed would otherwise have us read
-        the conversion before last. A sensor with no ``conv_time`` yet has not
-        answered the driver at all, which is not a bus to run this tier on.
+        the conversion before last.
+
+        A sensor whose ``conv_time`` has not been read yet contributes the
+        conversion time of the configured ``resolution_bits`` instead, which is
+        an upper bound for any sensor at or below that resolution -- so the
+        wait is still long enough for it, and one unreadable attribute on one
+        sensor costs the bus nothing. That attribute is retried every cycle
+        (:meth:`_ensure_resolution`); until it answers, this logs once per
+        sensor. Until section 8 item 39 this raised instead, and the bus lost
+        its fastest tier for five minutes over a sensor that answers
+        ``conv_time`` perfectly well when asked again.
         """
+        fallback_s = CONVERSION_TIME_S.get(self._resolution_bits, max(CONVERSION_TIME_S.values()))
         waits: list[float] = []
         for rom in present:
             conv_time_ms = self._conv_time_ms.get(rom)
             if conv_time_ms is None:
-                raise ValueError(f"{rom} reports no {_CONV_TIME_FILE}")
+                if rom not in self._conv_time_fallback_logged:
+                    self._conv_time_fallback_logged.add(rom)
+                    _LOG.info(
+                        "onewire: %s has not reported %s yet; the bus-wide conversion waits "
+                        "%.3f s for it, the configured %d-bit time, until it does",
+                        rom,
+                        _CONV_TIME_FILE,
+                        fallback_s,
+                        self._resolution_bits,
+                    )
+                sensor_s = fallback_s
+            else:
+                sensor_s = conv_time_ms / 1000.0
             observed = self._observed_bits.get(rom)
-            waits.append(max(conv_time_ms / 1000.0, CONVERSION_TIME_S.get(observed or 0, 0.0)))
+            waits.append(max(sensor_s, CONVERSION_TIME_S.get(observed or 0, 0.0)))
         return max(waits)
 
-    def _demote_netlink(self, bus_dir: Path, reason: str) -> None:
+    def _tier_failure_is_enough(
+        self, bus_name: str, counts: dict[str, int], tier: str, reason: str, *, structural: bool
+    ) -> bool:
+        """Counts this cycle's failure on a tier and says whether to give the tier up.
+
+        Module docstring, "Giving up a tier": ``tier_failures_before_demote``
+        consecutive failing cycles are the evidence, unless the failure is one
+        that cannot change by asking again. A cycle that fails without
+        demoting still finishes on the tier below, so nothing is lost while the
+        evidence is collected -- what is spent is one more failed probe.
+        """
+        failures = counts.get(bus_name, 0) + 1
+        counts[bus_name] = failures
+        if structural or failures >= self._tier_failures_before_demote:
+            return True
+        _LOG.info(
+            "onewire: %s failed the %s tier (%s); %d of %d consecutive failures, keeping the "
+            "tier and finishing this cycle on the one below; PROJECT.md item 39",
+            bus_name,
+            tier,
+            reason,
+            failures,
+            self._tier_failures_before_demote,
+        )
+        return False
+
+    def _demote_netlink(self, bus_dir: Path, reason: str, *, structural: bool = False) -> None:
+        if not self._tier_failure_is_enough(
+            bus_dir.name, self._netlink_failures, _TIER_NETLINK, reason, structural=structural
+        ):
+            return
         first = self._netlink_ok.get(bus_dir.name) is not False
         self._netlink_ok[bus_dir.name] = False
         self._netlink_retry_at[bus_dir.name] = self._clock() + self._netlink_retry_s
@@ -817,37 +1091,63 @@ class W1Source:
         return out
 
     def conv_time_ms(self) -> dict[str, int]:
-        """ROM id -> the driver's own ``conv_time`` after ``resolution`` was written."""
+        """ROM id -> the driver's own ``conv_time``, for the ids that have reported one.
+
+        A ROM id missing here has not answered that attribute *yet*: it is asked
+        again every cycle, and meanwhile the bus-wide conversion waits the
+        configured resolution's time for it (:meth:`_conversion_s`).
+        """
         return dict(self._conv_time_ms)
 
     def _ensure_resolution(self, present: Mapping[str, Path]) -> None:
+        """Writes the configured resolution once per sensor and learns its ``conv_time``.
+
+        Two facts, kept apart on purpose (module docstring, "Giving up a
+        tier"). The ``resolution`` write and its read-back happen **once** per
+        sensor: both are scratchpad traffic, and the value does not change on
+        its own. Whether this module knows the sensor's ``conv_time`` is a
+        different question, and its answer can be "not yet": that attribute is
+        a value the driver already holds, so reading it costs no bus traffic,
+        and it is asked again on every cycle until it answers rather than its
+        absence being cached for the life of the process. A transient failure
+        to read one attribute of one sensor used to cost the whole bus its
+        fastest tier for five minutes (section 8 item 39).
+        """
         for rom, slave_dir in present.items():
-            if rom in self._configured_resolution:
+            if rom not in self._configured_resolution:
+                self._configured_resolution.add(rom)
+                try:
+                    (slave_dir / _RESOLUTION_FILE).write_text(str(self._resolution_bits))
+                except OSError as exc:
+                    # Most likely the udev rule of deploy/99-w1-therm.rules has
+                    # not applied: resolution is root-owned and the service user
+                    # is not root. The sensor still reads, at whatever resolution
+                    # it has, so this is a warning and not a reason to drop the
+                    # bus.
+                    _LOG.warning("onewire: cannot set resolution for %s: %s", rom, exc)
+                try:
+                    readback = (slave_dir / _RESOLUTION_FILE).read_text().strip()
+                except OSError as exc:
+                    _LOG.debug("onewire: cannot read back resolution for %s: %s", rom, exc)
+                else:
+                    if readback != str(self._resolution_bits):
+                        _LOG.warning(
+                            "onewire: %s reports resolution %s bits, not the configured %d",
+                            rom,
+                            readback,
+                            self._resolution_bits,
+                        )
+                    _LOG.debug("onewire: %s at %s bits", rom, readback)
+            if rom in self._conv_time_ms:
                 continue
-            self._configured_resolution.add(rom)
             try:
-                (slave_dir / _RESOLUTION_FILE).write_text(str(self._resolution_bits))
-            except OSError as exc:
-                # Most likely the udev rule of deploy/99-w1-therm.rules has not
-                # applied: resolution is root-owned and the service user is not
-                # root. The sensor still reads, at whatever resolution it has,
-                # so this is a warning and not a reason to drop the bus.
-                _LOG.warning("onewire: cannot set resolution for %s: %s", rom, exc)
-            try:
-                readback = (slave_dir / _RESOLUTION_FILE).read_text().strip()
                 conv_time = int((slave_dir / _CONV_TIME_FILE).read_text().strip())
             except (OSError, ValueError) as exc:
-                _LOG.debug("onewire: cannot read back resolution/conv_time for %s: %s", rom, exc)
+                _LOG.debug("onewire: cannot read %s for %s: %s", _CONV_TIME_FILE, rom, exc)
                 continue
             self._conv_time_ms[rom] = conv_time
-            if readback != str(self._resolution_bits):
-                _LOG.warning(
-                    "onewire: %s reports resolution %s bits, not the configured %d",
-                    rom,
-                    readback,
-                    self._resolution_bits,
-                )
-            _LOG.debug("onewire: %s at %s bits, conv_time %d ms", rom, readback, conv_time)
+            self._conv_time_fallback_logged.discard(rom)
+            _LOG.debug("onewire: %s reports conv_time %d ms", rom, conv_time)
 
     def _bulk_probe_due(self, bus_name: str) -> bool:
         """Whether this cycle may trigger a bulk read on ``bus_name``."""
@@ -855,7 +1155,11 @@ class W1Source:
             return True
         return self._clock() >= self._bulk_retry_at.get(bus_name, 0.0)
 
-    def _demote_bulk(self, bus_dir: Path, reason: str) -> None:
+    def _demote_bulk(self, bus_dir: Path, reason: str, *, structural: bool = False) -> None:
+        if not self._tier_failure_is_enough(
+            bus_dir.name, self._bulk_failures, _TIER_BULK, reason, structural=structural
+        ):
+            return
         first = self._bulk_ok.get(bus_dir.name) is not False
         self._bulk_ok[bus_dir.name] = False
         self._bulk_retry_at[bus_dir.name] = self._clock() + self._bulk_retry_s
@@ -877,30 +1181,41 @@ class W1Source:
             _LOG.debug("onewire: cannot read %s: %s", trigger_path, exc)
             return None
 
-    def _bulk_convert(self, bus_dir: Path) -> None:
-        """Triggers one bulk conversion on ``bus_dir`` and checks it completed.
+    def _bulk_convert(self, bus_dir: Path) -> bool:
+        """Triggers one bulk conversion on ``bus_dir``; True if it registered.
 
         The kernel's implementation converts inside the ``write()``, so the
         status is read **once** afterwards and is expected to be ``1``; ``-1``
         is polled out under ``bulk_timeout_s`` for an implementation that
-        returns early. Anything else drops the bus to serial reads (retried
-        after ``bulk_retry_s``), and the caller's per-slave reads -- which then
-        each run their own conversion -- still produce this cycle's readings.
-        Never raises.
+        returns early. Anything else counts a failure against the tier (module
+        docstring, "Giving up a tier": ``tier_failures_before_demote``
+        consecutive ones drop the bus to serial reads for ``bulk_retry_s``, and
+        evidence that cannot change -- no such attribute -- drops it at once),
+        and either way the caller's per-slave reads still produce this cycle's
+        readings, each running its own conversion. False also means "this cycle
+        was a serial one", whatever the tier's standing. Never raises.
         """
         trigger_path = bus_dir / _TRIGGER_FILE
         before = self._read_bulk_state(trigger_path)
         if before is None:
-            self._demote_bulk(bus_dir, f"{_TRIGGER_FILE} is absent or unreadable")
-            return
+            # No such file is structural -- only one master system-wide gets one
+            # (module docstring) and that does not change while we watch. One
+            # that exists but would not read is a failure like any other.
+            absent = not trigger_path.exists()
+            self._demote_bulk(
+                bus_dir,
+                f"{_TRIGGER_FILE} is {'absent' if absent else 'unreadable'}",
+                structural=absent,
+            )
+            return False
         if before not in _BULK_STATES:
             self._demote_bulk(bus_dir, f"{_TRIGGER_FILE} reads {before!r}, not a w1_therm state")
-            return
+            return False
         try:
             trigger_path.write_bytes(_BULK_TRIGGER)
         except OSError as exc:
             self._demote_bulk(bus_dir, f"trigger write failed: {exc}")
-            return
+            return False
         state = self._read_bulk_state(trigger_path)
         if state == _BULK_IDLE:
             # The ABI's "no bulk conversion pending" after a write the kernel
@@ -913,37 +1228,71 @@ class W1Source:
                 f"{_TRIGGER_FILE} still {_BULK_IDLE!r} after the trigger: the kernel refused it, "
                 "look for 'unable to trigger a bulk read' and a phantom slave in dmesg",
             )
-            return
+            return False
         deadline = self._clock() + self._bulk_timeout_s
         while state == _BULK_RUNNING:
             if self._stop.is_set():
                 # Shutting down: leave the bus as it is (the driver finishes the
                 # conversion on its own) rather than spinning out the deadline.
-                return
+                return False
             if self._clock() >= deadline:
                 self._demote_bulk(
                     bus_dir, f"conversion unfinished after bulk_timeout_s={self._bulk_timeout_s} s"
                 )
-                return
+                return False
             self._stop.wait(self._poll_interval_s)
             state = self._read_bulk_state(trigger_path)
         if state != _BULK_DONE:
             self._demote_bulk(bus_dir, f"{_TRIGGER_FILE} reads {state!r} mid-conversion")
-            return
+            return False
         if self._bulk_ok.get(bus_dir.name) is False:
             _LOG.info("onewire: %s honours the bulk trigger again", bus_dir.name)
         self._bulk_ok[bus_dir.name] = True
+        self._bulk_failures[bus_dir.name] = 0
+        return True
+
+    def _stats_of(self, rom: str) -> ReadStats:
+        """The mutable counters for ``rom`` (:class:`ReadStats`), created on demand."""
+        stats = self._read_stats.get(rom)
+        if stats is None:
+            stats = ReadStats()
+            self._read_stats[rom] = stats
+        return stats
 
     def _read_temperature(self, slave_dir: Path, rom: str) -> float | None:
+        """One sysfs ``temperature`` read, counted by outcome (:class:`ReadStats`)."""
+        stats = self._stats_of(rom)
+        stats.attempts += 1
         try:
             raw = (slave_dir / _TEMPERATURE_FILE).read_text().strip()
-            milli = int(raw)
-        except (OSError, ValueError) as exc:
-            self._crc_errors[rom] = self._crc_errors.get(rom, 0) + 1
+        except OSError as exc:
+            stats.errors += 1
             _LOG.debug("onewire: read failed for %s: %s", rom, exc)
             return None
-        value = milli / 1000.0
-        return value if math.isfinite(value) else None
+        if not raw:
+            # Nothing at all, which is not the same as a failure: the kernel
+            # answers an empty read while a bulk conversion it started is in
+            # flight, so this says another reader is converting on this bus
+            # (module docstring, "One cycle at a time per bus master"). One
+            # process cannot do this to itself any more; another can.
+            stats.empty += 1
+            _LOG.debug(
+                "onewire: %s answered an empty %s -- a bulk conversion is in flight on this "
+                "bus, started by someone else",
+                rom,
+                _TEMPERATURE_FILE,
+            )
+            return None
+        try:
+            value = int(raw) / 1000.0
+        except (ValueError, OverflowError) as exc:
+            stats.rejected += 1
+            _LOG.debug("onewire: %s answered %r, not a temperature: %s", rom, raw, exc)
+            return None
+        if not math.isfinite(value):
+            stats.rejected += 1
+            return None
+        return value
 
     def _publish(self, result: Mapping[str, float | None]) -> None:
         ts = self._clock()
@@ -1026,9 +1375,18 @@ class W1Source:
 
     # -- diagnostics (tools/w1_commission.py) ------------------------------------
 
-    def crc_error_counts(self) -> dict[str, int]:
-        """Failed reads per ROM id since construction (``tools/w1_commission.py --check``)."""
-        return dict(self._crc_errors)
+    def read_stats(self) -> dict[str, ReadStats]:
+        """ROM id -> its read outcomes since construction (:class:`ReadStats`).
+
+        Every declared ROM id has an entry, whether or not any cycle ever
+        reached it: ``attempts`` is what a failure rate has to be measured
+        against, and a sensor with none was never on a bus to be read
+        (``tools/w1_commission.py --check`` prints the difference). Snapshot
+        copies, so a caller cannot move our counters; taken without the
+        publish lock, so a concurrent cycle may be counted mid-sensor -- these
+        are diagnostics, not the reading path.
+        """
+        return {rom: replace(stats) for rom, stats in self._read_stats.items()}
 
     def cycle_counts(self) -> dict[str, int]:
         """Completed read cycles per bus master name since :meth:`start`."""
@@ -1118,6 +1476,16 @@ def build_onewire_from_config(
         raise ConfigError(
             f"onewire.netlink_retry_s must be a number, got {type(netlink_retry_s).__name__}"
         )
+    tier_failures_before_demote = section.get(
+        "tier_failures_before_demote", _DEFAULT_TIER_FAILURES_BEFORE_DEMOTE
+    )
+    if not isinstance(tier_failures_before_demote, int) or isinstance(
+        tier_failures_before_demote, bool
+    ):
+        raise ConfigError(
+            "onewire.tier_failures_before_demote must be an int, got "
+            f"{type(tier_failures_before_demote).__name__}"
+        )
     slow_cycle_log_interval_s = section.get(
         "slow_cycle_log_interval_s", _DEFAULT_SLOW_CYCLE_LOG_INTERVAL_S
     )
@@ -1144,6 +1512,7 @@ def build_onewire_from_config(
             read_tier=read_tier,
             netlink_timeout_s=float(netlink_timeout_s),
             netlink_retry_s=float(netlink_retry_s),
+            tier_failures_before_demote=int(tier_failures_before_demote),
             slow_cycle_log_interval_s=float(slow_cycle_log_interval_s),
         )
     except ConfigError as exc:
