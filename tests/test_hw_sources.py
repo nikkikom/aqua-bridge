@@ -342,6 +342,40 @@ def test_onewire_fills_remaining_temps_and_release_stops_it(tmp_path: Path) -> N
     release()  # stops the reader thread(s); must not raise
 
 
+def test_start_readers_false_builds_everything_and_starts_no_reader_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """For a caller that wants the binding check and then drives the cycles itself.
+
+    One reader per bus master is the contract of ``run_bus_cycle``: two cycles
+    overlapping on one bus consume each other's readings (PROJECT.md section 8
+    item 39), and ``tools/w1_commission.py --check`` was both starting the threads
+    and reading the bus. ``release`` stays usable either way.
+    """
+    w1_root = tmp_path / "w1"
+    (w1_root / "w1_bus_master1" / "28-000000000001").mkdir(parents=True)
+    (w1_root / "w1_bus_master1" / "therm_bulk_read").write_text("1")
+    (w1_root / "w1_bus_master1" / "28-000000000001" / "temperature").write_text("22000")
+    onewire_section = {"sensors": {"prox_b01": "28-000000000001"}, "root": str(w1_root)}
+    started: list[str] = []
+    monkeypatch.setattr(W1Source, "start", lambda self: started.append("start"))
+
+    composite, release = _build(
+        xt6_section=_XT6_SECTION,
+        onewire_section=onewire_section,
+        temps=("air_z0", "prox_b01"),
+        start_readers=False,
+    )
+
+    assert isinstance(composite.onewire, W1Source)
+    assert started == []
+    assert composite.onewire.run_bus_cycle(w1_root / "w1_bus_master1") == {
+        "prox_b01": pytest.approx(22.0)
+    }
+    assert release is not None
+    release()  # no threads to join, sockets still closed; must not raise
+
+
 def test_missing_rom_at_startup_does_not_block_the_build(tmp_path: Path) -> None:
     onewire_section = {"sensors": {"prox_b01": "28-nope"}, "root": str(tmp_path / "w1_empty")}
     composite, release = _build(
