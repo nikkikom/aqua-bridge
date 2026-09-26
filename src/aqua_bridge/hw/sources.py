@@ -349,6 +349,7 @@ def build_composite_from_config(
     opener: Opener | None = None,
     watchdog_s: float | None = None,
     step_bound_s: float | None = None,
+    start_readers: bool = True,
 ) -> tuple[CompositeSource, Callable[[], None] | None]:
     """Builds the composite source/sink from raw config sections.
 
@@ -375,6 +376,18 @@ def build_composite_from_config(
     reader threads (``None`` when there is no 1-Wire source) -- the caller
     (``__main__.build_io``) runs it once at shutdown, the same slot the
     ``xt6``-only source leaves ``None``.
+
+    ``start_readers=False`` builds the same composite but leaves the 1-Wire
+    reader threads unstarted, for a caller that wants the binding check and
+    then drives :meth:`~aqua_bridge.hw.onewire.W1Source.run_bus_cycle` itself
+    (``tools/w1_commission.py --check``). One reader per bus is the contract of
+    that method -- two cycles overlapping on one bus master eat each other's
+    readings (``hw/onewire.py``, "One cycle at a time per bus master";
+    PROJECT.md section 8 item 39, where that is the defect being measured) --
+    and a tool that both starts the threads and reads the bus itself is
+    exactly two. ``release`` is returned either way and is safe to run on a
+    source that never started: it closes whatever netlink sockets the cycles
+    opened.
     """
     specs: list[tuple[str, Any]] = [
         (f"aquacomputer[{index}]", spec) for index, spec in enumerate(aquacomputer_section or [])
@@ -423,6 +436,7 @@ def build_composite_from_config(
     composite = CompositeSource(devices, onewire_source, smart=smart, clock=clock)
     release: Callable[[], None] | None = None
     if onewire_source is not None:
-        onewire_source.start()
+        if start_readers:
+            onewire_source.start()
         release = onewire_source.stop
     return composite, release

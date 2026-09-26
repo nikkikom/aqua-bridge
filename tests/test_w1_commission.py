@@ -14,6 +14,8 @@ from pathlib import Path
 import pytest
 import yaml
 
+from aqua_bridge.hw.onewire import W1Source
+
 TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
@@ -169,7 +171,7 @@ def _example_mpc_and_xt6() -> dict:
     return yaml.safe_load(EXAMPLE_CONFIG.read_text())
 
 
-def test_cmd_check_reports_cycle_time_and_crc_rate(
+def test_cmd_check_reports_cycle_time_and_per_sensor_read_outcomes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     data = _example_mpc_and_xt6()
@@ -194,7 +196,101 @@ def test_cmd_check_reports_cycle_time_and_crc_rate(
     # under a fake tree: no netlink connector in the suite, and this fake's
     # therm_bulk_read is a plain file, so the bus ends up reading one at a time.
     assert "(serial reads)" in out
-    assert "28-000000000001" in out
+    # Every sensor's reads against the attempts that sensor actually got -- three
+    # cycles on the one bus it lives on, not cycles * len(buses) (PROJECT.md item 39).
+    assert "28-000000000001: 0/3 reads failed (0.0%)" in out
+
+
+def test_cmd_check_is_the_only_reader_on_the_bus_while_it_measures(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The defect of PROJECT.md item 39: this command used to build the composite
+    the daemon builds -- which starts a reader thread per bus -- and then drive
+    cycles itself, so every measurement was taken with two cycles overlapping on
+    one bus master. On the board that read 6.4 s per cycle against 1.0 s and lost
+    a third of the reads. The binding check still happens; the reader threads do
+    not start.
+    """
+    data = _example_mpc_and_xt6()
+    w1_root = tmp_path / "w1"
+    bus = _make_bus(w1_root, "w1_bus_master1")
+    _make_slave(bus, "28-000000000001", "21000")
+    _make_trigger_always_done(monkeypatch, bus / "therm_bulk_read")
+    data["mpc"]["temps"] = ["coolant", "air", "prox_b01"]
+    data["onewire"] = {"sensors": {"prox_b01": "28-000000000001"}, "root": str(w1_root)}
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(data))
+
+    started: list[str] = []
+    monkeypatch.setattr(W1Source, "start", lambda self: started.append("start"))
+
+    rc = w1_commission.cmd_check(str(config_path), cycles=2)
+
+    assert rc == 0
+    assert started == [], "--check started the daemon's reader threads and then read the bus too"
+    out = capsys.readouterr().out
+    assert "binding check" in out, "the binding check is the other half of what --check is for"
+    assert "ms/cycle over 2 cycles" in out
+
+
+def test_cmd_check_does_not_report_a_rate_for_a_rom_that_is_on_no_bus(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A placeholder ROM id used to print ``0/40 failed reads (0.0%)`` -- the most
+    reassuring line in the report, about a sensor nothing had ever asked anything
+    of (PROJECT.md item 39). It has no attempts, so it gets no rate.
+    """
+    data = _example_mpc_and_xt6()
+    w1_root = tmp_path / "w1"
+    bus = _make_bus(w1_root, "w1_bus_master1")
+    _make_slave(bus, "28-000000000001", "21000")
+    _make_trigger_always_done(monkeypatch, bus / "therm_bulk_read")
+    data["mpc"]["temps"] = ["coolant", "air", "prox_b01", "prox_b02"]
+    data["onewire"] = {
+        "sensors": {"prox_b01": "28-000000000001", "prox_b02": "28-00000000ffff"},
+        "root": str(w1_root),
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(data))
+
+    rc = w1_commission.cmd_check(str(config_path), cycles=2)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "28-00000000ffff: no read attempted (not under any bus master)" in out
+    assert "28-00000000ffff: 0/" not in out
+    assert "28-000000000001: 0/2 reads failed (0.0%)" in out
+
+
+def test_cmd_check_tells_an_empty_read_from_a_failed_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The three ways a read produces no number are three different faults, and one
+    of them -- a read that answers nothing at all -- means a second reader was
+    converting on this bus. Printing them as one "failed reads" number hid the
+    difference that mattered (PROJECT.md item 39).
+    """
+    data = _example_mpc_and_xt6()
+    w1_root = tmp_path / "w1"
+    bus = _make_bus(w1_root, "w1_bus_master1")
+    _make_slave(bus, "28-000000000001", "")  # answers nothing: a conversion is in flight
+    _make_slave(bus, "28-000000000002", "not-a-number")  # answers something impossible
+    _make_trigger_always_done(monkeypatch, bus / "therm_bulk_read")
+    data["mpc"]["temps"] = ["coolant", "air", "prox_b01", "prox_b02"]
+    data["onewire"] = {
+        "sensors": {"prox_b01": "28-000000000001", "prox_b02": "28-000000000002"},
+        "root": str(w1_root),
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(data))
+
+    rc = w1_commission.cmd_check(str(config_path), cycles=2)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "28-000000000001: 2/2 reads failed (100.0%) [2 empty]  WARNING: > 1%" in out
+    assert "28-000000000002: 2/2 reads failed (100.0%) [2 rejected]  WARNING: > 1%" in out
+    assert "answered nothing at all" in out and "stop the daemon" in out
 
 
 def test_cmd_check_no_onewire_sensors_is_fine(

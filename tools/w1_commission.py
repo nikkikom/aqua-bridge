@@ -23,9 +23,19 @@ controllers/onewire) is caught here first, then runs a few dozen read cycles
 per bus and prints, per bus, which read path it ended up on (netlink, the
 kernel's bulk read, or one sensor at a time -- ``hw/onewire.py``, "Reading
 strategy"), the conversion time the
-driver reports for the configured resolution, the measured cycle time and
-the CRC error rate per sensor (plan section 12 risk 5: "measure with
-w1_commission.py --check").
+driver reports for the configured resolution, the measured cycle time and,
+per sensor, how its reads turned out against the attempts it actually got
+(plan section 12 risk 5: "measure with w1_commission.py --check").
+
+``--check`` is the **only reader on the bus while it measures**: it builds the
+daemon's composite source with the reader threads left unstarted and drives
+the cycles itself, because two cycles overlapping on one bus master consume
+each other's readings -- 6.4 s per cycle instead of 1.0 and a third of the
+reads lost, which is how this was found (PROJECT.md section 8 item 39,
+``hw/onewire.py`` "One cycle at a time per bus master"). A *running daemon* is
+a second reader this cannot lock out, so stop ``aqua-bridge.service`` before
+measuring; reads that answer nothing at all are counted and named, which is
+what that looks like from here.
 
 This tool imports :mod:`aqua_bridge.config` / :mod:`aqua_bridge.hw` only,
 never :mod:`aqua_bridge.control`: commissioning runs stand-alone, before an
@@ -38,9 +48,10 @@ import argparse
 import re
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
-from aqua_bridge.hw.onewire import DEFAULT_ROOT, W1Source
+from aqua_bridge.hw.onewire import DEFAULT_ROOT, ReadStats, W1Source
 
 __all__ = [
     "build_parser",
@@ -205,6 +216,14 @@ def cmd_check(config_path: str, *, cycles: int = 20) -> int:
             channels=app.mpc.channels,
             temps=app.mpc.temps,
             dt=app.mpc.dt,
+            # The daemon's builder starts one reader thread per bus; this
+            # command then drives cycles itself, and two cycles overlapping on
+            # one bus master consume each other's readings -- 6.4 s per cycle
+            # instead of 1.0 and a third of the reads lost, measured on the
+            # board (PROJECT.md section 8 item 39). So: build everything the
+            # daemon builds, including every binding check, and be the *only*
+            # reader while measuring.
+            start_readers=False,
         )
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
@@ -245,16 +264,63 @@ def cmd_check(config_path: str, *, cycles: int = 20) -> int:
     for bus_name, roms in discover_other_families(onewire.root).items():
         print(f"WARNING: {bus_name} carries {len(roms)} non-DS18B20 device(s): {roms}")
 
-    total_reads = cycles * len(buses)
-    if total_reads:
-        for rom, errors in sorted(onewire.crc_error_counts().items()):
-            rate = errors / total_reads
-            flag = "  WARNING: > 1%" if rate > 0.01 else ""
-            print(f"{rom}: {errors}/{total_reads} failed reads ({rate:.1%}){flag}")
+    _print_read_stats(onewire.read_stats(), declared_but_absent=set(missing))
 
     if release is not None:
         release()
     return 0
+
+
+def _print_read_stats(stats: Mapping[str, ReadStats], *, declared_but_absent: set[str]) -> None:
+    """Per-sensor read outcomes, each against the attempts it actually got.
+
+    Three different things used to print as one "failed reads" number over a
+    denominator that belonged to neither of them -- ``cycles * len(buses)``,
+    which is the attempts of no sensor at all on a board with two buses, and
+    which made a ROM id that is not on any bus read as ``0/40 failed (0.0%)``,
+    the most reassuring line in the report (PROJECT.md section 8 item 39). What
+    a sensor's reads did is:
+
+    * *not attempted* -- no cycle ever reached it. Either it is declared in
+      config and not under any bus master (a binding or wiring report, and
+      ``missing_roms()`` already said so above), or every cycle on its bus was
+      cut short before it. Never a rate.
+    * *errors* -- the kernel refused the read (EIO: the scratchpad failed its
+      CRC), or a netlink scratchpad did not come back. This is the number item
+      39's "< 1 %" is about.
+    * *empty* -- the read answered with nothing, which the kernel does while a
+      bulk conversion it started is in flight: someone else is reading this bus.
+    * *rejected* -- it answered something that is not a temperature.
+    """
+    for rom, stat in sorted(stats.items()):
+        if stat.attempts == 0:
+            why = (
+                "not under any bus master" if rom in declared_but_absent else "no cycle reached it"
+            )
+            print(f"{rom}: no read attempted ({why})")
+            continue
+        rate = stat.failed / stat.attempts
+        detail = ", ".join(
+            f"{count} {label}"
+            for label, count in (
+                ("errno/CRC", stat.errors),
+                ("empty", stat.empty),
+                ("rejected", stat.rejected),
+            )
+            if count
+        )
+        flag = "  WARNING: > 1%" if rate > 0.01 else ""
+        print(
+            f"{rom}: {stat.failed}/{stat.attempts} reads failed ({rate:.1%})"
+            f"{' [' + detail + ']' if detail else ''}{flag}"
+        )
+    empty = sum(stat.empty for stat in stats.values())
+    if empty:
+        print(
+            f"WARNING: {empty} read(s) answered nothing at all. The kernel does that while a "
+            "bulk conversion it started is still in flight, so a second reader was on the bus "
+            "-- stop the daemon (aqua-bridge.service) and run this again (PROJECT.md item 39)"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
