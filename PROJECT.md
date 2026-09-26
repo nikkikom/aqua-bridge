@@ -4544,13 +4544,17 @@ a model converges only with them.
      gets a `therm_bulk_read` and on a master carrying family-`00`
      phantoms, which silence that trigger; it needs no root and no kernel
      patch. A bus takes this tier when the connector answers
-     `W1_LIST_MASTERS` with this master's id in it, every present sensor's
+     `W1_LIST_MASTERS` with this master's id in it and every present sensor's
      8-byte identifier is readable (its own `id` attribute, else the ROM
-     name plus its CRC-8) and every present sensor has a `conv_time`. It
-     keeps it while the conversion command and at least one scratchpad
-     succeed. Anything else drops the bus one tier for
-     `onewire.netlink_retry_s` (300 s) and **the same cycle finishes on the
-     tier below, so no sample is lost**. Measured on the board, seven
+     name plus its CRC-8). It keeps it while the conversion command and at
+     least one scratchpad succeed. A sensor with no readable `conv_time` is
+     **not** a reason to leave the tier: the bus-wide wait falls back to the
+     conversion time of the configured `resolution_bits`, an upper bound for
+     anything at or below it, and that read-back is retried every cycle
+     rather than its absence cached (§8 item 39 — it used to cost the bus
+     its top tier for five minutes, on one sensor, on one unlucky read).
+     What does take the tier away is under "Giving up a tier" below, and
+     **the same cycle finishes on the tier below, so no sample is lost**. Measured on the board, seven
      sensors on one bus (the owner swaps sensors in and out, so the count is
      recorded with the numbers), per cycle: 876 ms at 12 bit and 316 ms at
      10 against 904 / 324 ms for the kernel's bulk read and 5664 / 1604 ms
@@ -4624,6 +4628,46 @@ a model converges only with them.
   60 s) — past that budget a bus starts aging sensors out of `read()` on
   some ticks with no other symptom, so this is the one place that says so
   (§8 item 39).
+  **One cycle at a time per bus master** (§8 item 39). A bus-wide cycle
+  *owns* its master from the conversion it starts to the last scratchpad it
+  reads, because the kernel keeps that ownership in one flag per slave: the
+  bulk trigger marks every slave "converting", the conversion marks them "a
+  value nobody has read yet", and the **first** read of a slave's
+  `temperature` consumes it. Two cycles overlapping on one master therefore
+  take readings away from each other — the loser's read starts its own
+  800 ms conversion — and a read that lands inside the other's Convert T
+  gets an **empty** string back, as does every read left in that cycle, since
+  that conversion holds the bus for 765 ms. Both halves were measured on the
+  board, and together they are the defect of §8 item 39. So
+  `run_bus_cycle` takes a lock per bus master name for the whole cycle: a
+  second caller waits instead of reading into the middle of one, and says so
+  once per bus, because two readers on one bus is a programming mistake whose
+  symptom looks exactly like bad wiring. The lock is per *bus master* —
+  two buses are two wires, with their own `bus_mutex` in the kernel and a
+  reader thread each — and it covers one process; a second *process*, a
+  commissioning tool against a running daemon, cannot be locked out, which is
+  why an empty read is counted and named apart from a failed one. `read()`
+  never takes this lock and never blocks.
+  **Giving up a tier is a decision about evidence** (§8 item 39). *Whose*
+  failure it is decides what may be demoted: one sensor's scratchpad, or one
+  unreadable attribute of one sensor, is that sensor's and never the bus's, so
+  only a bus-wide fact — no connector on this kernel, a master the
+  connector does not list, a conversion command that failed, a socket error,
+  or every sensor on the bus failing at once — moves a whole bus down.
+  *How many times* decides when: `onewire.tier_failures_before_demote`
+  (default 3) consecutive failing cycles, reset by any success, because a
+  failed probe costs one command and the cycle still finishes on the tier
+  below, while a demotion costs the fastest tier for five minutes — and on
+  a bus whose floor is serial reads, that is measured in samples the loop
+  never sees. Evidence that cannot change by being asked again (no `w1`
+  connector at all, a master not in the kernel's list, no `therm_bulk_read`
+  file) demotes on the first cycle regardless. Per-sensor read outcomes are
+  `W1Source.read_stats()`, counted apart — `errors` (an errno from the
+  read, or a netlink scratchpad that failed its CRC), `empty` (the kernel
+  answered nothing at all: someone else is converting on this bus),
+  `rejected` (an answer that is not a temperature) — each against that
+  sensor's own `attempts`, so a sensor no cycle ever reached reports no rate
+  instead of a flattering 0 %.
 - `hw/w1_netlink.py`: the 1-Wire transport over `AF_NETLINK` /
   `NETLINK_CONNECTOR` with `CN_W1_IDX`/`CN_W1_VAL` — sockets and byte
   layouts, no thermometers. `W1Netlink` opens and binds (`groups=0`, so
@@ -4685,8 +4729,11 @@ a model converges only with them.
 - `tools/w1_commission.py` (Pi, before the daemon): `--list` (every ROM
   id per bus with its reading), `--identify` (ranks sensors by warming
   rate while you warm one with a finger), `--check --config PATH` (builds
-  the exact composite the daemon would, then reports the bulk-read cycle
-  time per bus and the CRC error rate per sensor over `--cycles`).
+  the exact composite the daemon would — with its reader threads left
+  unstarted, so the tool is the only reader on the bus while it measures
+  (§8 item 39) — then reports the cycle time and read path per bus and,
+  per sensor, how its reads turned out against its own `attempts`, with an
+  errno, an empty answer and an unusable value counted apart).
 - `tools/aquacomputer_probe.py` (Pi, bring-up; replaces `sensors`): lists
   every discovered aquaero and Quadro (kind, serial, USB interface, node),
   then prints each one's status report (temperatures by group under their
@@ -9583,9 +9630,11 @@ Owner decision (2026-09-16):
     Not settled by this: anything that needs a full bus. The per-sensor
     cost model of item 39 was measured on two and three sensors here and has
     since been re-measured on up to eight (item 39, the re-derivation), but
-    the CRC error rate at 12 per bus is still unmeasured (no failed read in
-    ~50 reads here, nor in 600 there, which says nothing about a 5 m chain),
-    the second bus is not
+    the failed-read rate at 12 per bus was unmeasured then; it has since
+    been measured at **14** sensors on one bus, 0 failed reads in 280
+    bus-wide ones, once the two-readers defect of item 39 was out of the way
+    (no failed read in ~50 reads here either, which still says nothing about
+    a 5 m chain), the second bus is not
     wired — so defect (a) is observed as "the unwired master has no
     attribute", not yet as "the wired second bus cannot bulk-read" — and
     defect (b) has not been reproduced deliberately by putting a phantom on
@@ -9758,11 +9807,111 @@ Owner decision (2026-09-16):
     it (§3, the `onewire:` block): 0.0625 at 12 bit, 0.125 at 11, 0.25 at
     10, 0.5 at 9.
 
-    Still open, and what the wiring is for: the cycle time and CRC error
-    rate at 12 sensors per bus (clean at 8 on one bus so far, 0 failed reads
-    in 600; `--check` reports the read path, the driver's `conv_time` and
-    ms/cycle per bus), the second bus, and every ROM id bound with
-    `--identify`.
+    **14 sensors on one bus, and the hardware was never the problem**
+    (2026-09-26). The bus the plan asked about is wired: 14 DS18B20 on the
+    bit-banged GPIO 4 bus (`w1_bus_master2`), all 14 at 12 bit, externally
+    powered, `conv_time` 750 ms, plus the unterminated second bus with its two
+    family-`00` phantoms. `--check` against them read **6377 ms per cycle** and
+    lost reads in a pattern that rose with position in the read order and
+    saturated: 0, 0, 6, 6, 7, 11, 12, then 13 out of 20 cycles for each of the
+    last eight sensors. Read one sensor at a time (`bulk_read: off`) the same
+    bus was clean, at 22693 ms per cycle.
+
+    Every explanation on the bus's side was wrong, and each was measured
+    rather than argued away:
+
+    * **A hand-written bulk cycle on the same bus, minutes apart, is
+      perfect.** Open `<master>/therm_bulk_read`, write `trigger\n`, read the
+      status (`1`), read all 14 `temperature` files in sorted order: 1032,
+      1033 and 1005 ms, 766—788 ms of it inside the `write()`, 17 ms per
+      scratchpad, **no empty read and no failure**, and
+      `w1_master_attempts` unchanged across the cycle, so no kernel search
+      ran inside it. That is the 1.0 s this item predicted for 12 sensors, at
+      14.
+    * **Not the kernel's periodic search.** `options wire timeout=60` in
+      `/etc/modprobe.d` (§9), applied by reboot and confirmed by
+      `w1_master_timeout` reading 60, changed **nothing**: same 6.4 s, same
+      gradient, same 13/20. It is not in `deploy/` and does not belong there
+      (§9: the search is load-bearing for a re-attached sensor and a longer
+      interval is paid for in how long one reads as missing).
+    * **The 22693 ms of the serial run is itself the tell**: 14 sensors at
+      800 ms each is 11.2 s, and the measurement is 2.0x that. Something was
+      reading the bus twice.
+
+    **The defect was two cycles on one bus master, in our own process.**
+    `tools/w1_commission.py --check` builds the composite source the daemon
+    builds, and `build_composite_from_config` starts one reader thread per bus;
+    the tool then drove `run_bus_cycle` on the same buses from the main thread.
+    Nothing serialised them, and a cycle is not stateless on the bus: the
+    kernel marks each slave "value not read yet" after a bulk conversion and
+    the **first** read consumes that mark. Measured, on the board, both
+    consequences:
+
+    * one trigger, then the same sensor read three times: **18 ms**, then
+      **800 ms**, then **800 ms**. The first read takes the bulk scratchpad;
+      every later one starts its own conversion. A second reader stealing the
+      mark therefore costs the first 800 ms for that sensor, which is the 6.4 s.
+    * two threads each running the full cycle (the tool's shape exactly):
+      cycles of 9.7—11.4 s where the marks were stolen, and cycles of 1.6 s
+      where 12 of 14 reads came back **empty** — `..xxxxxxxxxxxx` — because
+      the other thread's Convert T was in flight and holds the bus for 765 ms,
+      so every read left in the cycle falls inside it. `int("")` was counted as
+      a failed read: that is the gradient, and the "everything after it in that
+      cycle is lost" shape.
+
+    The same race explains the netlink demotion in the same run
+    (`w1_bus_master2 does not read over netlink ... reports no conv_time`):
+    `_ensure_resolution` added a ROM id to its "configured" set *before*
+    filling the `conv_time` cache, so the other thread skipped the read-back
+    and then found no `conv_time` — and one sensor's missing attribute was
+    read as "this is not a bus to run this tier on", costing the whole bus its
+    fastest tier. The attribute was there the whole time: all 14 sensors report
+    `conv_time=750`, `resolution=12`, `ext_power=1` when asked directly.
+
+    **Fixed in three places, and each is a separate rule.** (1)
+    `run_bus_cycle` holds a lock per bus master for the whole cycle, so a
+    second caller in this process waits rather than reading into the middle of
+    one, and says so once per bus. (2) `--check` builds the daemon's composite
+    with `start_readers=False` and is the only reader while it measures — the
+    binding check, which is the other half of what it is for, still happens.
+    (3) A tier is given up on evidence: per *sensor* where the failure is one
+    sensor's (a missing `conv_time` now falls back to the configured
+    resolution's conversion time, an upper bound, and is retried every cycle),
+    and only after `onewire.tier_failures_before_demote` (default 3)
+    consecutive cycles where the fact is the bus's — except for evidence that
+    cannot change by asking again, which still demotes at once.
+
+    Measured after, same board, same `--check`, same 14 sensors:
+
+    | run | ms/cycle | failed reads |
+    |---|---|---|
+    | before | 6377 (reported as bulk) | 0—13 per sensor out of 20 cycles |
+    | after | **1049** (netlink) | **0/20 on all 14** |
+    | after, pinned to `read_tier: sysfs_bulk` | **1065—1079** | **0/20 on all 14** |
+    | hand-written cycle, for comparison | 1005—1033 | 0 |
+    | after, two readers in one process on purpose | 2102 | **0 of 280 reads** |
+
+    The last row is the point of the lock, separated from the point of the tool
+    fix: doing the wrong thing deliberately now costs a cycle that waits for
+    the other one (2 x 1049 ms) and loses **nothing**, where before it lost a
+    third of the readings. The netlink tier is kept through all of it, which is
+    the conv_time fix: the same run used to demote the bus on its first cycle.
+
+    **What `--check`'s own counter was measuring** (item 4 of the same
+    investigation). It printed `errors / (cycles * len(buses))` for every
+    declared ROM id — a denominator that belongs to no sensor at all on a
+    two-bus board (each sensor gets `cycles` attempts, on the one bus it lives
+    on), and, for the three placeholder ROM ids in the config that are on no
+    bus at all, `0/40 failed reads (0.0%)`: the most reassuring line in the
+    report, about sensors nothing had ever asked anything of. It now counts per
+    sensor — `attempts`, and `errors` / `empty` / `rejected` apart, because an
+    errno is the sensor's, an empty answer means somebody else is converting on
+    this bus, and a value that will not parse is neither — and a sensor with no
+    attempts is printed as `no read attempted (not under any bus master)`.
+
+    Still open: the second bus carrying real sensors (it is still
+    unterminated, with phantoms), the 12-per-bus split by zone pairs §2 asks
+    for, and every ROM id bound with `--identify` rather than by position.
 40. Cross-check zone-air against inlet sensor offsets at commissioning
     (0.1 °C of offset biases `E` by 15–35 %).
 41. Run the SMART agent on the PC against the real drives (smartctl
@@ -11162,6 +11311,18 @@ nothing is changed. If the interval ever has to grow it is
 operator's decision, and it is paid for in how long a re-attached sensor
 stays missing.
 
+**And it was tried, on the board, against a real symptom** (§8 item 39):
+`options wire timeout=60`, applied by reboot and confirmed by
+`w1_master_timeout` reading 60, changed the 14-sensor bus's failure rate by
+**nothing at all** — same 6.4 s per cycle, same gradient, same 13 lost cycles
+out of 20 for the sensors at the end of the read order. The cause was two of
+our own read cycles overlapping on one bus master, and a hand-written cycle on
+the same bus recorded `w1_master_attempts` unchanged across it, i.e. no search
+inside the cycle at all. So the knob stays out of `deploy/`: it buys nothing
+measured, and it costs up to a minute of a re-attached sensor reading as
+missing. A kernel tunable belongs in `deploy/` when a measurement says it
+does.
+
 **CPU note:** 1-Wire is bit-banged by the kernel with busy-waits; the
 conversion itself is a sleep, not a spin, so what costs a core is the
 per-sensor traffic around it — the ~40 ms a serial read spends above
@@ -11707,10 +11868,13 @@ on a Zero W; the hardware steps are waiting for the aquaero.
    - `.venv/bin/python tools/w1_commission.py --check --config
      /etc/aqua-bridge/config.yaml` builds the exact composite the daemon
      would (every name bound once, every ROM present) and reports, per
-     bus, the read path the driver gave it (bulk or serial, §8 item 38),
-     the `conv_time` it reports and the cycle time, plus the CRC error rate
-     per sensor over 20 cycles: aim for < 1 % and a cycle under
-     `max_age_s / 2` (§8 item 39).
+     bus, the read path the driver gave it (netlink, bulk or serial,
+     §8 item 38), the `conv_time` it reports and the cycle time, plus each
+     sensor's failed reads against its own attempts over 20 cycles: aim for
+     < 1 % and a cycle under `max_age_s / 2` (§8 item 39). **Stop the
+     daemon first** if it is running: two readers on one bus master lose
+     about a third of the readings and cost six times the cycle time, and
+     reads that answer nothing at all are how that shows up here.
 10. One diagnostic tick as the service user:
     `.venv/bin/python -m aqua_bridge --config /etc/aqua-bridge/config.yaml --source composite --once`
     (legacy: without `--source`, which defaults to `xt6`) reads every

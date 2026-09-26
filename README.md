@@ -266,9 +266,16 @@ is not yet confirmed on real hardware, on either board.
    …) in `onewire.sensors` — repeat per sensor. `--check` builds the
    exact composite the daemon would (every name bound once, every ROM
    present) and reports, per bus, which of the three read tiers it ended up
-   on, the conversion time the driver reports, the cycle time, and the CRC
-   error rate per sensor over 20 cycles: aim for < 1 % and a cycle under
-   `max_age_s / 2`. The tiers are `netlink` (one conversion for the whole
+   on, the conversion time the driver reports, the cycle time, and each
+   sensor's failed reads against its own attempts over 20 cycles: aim for
+   < 1 % and a cycle under `max_age_s / 2`. **Stop the daemon before
+   running it**: one reader per bus is the contract, and two cycles
+   overlapping on one bus master eat each other's readings — six times the
+   cycle time and a third of the reads gone (PROJECT.md §8 item 39).
+   `--check` itself is only ever one reader; reads that answer nothing at
+   all are what a second one looks like, and they are counted and named
+   apart from an errno or an unusable value. A sensor that is on no bus
+   prints `no read attempted`, never a 0 % failure rate. The tiers are `netlink` (one conversion for the whole
    bus over the kernel's netlink connector, no root and no udev rule
    needed, available on **every** bus), `bulk` (the kernel's own
    `therm_bulk_read`, which only one master system-wide ever gets and which
