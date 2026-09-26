@@ -44,6 +44,13 @@ ExecStart=/opt/aqua-bridge/.venv/bin/python -m aqua_bridge --config /etc/aqua-br
 # atomically every model_store_interval_s and at the clean stop). A legacy config ignores
 # it. Delete model.json for a clean prior (the calibrations go with it).
 StateDirectory=aqua-bridge
+# /run/aqua-bridge, owned by User=, tmpfs and re-created empty on every start:
+# onewire.lock_path's default (hw/onewire.py, ReaderLock) lives here, held for
+# as long as the 1-Wire reader threads run so tools/w1_commission.py --check
+# can tell this daemon is reading before it measures the same buses (PROJECT.md
+# item 39, "a cross-process lock is a different animal"). Meaningless across a
+# restart by design -- unlike StateDirectory above, nothing here is preserved.
+RuntimeDirectory=aqua-bridge
 Restart=always
 # 5 s, not systemd's 100 ms default: it keeps a daemon that exits immediately
 # (a config error) from spinning the CPU and the journal, and it is far inside

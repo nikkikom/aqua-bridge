@@ -147,6 +147,16 @@ def test_unit_gives_the_model_store_a_state_directory(unit):
     assert '"STATE_DIRECTORY"' in source and 'FILENAME = "model.json"' in source
 
 
+def test_unit_gives_the_onewire_reader_lock_a_runtime_directory(unit):
+    """PROJECT.md item 39: tools/w1_commission.py --check refuses to measure
+    while the daemon is reading the same buses by trying to take the same
+    cross-process lock (hw/onewire.py's ReaderLock) the daemon holds while its
+    reader threads run, at onewire.lock_path's default of
+    /run/aqua-bridge/onewire.lock. RuntimeDirectory=aqua-bridge is what makes
+    that path writable by User= without running the daemon as root."""
+    assert unit["RuntimeDirectory"] == ["aqua-bridge"]
+
+
 # --- udev rules vs the service account's groups (review finding F2) ---------------------
 
 

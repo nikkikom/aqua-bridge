@@ -12,7 +12,13 @@ from pathlib import Path
 import pytest
 
 from aqua_bridge.config import load_config
-from aqua_bridge.hw.onewire import W1Source, build_onewire_from_config
+from aqua_bridge.hw import onewire as onewire_mod
+from aqua_bridge.hw.onewire import (
+    ReaderLock,
+    ReaderLockOutcome,
+    W1Source,
+    build_onewire_from_config,
+)
 from aqua_bridge.hw.w1_netlink import W1Netlink
 from aqua_bridge.hw.w1_therm_netlink import reg_num_from_rom_name
 from aqua_bridge.model import ConfigError
@@ -783,6 +789,7 @@ def test_start_spawns_a_thread_per_bus_and_publishes(
         root=root,
         clock=time.monotonic,
         poll_interval_s=0.005,
+        lock_path=tmp_path / "onewire.lock",
     )
     src.start()
     try:
@@ -802,7 +809,13 @@ def test_start_is_idempotent(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     _make_slave(bus, "28-000000000001", "21000")
     _patch_trigger(monkeypatch, bus / "therm_bulk_read", ["1"])
 
-    src = W1Source({"a": "28-000000000001"}, max_age_s=10.0, root=root, poll_interval_s=0.005)
+    src = W1Source(
+        {"a": "28-000000000001"},
+        max_age_s=10.0,
+        root=root,
+        poll_interval_s=0.005,
+        lock_path=tmp_path / "onewire.lock",
+    )
     src.start()
     threads_first = list(src._threads)
     src.start()
@@ -816,7 +829,12 @@ def test_stop_without_start_is_a_noop(tmp_path: Path) -> None:
 
 
 def test_start_with_no_bus_master_logs_and_does_not_raise(tmp_path: Path) -> None:
-    src = W1Source({"a": "28-000000000001"}, max_age_s=10.0, root=tmp_path / "empty")
+    src = W1Source(
+        {"a": "28-000000000001"},
+        max_age_s=10.0,
+        root=tmp_path / "empty",
+        lock_path=tmp_path / "onewire.lock",
+    )
     src.start()  # no bus masters at all: no threads, no exception
     src.stop()
 
@@ -826,13 +844,115 @@ def test_start_with_missing_rom_is_a_warning_not_fatal(
 ) -> None:
     root = tmp_path / "w1"
     _make_bus(root, "w1_bus_master1")  # no slaves at all
-    src = W1Source({"a": "28-000000000001"}, max_age_s=10.0, root=root, poll_interval_s=0.01)
+    src = W1Source(
+        {"a": "28-000000000001"},
+        max_age_s=10.0,
+        root=root,
+        poll_interval_s=0.01,
+        lock_path=tmp_path / "onewire.lock",
+    )
     with caplog.at_level("WARNING"):
         src.start()
     try:
         assert any("28-000000000001" in rec.message for rec in caplog.records)
     finally:
         src.stop()
+
+
+# --- ReaderLock / cross-process reader lock ---------------------------------------------
+
+
+def test_reader_lock_acquire_then_held_by_another_then_free_again(tmp_path: Path) -> None:
+    lock_path = tmp_path / "run" / "onewire.lock"  # parent does not exist yet
+    first = ReaderLock(lock_path)
+    second = ReaderLock(lock_path)
+
+    assert first.try_acquire() is ReaderLockOutcome.ACQUIRED
+    assert second.try_acquire() is ReaderLockOutcome.HELD
+    first.release()
+    assert second.try_acquire() is ReaderLockOutcome.ACQUIRED
+    second.release()
+
+
+def test_reader_lock_try_acquire_is_idempotent_while_held(tmp_path: Path) -> None:
+    lock = ReaderLock(tmp_path / "onewire.lock")
+    assert lock.try_acquire() is ReaderLockOutcome.ACQUIRED
+    assert lock.try_acquire() is ReaderLockOutcome.ACQUIRED, "already ours; must not reopen"
+    lock.release()
+
+
+def test_reader_lock_release_without_acquire_is_a_noop(tmp_path: Path) -> None:
+    ReaderLock(tmp_path / "onewire.lock").release()  # must not raise
+
+
+def test_reader_lock_unknown_when_the_directory_cannot_be_created(tmp_path: Path) -> None:
+    """A plain file sitting where the lock's directory should be: mkdir(parents=True)
+    cannot create it, and the lock says it cannot tell rather than guessing free."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    lock = ReaderLock(blocker / "onewire.lock")
+    assert lock.try_acquire() is ReaderLockOutcome.UNKNOWN
+
+
+def test_reader_lock_unknown_without_fcntl(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The platform this repo also develops on that lacks flock semantics
+    (module docstring, hidraw.py's own guard): never guessed past, a
+    genuine "cannot tell", the same as a permission error would produce."""
+    monkeypatch.setattr(onewire_mod, "fcntl", None)
+    lock = ReaderLock(tmp_path / "onewire.lock")
+    assert lock.try_acquire() is ReaderLockOutcome.UNKNOWN
+
+
+def test_start_takes_the_reader_lock_and_stop_releases_it(tmp_path: Path) -> None:
+    """The daemon's own run leaves the same trace ``--check`` looks for: the
+    lock is held for as long as the reader threads run, and free again once
+    :meth:`W1Source.stop` returns (module docstring, "A cross-process lock is
+    a different animal")."""
+    root = tmp_path / "empty"  # no bus masters: nothing to read, only the lock matters here
+    lock_path = tmp_path / "onewire.lock"
+    src = W1Source({"a": "28-000000000001"}, max_age_s=10.0, root=root, lock_path=lock_path)
+    probe = ReaderLock(lock_path)
+
+    assert probe.try_acquire() is ReaderLockOutcome.ACQUIRED
+    probe.release()
+
+    src.start()
+    try:
+        assert probe.try_acquire() is ReaderLockOutcome.HELD
+    finally:
+        src.stop()
+    assert probe.try_acquire() is ReaderLockOutcome.ACQUIRED
+    probe.release()
+
+
+def test_start_logs_but_does_not_refuse_when_the_lock_is_already_held(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    """A diagnostic tool's lock must never cost a zone its cooling (plan
+    section 1 priority 1): the daemon starts its reader threads regardless,
+    and only logs that a second reader will not be able to tell from this
+    lock that it is running."""
+    root = tmp_path / "w1"
+    bus = _make_bus(root, "w1_bus_master1")
+    _make_slave(bus, "28-000000000001", "21000")
+    lock_path = tmp_path / "onewire.lock"
+    holder = ReaderLock(lock_path)
+    assert holder.try_acquire() is ReaderLockOutcome.ACQUIRED
+    src = W1Source(
+        {"a": "28-000000000001"},
+        max_age_s=10.0,
+        root=root,
+        poll_interval_s=0.01,
+        lock_path=lock_path,
+    )
+    try:
+        with caplog.at_level("WARNING"):
+            src.start()
+        assert src._threads, "the daemon must start its reader threads regardless of the lock"
+        assert "could not take the reader lock" in caplog.text
+    finally:
+        src.stop()
+        holder.release()
 
 
 # --- build_onewire_from_config ---------------------------------------------------------
@@ -881,6 +1001,7 @@ def test_build_onewire_defaults_the_read_strategy_keys(tmp_path: Path) -> None:
     assert src._netlink_retry_s == pytest.approx(300.0)
     assert src._tier_failures_before_demote == 3
     assert src._slow_cycle_log_interval_s == pytest.approx(60.0)
+    assert src.lock_path == Path("/run/aqua-bridge/onewire.lock")
 
 
 def test_build_onewire_passes_the_read_strategy_keys_through(tmp_path: Path) -> None:
@@ -897,6 +1018,7 @@ def test_build_onewire_passes_the_read_strategy_keys_through(tmp_path: Path) -> 
             "netlink_retry_s": 60.0,
             "tier_failures_before_demote": 1,
             "slow_cycle_log_interval_s": 15.0,
+            "lock_path": str(tmp_path / "onewire.lock"),
         },
         default_max_age_s=7.5,
     )
@@ -910,6 +1032,7 @@ def test_build_onewire_passes_the_read_strategy_keys_through(tmp_path: Path) -> 
     assert src._netlink_retry_s == pytest.approx(60.0)
     assert src._tier_failures_before_demote == 1
     assert src._slow_cycle_log_interval_s == pytest.approx(15.0)
+    assert src.lock_path == tmp_path / "onewire.lock"
 
 
 def test_build_onewire_uses_default_max_age_when_absent(tmp_path: Path) -> None:
@@ -967,6 +1090,8 @@ def test_build_onewire_explicit_max_age_overrides_default(tmp_path: Path) -> Non
             {"sensors": {"a": "28-1"}, "slow_cycle_log_interval_s": 0},
             "slow_cycle_log_interval_s must be > 0",
         ),
+        ({"sensors": {"a": "28-1"}, "lock_path": 1}, "lock_path must be a non-empty string"),
+        ({"sensors": {"a": "28-1"}, "lock_path": ""}, "lock_path must be a non-empty string"),
         ({"sensors": {"a": "28-1"}, "enabled": "true"}, "onewire.enabled must be true or false"),
         # item 57: the check runs even when it would otherwise return None (no sensors) --
         # a mistyped enabled: is a config mistake regardless of whether anything reads it.

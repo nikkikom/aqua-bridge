@@ -186,10 +186,33 @@ bus master name for the whole cycle, so a second caller **waits** instead of
 reading into the middle of a cycle, and says so once per bus in the log --
 two readers on one bus is a programming mistake, not a bus fault, and the
 symptom (a third of the readings gone, six times the cycle time) looks
-exactly like bad wiring. The lock covers this process only; a second *process*
-reading the same bus -- ``tools/w1_commission.py`` against a running daemon --
-cannot be locked out, which is why ``empty`` is counted and named apart.
+exactly like bad wiring. The lock covers this process only, so it cannot
+reach a second *process* reading the same bus -- ``tools/w1_commission.py``
+against a running daemon -- which is why ``empty`` is still counted and named
+apart: a cross-process reader that goes ahead anyway (``--check --force``, or
+a daemon that could not take :class:`ReaderLock` below) is caught here too,
+just later and more expensively than being refused up front.
 ``read()`` never takes this lock, so nothing here can hold up a tick.
+
+**A cross-process lock is a different animal (section 8 item 39,
+"proposals").** :meth:`W1Source.start` takes an OS-level advisory lock
+(:class:`ReaderLock`, ``flock(2)`` on ``onewire.lock_path``) for as long as
+its reader threads run, and :meth:`W1Source.stop` releases it.
+``tools/w1_commission.py --check`` tries to take the same lock before it
+drives a single cycle; if it cannot, something else is already reading these
+buses and its measurement would be the corruption above, reported as if it
+were the hardware's fault. This is preferred over asking systemd whether
+``aqua-bridge.service`` is active: a unit lookup only answers for one name,
+needs systemd reachable, and says nothing about a foreground run, a renamed
+unit or a container sharing this root, where an ``flock`` on a path every
+reader opens does not care what called it or how. The daemon never refuses
+to *start* over this lock (a diagnostic tool's lock must never cost a zone
+its cooling, plan section 1 priority 1); it only logs if it could not be
+taken. Three outcomes, never guessed past: the lock is taken (nothing else
+was reading), it is held (something is), or it cannot be told at all -- the
+lock directory does not exist and could not be created, a permission error,
+or a filesystem with no ``flock`` support -- which ``--check`` treats the
+same as "held" unless ``--force`` says otherwise.
 
 :meth:`W1Source.read` (called from the control loop thread) never touches
 the filesystem and never blocks: it returns the latest published sample for
@@ -239,6 +262,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -252,7 +276,18 @@ from aqua_bridge.hw.w1_therm_netlink import (
 )
 from aqua_bridge.model import ConfigError
 
-__all__ = ["ReadStats", "W1Source", "build_onewire_from_config"]
+try:  # Linux and macOS have fcntl; flock(2) is what ReaderLock needs from it.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+
+__all__ = [
+    "ReadStats",
+    "ReaderLock",
+    "ReaderLockOutcome",
+    "W1Source",
+    "build_onewire_from_config",
+]
 
 _LOG = logging.getLogger("aqua_bridge.hw.onewire")
 
@@ -403,6 +438,102 @@ _DEFAULT_TIER_FAILURES_BEFORE_DEMOTE = 3
 # enough that an operator watching the log sees it soon, rare enough that a
 # bus that stays over budget for the life of the daemon does not flood it.
 _DEFAULT_SLOW_CYCLE_LOG_INTERVAL_S = 60.0
+#: ``onewire.lock_path``: where :class:`ReaderLock` takes its ``flock(2)``.
+#: ``/run`` is a tmpfs cleared every boot, matching a lock that only ever means
+#: "someone is reading right now" -- it must never survive to mean anything
+#: once the reader that took it is gone. A per-service ``RuntimeDirectory=``
+#: (``deploy/aqua-bridge.service``) gives the daemon's user write access to
+#: this directory without running it as root; ``tools/w1_commission.py`` is
+#: expected to run as the same user, or with equivalent access to this path.
+_DEFAULT_LOCK_PATH = "/run/aqua-bridge/onewire.lock"
+
+
+class ReaderLockOutcome(StrEnum):
+    """What :meth:`ReaderLock.try_acquire` found.
+
+    A name lookup (is a given systemd unit active?) can only ever answer for
+    the one name it asks about, needs systemd reachable to ask at all, and
+    says nothing about a foreground run, a differently named unit or a
+    container sharing this root. ``flock(2)`` on a path every reader opens
+    does not care what called it or how, which is why :class:`ReaderLock`
+    uses that instead (section 8 item 39, "proposals").
+    """
+
+    #: We hold the lock now; nothing else did a moment ago. Caller must
+    #: :meth:`ReaderLock.release` it when done.
+    ACQUIRED = "acquired"
+    #: Something else holds it -- reading right now, by definition, since
+    #: nothing takes this lock except to drive read cycles.
+    HELD = "held"
+    #: Could not tell, and never guessed past that: the lock directory does
+    #: not exist and could not be created, a permission error, or a
+    #: filesystem with no ``flock`` support (or no :mod:`fcntl` at all).
+    UNKNOWN = "unknown"
+
+
+class ReaderLock:
+    """One ``flock(2)`` advisory lock, held by whoever is driving read cycles.
+
+    :meth:`W1Source.start` takes it for as long as its reader threads run and
+    :meth:`W1Source.stop` releases it; ``tools/w1_commission.py --check``
+    tries to take the same one before it drives a single cycle of its own.
+    Two cycles overlapping on one bus master consume each other's kernel
+    "value ready" marks (module docstring, "One cycle at a time per bus
+    master") -- this lock is what lets a second driver find that out *before*
+    it starts, rather than from the corrupted numbers afterward.
+
+    Non-blocking throughout: a caller that cannot have the lock right now
+    is told so and left to decide, never made to wait for it (the daemon
+    must never block starting on a diagnostic tool, and a diagnostic tool
+    that blocked here could wait out the daemon's entire run).
+    """
+
+    def __init__(self, path: str | Path) -> None:
+        self._path = Path(path)
+        self._file: Any = None
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def try_acquire(self) -> ReaderLockOutcome:
+        """Non-blocking; see :class:`ReaderLockOutcome` for the three results.
+
+        Idempotent while already held by this instance (returns ``ACQUIRED``
+        again without reopening anything).
+        """
+        if self._file is not None:
+            return ReaderLockOutcome.ACQUIRED
+        if fcntl is None:  # pragma: no cover - Windows
+            return ReaderLockOutcome.UNKNOWN
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            fh = self._path.open("a+")
+        except OSError as exc:
+            _LOG.debug("onewire: could not open reader lock %s: %s", self._path, exc)
+            return ReaderLockOutcome.UNKNOWN
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            fh.close()
+            return ReaderLockOutcome.HELD
+        except OSError as exc:
+            fh.close()
+            _LOG.debug("onewire: could not lock %s: %s", self._path, exc)
+            return ReaderLockOutcome.UNKNOWN
+        self._file = fh
+        return ReaderLockOutcome.ACQUIRED
+
+    def release(self) -> None:
+        """Idempotent; safe to call whether or not the lock was ever taken."""
+        if self._file is None:
+            return
+        try:
+            if fcntl is not None:  # pragma: no branch - only None on Windows
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._file.close()
+            self._file = None
 
 
 @dataclass
@@ -514,6 +645,15 @@ class W1Source:
         Called with no arguments to build one
         :class:`~aqua_bridge.hw.w1_netlink.W1Netlink` per bus master. Injected
         so tests drive the whole ladder without opening a socket.
+    lock_path:
+        Where :meth:`start`/:meth:`stop` take and release the cross-process
+        :class:`ReaderLock` (:data:`_DEFAULT_LOCK_PATH`). Also what
+        ``tools/w1_commission.py --check`` probes before measuring, so it
+        must name a path every reader of this ``root`` can reach -- a
+        second, unrelated ``root`` (a config for a different board sharing
+        this file by mistake) would make ``--check`` refuse against a
+        daemon reading nothing it cares about, which is why this is a
+        config key and not folded into ``root`` itself.
     """
 
     def __init__(
@@ -534,6 +674,7 @@ class W1Source:
         tier_failures_before_demote: int = _DEFAULT_TIER_FAILURES_BEFORE_DEMOTE,
         slow_cycle_log_interval_s: float = _DEFAULT_SLOW_CYCLE_LOG_INTERVAL_S,
         netlink_factory: Callable[[], W1Netlink] | None = None,
+        lock_path: str | Path = _DEFAULT_LOCK_PATH,
     ) -> None:
         if not sensors:
             raise ConfigError("onewire.sensors must not be empty")
@@ -588,6 +729,8 @@ class W1Source:
         self._tier_failures_before_demote = int(tier_failures_before_demote)
         self._slow_cycle_log_interval_s = float(slow_cycle_log_interval_s)
         self._netlink_factory = netlink_factory
+        self.lock_path = Path(lock_path)
+        self._reader_lock = ReaderLock(self.lock_path)
 
         self._lock = threading.Lock()
         self._latest: dict[str, _Sample] = {}
@@ -1308,6 +1451,14 @@ class W1Source:
         A declared ROM id missing from every bus at this point is logged as
         a warning (plan section 1: "a sensor absent from the bus at
         startup"), never raised.
+
+        Also takes :attr:`lock_path`'s cross-process :class:`ReaderLock` for
+        as long as the reader threads run (:meth:`stop` releases it), so a
+        commissioning run elsewhere can tell this daemon is reading before it
+        starts a cycle of its own (module docstring, "A cross-process lock is
+        a different animal"). Never blocks and never refuses to start over
+        it -- a diagnostic tool's lock must not cost a zone its cooling
+        (plan section 1 priority 1) -- only logs if it could not be taken.
         """
         if self._threads:
             return
@@ -1317,6 +1468,16 @@ class W1Source:
         for missing in self.missing_roms():
             names = ", ".join(self._rom_to_names[missing])
             _LOG.warning("onewire: ROM %s (%s) not found under %s", missing, names, self.root)
+        outcome = self._reader_lock.try_acquire()
+        if outcome is not ReaderLockOutcome.ACQUIRED:
+            _LOG.warning(
+                "onewire: could not take the reader lock at %s (%s); "
+                "tools/w1_commission.py --check will not be able to tell this daemon is "
+                "reading from it and may measure the two-cycle corruption of PROJECT.md "
+                "item 39 without warning",
+                self.lock_path,
+                outcome.value,
+            )
         self._stop.clear()
         for bus_dir in buses:
             self._cycle_counts.setdefault(bus_dir.name, 0)
@@ -1343,7 +1504,7 @@ class W1Source:
             self._stop.wait(self._poll_interval_s)
 
     def stop(self) -> None:
-        """Stops every reader thread and closes every netlink socket.
+        """Stops every reader thread, closes every netlink socket, releases the lock.
 
         Idempotent; safe to call if never started. Each reader thread notices
         the stop request within one bus-wide conversion or one sensor's
@@ -1357,6 +1518,23 @@ class W1Source:
         self._threads.clear()
         for bus_name in list(self._transports):
             self._close_transport(bus_name)
+        self._reader_lock.release()
+
+    # -- cross-process reader lock (tools/w1_commission.py) ----------------------
+
+    def acquire_reader_lock(self) -> ReaderLockOutcome:
+        """Tries to take :attr:`lock_path`'s :class:`ReaderLock`; see
+        :class:`ReaderLockOutcome`. Used directly by ``tools/w1_commission.py
+        --check`` (never by :meth:`read` or a cycle) before it drives a
+        single cycle of its own; :meth:`start` uses the same instance for the
+        daemon's own run, so only one of the two ever actually opens it on a
+        given :class:`W1Source`.
+        """
+        return self._reader_lock.try_acquire()
+
+    def release_reader_lock(self) -> None:
+        """Releases the lock :meth:`acquire_reader_lock` took; idempotent."""
+        self._reader_lock.release()
 
     # -- read (non-blocking, loop thread) ----------------------------------------
 
@@ -1497,6 +1675,9 @@ def build_onewire_from_config(
             f"{type(slow_cycle_log_interval_s).__name__}"
         )
     root = section.get("root", DEFAULT_ROOT)
+    lock_path = section.get("lock_path", _DEFAULT_LOCK_PATH)
+    if not isinstance(lock_path, str) or not lock_path:
+        raise ConfigError(f"onewire.lock_path must be a non-empty string, got {lock_path!r}")
 
     try:
         return W1Source(
@@ -1514,6 +1695,7 @@ def build_onewire_from_config(
             netlink_retry_s=float(netlink_retry_s),
             tier_failures_before_demote=int(tier_failures_before_demote),
             slow_cycle_log_interval_s=float(slow_cycle_log_interval_s),
+            lock_path=lock_path,
         )
     except ConfigError as exc:
         raise ConfigError(f"onewire: {exc}") from exc

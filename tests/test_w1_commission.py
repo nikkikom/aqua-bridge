@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from aqua_bridge.hw.onewire import W1Source
+from aqua_bridge.hw.onewire import ReaderLock, ReaderLockOutcome, W1Source
 
 TOOLS_DIR = Path(__file__).resolve().parent.parent / "tools"
 if str(TOOLS_DIR) not in sys.path:
@@ -180,7 +180,11 @@ def test_cmd_check_reports_cycle_time_and_per_sensor_read_outcomes(
     _make_slave(bus, "28-000000000001", "21000")
     _make_trigger_always_done(monkeypatch, bus / "therm_bulk_read")
     data["mpc"]["temps"] = ["coolant", "air", "prox_b01"]
-    data["onewire"] = {"sensors": {"prox_b01": "28-000000000001"}, "root": str(w1_root)}
+    data["onewire"] = {
+        "sensors": {"prox_b01": "28-000000000001"},
+        "root": str(w1_root),
+        "lock_path": str(tmp_path / "onewire.lock"),
+    }
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(data))
 
@@ -217,7 +221,11 @@ def test_cmd_check_is_the_only_reader_on_the_bus_while_it_measures(
     _make_slave(bus, "28-000000000001", "21000")
     _make_trigger_always_done(monkeypatch, bus / "therm_bulk_read")
     data["mpc"]["temps"] = ["coolant", "air", "prox_b01"]
-    data["onewire"] = {"sensors": {"prox_b01": "28-000000000001"}, "root": str(w1_root)}
+    data["onewire"] = {
+        "sensors": {"prox_b01": "28-000000000001"},
+        "root": str(w1_root),
+        "lock_path": str(tmp_path / "onewire.lock"),
+    }
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(data))
 
@@ -249,6 +257,7 @@ def test_cmd_check_does_not_report_a_rate_for_a_rom_that_is_on_no_bus(
     data["onewire"] = {
         "sensors": {"prox_b01": "28-000000000001", "prox_b02": "28-00000000ffff"},
         "root": str(w1_root),
+        "lock_path": str(tmp_path / "onewire.lock"),
     }
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(data))
@@ -280,6 +289,7 @@ def test_cmd_check_tells_an_empty_read_from_a_failed_one(
     data["onewire"] = {
         "sensors": {"prox_b01": "28-000000000001", "prox_b02": "28-000000000002"},
         "root": str(w1_root),
+        "lock_path": str(tmp_path / "onewire.lock"),
     }
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(data))
@@ -291,6 +301,162 @@ def test_cmd_check_tells_an_empty_read_from_a_failed_one(
     assert "28-000000000001: 2/2 reads failed (100.0%) [2 empty]  WARNING: > 1%" in out
     assert "28-000000000002: 2/2 reads failed (100.0%) [2 rejected]  WARNING: > 1%" in out
     assert "answered nothing at all" in out and "stop the daemon" in out
+
+
+# --- cmd_check: refusing to measure while another reader is on the bus ---------------
+
+
+def _minimal_check_config(tmp_path: Path) -> tuple[Path, Path]:
+    """A one-sensor config good enough to reach the daemon-detection step;
+    returns ``(config_path, lock_path)``."""
+    data = _example_mpc_and_xt6()
+    w1_root = tmp_path / "w1"
+    bus = _make_bus(w1_root, "w1_bus_master1")
+    _make_slave(bus, "28-000000000001", "21000")
+    lock_path = tmp_path / "onewire.lock"
+    data["mpc"]["temps"] = ["coolant", "air", "prox_b01"]
+    data["onewire"] = {
+        "sensors": {"prox_b01": "28-000000000001"},
+        "root": str(w1_root),
+        "lock_path": str(lock_path),
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(data))
+    return config_path, lock_path
+
+
+def test_cmd_check_refuses_when_the_daemon_is_detected(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The detector is injected here -- no real lock file, no systemd -- so this
+    exercises ``cmd_check``'s own branching: told the lock is held, it must
+    refuse before driving a single cycle, and say *why* the measurement would
+    be wrong (the two-cycle corruption of PROJECT.md item 39), not merely that
+    something is running.
+    """
+    config_path, lock_path = _minimal_check_config(tmp_path)
+    cycles_run: list[str] = []
+    monkeypatch.setattr(
+        W1Source, "run_bus_cycle", lambda self, bus_dir: cycles_run.append(bus_dir.name) or {}
+    )
+
+    rc = w1_commission.cmd_check(
+        str(config_path), cycles=5, detect=lambda source: ReaderLockOutcome.HELD
+    )
+
+    assert rc == w1_commission.EXIT_DAEMON_DETECTED
+    assert cycles_run == [], "a cycle ran despite the daemon being detected"
+    err = capsys.readouterr().err
+    assert "refusing to measure" in err
+    assert str(lock_path) in err
+    assert "value ready" in err and "empty" in err, "explains the corruption, not just the fact"
+    assert "PROJECT.md item 39" in err
+    assert "--force" in err
+
+
+def test_cmd_check_cannot_tell_refuses_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """UNKNOWN is its own case, not silently folded into "measure anyway": the
+    tool says it cannot tell and leaves the decision to the operator."""
+    config_path, _lock_path = _minimal_check_config(tmp_path)
+    cycles_run: list[str] = []
+    monkeypatch.setattr(
+        W1Source, "run_bus_cycle", lambda self, bus_dir: cycles_run.append(bus_dir.name) or {}
+    )
+
+    rc = w1_commission.cmd_check(
+        str(config_path), cycles=5, detect=lambda source: ReaderLockOutcome.UNKNOWN
+    )
+
+    assert rc == w1_commission.EXIT_DAEMON_DETECTED
+    assert cycles_run == []
+    err = capsys.readouterr().err
+    assert "cannot tell" in err
+    assert "--force" in err
+
+
+def test_cmd_check_force_measures_anyway_and_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The escape hatch: --force measures despite a detected daemon, and the
+    output says the numbers will be wrong -- chosen deliberately, not by
+    accident."""
+    config_path, _lock_path = _minimal_check_config(tmp_path)
+    _make_trigger_always_done(monkeypatch, tmp_path / "w1" / "w1_bus_master1" / "therm_bulk_read")
+
+    rc = w1_commission.cmd_check(
+        str(config_path),
+        cycles=2,
+        force=True,
+        detect=lambda source: ReaderLockOutcome.HELD,
+    )
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "--force" in out and "wrong" in out
+    assert "ms/cycle over 2 cycles" in out, "the measurement still ran under --force"
+
+
+def test_cmd_check_measures_normally_when_nothing_else_is_reading(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ordinary path, unaffected: the real detector (no injection here)
+    finds the lock free and measures exactly as before this change."""
+    config_path, _lock_path = _minimal_check_config(tmp_path)
+    _make_trigger_always_done(monkeypatch, tmp_path / "w1" / "w1_bus_master1" / "therm_bulk_read")
+
+    rc = w1_commission.cmd_check(str(config_path), cycles=2)
+
+    assert rc == 0
+    assert "ms/cycle over 2 cycles" in capsys.readouterr().out
+
+
+def test_cmd_check_refuses_against_a_lock_really_held_by_another_process(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """End to end, no injected fake: a second, independent ReaderLock instance
+    (standing in for a running daemon, or another ``--check``) holds the real
+    lock file, and the tool's own default detector -- real ``flock(2)`` --
+    must find it held.
+    """
+    config_path, lock_path = _minimal_check_config(tmp_path)
+    other = ReaderLock(lock_path)
+    assert other.try_acquire() is ReaderLockOutcome.ACQUIRED
+    try:
+        rc = w1_commission.cmd_check(str(config_path), cycles=2)
+    finally:
+        other.release()
+
+    assert rc == w1_commission.EXIT_DAEMON_DETECTED
+    assert "refusing to measure" in capsys.readouterr().err
+
+
+def test_cmd_check_cannot_tell_for_real_when_the_lock_path_is_unusable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A file sitting where the lock's directory should be: mkdir(parents=True)
+    cannot create it, and the real detector says "cannot tell" rather than
+    guess "free"."""
+    data = _example_mpc_and_xt6()
+    w1_root = tmp_path / "w1"
+    bus = _make_bus(w1_root, "w1_bus_master1")
+    _make_slave(bus, "28-000000000001", "21000")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    data["mpc"]["temps"] = ["coolant", "air", "prox_b01"]
+    data["onewire"] = {
+        "sensors": {"prox_b01": "28-000000000001"},
+        "root": str(w1_root),
+        "lock_path": str(blocker / "onewire.lock"),
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(data))
+
+    rc = w1_commission.cmd_check(str(config_path), cycles=2)
+
+    assert rc == w1_commission.EXIT_DAEMON_DETECTED
+    assert "cannot tell" in capsys.readouterr().err
 
 
 def test_cmd_check_no_onewire_sensors_is_fine(
@@ -311,7 +477,11 @@ def test_cmd_check_missing_rom_is_a_warning_not_a_failure(
 ) -> None:
     data = _example_mpc_and_xt6()
     data["mpc"]["temps"] = ["coolant", "air", "prox_b01"]
-    data["onewire"] = {"sensors": {"prox_b01": "28-absent"}, "root": str(tmp_path / "w1_empty")}
+    data["onewire"] = {
+        "sensors": {"prox_b01": "28-absent"},
+        "root": str(tmp_path / "w1_empty"),
+        "lock_path": str(tmp_path / "onewire.lock"),
+    }
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(data))
 
