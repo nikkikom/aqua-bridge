@@ -537,6 +537,9 @@ def test_board_script_takes_every_value_from_a_variable_with_a_default():
         "JOURNAL_MAX_RETENTION": "30day",
         "JOURNAL_SYNC_INTERVAL": "5m",
         "WIFI_POWERSAVE": "off",
+        "NET_IFACE": "wlan0",
+        "NET_CONNECTION": "",
+        "NET_AUTOCONNECT_RETRIES": "0",
         "NET_RECOVER_INTERVAL": "5min",
     }
     for name, default in knobs.items():
@@ -693,6 +696,45 @@ def test_board_script_verifies_the_watchdog_instead_of_trusting_the_write():
     assert reexec_line < apply_pos < done_marker
 
 
+def test_board_script_sets_and_verifies_the_autoconnect_retries():
+    """The setting whose silent default cost four days off the network. NetworkManager's
+    `connection.autoconnect-retries` is 4 unless something says otherwise, and four
+    consecutive association failures then block autoconnect for the profile until a
+    manual activation, a NetworkManager restart or a reboot resets it. So the script
+    writes it *and* reads the effective value back -- the same "verify, do not assume"
+    the watchdog and journald settings got after each of them was written successfully
+    and had no effect. The report is called once for --check (before anything is written,
+    so it describes the board as it is) and once after the apply."""
+    text = BOARD_SCRIPT.read_text()
+    assert _shell_default(BOARD_SCRIPT, "NET_AUTOCONNECT_RETRIES") == "0"  # 0 = forever
+    assert "nmcli connection modify" in text
+    assert "connection.autoconnect-retries" in text
+    assert "0 = retry forever" in text
+    assert "would set:" in text  # --check reports it and writes nothing
+    assert "connection.autoconnect-retries (" in text  # the effective value, per profile
+    assert "OK: matches NET_AUTOCONNECT_RETRIES=" in text
+    assert "WARNING: asked for NET_AUTOCONNECT_RETRIES=" in text
+    calls = [
+        m.start() for m in re.finditer(r"^\s*autoconnect_retries_report\s*$", text, re.MULTILINE)
+    ]
+    assert len(calls) == 2
+    check_pos, apply_pos = calls
+    def_pos = text.index("autoconnect_retries_report() {")
+    check_exit = text.index("== check: changes pending, nothing was written ==")
+    assert def_pos < check_pos < check_exit
+    modify_pos = text.index("nmcli connection modify")
+    done_marker = text.index("== done ==")
+    assert modify_pos < apply_pos < done_marker
+
+
+def test_board_script_refuses_a_nonsense_autoconnect_retries():
+    """A knob that decides whether the board ever comes back on its own does not get to
+    be a typo that NetworkManager rejects later, out of sight."""
+    text = BOARD_SCRIPT.read_text()
+    assert 'if [[ ! "$NET_AUTOCONNECT_RETRIES" =~ ^(-1|[0-9]+)$ ]]; then' in text
+    assert "error: NET_AUTOCONNECT_RETRIES must be a whole number" in text
+
+
 def test_the_soc_watchdog_sits_above_the_service_watchdog(unit):
     """The order is the point (section 2): a slow tick must get a daemon restart, which
     is cheap, before the board gets a reset, which costs a whole boot and spends the
@@ -758,6 +800,9 @@ def test_network_recovery_never_escalates_beyond_re_associating():
                     assert forbidden not in value, f"{path.name}: {key}={value}"
     script = NET_SCRIPT.read_text()
     assert "device disconnect" in script and "device connect" in script
+    # The disconnected branch's one action, and the reason it is allowed: a manual
+    # activation is also what resets NetworkManager's autoconnect retry counter.
+    assert "connection up id" in script
 
 
 def test_the_recovery_unit_is_wired_to_nothing_that_cools():
@@ -778,7 +823,12 @@ def test_one_check_cannot_outlast_the_units_start_timeout():
     for `device connect` alone (90 s) is already above systemd's default start timeout,
     and a run killed part-way through is a run that finished none of its bookkeeping."""
     script = NET_SCRIPT.read_text()
+    # Every blocking nmcli carries the wait: the two of the up-but-dead branch and
+    # the one activation of the disconnected branch. nmcli's own default for
+    # `connection up` is the same 90 s as for `device connect`.
     assert script.count('nmcli -w "$AQUA_NET_NMCLI_WAIT_S" device') == 2
+    assert script.count('nmcli -w "$AQUA_NET_NMCLI_WAIT_S" connection up') == 1
+    assert script.count('nmcli -w "$AQUA_NET_NMCLI_WAIT_S"') == 3
     wait = float(_shell_default(NET_SCRIPT, "AQUA_NET_NMCLI_WAIT_S"))
     ping_deadline = float(_shell_default(NET_SCRIPT, "AQUA_NET_PING_DEADLINE_S"))
     timeout = float(_unit_values(NET_UNIT.read_text())["TimeoutStartSec"][0])
@@ -797,6 +847,12 @@ def test_no_net_recover_is_an_off_switch_and_not_a_skipped_step():
         assert f"remove_path {dst}" in text
 
 
+#: Executables the script may never reach for. Stubbed alongside nmcli/ip/ping so a
+#: run that called one shows up in the call log, rather than being ruled out only by
+#: reading the source.
+FORBIDDEN_TOOLS = ("reboot", "shutdown", "poweroff", "halt", "systemctl")
+
+
 def _stub_bin(
     root: Path,
     *,
@@ -805,21 +861,35 @@ def _stub_bin(
     ping_ok: bool,
     connect_rc: int = 0,
     connect_delay_s: float = 0.0,
+    profile: str = "board-wifi",
+    up_rc: int = 0,
 ) -> Path:
     """nmcli / ip / ping stubs under ``root`` that log every call to ``root/calls.log``.
 
-    ``connect_rc``/``connect_delay_s`` are the branches the guards exist for: with the
-    router off, `nmcli device connect` does not return 0 in a millisecond -- it fails, or
-    it takes long enough that systemd kills the unit part-way through.
+    ``connect_rc``/``connect_delay_s``/``up_rc`` are the branches the guards exist for:
+    with the router off, neither `nmcli device connect` nor `nmcli connection up`
+    returns 0 in a millisecond -- they fail, or they take long enough that systemd kills
+    the unit part-way through.
+
+    ``profile`` is the NetworkManager profile name the stub reports, and nothing in the
+    script may know it in advance: a board's Wi-Fi profile is normally named after the
+    SSID, which stays out of this repository.
     """
     bin_dir = root / "bin"
     bin_dir.mkdir(parents=True)
     state = "100 (connected)" if connected else "30 (disconnected)"
+    # GENERAL.CONNECTION is "--" on a device that is not connected, which is exactly the
+    # case that has to fall through to discovering the profile some other way.
+    bound = profile if connected else "--"
     (bin_dir / "nmcli").write_text(
         "#!/bin/sh\n"
         f'echo "nmcli $*" >> "{root}/calls.log"\n'
         'case "$*" in\n'
-        f'  *"device show"*) echo "GENERAL.STATE:{state}" ;;\n'
+        f'  *"connection up"*) exit {up_rc} ;;\n'
+        f"  *\"device show\"*) printf 'GENERAL.STATE:{state}\\n'"
+        f"'GENERAL.CONNECTION:{bound}\\nGENERAL.TYPE:wifi\\n' ;;\n"
+        '  *"connection.interface-name"*) echo "connection.interface-name:wlan0" ;;\n'
+        f'  *"NAME,TYPE"*) echo "{profile}:wifi" ;;\n'
         f'  *"device connect"*) sleep {connect_delay_s}; exit {connect_rc} ;;\n'
         "esac\n"
         "exit 0\n"
@@ -829,13 +899,17 @@ def _stub_bin(
     (bin_dir / "ping").write_text(
         f'#!/bin/sh\necho "ping $*" >> "{root}/calls.log"\nexit {0 if ping_ok else 1}\n'
     )
-    for name in ("nmcli", "ip", "ping"):
+    for name in FORBIDDEN_TOOLS:
+        (bin_dir / name).write_text(f'#!/bin/sh\necho "{name} $*" >> "{root}/calls.log"\nexit 0\n')
+    for name in ("nmcli", "ip", "ping", *FORBIDDEN_TOOLS):
         (bin_dir / name).chmod(0o755)
     (root / "calls.log").write_text("")
     return bin_dir
 
 
-def _run_recovery(root: Path, bin_dir: Path, runs: int) -> list[str]:
+def _run_recovery(
+    root: Path, bin_dir: Path, runs: int, extra_env: dict[str, str] | None = None
+) -> list[str]:
     bash = shutil.which("bash")
     if bash is None:  # pragma: no cover - bash is in packages-rpi.txt and in CI
         pytest.skip("bash not available")
@@ -843,6 +917,7 @@ def _run_recovery(root: Path, bin_dir: Path, runs: int) -> list[str]:
         "PATH": f"{bin_dir}:/usr/bin:/bin",
         "AQUA_NET_STATE_DIR": str(root / "state"),
         "AQUA_NET_PING_DEADLINE_S": "1",
+        **(extra_env or {}),
     }
     return [
         subprocess.run(
@@ -952,13 +1027,129 @@ def test_a_re_association_killed_part_way_through_still_counts_as_a_bounce(tmp_p
     assert "autoconnect yes" in calls  # restored before the connect, so NM retries alone
 
 
-def test_no_gateway_and_no_carrier_are_both_no_ops(tmp_path):
-    """With the router off long enough the lease is gone, and a disconnected interface
-    is NetworkManager's own retry to make: neither is this script's business."""
+def test_no_gateway_is_a_no_op(tmp_path):
+    """With the router off long enough the lease is gone, and a connected interface with
+    no default route has nothing to probe: there is no address to ping and none may be
+    written down here."""
     no_gateway = _stub_bin(tmp_path / "a", connected=True, gateway="", ping_ok=False)
     _run_recovery(tmp_path / "a", no_gateway, runs=3)
     assert "ping" not in (tmp_path / "a" / "calls.log").read_text()
-    disconnected = _stub_bin(tmp_path / "b", connected=False, gateway="192.0.2.1", ping_ok=False)
-    _run_recovery(tmp_path / "b", disconnected, runs=3)
-    calls = (tmp_path / "b" / "calls.log").read_text()
-    assert "ping" not in calls and "device disconnect" not in calls
+
+
+def test_a_disconnected_interface_is_activated_instead_of_left_to_networkmanager(tmp_path):
+    """The defect of 2026-09-30, and the one expectation in this file that was wrong:
+    this test used to assert that a disconnected device is "NetworkManager's own retry to
+    make" and therefore a no-op. NetworkManager had stopped retrying -- a disconnect
+    storm spent its four default `connection.autoconnect-retries` in about three minutes,
+    after which it blocks autoconnect for the profile until something resets it -- and the
+    board sat unreachable for four days while this timer logged "standing by" every five
+    minutes. The action for that state is a manual activation of the profile, which is
+    also what resets NetworkManager's retry counter."""
+    bin_dir = _stub_bin(tmp_path, connected=False, gateway="192.0.2.1", ping_ok=False)
+    (out,) = _run_recovery(tmp_path, bin_dir, runs=1)
+    calls = (tmp_path / "calls.log").read_text()
+    assert "connection up id board-wifi" in calls
+    assert "ping" not in calls  # a link that is down has nothing to probe
+    assert "device disconnect" not in calls  # that is the other branch's action
+    assert "disconnected" in out and "activating its profile" in out
+    assert "standing by" not in out
+
+
+@pytest.mark.parametrize("profile", ["board-wifi", "some-other-profile"])
+def test_the_profile_to_activate_is_whatever_networkmanager_reports(tmp_path, profile):
+    """A Wi-Fi profile is normally named after the SSID, so no name may be a literal in
+    deploy/: the script activates whatever profile nmcli reports for the interface."""
+    root = tmp_path / profile
+    bin_dir = _stub_bin(root, connected=False, gateway="", ping_ok=False, profile=profile)
+    _run_recovery(root, bin_dir, runs=1)
+    assert f"connection up id {profile}" in (root / "calls.log").read_text()
+
+
+def test_the_connection_name_is_a_variable_in_both_scripts():
+    """Both the knob and every use of it: an operator override with a documented default
+    of "discover it", and no profile name spelled out in a command."""
+    assert _shell_default(NET_SCRIPT, "AQUA_NET_CONNECTION") == ""
+    assert _shell_default(BOARD_SCRIPT, "NET_CONNECTION") == ""
+    uses = 0
+    for path in (NET_SCRIPT, BOARD_SCRIPT):
+        for line in _code_lines(path):
+            for match in re.finditer(r"connection (?:up id|modify) (\S+)", line):
+                uses += 1
+                assert match.group(1).startswith('"$'), f"{path.name}: {line}"
+    assert uses == 2  # one activation in the script, one modify in the installer
+
+
+def test_a_disconnected_interface_is_retried_at_its_own_rate_not_the_timers(tmp_path):
+    """AQUA_NET_RECONNECT_MIN_S, not the timer, decides how hard an absent access point
+    is knocked on -- so the owner may run the timer as often as they like for faster
+    detection without turning the cadence into retry pressure."""
+    bin_dir = _stub_bin(tmp_path, connected=False, gateway="", ping_ok=False)
+    _run_recovery(tmp_path, bin_dir, runs=5)  # five checks well inside one interval
+    calls = (tmp_path / "calls.log").read_text().splitlines()
+    assert sum(1 for line in calls if "connection up" in line) == 1
+    other = _stub_bin(tmp_path / "fast", connected=False, gateway="", ping_ok=False)
+    _run_recovery(tmp_path / "fast", other, runs=5, extra_env={"AQUA_NET_RECONNECT_MIN_S": "0"})
+    calls = (tmp_path / "fast" / "calls.log").read_text().splitlines()
+    assert sum(1 for line in calls if "connection up" in line) == 5
+
+
+def test_a_link_down_for_hours_says_so_loudly_instead_of_in_identical_lines(tmp_path):
+    """Four days of `wlan0 is not connected (30 (disconnected)); NetworkManager owns
+    that, standing` every five minutes, with nothing happening behind them, is what this
+    replaced. A long outage now gets one line an hour that names how long and how many
+    attempts -- and words it so that reading it can never be mistaken for a reason to
+    escalate, because with the router off that line is the entire response."""
+    bin_dir = _stub_bin(tmp_path, connected=False, gateway="", ping_ok=False)
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "down-since").write_text(f"{int(time.time()) - 5 * 3600}\n")
+    (state / "down-tries").write_text("50\n")
+    outputs = _run_recovery(tmp_path, bin_dir, runs=3)
+    loud = [out for out in outputs if "WARNING" in out]
+    assert len(loud) == 1  # once an hour, not once a run
+    assert "5h0m" in loud[0] and "51 activation attempt" in loud[0]
+    assert "no reboot" in loud[0] and "fans are unaffected" in loud[0]
+
+
+def test_the_access_point_being_absent_is_a_wait_and_never_an_escalation(tmp_path):
+    """The owner's standing rule: switching off the home router must never degrade
+    cooling. Every activation then fails, and the only allowed response is to keep
+    waiting -- no counter of failures may ever unlock a bigger hammer, because there is
+    no bigger hammer here to unlock."""
+    bin_dir = _stub_bin(tmp_path, connected=False, gateway="", ping_ok=False, up_rc=1)
+    outputs = _run_recovery(tmp_path, bin_dir, runs=6, extra_env={"AQUA_NET_RECONNECT_MIN_S": "0"})
+    calls = (tmp_path / "calls.log").read_text()
+    assert calls.count("connection up") == 6  # still only ever this, six failures deep
+    assert any("wait and not a fault" in out for out in outputs)
+
+
+@pytest.mark.parametrize(
+    ("connected", "ping_ok", "up_rc"), [(True, False, 0), (False, False, 0), (False, False, 1)]
+)
+def test_no_state_of_the_link_ever_reboots_or_restarts_anything(
+    tmp_path, connected, ping_ok, up_rc
+):
+    """The behavioural twin of test_network_recovery_never_escalates_beyond_re_associating,
+    which reads the source: reboot, shutdown, poweroff, halt and systemctl are all on PATH
+    as logging stubs, so a run that reached for one would show up in the call log. Checked
+    for a link that is up but dead, a disconnected link that comes back, and one that
+    never does."""
+    bin_dir = _stub_bin(
+        tmp_path, connected=connected, gateway="192.0.2.1", ping_ok=ping_ok, up_rc=up_rc
+    )
+    _run_recovery(tmp_path, bin_dir, runs=8, extra_env={"AQUA_NET_RECONNECT_MIN_S": "0"})
+    calls = (tmp_path / "calls.log").read_text()
+    for forbidden in FORBIDDEN_TOOLS:
+        assert forbidden not in calls
+
+
+def test_the_link_coming_back_clears_the_outage_and_says_what_it_took(tmp_path):
+    """The payoff line: the journal has to show that the activations were what ended the
+    outage, and the counters have to reset so the next one starts from zero."""
+    down = _stub_bin(tmp_path / "down", connected=False, gateway="", ping_ok=False)
+    _run_recovery(tmp_path / "down", down, runs=1)
+    up = _stub_bin(tmp_path / "up", connected=True, gateway="192.0.2.1", ping_ok=True)
+    # The same state dir, with a connected device in front of it now.
+    (out,) = _run_recovery(tmp_path / "down", up, runs=1)
+    assert "is connected again after 1 activation attempt(s)" in out
+    assert (tmp_path / "down" / "state" / "down-tries").read_text().strip() == "0"

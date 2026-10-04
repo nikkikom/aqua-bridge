@@ -1,5 +1,5 @@
 [Unit]
-Description=aqua-bridge board: re-associate Wi-Fi when the link is up but dead
+Description=aqua-bridge board: re-associate or re-activate a dead Wi-Fi link
 Documentation=file:///opt/aqua-bridge/PROJECT.md
 # NetworkManager only. Deliberately NOT ordered against network-online.target:
 # this unit's whole job is the case where the network is not online, and
@@ -12,21 +12,24 @@ After=NetworkManager.service
 
 [Service]
 Type=oneshot
-# Root because "nmcli device disconnect/connect" needs it. The script does
-# nothing else that would: it reads nmcli and ip, pings one gateway, and keeps
-# two counters under RuntimeDirectory.
+# Root because "nmcli device disconnect/connect" and "nmcli connection up" need
+# it. The script does nothing else that would: it reads nmcli and ip, pings one
+# gateway, and keeps its counters under RuntimeDirectory.
 ExecStart=/usr/local/lib/aqua-bridge/aqua-net-recover.sh
 # Behind the control loop on a single-core-bound board: a Wi-Fi check must never
 # take CPU from a tick.
 Nice=10
-# Explicit, and above what one check can cost: two nmcli device commands at
+# Explicit, and above what one check can cost. A check takes one branch or the
+# other, never both: the up-but-dead branch is two nmcli device commands at
 # AQUA_NET_NMCLI_WAIT_S (20 s each by default) plus AQUA_NET_PING_DEADLINE_S
-# (5 s) = 45 s, so 90 s is twice the worst case and still well inside the
-# timer's 5 min. systemd's default would be DefaultTimeoutStartSec (1min 30s on
-# this board), which is *below* nmcli's own default wait for "device connect"
-# (90 s) plus everything before it -- a slow re-association would be SIGKILLed
-# part-way through. The script now passes an explicit --wait for that, and this
-# bound is the backstop; tests/test_deploy.py checks the two against each other.
+# (5 s) = 45 s, and the disconnected branch is one "nmcli connection up" at the
+# same 20 s. So 90 s is twice the worst case and still well inside the timer's
+# 5 min. systemd's default would be DefaultTimeoutStartSec (1min 30s on this
+# board), which is *below* nmcli's own default wait for "device connect" and
+# "connection up" (90 s) plus everything before it -- a slow activation would be
+# SIGKILLed part-way through. The script passes an explicit --wait for all three,
+# and this bound is the backstop; tests/test_deploy.py checks them against each
+# other.
 TimeoutStartSec=90
 # /run/aqua-net-recover, kept between the timer's runs (the counters are
 # meaningless across a reboot, which is why they live on tmpfs).

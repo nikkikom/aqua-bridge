@@ -6,9 +6,15 @@ Documentation=file:///opt/aqua-bridge/PROJECT.md
 # OnBootSec= and OnUnitActiveSec= are both written by
 # deploy/install-board-watchdogs.sh from its NET_RECOVER_INTERVAL variable; the
 # values here are that script's default and tests/test_deploy.py checks the two
-# agree. Five minutes: two failed checks (the script's AQUA_NET_FAIL_CHECKS)
-# are ten minutes of a dead link before anything is re-associated, and one
-# check costs a handful of pings.
+# agree. That variable's comment carries the argument for five minutes in full.
+# In short: it is the detection latency for both of the script's cases -- two
+# failed checks (AQUA_NET_FAIL_CHECKS) are ten minutes of an up-but-dead link
+# before it is re-associated, and one check of a disconnected device acts at
+# once, so a profile NetworkManager has given up on is unreachable for one
+# interval and an association, about six minutes. Retry pressure is not this
+# file's business: AQUA_NET_RECONNECT_MIN_S throttles activations inside the
+# script, so this interval can be lowered for faster detection without turning
+# into a knock every minute on an access point that is simply off.
 OnBootSec=5min
 OnUnitActiveSec=5min
 # The check is not urgent and the board has one job; let systemd coalesce it.

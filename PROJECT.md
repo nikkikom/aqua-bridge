@@ -450,28 +450,51 @@ the home router must never degrade cooling. Traced, path by path, on
   the DAS solvers work to `limit - k·sigma`, so a wider sigma can only raise
   duty. A sigma past `sigma_fault_c` is a zone fault: hold, then ramp high.
   Losing the network makes the fans work harder, never less.
-- **Recovery never escalates.** `deploy/aqua-net-recover.sh` (a `oneshot` unit
-  behind a 5 min timer) probes the gateway its own interface was handed — no
-  hardcoded address — and, after two failed checks, re-associates the Wi-Fi
-  interface with `nmcli device disconnect`/`connect`. That is all it may do:
-  no reboot in any form, no `systemctl`, nothing that touches
-  `aqua-bridge.service`, `aqua-heartbeat.service` or a controller. After three
-  fruitless re-associations it logs one line and then says nothing at all until
-  a probe succeeds, so a router that is simply switched off costs one journal
-  line — not a bounce loop, and not a line every timer period either. Three
-  details make that true rather than merely intended: the counter moves
-  *before* the `nmcli` pair, so a re-association that hangs until systemd kills
-  the unit still counts as the attempt it was; each `nmcli` carries an explicit
-  `--wait` (`AQUA_NET_NMCLI_WAIT_S`, 20 s) because `device connect`'s own
-  default is 90 s, longer than any sane start timeout; and `device disconnect`
-  blocks autoconnect until a manual activation (`nmcli(1)`), so autoconnect is
-  restored *between* the disconnect and the connect — a run killed in the
-  middle then leaves NetworkManager retrying on its own instead of leaving the
-  board off the network until somebody logs in locally. It exists
-  because of the outage below; it is not part of cooling and cannot become part
-  of it. A gateway watchdog that *reboots* is forbidden outright: with the
-  router off it is a reboot loop, and every reboot is a heartbeat gap and a jolt
-  on the fans.
+- **Recovery acts in both states the link can fail in, and never escalates
+  past them.** `deploy/aqua-net-recover.sh` (a `oneshot` unit behind a 5 min
+  timer) looks at `GENERAL.STATE` for the interface and takes one of two
+  branches.
+  - *Connected, and the link carries nothing.* It probes the gateway its own
+    interface was handed — no hardcoded address — and, after two failed checks,
+    re-associates with `nmcli device disconnect`/`connect`. After three
+    fruitless re-associations it logs one line and then says nothing at all
+    until a probe succeeds, so a router that is simply switched off costs one
+    journal line — not a bounce loop, and not a line every timer period either.
+    Three details make that true rather than merely intended: the counter moves
+    *before* the `nmcli` pair, so a re-association that hangs until systemd
+    kills the unit still counts as the attempt it was; each `nmcli` carries an
+    explicit `--wait` (`AQUA_NET_NMCLI_WAIT_S`, 20 s) because `device connect`'s
+    own default is 90 s, longer than any sane start timeout; and `device
+    disconnect` blocks autoconnect until a manual activation (`nmcli(1)`), so
+    autoconnect is restored *between* the disconnect and the connect — a run
+    killed in the middle then leaves NetworkManager retrying on its own instead
+    of leaving the board off the network until somebody logs in locally.
+  - *Disconnected, and nothing is retrying it.* It brings the profile up again
+    with `nmcli connection up` — a manual activation, which is also what resets
+    NetworkManager's own autoconnect retry counter. This branch **used to stand
+    down**: "`wlan0` is not connected; NetworkManager owns that, standing by",
+    on the reasoning that a disconnected device is NetworkManager's retry to
+    make. NetworkManager had given up, and the board spent four days off the
+    network with this timer printing that same line every five minutes (the
+    second outage below). The profile's name is never written down here — a
+    Wi-Fi profile is normally the SSID — so it is discovered from `nmcli`, or
+    named in `AQUA_NET_CONNECTION`. Activations are throttled by
+    `AQUA_NET_RECONNECT_MIN_S` rather than by the timer's period, so the timer
+    stays free to be a cheap detector.
+  That is all it may do, in either branch: no reboot in any form, no
+  `systemctl`, nothing that touches `aqua-bridge.service`,
+  `aqua-heartbeat.service` or a controller. **An absent access point is a wait,
+  not a fault to escalate**: with the router off every re-association and every
+  activation fails, that is the expected outcome, and no count of failures
+  unlocks a bigger hammer — there is no bigger hammer here to unlock. What a
+  long outage does get is one loud line every `AQUA_NET_LOUD_EVERY_S` (1 h)
+  naming how long the link has been down and how many activations have been
+  tried, worded so that reading it cannot be mistaken for a reason to escalate.
+  That line is the lesson of the second outage: four days of identical
+  "standing by" lines with nothing behind them read exactly like four days of a
+  unit doing its job. A gateway watchdog that *reboots* is forbidden outright:
+  with the router off it is a reboot loop, and every reboot is a heartbeat gap
+  and a jolt on the fans.
 
 **The outage that shaped this (2026-09-17).** The board dropped off the
 network for hours. It kept running and kept feeding the aquaero's software
@@ -487,6 +510,45 @@ time, for the size cap above to mean anything — it did not, until the fix the
 same bullet now describes: Raspberry Pi OS's own volatile-storage drop-in
 outsorted this script's, and the journal stayed in `/run/log/journal`
 regardless.
+
+**The second outage, and the one this layering did not cover (2026-10-04).**
+The board ran for **eight days without a stumble** — one boot, 2026-09-26 02:54
+to 2026-10-04 12:24, no crash, no reset, the heartbeat feeding the aquaero's
+software sensor the whole way — and was unreachable over Wi-Fi for the last
+four of them, until it was power-cycled. **Nothing fell over except the link.**
+With the journal finally persistent (the fix above), the board's own record
+says what happened, and it is not any of the three things previously suspected:
+not Wi-Fi power save, not the kernel's periodic 1-Wire bus search, not a stale
+IPv6 prefix.
+
+- Disconnects escalated over days: one on 09-26, one on 09-28, two on 09-29,
+  **eighteen on 09-30**. Across the boot: 16 with `reason=0` and
+  `locally_generated=1` (the station itself dropped the link), 5 with
+  `reason=15` (4-way handshake timeout), 1 with `reason=16` (group key
+  handshake timeout).
+- Last association: 09-30 19:12. After that, for four days, **not one
+  `wpa_supplicant` line at all** — no scan, no association attempt — and no
+  NetworkManager activation attempt either. A radio that is not even trying is
+  not a radio in power save.
+- The cause of that silence: `connection.autoconnect-retries` on the profile
+  was at NetworkManager's default of **4**. Four consecutive failures and
+  NetworkManager blocks autoconnect for that profile until a manual activation,
+  a NetworkManager restart or a reboot resets it. The storm on 09-30 spent
+  those four attempts in about three minutes, and then there was nothing left
+  to spend.
+- **Our own recovery unit stood down in exactly this case**, every five minutes
+  for four days: `wlan0 is not connected (30 (disconnected)); NetworkManager
+  owns that, standing`. It only acted on a link that was up but dead; a
+  genuinely disconnected device it left to NetworkManager, which had given up.
+
+So the 2026-09-17 power-save fix was not wrong and was not the cause of this —
+it addressed a different failure (associated and silent) and that failure has
+not recurred. Two fixes came out of this one: the profile now carries
+`connection.autoconnect-retries=0` (retry forever), written and *verified* by
+`deploy/install-board-watchdogs.sh` (§9), and `aqua-net-recover.sh` no longer
+assumes NetworkManager will recover — the bullet above has both branches. The
+fans were never involved in any of it: eight days of cooling, four of them with
+nobody able to look.
 
 ### USB spike results (2026-09-14)
 
@@ -11671,8 +11733,9 @@ XT6 firmware reverts (spike §2.3) or the board comes back. Accepted if
 
 `deploy/install-board-watchdogs.sh` — idempotent, run by the owner with
 `sudo`, `--check` reports without writing anything, `--no-net-recover`
-leaves the Wi-Fi timer out. It installs layer 3 of §2 and the two board
-settings the 2026-09-17 outage produced, and it touches
+leaves the Wi-Fi timer out. It installs layer 3 of §2 and the three board
+settings the two Wi-Fi outages produced (power save off, unlimited autoconnect
+retries, the re-association timer), and it touches
 `aqua-bridge.service`, the controllers and `config.yaml` **not at all**
 (`install-pi.sh` owns the unit; the script only *reads* it, to print the
 layering). Every number is a variable at the top, overridable from the
@@ -11688,6 +11751,9 @@ environment (`sudo SOC_WATCHDOG_SEC=90 deploy/install-board-watchdogs.sh`):
 | `JOURNAL_MAX_RETENTION` | `30day` | `MaxRetentionSec=` in the same file |
 | `JOURNAL_SYNC_INTERVAL` | `5m` | `SyncIntervalSec=` in the same file |
 | `WIFI_POWERSAVE` | `off` | `wifi.powersave = 2` in `/etc/NetworkManager/conf.d/10-aqua-wifi-powersave.conf` (`keep`: install nothing) |
+| `NET_IFACE` | `wlan0` | nothing; it is the interface whose profile the next two apply to |
+| `NET_CONNECTION` | *empty* | nothing; empty means "discover the profile(s) for `NET_IFACE`" (no SSID in this repository) |
+| `NET_AUTOCONNECT_RETRIES` | `0` | `connection.autoconnect-retries` on those profiles, with `nmcli connection modify` (`0` = forever, `-1` = leave it to NetworkManager) |
 | `NET_RECOVER_INTERVAL` | `5min` | `OnBootSec=`/`OnUnitActiveSec=` in `aqua-net-recover.timer` |
 
 `--no-net-recover` is an off switch, not a skipped step: it stops and disables
@@ -11760,29 +11826,79 @@ Notes that only show up on a real board:
 - **NetworkManager is reloaded, never restarted** (a restart drops the active
   connection, and the script has to be safe over ssh). `wifi.powersave` applies
   from the next activation of the interface — a reconnect or a reboot.
+- **`connection.autoconnect-retries` is the setting whose silent default cost
+  four days off the network** (§2, the 2026-10-04 incident). NetworkManager's
+  default is 4: four consecutive association failures and it blocks autoconnect
+  for that profile until a manual activation, a NetworkManager restart or a
+  reboot resets it — and then nothing in the system is trying any more, which is
+  invisible precisely because there is nothing left to log. The script sets it
+  to `NET_AUTOCONNECT_RETRIES` (`0`, retry forever) with `nmcli connection
+  modify`, and then **reads the effective value back** per profile and warns
+  when it is not what was asked for, for the same reason the two drop-ins above
+  are verified: this setting had already been "applied" by the default nobody
+  chose. It is a per-profile property, not something a `NetworkManager.conf`
+  drop-in can default, so unlike `wifi.powersave` it has to be written on the
+  profile itself. Which profile is **discovered, never named here** — a Wi-Fi
+  profile is normally the SSID and this repository is public: in order,
+  `NET_CONNECTION` if the owner set it, else the profile NetworkManager has on
+  `NET_IFACE` right now, else every profile that names `NET_IFACE` in
+  `connection.interface-name`, else every profile of that device's type. All
+  matches, not the first: the setting missing from whichever profile activates
+  next is the whole defect. Setting it changes nothing about the active
+  connection, so the script stays safe to run over ssh and with the router off.
 - `install-pi.sh` does not call this script and this script does not call
   `install-pi.sh`; run both, in either order.
 
 `deploy/aqua-net-recover.{sh,service,timer}` are the network-recovery unit
-described in §2. The script is installed to
-`/usr/local/lib/aqua-bridge/aqua-net-recover.sh`; its own knobs
-(`AQUA_NET_IFACE`, `AQUA_NET_FAIL_CHECKS`, `AQUA_NET_MAX_BOUNCES`,
+described in §2, whose two branches — a link that is up but dead, and a device
+that is disconnected with nothing retrying it — are argued there. The script is
+installed to `/usr/local/lib/aqua-bridge/aqua-net-recover.sh`; its own knobs
+(`AQUA_NET_IFACE`, `AQUA_NET_CONNECTION`, `AQUA_NET_FAIL_CHECKS`,
+`AQUA_NET_MAX_BOUNCES`, `AQUA_NET_RECONNECT_MIN_S`, `AQUA_NET_LOUD_EVERY_S`,
 `AQUA_NET_PING_COUNT`, `AQUA_NET_PING_DEADLINE_S`, `AQUA_NET_NMCLI_WAIT_S`,
 `AQUA_NET_STATE_DIR`) are
 at the top of the file with their reasoning; the unit passes none of them, so
 an override is `systemctl edit aqua-net-recover.service`. The unit's
-`TimeoutStartSec=90` is twice the worst case those defaults allow
-(`2·AQUA_NET_NMCLI_WAIT_S + AQUA_NET_PING_DEADLINE_S` = 45 s) and is set
-explicitly because systemd's default (1 min 30 s here) is *below* `nmcli`'s own
-default wait for `device connect` alone. Counters live under
+`TimeoutStartSec=90` is twice the worst case those defaults allow — a check
+takes one branch or the other, never both, and the up-but-dead one is the
+dearer at `2·AQUA_NET_NMCLI_WAIT_S + AQUA_NET_PING_DEADLINE_S` = 45 s against
+the disconnected branch's single 20 s activation — and it is set explicitly
+because systemd's default (1 min 30 s here) is *below* `nmcli`'s own default
+wait for `device connect` or `connection up` alone. Counters live under
 `RuntimeDirectory=` (tmpfs: they are meaningless across a reboot and must not
 wear the card). `--dry-run` reports what one check would do and changes
-nothing. `tests/test_deploy.py` runs the script against `nmcli`/`ip`/`ping`
-stubs and fails if it ever re-associates more than `AQUA_NET_MAX_BOUNCES`
-times, pings without a gateway, or touches a disconnected interface that
-NetworkManager is already retrying. The stubs cover the failing branches too,
-which are the ones the guards exist for: an `nmcli` that exits non-zero, one
-slow enough to be killed mid-run, and the silence after the give-up.
+nothing.
+
+**Why the timer stays at 5 min.** With the disconnected branch now acting, this
+interval *is* the worst case for how long a board whose profile NetworkManager
+gave up on stays unreachable: one interval plus one association, about six
+minutes, against the four days it cost before. Shortening it buys minutes on a
+fault that showed up once in eight days, and costs three things. The
+up-but-dead branch deliberately waits two failed checks (ten minutes) before it
+bounces a link, and a shorter interval shortens exactly that patience — which
+is the only place in here where acting too eagerly could hurt a live link. One
+run is bounded at `TimeoutStartSec=90`, a fifth of this interval, so a slow
+`nmcli` can never leave runs queued behind each other; at 1 min the bound would
+exceed the period. And five times the wakeups on a board whose single core
+belongs to the control loop is a real cost for a reachability problem. Retry
+pressure is no longer the timer's business at all —
+`AQUA_NET_RECONNECT_MIN_S` (240 s) throttles activations inside the script — so
+an owner who wants faster detection can lower `NET_RECOVER_INTERVAL` without
+turning it into a knock every minute on an access point that is simply off. The
+four days were never a cadence problem: the timer ran about 1150 times and did
+nothing.
+
+`tests/test_deploy.py` runs the script against `nmcli`/`ip`/`ping` stubs and
+fails if it ever re-associates more than `AQUA_NET_MAX_BOUNCES` times, pings
+without a gateway, leaves a disconnected interface alone, activates a profile
+whose name it did not get from `nmcli`, activates more often than
+`AQUA_NET_RECONNECT_MIN_S` allows, or stays quiet through an outage long enough
+to deserve the hourly line. `reboot`, `shutdown`, `poweroff`, `halt` and
+`systemctl` are on the stub `PATH` as loggers, so "it never escalates" is
+checked by running it in every link state and not only by reading it. The stubs
+cover the failing branches too, which are the ones the guards exist for: an
+`nmcli` that exits non-zero, one slow enough to be killed mid-run, and the
+silence after the give-up.
 
 **The free-space rule's journal cap is this script's, not a second one.**
 `health.HostHealthConfig.disk_free_min_gb`'s default (§3, "the card is low
@@ -11940,10 +12056,14 @@ on a Zero W; the hardware steps are waiting for the aquaero.
    says why; the fans are controlled regardless.
 6b. Board hardening, once per card and independent of the hardware steps:
    `sudo deploy/install-board-watchdogs.sh` (`--check` first to see what it
-   would change). SoC watchdog, journald caps, Wi-Fi power save off, and the
-   Wi-Fi re-association timer — §9 *Board hardening*, §2 *Watchdog layering*.
+   would change). SoC watchdog, journald caps, Wi-Fi power save off,
+   `connection.autoconnect-retries=0` on the Wi-Fi profile, and the Wi-Fi
+   re-association timer — §9 *Board hardening*, §2 *Watchdog layering*.
    It enables `aqua-net-recover.timer` and nothing else; it never enables or
-   starts `aqua-bridge`.
+   starts `aqua-bridge`. Read the report at the end: it prints the effective
+   watchdog timeouts, the effective journald `Storage=` and the effective
+   `connection.autoconnect-retries`, and warns rather than claiming success
+   when any of the three is not what was asked for.
 7. USB: dwc2 host, powered hub, XT6 on USB; the Quadro on aquabus (its PWM
    is writable through the aquaero, §2), or on its own USB port.
 8. `lsusb`, then `.venv/bin/python tools/aquacomputer_probe.py` as the
