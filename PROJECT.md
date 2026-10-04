@@ -9459,6 +9459,63 @@ Owner decision (2026-09-16):
     labelled comparison; see that item for both sets of numbers
     (`tests/test_bench_model_store.py`).
 
+149. **A Bluetooth rescue path, independent of the network** (owner,
+    2026-10-04). To be designed and built later; this item records the
+    decision and what it needs, not an implementation.
+
+    Why it is needed: the board drops off Wi-Fi repeatedly, and nothing
+    done so far has fixed that. Power save on the BCM43430 is off,
+    through a NetworkManager drop-in rather than the connection profile
+    and confirmed off in the kernel log (§2 *Watchdog layering*, the
+    2026-09-17 outage; item 134); the journal is persistent, confirmed
+    rather than assumed after the 2026-09-20 to 2026-09-25 outage it left
+    unreadable (§9 *Board hardening*); the SoC and service watchdogs are
+    installed (item 134). The drops continue regardless. Once the board
+    sits inside the DAS enclosure, Wi-Fi is the only way to reach it, and
+    losing that is unacceptable to the owner — hence an out-of-band path
+    that does not depend on the network at all, and the owner wants it
+    over Bluetooth rather than the UART header.
+
+    What blocks it: Bluetooth is deliberately off on this board. On
+    2026-09-20 the PL011 UART was given to the Digole display
+    (`enable_uart=1`, `dtoverlay=disable-bt`, §9 *Overlays and modules*;
+    §2 "Digole: UART `/dev/serial0`"), and the `bluetooth` and `hciuart`
+    services were disabled. Restoring it is therefore part of the work,
+    and there are two routes: `dtoverlay=miniuart-bt` (Bluetooth moves to
+    the mini UART, the display keeps PL011), or moving the Digole to I2C
+    over the solder jumper it supports on its own board (I2C is already
+    on, `dtparam=i2c_arm=on`, §9) — which frees the UART entirely instead
+    of sharing it.
+
+    What it does not cover: on a Raspberry Pi Zero 2 W, Wi-Fi and
+    Bluetooth are one chip (the BCM43430) on one antenna. A rescue path
+    over Bluetooth therefore shares a failure domain with the thing it is
+    rescuing — it covers a lost association, a broken address, DHCP or a
+    wedged network stack, and it does **not** cover a wedged radio or a
+    firmware trap in the combo chip. What covers the rest: a USB Ethernet
+    adapter on the powered hub §2 already requires, or a serial console
+    on the GPIO header. A rescue path presented as complete when it
+    shares that failure domain is worse than none, because nobody adds
+    the second one once the first looks sufficient.
+
+    Shape of the work, for whoever picks it up: a Bluetooth serial
+    console (RFCOMM/SPP behind a getty, or BLE) needs pairing done ahead
+    of time and stored on the board, `bluetoothd` running, a unit that
+    listens, and a decision about what the console may do — a root shell
+    over a radio link is a security decision, not a detail. It must also
+    obey the standing rule nothing in the rescue path may break: it must
+    not interfere with the control loop or the heartbeat that layer 4 of
+    §2 *Watchdog layering* depends on (30 s of silence on `softN` drives
+    every output to 100 %).
+
+    Open question, to settle first rather than answered here: whether the
+    drops are a radio problem at all. The board is reached by a name that
+    currently resolves only to IPv6 addresses, and a provider that
+    re-dials nightly changes the global prefix, so a stale `AAAA` record
+    would look exactly like a lost board while the board is fine. Pinning
+    an IPv4 lease, or using the ULA address instead, would settle it — and
+    the answer changes what this rescue path is even for.
+
 ### 8.3 Open — needs the DAS hardware
 
 31. USB host: `dtoverlay=dwc2,dr_mode=host` (`deploy/host-usb.sh`), powered
