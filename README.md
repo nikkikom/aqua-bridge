@@ -124,15 +124,21 @@ is not yet confirmed on real hardware, on either board.
    ```
 
    That one installs the SoC hardware watchdog, journald size and
-   retention caps for the persistent journal, Wi-Fi power save off, and a
-   timer that re-associates the Wi-Fi interface if the link goes deaf —
-   and nothing else: it never reboots, never restarts `aqua-bridge` and
-   never touches a controller, because the network is outside the cooling
-   path (PROJECT.md §2 *Watchdog layering*, §9 *Board hardening*). Every
-   value is a variable at the top of the script. A router that is simply
-   switched off costs one journal line and then silence; `--no-net-recover`
-   turns the Wi-Fi timer off again (it stops, disables and removes it), and
-   `--check` reports without writing anything.
+   retention caps for the persistent journal, Wi-Fi power save off,
+   unlimited NetworkManager autoconnect retries on the Wi-Fi profile
+   (`connection.autoconnect-retries=0`; the default of 4 is what left the
+   board off the network for four days once, PROJECT.md §2), and a timer
+   that re-associates the Wi-Fi interface if the link goes deaf or brings
+   its profile up again if NetworkManager has stopped trying — and nothing
+   else: it never reboots, never restarts `aqua-bridge` and never touches a
+   controller, because the network is outside the cooling path (PROJECT.md
+   §2 *Watchdog layering*, §9 *Board hardening*). Every value is a variable
+   at the top of the script, and the three settings that can be silently
+   overridden by something else on the board are read back and verified
+   rather than assumed. A router that is simply switched off is a wait, not
+   a fault: it costs a journal line an hour and no escalation of any kind.
+   `--no-net-recover` turns the Wi-Fi timer off again (it stops, disables
+   and removes it), and `--check` reports without writing anything.
 
 6. **Config.** Edit `/etc/aqua-bridge/config.yaml`: `mpc.channels` /
    `mpc.temps` / `mpc.sensors` / `mpc.topology` for the enclosure, the

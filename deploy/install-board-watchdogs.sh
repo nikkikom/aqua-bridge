@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Idempotent board hardening for a Raspberry Pi running aqua-bridge: the SoC
-# hardware watchdog, journald limits, Wi-Fi power save off, and the Wi-Fi
-# re-association timer (PROJECT.md §2 "Watchdog layering", §9).
+# hardware watchdog, journald limits, Wi-Fi power save off, unlimited
+# NetworkManager autoconnect retries, and the Wi-Fi re-association timer
+# (PROJECT.md §2 "Watchdog layering", §9).
 #
 # It does NOT touch aqua-bridge.service, the controllers, or the daemon's
 # config: the service watchdog lives in deploy/aqua-bridge.service and is
@@ -21,6 +22,17 @@
 # skipped step (a timer left enabled would keep running an old copy of the
 # script with whatever thresholds it was installed with). The watchdog and
 # journald settings are installed either way.
+#
+# Three settings here are verified rather than assumed, because all three have
+# already been written successfully and had no effect. Two are drop-ins that
+# compete with vendor files (next paragraph). The third is
+# connection.autoconnect-retries on the Wi-Fi profile: left at NetworkManager's
+# default of 4, four consecutive association failures block autoconnect for
+# that profile until something resets it -- which cost the owner's board four
+# days off the network on 2026-09-30 while it kept cooling perfectly throughout
+# (PROJECT.md §9 "Board hardening"). That default is silent, so this script
+# reads the effective value back from nmcli and says plainly when it is not
+# what was asked for.
 #
 # Two of the drop-ins below compete with vendor files Raspberry Pi OS ships in
 # the same *.conf.d directories. systemd merges *.conf.d fragments in lexical
@@ -101,9 +113,46 @@ JOURNAL_SYNC_INTERVAL="${JOURNAL_SYNC_INTERVAL:-5m}"
 # every wireless profile (the 2026-09-17 outage: BCM43430 associated, power save
 # on, unreachable for hours). "keep" installs no drop-in and removes none.
 WIFI_POWERSAVE="${WIFI_POWERSAVE:-off}"
-# How often aqua-net-recover.timer runs one check (a systemd time span). The
-# script re-associates only after two failed checks, so this is half the
-# reaction time.
+# The interface whose NetworkManager profile gets NET_AUTOCONNECT_RETRIES below:
+# wlan0 on a Raspberry Pi Zero 2 W. aqua-net-recover.sh carries its own
+# AQUA_NET_IFACE with the same default rather than inheriting this one, because
+# that script runs from a systemd timer with no environment and has to stand
+# alone; set both if the board's Wi-Fi interface is named something else.
+NET_IFACE="${NET_IFACE:-wlan0}"
+# The NetworkManager profile(s) to set connection.autoconnect-retries on. Empty
+# means discover them (nm_connections below), and empty is the default on
+# purpose: a Wi-Fi profile is normally named after the SSID, and no SSID may be
+# written down in this public repository. Set it to one profile name on a board
+# where the discovery would pick the wrong one of several.
+NET_CONNECTION="${NET_CONNECTION:-}"
+# connection.autoconnect-retries on that profile. 0 means "retry forever", which
+# is the whole point of setting it: NetworkManager's own default is 4, and four
+# consecutive failures block autoconnect for the profile until a manual
+# activation, a NetworkManager restart or a reboot resets it. On 2026-09-30 a
+# disconnect storm on the owner's board spent those four attempts in about three
+# minutes, and the board then sat with the radio idle for four days --
+# wpa_supplicant logged nothing at all, not one scan, not one association
+# attempt -- until it was power-cycled. The daemon kept cooling the whole time;
+# only the link was gone. -1 is accepted and means "leave it to NetworkManager's
+# global default", i.e. opt out of this fix deliberately.
+NET_AUTOCONNECT_RETRIES="${NET_AUTOCONNECT_RETRIES:-0}"
+# How often aqua-net-recover.timer runs one check (a systemd time span). It is
+# the detection latency for both of that script's cases, and with the
+# disconnected case now acting (it used to stand down), this interval is the
+# worst case for how long a board whose profile NetworkManager gave up on stays
+# unreachable: one interval plus one association, about six minutes, against the
+# four days it cost before. 5 min is kept rather than shortened, for three
+# reasons. The up-but-dead case deliberately needs two failed checks (ten
+# minutes) before it bounces a link, and shortening the interval shortens that
+# patience too -- which is where the risk of bouncing a live link lives. One run
+# is bounded at aqua-net-recover.service's TimeoutStartSec=90, a fifth of this
+# interval, so a slow nmcli can never leave runs queued behind each other. And
+# retry pressure is no longer this knob's business: AQUA_NET_RECONNECT_MIN_S in
+# the script throttles activations on its own, so a faster timer here buys
+# detection latency and cannot turn into hammering an absent access point.
+# Lowering it to 1min is safe and costs five times the wakeups on a board whose
+# single core belongs to the control loop; the four days were not a cadence
+# problem anyway -- the timer ran about 1150 times and did nothing.
 NET_RECOVER_INTERVAL="${NET_RECOVER_INTERVAL:-5min}"
 
 set -euo pipefail
@@ -187,6 +236,11 @@ case "$WIFI_POWERSAVE" in
     exit 2
     ;;
 esac
+if [[ ! "$NET_AUTOCONNECT_RETRIES" =~ ^(-1|[0-9]+)$ ]]; then
+  echo "error: NET_AUTOCONNECT_RETRIES must be a whole number (0 = forever," \
+    "-1 = NetworkManager's global default), got '$NET_AUTOCONNECT_RETRIES'" >&2
+  exit 2
+fi
 case "$JOURNAL_STORAGE" in
   persistent | volatile | auto) ;;
   *)
@@ -302,6 +356,107 @@ watchdog_report() {
       "lexically later filename is winning; 'systemd-analyze cat-config" \
       "systemd/system.conf' shows which one. PROJECT.md §9 'Board hardening'."
   fi
+}
+
+# nm_connections. The NetworkManager profiles connection.autoconnect-retries is
+# set on and read back from -- never a profile name written down here, since a
+# Wi-Fi profile is normally named after the SSID and this repository is public.
+# In order: NET_CONNECTION, if the owner named one; else the profile
+# NetworkManager has on $NET_IFACE right now; else every profile that names
+# $NET_IFACE in connection.interface-name; else every profile of $NET_IFACE's own
+# type (a board with one Wi-Fi profile, which is this one). Several at once on
+# purpose, unlike aqua-net-recover.sh's single pick: this runs once, by hand, and
+# the setting missing from whichever profile activates next is exactly the defect
+# it exists to prevent. Prints nothing when nmcli knows of no candidate.
+nm_connections() {
+  if [[ -n "$NET_CONNECTION" ]]; then
+    printf '%s\n' "$NET_CONNECTION"
+    return 0
+  fi
+  local show bound dev_type line name ctype iface_of
+  show="$(nmcli -t -f GENERAL.CONNECTION,GENERAL.TYPE device show "$NET_IFACE" 2> /dev/null || true)"
+  bound="$(printf '%s\n' "$show" | sed -n 's/^GENERAL\.CONNECTION://p' | head -n 1)"
+  bound="${bound//\\:/:}"
+  if [[ -n "$bound" && "$bound" != "--" ]]; then
+    printf '%s\n' "$bound"
+    return 0
+  fi
+  dev_type="$(printf '%s\n' "$show" | sed -n 's/^GENERAL\.TYPE://p' | head -n 1)"
+  local by_iface=() by_type=()
+  # nmcli -t escapes a ':' inside a value as '\:', so the type is split off the
+  # end (it never contains one) rather than by IFS.
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    ctype="${line##*:}"
+    name="${line%:*}"
+    name="${name//\\:/:}"
+    [[ -n "$name" ]] || continue
+    iface_of="$(nmcli -t -f connection.interface-name connection show "$name" 2> /dev/null \
+      | sed -n 's/^connection\.interface-name://p' | head -n 1)"
+    if [[ "$iface_of" == "$NET_IFACE" ]]; then
+      by_iface+=("$name")
+    elif [[ -n "$dev_type" && "$ctype" == "$dev_type" ]]; then
+      by_type+=("$name")
+    fi
+  done < <(nmcli -t -f NAME,TYPE connection show 2> /dev/null || true)
+  if [[ "${#by_iface[@]}" -gt 0 ]]; then
+    printf '%s\n' "${by_iface[@]}"
+  elif [[ "${#by_type[@]}" -gt 0 ]]; then
+    printf '%s\n' "${by_type[@]}"
+  fi
+}
+
+# autoconnect_retries_of <profile>. The value NetworkManager actually has stored,
+# first field only: nmcli prints some integer properties as "-1 (default)".
+autoconnect_retries_of() {
+  nmcli -t -f connection.autoconnect-retries connection show "$1" 2> /dev/null \
+    | sed -n 's/^connection\.autoconnect-retries://p' | head -n 1 | awk '{ print $1 }'
+}
+
+# autoconnect_retries_report. Prints what NetworkManager will actually do after
+# a failed association, not what was asked for -- read back from nmcli, the one
+# question a writer of this setting cannot answer by looking at its own write,
+# the same principle as watchdog_report and journald_storage_report. This is the
+# setting whose silent default of 4 cost four days off the network, so a board
+# where it did not take has to say so. Needs no root; --check calls it before
+# anything is written, so it reports the board's *current* state.
+autoconnect_retries_report() {
+  if ! command -v nmcli > /dev/null 2>&1; then
+    echo "  (nmcli not found, cannot verify connection.autoconnect-retries)"
+    return 0
+  fi
+  local names=() name value
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    names+=("$name")
+  done < <(nm_connections)
+  if [[ "${#names[@]}" -eq 0 ]]; then
+    echo "  WARNING: NetworkManager knows no profile for NET_IFACE=$NET_IFACE, so" \
+      "connection.autoconnect-retries is set nowhere and NetworkManager's own" \
+      "default of 4 is what this board will use: four consecutive association" \
+      "failures and autoconnect for the profile is blocked until a manual" \
+      "activation, a NetworkManager restart or a reboot. Name the profile in" \
+      "NET_CONNECTION and re-run. PROJECT.md §9 'Board hardening'."
+    return 0
+  fi
+  for name in "${names[@]}"; do
+    value="$(autoconnect_retries_of "$name")"
+    echo "  connection.autoconnect-retries ($name): ${value:-unknown}"
+    if [[ -n "$value" && "$value" == "$NET_AUTOCONNECT_RETRIES" ]]; then
+      if [[ "$NET_AUTOCONNECT_RETRIES" == "0" ]]; then
+        echo "  OK: matches NET_AUTOCONNECT_RETRIES=0 (0 = retry forever)"
+      else
+        echo "  OK: matches NET_AUTOCONNECT_RETRIES=$NET_AUTOCONNECT_RETRIES"
+      fi
+    else
+      echo "  WARNING: asked for NET_AUTOCONNECT_RETRIES=$NET_AUTOCONNECT_RETRIES," \
+        "NetworkManager has connection.autoconnect-retries=${value:-unknown} on" \
+        "'$name'. -1 means NetworkManager's global default, which is 4: four" \
+        "consecutive association failures and autoconnect for this profile is" \
+        "blocked until a manual activation, a NetworkManager restart or a" \
+        "reboot -- the four days of 2026-09-30. PROJECT.md §9 'Board hardening'."
+    fi
+  done
 }
 
 # journald_storage_report. Prints what journald is actually doing, not what was
@@ -424,6 +579,46 @@ else
   echo "  WIFI_POWERSAVE=keep: leaving $NM_DROPIN alone"
 fi
 
+echo "== Wi-Fi autoconnect retries =="
+# Not a drop-in: connection.autoconnect-retries is a per-profile property and
+# NetworkManager.conf's [connection] defaults section does not cover it, so this
+# is an nmcli write against whatever profile(s) nm_connections finds. It changes
+# nothing about cooling and nothing about the active connection -- the property
+# only decides how long NetworkManager keeps retrying after a failure -- so it is
+# safe to run over ssh and safe with the router off.
+if ! command -v nmcli > /dev/null 2>&1; then
+  echo "  nmcli not found; nothing to set"
+else
+  NM_CONNECTIONS=()
+  while IFS= read -r conn_name; do
+    [[ -n "$conn_name" ]] || continue
+    NM_CONNECTIONS+=("$conn_name")
+  done < <(nm_connections)
+  if [[ "${#NM_CONNECTIONS[@]}" -eq 0 ]]; then
+    echo "  no NetworkManager profile found for NET_IFACE=$NET_IFACE; nothing to set" \
+      "(the report below says what that leaves the board running)"
+  fi
+  for conn_name in "${NM_CONNECTIONS[@]}"; do
+    conn_retries="$(autoconnect_retries_of "$conn_name")"
+    if [[ "$conn_retries" == "$NET_AUTOCONNECT_RETRIES" ]]; then
+      echo "  unchanged: '$conn_name' connection.autoconnect-retries=$conn_retries"
+      continue
+    fi
+    CHANGED=1
+    if [[ "$CHECK_ONLY" -eq 1 ]]; then
+      echo "  would set: '$conn_name' connection.autoconnect-retries" \
+        "${conn_retries:-unknown} -> $NET_AUTOCONNECT_RETRIES"
+      continue
+    fi
+    if as_root nmcli connection modify "$conn_name" \
+      connection.autoconnect-retries "$NET_AUTOCONNECT_RETRIES"; then
+      echo "  set: '$conn_name' connection.autoconnect-retries=$NET_AUTOCONNECT_RETRIES"
+    else
+      echo "  WARNING: could not set connection.autoconnect-retries on '$conn_name'"
+    fi
+  done
+fi
+
 if [[ "$NET_RECOVER" -eq 1 ]]; then
   echo "== Wi-Fi re-association timer =="
   install_text "$NET_RECOVER_DST" 755 < "$NET_RECOVER_SRC"
@@ -463,6 +658,9 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
   echo "== journald storage (current board state, before any change) =="
   journald_storage_report
   echo
+  echo "== Wi-Fi autoconnect retries (current board state, before any change) =="
+  autoconnect_retries_report
+  echo
   if [[ "$CHANGED" -eq 1 ]]; then
     echo "== check: changes pending, nothing was written =="
   else
@@ -496,6 +694,8 @@ if [[ "$NEEDS_NM_RELOAD" -eq 1 ]] && systemctl is-active --quiet NetworkManager;
   as_root systemctl reload NetworkManager
   echo "  NetworkManager reloaded; power save is off from the next association on"
 fi
+echo "== Wi-Fi autoconnect retries =="
+autoconnect_retries_report
 if [[ "$NET_RECOVER" -eq 1 ]]; then
   as_root systemctl enable --now aqua-net-recover.timer
   echo "  aqua-net-recover.timer: $(systemctl is-active aqua-net-recover.timer)"
@@ -523,8 +723,15 @@ every fan at 100 % -- before the recovery starts. Loud, never under-cooled.
 PROJECT.md §2 has the timeline.
 
 Nothing above reacts to the network. aqua-net-recover only re-associates the
-Wi-Fi interface: it never reboots, never restarts aqua-bridge and never touches
-a controller (PROJECT.md §2).
+Wi-Fi interface and brings its NetworkManager profile up again: it never
+reboots, never restarts aqua-bridge and never touches a controller
+(PROJECT.md §2). With the access point off, both are no-ops that cost a journal
+line -- waiting is the whole response, and there is no escalation above it.
+
+connection.autoconnect-retries=${NET_AUTOCONNECT_RETRIES} on the Wi-Fi profile
+is the other half of that: NetworkManager's default of 4 is what let the board
+stop trying altogether on 2026-09-30, and the report above reads the effective
+value back rather than trusting this script's own write.
 EOF
 if [[ "$NET_RECOVER" -eq 1 ]]; then
   echo "Try it by hand with"
