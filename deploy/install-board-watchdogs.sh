@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Idempotent board hardening for a Raspberry Pi running aqua-bridge: the SoC
 # hardware watchdog, journald limits, Wi-Fi power save off, unlimited
-# NetworkManager autoconnect retries, and the Wi-Fi re-association timer
-# (PROJECT.md §2 "Watchdog layering", §9).
+# NetworkManager autoconnect retries, the Wi-Fi re-association timer, and the
+# network diagnostic watcher (PROJECT.md §2 "Watchdog layering", §9).
 #
 # It does NOT touch aqua-bridge.service, the controllers, or the daemon's
 # config: the service watchdog lives in deploy/aqua-bridge.service and is
@@ -14,6 +14,7 @@
 #   sudo deploy/install-board-watchdogs.sh            # apply
 #   deploy/install-board-watchdogs.sh --check         # report only, change nothing
 #   sudo deploy/install-board-watchdogs.sh --no-net-recover
+#   sudo deploy/install-board-watchdogs.sh --no-net-watch
 #
 # --check needs no root and writes nothing; it prints what would change.
 # --no-net-recover installs no Wi-Fi script, unit or timer, and *removes* the
@@ -22,6 +23,17 @@
 # skipped step (a timer left enabled would keep running an old copy of the
 # script with whatever thresholds it was installed with). The watchdog and
 # journald settings are installed either way.
+# --no-net-watch does the same for the diagnostic watcher, and for the same
+# reason: a long-running service left enabled keeps running the copy of the
+# script installed back then.
+#
+# The two network units do different jobs and neither needs the other.
+# aqua-net-recover acts: it re-associates a dead link and re-activates a profile
+# NetworkManager has given up on. aqua-net-watch only ever observes: it samples
+# the interface, the association, the address, the route, the gateway's
+# neighbour entry and the SoC's own power and temperature figures, and records
+# whether the previous boot ended cleanly. It never sends a packet, never loads
+# a module and never touches a service, so the two cannot fight.
 #
 # Three settings here are verified rather than assumed, because all three have
 # already been written successfully and had no effect. Two are drop-ins that
@@ -154,6 +166,26 @@ NET_AUTOCONNECT_RETRIES="${NET_AUTOCONNECT_RETRIES:-0}"
 # single core belongs to the control loop; the four days were not a cadence
 # problem anyway -- the timer ran about 1150 times and did nothing.
 NET_RECOVER_INTERVAL="${NET_RECOVER_INTERVAL:-5min}"
+# Seconds between two samples of deploy/aqua-net-watch.sh while the link is
+# healthy, written into aqua-net-watch.service as
+# Environment=AQUA_NETWATCH_INTERVAL_S. 15 s is the resolution of the one answer
+# that watcher exists to give: which of the interface, the association, the IPv4
+# address, the default route and the gateway stops working FIRST, since four of
+# those five failures look identical from outside the board and want four
+# different fixes. It is also how stale the newest sample line may be when the
+# board dies without warning -- and after 2026-10-06 that line, with the rail's
+# last known voltage and throttle flags on it, is the evidence. It must stay well
+# below the time each layer takes to notice the one beneath it (a DHCP client
+# gives up in seconds, ARP in tens of seconds) or two layers failing in sequence
+# collapse into one sample and the ordering, which is the whole point, is lost.
+# The script's own default is the same 15, and tests/test_deploy.py checks that
+# this, the unit and the script agree.
+NET_WATCH_INTERVAL="${NET_WATCH_INTERVAL:-15}"
+# The same while any layer is bad (Environment=AQUA_NETWATCH_OUTAGE_INTERVAL_S).
+# Slower on purpose and never faster than the above: by then the transitions have
+# already been snapshotted, and what the next hours -- or, on 2026-10-06, thirty
+# of them -- need is the evolution on record without filling a capped journal.
+NET_WATCH_OUTAGE_INTERVAL="${NET_WATCH_OUTAGE_INTERVAL:-30}"
 
 set -euo pipefail
 
@@ -195,12 +227,17 @@ NET_UNIT_SRC="$SCRIPT_DIR/aqua-net-recover.service"
 NET_UNIT_DST="/etc/systemd/system/aqua-net-recover.service"
 NET_TIMER_SRC="$SCRIPT_DIR/aqua-net-recover.timer"
 NET_TIMER_DST="/etc/systemd/system/aqua-net-recover.timer"
+NET_WATCH_SRC="$SCRIPT_DIR/aqua-net-watch.sh"
+NET_WATCH_DST="/usr/local/lib/aqua-bridge/aqua-net-watch.sh"
+NET_WATCH_UNIT_SRC="$SCRIPT_DIR/aqua-net-watch.service"
+NET_WATCH_UNIT_DST="/etc/systemd/system/aqua-net-watch.service"
 
 CHECK_ONLY=0
 NET_RECOVER=1
+NET_WATCH=1
 
 usage() {
-  echo "Usage: $0 [--check] [--no-net-recover]" >&2
+  echo "Usage: $0 [--check] [--no-net-recover] [--no-net-watch]" >&2
   exit 2
 }
 
@@ -211,6 +248,9 @@ for arg in "$@"; do
       ;;
     --no-net-recover)
       NET_RECOVER=0
+      ;;
+    --no-net-watch)
+      NET_WATCH=0
       ;;
     *)
       usage
@@ -239,6 +279,18 @@ esac
 if [[ ! "$NET_AUTOCONNECT_RETRIES" =~ ^(-1|[0-9]+)$ ]]; then
   echo "error: NET_AUTOCONNECT_RETRIES must be a whole number (0 = forever," \
     "-1 = NetworkManager's global default), got '$NET_AUTOCONNECT_RETRIES'" >&2
+  exit 2
+fi
+for name in NET_WATCH_INTERVAL NET_WATCH_OUTAGE_INTERVAL; do
+  if [[ ! "${!name}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: $name must be a whole number of seconds, got '${!name}'" >&2
+    exit 2
+  fi
+done
+if [[ "$NET_WATCH_OUTAGE_INTERVAL" -lt "$NET_WATCH_INTERVAL" ]]; then
+  echo "error: NET_WATCH_OUTAGE_INTERVAL ($NET_WATCH_OUTAGE_INTERVAL) below" \
+    "NET_WATCH_INTERVAL ($NET_WATCH_INTERVAL): an outage is the long part and" \
+    "must not be sampled faster than health" >&2
   exit 2
 fi
 case "$JOURNAL_STORAGE" in
@@ -650,6 +702,41 @@ else
     "cooling path, PROJECT.md §2)"
 fi
 
+NEEDS_WATCH_RESTART=0
+if [[ "$NET_WATCH" -eq 1 ]]; then
+  echo "== network diagnostic watcher =="
+  install_text "$NET_WATCH_DST" 755 < "$NET_WATCH_SRC"
+  NEEDS_WATCH_RESTART="$LAST_WROTE"
+  watch_tmp="$(mktemp)"
+  sed -e "s|^Environment=AQUA_NETWATCH_INTERVAL_S=.*|Environment=AQUA_NETWATCH_INTERVAL_S=$NET_WATCH_INTERVAL|" \
+    -e "s|^Environment=AQUA_NETWATCH_OUTAGE_INTERVAL_S=.*|Environment=AQUA_NETWATCH_OUTAGE_INTERVAL_S=$NET_WATCH_OUTAGE_INTERVAL|" \
+    "$NET_WATCH_UNIT_SRC" > "$watch_tmp"
+  install_text "$NET_WATCH_UNIT_DST" 644 < "$watch_tmp"
+  rm -f "$watch_tmp"
+  if [[ "$LAST_WROTE" -eq 1 ]]; then
+    NEEDS_WATCH_RESTART=1
+  fi
+else
+  echo "== network diagnostic watcher: off (--no-net-watch) =="
+  # Same argument as the timer above, and more pointed: this one is a
+  # long-running service, so an earlier run's copy keeps sampling on its old
+  # cadence until something stops it.
+  if [[ -e "$NET_WATCH_UNIT_DST" ]]; then
+    CHANGED=1
+    if [[ "$CHECK_ONLY" -eq 1 ]]; then
+      echo "  would stop and disable aqua-net-watch.service"
+    else
+      as_root systemctl disable --now aqua-net-watch.service || true
+      echo "  stopped and disabled aqua-net-watch.service"
+    fi
+  fi
+  remove_path "$NET_WATCH_UNIT_DST"
+  remove_path "$NET_WATCH_DST"
+  echo "  (the clean-stop marker under /var/lib/aqua-net-watch is left alone: it" \
+    "is evidence, not configuration, and 'systemctl clean --what=state" \
+    "aqua-net-watch.service' removes it)"
+fi
+
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
   echo
   echo "== SoC watchdog (current board state, before any change) =="
@@ -700,6 +787,22 @@ if [[ "$NET_RECOVER" -eq 1 ]]; then
   as_root systemctl enable --now aqua-net-recover.timer
   echo "  aqua-net-recover.timer: $(systemctl is-active aqua-net-recover.timer)"
 fi
+if [[ "$NET_WATCH" -eq 1 ]]; then
+  echo "== network diagnostic watcher =="
+  as_root systemctl enable --now aqua-net-watch.service
+  # A long-running service keeps running whatever it was started with, so a
+  # changed script or unit has to be picked up explicitly. Restarting it is
+  # harmless by construction: it only reads, and its own ExecStop= records the
+  # stop so the restart shows up in its boot report as a restart rather than as a
+  # board that lost power.
+  if [[ "$NEEDS_WATCH_RESTART" -eq 1 ]]; then
+    as_root systemctl restart aqua-net-watch.service
+    echo "  restarted to pick up the new script/unit"
+  fi
+  echo "  aqua-net-watch.service: $(systemctl is-active aqua-net-watch.service)"
+  echo "  read an outage out of it with:"
+  echo "    journalctl -t aqua-net-watch -o short-iso --since -2h"
+fi
 
 service_watchdog="?"
 if [[ -r "$UNIT_SRC" ]]; then
@@ -722,6 +825,15 @@ the heartbeat itself, a kill by either of them has already cost the alarm --
 every fan at 100 % -- before the recovery starts. Loud, never under-cooled.
 PROJECT.md §2 has the timeline.
 
+aqua-net-watch is not a watchdog at all and is not a layer above: it is the
+instrument. It samples, every ${NET_WATCH_INTERVAL} s, which of the interface's
+existence, the association, the IPv4 address, the default route and the gateway
+is working, together with the SoC's throttle flags, core voltage and
+temperature; it dumps everything on a change; and it reports at startup whether
+the previous boot ended cleanly or the board lost power. It sends no packet,
+loads no module, touches no service and writes nothing but a three-line
+clean-stop marker. It cannot fight aqua-net-recover because it cannot act.
+
 Nothing above reacts to the network. aqua-net-recover only re-associates the
 Wi-Fi interface and brings its NetworkManager profile up again: it never
 reboots, never restarts aqua-bridge and never touches a controller
@@ -734,8 +846,15 @@ stop trying altogether on 2026-09-30, and the report above reads the effective
 value back rather than trusting this script's own write.
 EOF
 if [[ "$NET_RECOVER" -eq 1 ]]; then
-  echo "Try it by hand with"
+  echo "Try the recovery script by hand with"
   echo "  ${NET_RECOVER_DST} --dry-run"
 else
-  echo "It is not installed (--no-net-recover)."
+  echo "The recovery script is not installed (--no-net-recover)."
+fi
+if [[ "$NET_WATCH" -eq 1 ]]; then
+  echo "Try the watcher by hand with"
+  echo "  ${NET_WATCH_DST} --once"
+  echo "  ${NET_WATCH_DST} --boot-report"
+else
+  echo "The watcher is not installed (--no-net-watch)."
 fi

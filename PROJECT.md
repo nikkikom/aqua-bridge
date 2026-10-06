@@ -11755,12 +11755,19 @@ environment (`sudo SOC_WATCHDOG_SEC=90 deploy/install-board-watchdogs.sh`):
 | `NET_CONNECTION` | *empty* | nothing; empty means "discover the profile(s) for `NET_IFACE`" (no SSID in this repository) |
 | `NET_AUTOCONNECT_RETRIES` | `0` | `connection.autoconnect-retries` on those profiles, with `nmcli connection modify` (`0` = forever, `-1` = leave it to NetworkManager) |
 | `NET_RECOVER_INTERVAL` | `5min` | `OnBootSec=`/`OnUnitActiveSec=` in `aqua-net-recover.timer` |
+| `NET_WATCH_INTERVAL` | `15` | `Environment=AQUA_NETWATCH_INTERVAL_S=` in `aqua-net-watch.service` (seconds between samples while healthy) |
+| `NET_WATCH_OUTAGE_INTERVAL` | `30` | `Environment=AQUA_NETWATCH_OUTAGE_INTERVAL_S=` in the same unit; refused below `NET_WATCH_INTERVAL` |
 
 `--no-net-recover` is an off switch, not a skipped step: it stops and disables
 `aqua-net-recover.timer` and deletes the three installed files. Skipping alone
 would leave a previously enabled timer running the copy of the script installed
 back then, with the thresholds it had back then — and a re-run with the flag
 would look like it had turned the recovery off while it had not.
+`--no-net-watch` is the same switch for the diagnostic watcher, and the argument
+is sharper there because that one is a long-running service rather than a
+oneshot: a copy left running keeps sampling on its old cadence until something
+stops it. For the same reason a re-run that *changes* the watcher's script or
+unit also restarts it; a re-run that changes neither restarts nothing.
 
 Notes that only show up on a real board:
 
@@ -11917,6 +11924,208 @@ than the caps let on — the two bullets above have the finding and the fix.
 as margin on top of the recorder-plus-model-store arithmetic, never a term
 it depends on — now because persistence is guaranteed and verified, not
 because it might not apply.
+
+### Network diagnostic watcher: what fails first, and what the rail was doing
+
+`deploy/aqua-net-watch.{sh,service}`, installed by
+`install-board-watchdogs.sh` alongside the recovery timer (`--no-net-watch`
+leaves it out and removes it). It is **not** a watchdog and not a layer of §2:
+it is the instrument. It observes and records; it never acts.
+
+**The question.** Every network outage this board has had was diagnosed
+afterwards, from whatever the journal happened to hold, and three of them were
+diagnosed wrongly at first — because from outside the board they are the same
+symptom, "it is unreachable", and they want different fixes. What tells them
+apart is the **order** in which things stopped working, and nothing was
+recording that. So the watcher samples a ladder, lowest rung first, and the
+lowest bad rung is the diagnosis:
+
+| Rung | What it means when this is the lowest bad one | Seen |
+|------|----------------------------------------------|------|
+| `iface` | there is no netdev at all: nothing to associate, address, route or recover | 2026-10-06, the `brcmfmac` firmware download over SDIO failing its checksum |
+| `assoc` | the interface exists and the association drops (no BSSID, `wpa_state` leaves `COMPLETED`) | 2026-09-30, the 18-disconnect storm that ended in a temp-disabled SSID |
+| `v4` | the association holds and the IPv4 address disappears — a DHCP fault, not a radio one | the lease loss behind several of them |
+| `rt` | the address holds and the default route goes — NetworkManager, not the radio | |
+| `gw` | all of that holds and the gateway stops answering — the other end of the link | 2026-10-06, the stale neighbour entry |
+
+The layers **above** the lowest bad one report `na`, not `DOWN`: the address
+being missing from an interface that does not exist is not evidence of
+anything, and four spurious `DOWN`s would bury the rung that matters. The same
+rule applies to `gw` with no route — whether the gateway answers is then
+unknowable, not bad.
+
+Underneath all five rungs, the rail. The 2026-10-06 forensics moved the
+question: the last healthy boot did not fail at the network, it **died** — the
+journal stops mid-stream on a routine line eleven seconds after the interface
+had re-associated and taken a lease, with no service shutdown, no shutdown
+target, no panic, no OOM, no watchdog expiry. Then twenty boots in a row each
+died about six seconds in, to the second; the SoC watchdog's timeout is sixty
+seconds, so it was not that either, and the boot that finally survived is the
+one whose radio firmware failed its checksum. A supply that collapses and
+retries looks exactly like that, and so does a marginal rail corrupting a bulk
+SDIO transfer — but there is **no positive evidence** for it, because the
+firmware's throttle flags latch only within the boot they happen in, so every
+clean `get_throttled` reading we have was taken after the reset that cleared
+them. That is not an argument to settle, it is a measurement to take:
+
+- **every sample carries the SoC's own figures** next to the network ones — the
+  firmware's throttle flag word, the core voltage and the die temperature — and
+  a change in that flag word is a transition in its own right, with a full
+  snapshot behind it. Partly for the transition and partly for the last line
+  before a death: whatever the journal's final sample says the rail was doing
+  is evidence nobody had before. A sag is deliberately **not** a rung of the
+  ladder, because the latched "has occurred" bits would otherwise keep a board
+  that sagged once in the degraded state until its next reset;
+- **a boot report, once at startup**, says whether the previous boot ended
+  cleanly. A kernel cannot log its own power loss, so it is recorded from the
+  other side: `ExecStop=` writes a three-line marker under
+  `StateDirectory=aqua-net-watch` (on `/var`, never `RuntimeDirectory=` — a
+  marker on tmpfs would be erased by exactly the event it exists to detect),
+  and the next start either finds it (*the board was shut down*) or does not
+  (*it was reset or lost power*), reports the previous boot's id and the
+  timestamp of its last journal entry from `journalctl --list-boots`, and then
+  clears it, so each marker answers for exactly one boot. A marker naming
+  *this* boot is a third answer — the unit was restarted inside one boot — and
+  is reported as such rather than as a verdict on a board. "Did it reboot or
+  did it lose power" stops being an inference about every future event.
+
+**How to read it.** One unit, one `SyslogIdentifier`, so the whole story of an
+outage — the boot report, the samples leading in, the dump at the transition,
+the recovery — is one command:
+
+```bash
+journalctl -t aqua-net-watch -o short-iso --since -2h
+# just the skeleton: every transition and every dump boundary, no sample lines
+journalctl -t aqua-net-watch -o short-iso --since -2h \
+  | grep -E ' (ABSENT|BOOT|CHANGE|DEGRADED|POWER|RECOVERED|ROAM|SILENT|snapshot (begin|end)) '
+# one section of the dumps, e.g. the cached scan results that show both APs
+journalctl -t aqua-net-watch | grep 'snapshot \[scan\]'
+```
+
+Line kinds: `sample` (one per interval while anything is moving, one per
+`AQUA_NETWATCH_IDLE_EVERY` while nothing is); `CHANGE`, which names every
+component that moved as `old->new`, the layers they belong to, **and `held=`
+the layers that did not** — `wpa=COMPLETED->DISCONNECTED … held=iface,v4,rt,gw`
+is a whole diagnosis on one line; `DEGRADED first=…` and `RECOVERED after=…
+lost=… back=… bssid=same|changed(…)`; `ABSENT`, the headline for the lowest
+rung, carrying whether the driver module is loaded, which netdevs *do* exist,
+and the first firmware/SDIO failure this boot's kernel log holds, quoted;
+`POWER`, the decoded flag word; `ROAM`, a BSSID change with the association
+never dropping (newly possible since 2026-10-05, when a second access point on
+the same SSID appeared); `SILENT`, every layer up and nothing arriving, which is
+the 2026-09-17 shape and which the ladder alone calls healthy; and `snapshot`
+blocks whose every body line is tagged with its section.
+
+A snapshot dumps addresses, both route tables, both neighbour tables,
+`wpa_cli status`/`signal_poll`/`scan_results`, `/proc/net/wireless`,
+NetworkManager's view of the device and the active connection, a DHCP lease if
+one can be read, this boot's wireless-driver kernel lines **from the top** (the
+firmware verdict is printed once, in early boot, so a tail of the recent ring
+buffer is exactly where it is not) and the recent end of the same filter, the
+`NetworkManager`, `wpa_supplicant` and `aqua-net-recover` journal tails, load
+average, memory, the interface's full counters, and the rail with the flag word
+decoded. When the interface is absent it adds the firmware verdict, `/proc/modules`
+for the driver and its dependencies, the netdev list, the SDIO and MMC devices
+the chip hangs off, and the firmware blobs on disk with their sizes.
+
+**It is inert, and that is enforced twice.** In the script: no reconnect, no
+re-association, no scan, no `modprobe`, no reboot, no service touched, no
+controller opened, and **no packet sent — not even a ping**. That last one is
+not tidiness. A ping every fifteen seconds would refresh the gateway's ARP entry
+and keep the link busy, which would hide both symptoms being hunted: a stale or
+failed neighbour entry, and the power-save state that made the link go deaf for
+hours on 2026-09-17. An observer that keeps the patient awake is not observing.
+`aqua-net-recover.sh`'s own five-minutely ping *is* the active probe, and the
+watcher reads its result out of the kernel's neighbour table for free. In the
+unit: `RestrictAddressFamilies=AF_UNIX AF_NETLINK` — no family that can carry a
+packet — an empty `CapabilityBoundingSet=` (the kernel log is read with
+`journalctl -k`, not `dmesg`, precisely so `CAP_SYSLOG` is not needed),
+`PrivateDevices=yes` with exactly one physical node allowed back,
+`DeviceAllow=/dev/vcio r`, which is the firmware mailbox the rail is measured
+through and nothing else, `ProtectSystem=strict` with the one `StateDirectory=`
+writable, no `WatchdogSec=`, no `OnFailure=`, no `StartLimitAction=` and
+`StartLimitIntervalSec=0`, so a crash-looping observer cannot escalate to
+anything or be parked as failed. `ProcSubset=` is deliberately left at its
+default: `pid` would hide `/proc/net/route`, `/proc/net/wireless` and
+`/proc/modules`, which are three of the things the unit exists to read. If a
+kernel here does not place `/dev/vcio` in the private `/dev`, the symptom is
+`thr=? volt=?` on the sample lines and nothing worse — `vcgencmd` is optional
+throughout, and the die temperature and the kernel's own undervoltage alarm bit
+still come from `/sys`.
+
+**And it cannot fight `aqua-net-recover.sh`,** which stays the only thing in the
+repository that acts on the network. It sends no packets, so it cannot change
+what the recovery script measures. It runs no command that changes anything —
+`nmcli` only `device show`/`connection show --active`, never `device wifi list`
+(which can trigger a scan), and `wpa_cli` only `status`, `signal_poll` and
+`scan_results`. It shares no state: the recovery script's counters live on tmpfs
+under `/run/aqua-net-recover`, the watcher's single file lives under `/var/lib/
+aqua-net-watch`, and neither reads the other's. Nothing orders the two units
+against each other and neither is wired to `aqua-bridge.service` or
+`aqua-heartbeat.service` in any direction. And the watcher *reads*
+`aqua-net-recover.service`'s journal into every full snapshot, so when the
+recovery script re-associates the link, the change is attributed to it in the
+same dump instead of looking like a fault of its own. They cooperate in the
+record; they do not compete on the wire.
+
+**Why a service and not a timer.** At a 15 s cadence a timer would cost about
+5760 unit activations a day — two lines of systemd's own bookkeeping per
+activation, more journal than the samples themselves — and every sample would
+have to persist its predecessor's counters and state to a file to be able to say
+anything about a change. One process holding that in shell variables writes no
+files at all. It runs at `Nice=19` with `CPUWeight=20`, `IOSchedulingClass=idle`
+and `OOMScoreAdjust=500`, so it yields to the control loop whenever the two
+compete and is the first thing the kernel takes under memory pressure. No hard
+`CPUQuota=`, on purpose: that would stretch a snapshot across the very seconds it
+is trying to capture.
+
+**What it costs.** About eleven short-lived processes per sample (one
+`ip -o addr`, one `ip -4 neigh`, one `wpa_cli status`, three `vcgencmd` reads
+sharing one subshell, and the `timeout` wrappers) — and none of the network ones
+while the interface is absent, since there is nothing to ask. Everything else —
+presence, operstate, carrier, the packet and error counters, signal, the default
+route, the IPv6 scope counts, the die temperature, the undervoltage alarm bit,
+whether the driver module is loaded — is read from `/sys` and `/proc` by the
+shell itself, with no fork. Under 1 % of one core at the default cadence. In the
+journal: a sample line is about 190 bytes, of which the four power fields are
+about 35; steady state is one line every 30 s (`AQUA_NETWATCH_IDLE_EVERY=2` at
+15 s), so about 2880 lines — call it **1.3 MB a day**, of which the power fields
+are roughly 0.25 MB — plus one full snapshot and one boot report per start. A day
+with a handful of episodes stays under 2 MB. The ceiling is bounded on purpose
+and not by luck: sample lines cannot exceed one per
+`AQUA_NETWATCH_OUTAGE_INTERVAL_S`, full snapshots one per
+`AQUA_NETWATCH_FULL_MIN_S` (900 s) and brief ones one per
+`AQUA_NETWATCH_SNAPSHOT_MIN_S` (120 s), which is about **17 MB a day** for a day
+of nothing but flapping — in a case that would have given the answer within its
+first hour. A day with no interface at all is the cheapest of all, under 1.4 MB.
+
+Every cadence, threshold, path and the interface name is a knob at the top of the
+script with its reasoning: `AQUA_NETWATCH_IFACE`, `_INTERVAL_S`,
+`_OUTAGE_INTERVAL_S`, `_IDLE_EVERY`, `_SNAPSHOT_MIN_S`, `_FULL_MIN_S`,
+`_SNAPSHOT_LINES`, `_SCAN_MAX`, `_SILENT_SAMPLES`, `_LOUD_EVERY_S`,
+`_CMD_TIMEOUT_S`, `_DRIVER_GREP`, `_FW_FAIL_GREP`, `_DRIVER_MODULE`,
+`_FIRMWARE_GLOB`, `_STATE_DIR`, `_BOOT_LIST`, `_THERMAL_ZONE`, `_WPA_UNIT`,
+`_WPA_CTRL` and `_ROOT` (a test seam: it prefixes `/sys` and `/proc` so
+`tests/test_deploy.py` can run the sampler against a fabricated tree on a
+machine with no wireless interface). The unit passes only the two cadences, from
+the installer's knob table above; anything else is `systemctl edit
+aqua-net-watch.service`. By hand: `--once`, `--samples N`, `--boot-report`
+(which leaves the marker alone, so looking does not consume it) and
+`--mark-clean-stop` (what `ExecStop=` runs).
+
+`tests/test_deploy.py` walks the board through scripted states and fails if the
+ladder misreports which rung moved or which held, if a dump is taken on a sample
+that changed nothing, if an absent interface is reported as "down" rather than
+with the kernel's verdict, if a changed IPv6 prefix costs a dump, if a rail
+transition does not, or if the boot report cannot tell a shutdown from a power
+loss. The step from one state to the next is driven by the stub `sleep` on
+`PATH`, which the script calls exactly once per loop and nothing else calls, so
+the tests have no wall-clock dependence at all. `reboot`, `shutdown`,
+`poweroff`, `halt`, `systemctl`, `modprobe`, `rmmod`, `insmod`, `ping`,
+`arping`, `dhclient`, `ifconfig` and `iwconfig` are all on the stub `PATH` as
+loggers, so "it never acts" is checked by running it in every state — an
+interface that disappears and comes back, a handshake that never completes, a
+gateway that stops answering, a rail that sags — and not only by reading it.
 
 ### udev
 

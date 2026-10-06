@@ -140,6 +140,36 @@ is not yet confirmed on real hardware, on either board.
    `--no-net-recover` turns the Wi-Fi timer off again (it stops, disables
    and removes it), and `--check` reports without writing anything.
 
+   It also installs the **network diagnostic watcher**,
+   `deploy/aqua-net-watch.{sh,service}` — which is not a watchdog but an
+   instrument, and which never acts. Every outage this board has had was
+   diagnosed after the fact from whatever the journal happened to hold, and
+   from outside the board they all look the same: it is unreachable. What
+   tells them apart is the *order* in which things stopped, so the watcher
+   samples a ladder every 15 s — does the interface exist, is it associated,
+   has it an IPv4 address, has it a default route, is the gateway answering —
+   dumps everything on a change, names in one line which rungs moved and which
+   *held*, and keeps sampling and logging through an outage and out the other
+   side. Alongside those it carries the SoC's own throttle flags, core voltage
+   and temperature, so the last line before an abrupt death says what the rail
+   was doing, and it reports at startup whether the previous boot ended
+   cleanly or the board lost power (a kernel cannot log its own power loss, so
+   it is recorded from the other side, with a marker written at a clean stop).
+   It sends no packet — not even a ping: a ping would refresh the gateway's
+   ARP entry and keep the radio out of power save, and a stale neighbour entry
+   and a radio asleep are two of the things being looked for, so an observer
+   that pings is an observer that hides its own evidence. It loads no module,
+   touches no service, and writes nothing but that three-line marker. Read an outage out of it
+   with
+
+   ```bash
+   journalctl -t aqua-net-watch -o short-iso --since -2h
+   ```
+
+   `--no-net-watch` leaves it out and removes it. PROJECT.md §9 *Network
+   diagnostic watcher* has the ladder, the line formats, the journal cost and
+   why it cannot get in `aqua-net-recover`'s way.
+
 6. **Config.** Edit `/etc/aqua-bridge/config.yaml`: `mpc.channels` /
    `mpc.temps` / `mpc.sensors` / `mpc.topology` for the enclosure, the
    `aquacomputer:` list (one entry per controller — the supported topology
