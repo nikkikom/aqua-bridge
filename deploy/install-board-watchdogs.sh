@@ -127,10 +127,20 @@ REBOOT_WATCHDOG_SEC="${REBOOT_WATCHDOG_SEC:-120}"
 JOURNAL_STORAGE="${JOURNAL_STORAGE:-persistent}"
 # Journald caps: with the journal persistent, it now competes for the card.
 # Left alone, SystemMaxUse defaults to 10 % of the filesystem (about 1.5 GB of
-# the owner's 15 GB card) and SystemMaxFileSize to an eighth of that. 200M is a
-# fiftieth of the free space and far more than this daemon's steady logging
-# needs; 16M files keep one rotation cheap on an SD card.
-JOURNAL_MAX_USE="${JOURNAL_MAX_USE:-200M}"
+# a 15 GB card) and SystemMaxFileSize to an eighth of that; 16M files keep one
+# rotation cheap on an SD card.
+#
+# The size cap was 200M until 2026-10-06, when it turned out to be the reason
+# an outage could not be explained. A boot that ends without a clean stop
+# leaves its journal unrotated, and journald allocates one 8M file per boot, so
+# a board that resets repeatedly spends the cap on near-empty files: twenty such
+# boots left 160M of them, and the eviction that made room threw away every
+# record from before the episode -- including the boots that would have shown
+# how it started. The cap has to be large enough that a reset loop cannot
+# outbid the history it is evidence for. 1G is a fifteenth of that card and
+# still bounded; the retention cap below, not this one, is what keeps an idle
+# board from hoarding.
+JOURNAL_MAX_USE="${JOURNAL_MAX_USE:-1G}"
 JOURNAL_MAX_FILE_SIZE="${JOURNAL_MAX_FILE_SIZE:-16M}"
 # Discard entries older than this even when the size cap is not reached: a
 # journal that only rotates by size keeps years of nothing on an idle board.

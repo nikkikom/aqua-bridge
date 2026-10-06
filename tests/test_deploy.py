@@ -534,7 +534,7 @@ def test_board_script_takes_every_value_from_a_variable_with_a_default():
         "SOC_WATCHDOG_SEC": "60",
         "REBOOT_WATCHDOG_SEC": "120",
         "JOURNAL_STORAGE": "persistent",
-        "JOURNAL_MAX_USE": "200M",
+        "JOURNAL_MAX_USE": "1G",
         "JOURNAL_MAX_FILE_SIZE": "16M",
         "JOURNAL_MAX_RETENTION": "30day",
         "JOURNAL_SYNC_INTERVAL": "5m",
