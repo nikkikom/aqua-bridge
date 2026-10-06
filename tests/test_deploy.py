@@ -1210,6 +1210,8 @@ def _watch_stage(
     volts: str = "1.3250V",
     temp: str = "47.1",
     uv: str = "0",
+    wpa_err: str = "",
+    iw_silent: bool = False,
 ) -> None:
     """One sampled state of the board, as a fake /sys + /proc + stub data under ``path``.
 
@@ -1279,6 +1281,18 @@ def _watch_stage(
     if dev:
         status += f"wpa_state={wpa}\n"
     (data / "wpa").write_text(status)
+    # What wpa_cli says instead of a status when it cannot reach the supplicant.
+    # On the board it was exactly this, for days, and the first version of this
+    # script captured it and threw it away.
+    (data / "wpa_err").write_text(f"{wpa_err}\n" if wpa_err else "")
+    iw = ""
+    if dev and not iw_silent:
+        iw = (
+            f"Connected to {bssid} (on wlan0)\n\tSSID: {ssid}\n\tfreq: {freq}\n\tsignal: -62 dBm\n"
+            if bssid
+            else "Not connected.\n"
+        )
+    (data / "iw").write_text(iw)
     (data / "vc_throttled").write_text(f"throttled={throttled}\n")
     (data / "vc_volts").write_text(f"volt={volts}\n")
     (data / "vc_temp").write_text(f"temp={temp}'C\n")
@@ -1319,12 +1333,16 @@ def _watch_board(base: Path, stages: list[dict[str, object]]) -> Path:
     (bin_dir / "wpa_cli").write_text(
         "#!/bin/sh\n"
         'echo "wpa_cli $*" >> "$CALLS"\n'
+        'if [ -s "$W_ROOT/data/wpa_err" ]; then cat "$W_ROOT/data/wpa_err" >&2; exit 255; fi\n'
         'case "$*" in\n'
         '  *status*) cat "$W_ROOT/data/wpa" ;;\n'
         '  *signal_poll*) echo "RSSI=-62" ;;\n'
         '  *scan_results*) echo "aa:bb:cc:dd:ee:ff\t2437\t-62\t[ESS]\ta-network" ;;\n'
         "esac\n"
     )
+    # `iw dev <iface> link` is the fallback source: it reads the association the
+    # driver already holds and starts nothing.
+    (bin_dir / "iw").write_text('#!/bin/sh\necho "iw $*" >> "$CALLS"\ncat "$W_ROOT/data/iw"\n')
     (bin_dir / "vcgencmd").write_text(
         "#!/bin/sh\n"
         'echo "vcgencmd $*" >> "$CALLS"\n'
@@ -1488,14 +1506,36 @@ def test_the_watcher_unit_cannot_send_a_packet_or_open_a_controller():
     assert set(families) == {"AF_UNIX", "AF_NETLINK"}
     assert values["CapabilityBoundingSet"] == [""]
     assert values["AmbientCapabilities"] == [""]
-    assert values["PrivateDevices"] == ["yes"]
-    assert values["DeviceAllow"] == ["/dev/vcio r"]
+    # NOT PrivateDevices=yes, measured on the board: a private /dev is a fresh
+    # tmpfs that DeviceAllow= does not bind a physical node back into, so the
+    # firmware tool could not be reached and every sample read "thr=? volt=?" --
+    # the rail measurement silently missing, which is worse than never having
+    # written it. DevicePolicy=closed keeps the guarantee that mattered: only the
+    # API pseudo-devices and the nodes named here, so a controller's hidraw node
+    # is as unopenable as it was.
+    assert "PrivateDevices" not in values
+    assert values["DevicePolicy"] == ["closed"]
+    assert values["DeviceAllow"] == ["/dev/vcio r", "/dev/vchiq rw"]
+    for allowed in values["DeviceAllow"]:
+        assert "hidraw" not in allowed and "usb" not in allowed, allowed
     assert values["ProtectSystem"] == ["strict"]
     assert values["NoNewPrivileges"] == ["yes"]
     assert values["ProtectKernelModules"] == ["yes"]
     # ProcSubset=pid would hide /proc/net/route, /proc/net/wireless and /proc/modules,
     # which are three of the things this unit exists to read.
     assert "ProcSubset" not in values
+    # wpa_cli has to create a socket of its own before the supplicant can reply to
+    # it, and under ProtectSystem=strict there was nowhere to put it; a private
+    # /tmp is writable but invisible to the supplicant, which is the other half of
+    # the same fault. Both candidate paths from the binary's own strings are
+    # granted, tolerating absence, and nothing else is.
+    assert values["PrivateTmp"] == ["no"]
+    writable = values["ReadWritePaths"][0].split()
+    assert set(writable) == {"-/tmp", "-/run/wpa_supplicant"}
+    # And specifically NOT the state of anything else on the board: the model
+    # store and the recovery script's counters stay out of reach.
+    for path in writable:
+        assert "aqua-bridge" not in path and "aqua-net-recover" not in path, path
     for key in ("ExecStart", "ExecStop", "ExecStartPre", "ExecReload"):
         for value in values.get(key, []):
             assert "aqua-net-watch.sh" in value, value
@@ -1886,6 +1926,121 @@ def test_no_net_watch_is_an_off_switch_and_not_a_skipped_step():
     # And a changed script or unit is picked up, which a oneshot timer never needs.
     assert "systemctl restart aqua-net-watch.service" in text
     assert "systemctl enable --now aqua-net-watch.service" in text
+
+
+#: What wpa_cli actually printed on the board, for days, instead of a status.
+WPA_SANDBOX_ERROR = (
+    "Failed to connect to non-global ctrl_ifname: wlan0  error: Read-only file system"
+)
+
+
+def test_an_unreachable_supplicant_is_a_degraded_source_not_a_degraded_network(tmp_path):
+    """The defect that made the instrument useless as shipped. With wpa_cli unable to
+    reach the supplicant from inside the unit's sandbox, every sample read
+    `assoc:DOWN` and the first one announced `DEGRADED first=assoc` -- on a board that
+    was associated, had its address and route, and was reaching its gateway. An
+    instrument that reports a fault continuously cannot show the fault it exists to
+    catch: the real event arrives into a log that has been crying wolf for days, and the
+    DEGRADED/RECOVERED pair the owner greps for is already spent.
+
+    The rule: a degraded SOURCE is never a degraded NETWORK. When the only evidence
+    available is the kernel's own link state plus a BSSID, "connected to this BSSID with
+    the carrier up, address and route present, gateway answering" is a working network
+    and the unit says so."""
+    stages = [{"wpa_err": WPA_SANDBOX_ERROR} for _ in range(4)]
+    bin_dir = _watch_board(tmp_path, stages)
+    lines = _run_watch(tmp_path, bin_dir, samples=4, extra_env={"AQUA_NETWATCH_IDLE_EVERY": "1"})
+    samples = _kinds(lines, "sample")
+    assert len(samples) == 4
+    for line in samples:
+        assert "layers=ok" in line, line
+        # The marker stays: a reader can see which source spoke, and that the
+        # handshake state is not in this line.
+        assert "wpa=ASSOCIATED(iw)" in line, line
+    assert _kinds(lines, "DEGRADED") == []
+    assert _kinds(lines, "RECOVERED") == []
+    # ...and the reason is named once, with what wpa_cli actually said, rather than
+    # swallowed. Bisecting the unit's sandbox from the outside is what it cost the
+    # first time.
+    (notice,) = _kinds(lines, "WPASRC")
+    assert "src=iw" in notice
+    assert WPA_SANDBOX_ERROR in notice
+    assert "CANNOT see a" in notice and "4-way-handshake" in notice
+    assert "degraded source, not a degraded network" in notice
+    assert "PrivateTmp=no" in notice  # where to look if it persists
+
+
+def test_the_fallback_still_calls_a_real_loss_of_association_down(tmp_path):
+    """The other half of the rule: the association rung is reserved for evidence that
+    the board is genuinely not associated, and the fallback can still supply that. `iw`
+    answering "Not connected" is positive evidence, not a missing source."""
+    stages = [
+        {"wpa_err": WPA_SANDBOX_ERROR},
+        {"wpa_err": WPA_SANDBOX_ERROR, "bssid": "", "v4": "", "gw": ""},
+    ]
+    bin_dir = _watch_board(tmp_path, stages)
+    lines = _run_watch(tmp_path, bin_dir, samples=2)
+    assert "layers=ok" in _kinds(lines, "sample")[0]
+    last = _kinds(lines, "sample")[-1]
+    assert "wpa=UNASSOCIATED(iw)" in last
+    assert "assoc:DOWN" in last
+    (degraded,) = _kinds(lines, "DEGRADED")
+    assert "first=assoc" in degraded
+
+
+def test_a_link_with_no_source_at_all_is_judged_by_the_kernel_and_believed(tmp_path):
+    """Neither source answering is still not a reason to invent a fault. The kernel's
+    carrier is then the only evidence there is, and it is positive evidence."""
+    stages = [{"wpa_err": WPA_SANDBOX_ERROR, "iw_silent": True} for _ in range(2)]
+    bin_dir = _watch_board(tmp_path, stages)
+    lines = _run_watch(tmp_path, bin_dir, samples=2)
+    for line in _kinds(lines, "sample"):
+        assert "layers=ok" in line, line
+        assert "wpa=?" in line and "bss=-" in line, line
+    assert _kinds(lines, "DEGRADED") == []
+    (notice,) = _kinds(lines, "WPASRC")
+    assert "src=none" in notice
+
+
+def test_a_carrier_that_drops_is_down_whatever_the_source_says(tmp_path):
+    """No source may override the kernel: cfg80211 drops the carrier the moment an
+    association goes, so a stale BSSID from any source cannot hold the rung up."""
+    stages = [{}, {"carrier": "0", "operstate": "down"}]
+    bin_dir = _watch_board(tmp_path, stages)
+    lines = _run_watch(tmp_path, bin_dir, samples=2)
+    assert "assoc:DOWN" in _kinds(lines, "sample")[-1]
+    assert "first=assoc" in _kinds(lines, "DEGRADED")[0]
+
+
+def test_a_handshake_in_progress_is_still_down_when_the_supplicant_can_be_asked(tmp_path):
+    """The reason wpa_cli is worth the two sandbox exceptions it costs: it is the only
+    source that can see a 4-way handshake that never completes, which is the shape of
+    the 2026-09-30 storm. With it reachable, anything short of COMPLETED is a real
+    DOWN -- the fallback's laxer rule must not leak into this branch."""
+    stages = [{}, {"wpa": "4WAY_HANDSHAKE"}]
+    bin_dir = _watch_board(tmp_path, stages)
+    lines = _run_watch(tmp_path, bin_dir, samples=2)
+    last = _kinds(lines, "sample")[-1]
+    assert "wpa=4WAY_HANDSHAKE" in last and "assoc:DOWN" in last
+    assert "first=assoc" in _kinds(lines, "DEGRADED")[0]
+    assert _kinds(lines, "WPASRC") == []  # the richer source answered, so no notice
+
+
+def test_the_watcher_reads_the_firmware_mailbox_and_nothing_else_in_dev():
+    """The rail is the whole point of the power sampling, and it is read through
+    /dev/vcio. A measurement nobody notices is missing is worse than none, so the unit
+    ships the setting that was verified to work on the board rather than documenting a
+    drop-in for it."""
+    values = _unit_values(WATCH_UNIT.read_text())
+    assert values["DevicePolicy"] == ["closed"]
+    assert any(allowed.startswith("/dev/vcio") for allowed in values["DeviceAllow"])
+    script = WATCH_SCRIPT.read_text()
+    for reading in ("get_throttled", "measure_volts core", "measure_temp"):
+        assert f"vcgencmd {reading}" in script, reading
+    # Still optional: a board without the tool keeps sampling, with the die
+    # temperature and the undervoltage bit from /sys.
+    assert "HAVE_VCGENCMD" in script
+    assert _shell_default(WATCH_SCRIPT, "AQUA_NETWATCH_THERMAL_ZONE") == "thermal_zone0"
 
 
 def test_the_board_script_refuses_an_outage_cadence_faster_than_the_healthy_one():

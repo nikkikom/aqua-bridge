@@ -12013,8 +12013,33 @@ and the first firmware/SDIO failure this boot's kernel log holds, quoted;
 `POWER`, the decoded flag word; `ROAM`, a BSSID change with the association
 never dropping (newly possible since 2026-10-05, when a second access point on
 the same SSID appeared); `SILENT`, every layer up and nothing arriving, which is
-the 2026-09-17 shape and which the ladder alone calls healthy; and `snapshot`
+the 2026-09-17 shape and which the ladder alone calls healthy; `WPASRC`, said
+when the association rung has had to fall back from `wpa_cli` to `iw`, carrying
+what `wpa_cli` actually said and what the fallback cannot see; and `snapshot`
 blocks whose every body line is tagged with its section.
+
+**The `assoc` rung's sources, and the rule a degraded source is held to.** Three
+sources, in order of how much they can tell you: `wpa_cli status` gives the real
+`wpa_state`, and it is the only one that can see a 4-way handshake that never
+completes or a group-key timeout — the entire shape of 2026-09-30 — so with it
+answering, anything short of `COMPLETED` is a real `DOWN`. `iw dev <iface> link`
+gives the association but not how it was reached. Failing both, there is only the
+kernel's own carrier. The rule, learned the hard way on the first install: **a
+degraded source is never a degraded network.** The first version reported
+`assoc:DOWN` whenever `wpa_state` was unavailable, so a board that was
+associated, addressed, routed and reaching its gateway announced
+`DEGRADED first=assoc` and then held the fault open for days — and an instrument
+that cries wolf continuously cannot show the one event it exists to catch,
+because the `DEGRADED`/`RECOVERED` pair the owner greps for is already spent.
+Now the carrier is checked first and no source may override it (cfg80211 drops
+it the moment an association goes); `COMPLETED` is required only of the source
+that can report it; a BSSID under a live carrier is reported as the working link
+it is; `iw`'s own "Not connected" is positive evidence the other way; and with
+no source at all the carrier is believed, because it is the only evidence there
+is and it is positive. The sample line keeps the `(iw)` marker in
+`wpa=ASSOCIATED(iw)`, so a reader sees which source spoke and that the handshake
+detail is not in that line — a real loss, and the `WPASRC` line names it
+together with the reason, instead of leaving it to be bisected from outside.
 
 A snapshot dumps addresses, both route tables, both neighbour tables,
 `wpa_cli status`/`signal_poll`/`scan_results`, `/proc/net/wireless`,
@@ -12040,18 +12065,55 @@ watcher reads its result out of the kernel's neighbour table for free. In the
 unit: `RestrictAddressFamilies=AF_UNIX AF_NETLINK` — no family that can carry a
 packet — an empty `CapabilityBoundingSet=` (the kernel log is read with
 `journalctl -k`, not `dmesg`, precisely so `CAP_SYSLOG` is not needed),
-`PrivateDevices=yes` with exactly one physical node allowed back,
-`DeviceAllow=/dev/vcio r`, which is the firmware mailbox the rail is measured
-through and nothing else, `ProtectSystem=strict` with the one `StateDirectory=`
-writable, no `WatchdogSec=`, no `OnFailure=`, no `StartLimitAction=` and
-`StartLimitIntervalSec=0`, so a crash-looping observer cannot escalate to
-anything or be parked as failed. `ProcSubset=` is deliberately left at its
-default: `pid` would hide `/proc/net/route`, `/proc/net/wireless` and
-`/proc/modules`, which are three of the things the unit exists to read. If a
-kernel here does not place `/dev/vcio` in the private `/dev`, the symptom is
-`thr=? volt=?` on the sample lines and nothing worse — `vcgencmd` is optional
-throughout, and the die temperature and the kernel's own undervoltage alarm bit
-still come from `/sys`.
+`DevicePolicy=closed` with two nodes allowed back — `DeviceAllow=/dev/vcio r`
+and `DeviceAllow=/dev/vchiq rw`, the firmware mailbox the rail is measured
+through and the alternate route some builds of `vcgencmd` take, and nothing else
+— `ProtectSystem=strict`, no `WatchdogSec=`, no `OnFailure=`, no
+`StartLimitAction=` and `StartLimitIntervalSec=0`, so a crash-looping observer
+cannot escalate to anything or be parked as failed. `ProcSubset=` is deliberately
+left at its default: `pid` would hide `/proc/net/route`, `/proc/net/wireless` and
+`/proc/modules`, which are three of the things the unit exists to read.
+
+**Three exceptions to that hardening, all of them measured on the board rather
+than reasoned about, and all of them because the alternative was an instrument
+that silently did not measure.**
+
+- **`DevicePolicy=closed` and not `PrivateDevices=yes`.** Under
+  `PrivateDevices=yes` the firmware tool failed with `Can't open device file:
+  /dev/vcio_gencmd` and every sample read `thr=? volt=?` — the rail measurement
+  missing, which is worse than never having written it, because nobody notices. A
+  private `/dev` is a fresh tmpfs holding only the API pseudo-devices;
+  `DeviceAllow=` does not bind a physical node back into it, and `vcgencmd`'s
+  fallback of creating the node itself needs `CAP_MKNOD`, which the empty
+  `CapabilityBoundingSet=` denies. With `DevicePolicy=closed` the same call
+  returns `throttled=0x0`. The guarantee that mattered is unchanged — only the
+  API pseudo-devices plus the two nodes named above, so a controller's `hidraw`
+  node is as unopenable as it was — and what is traded is that the real `/dev` is
+  visible rather than replaced, so the denial comes from the cgroup device filter
+  instead of from the node being absent.
+- **`ReadWritePaths=-/tmp -/run/wpa_supplicant`.** `wpa_cli` cannot ask the
+  supplicant anything until it has created a socket of its *own* for the reply to
+  come back to, and under `ProtectSystem=strict` there was nowhere to put it
+  (`error: Read-only file system`). The binary's own strings give both candidate
+  paths — `/tmp/wpa_ctrl_%d-%d` and `%s/wpa_ctrl_%d-%d` against the control
+  directory — so both are granted, tolerating absence, because
+  `/run/wpa_supplicant` does not exist on a boot where the radio never came up,
+  which is precisely a boot this unit has to survive.
+- **`PrivateTmp=no`.** The other half of the same fault: a private `/tmp` is
+  writable, so the client socket is created happily, and then the supplicant —
+  which lives outside this sandbox — cannot see that path to reply to it, so every
+  call ends in `'STATUS' command timed out`. Sharing `/tmp` costs nothing worth
+  having: it is world-writable with the sticky bit for every user on the board
+  already, so a root-run observer gaining it adds no reach that matters.
+
+Everything else stays read-only, which is the part that matters here: `/usr`,
+`/etc`, `/var/lib` and `/run` are all still out of reach, so the watcher cannot
+touch `aqua-bridge`'s model store or `aqua-net-recover`'s counters, and the one
+path it writes of its own accord is still only its `StateDirectory=`.
+`vcgencmd` also remains optional throughout — with neither node reachable the
+sample lines say `thr=?`, the `WPASRC`/`thr=?` evidence is in the journal rather
+than absent from it, and the die temperature and the kernel's own undervoltage
+alarm bit still come from `/sys`.
 
 **And it cannot fight `aqua-net-recover.sh`,** which stays the only thing in the
 repository that acts on the network. It sends no packets, so it cannot change
