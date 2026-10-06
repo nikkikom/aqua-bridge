@@ -361,6 +361,7 @@ def test_install_script_das_flag_installs_das_config_and_dropin_never_enabling()
         "install-board-watchdogs.sh",
         "aqua-net-recover.sh",
         "aqua-net-watch.sh",
+        "aqua-radio-recover.sh",
     ],
 )
 def test_shell_scripts_parse(script):
@@ -2053,3 +2054,614 @@ def test_the_board_script_refuses_an_outage_cadence_faster_than_the_healthy_one(
         'if [[ "$AQUA_NETWATCH_OUTAGE_INTERVAL_S" -lt "$AQUA_NETWATCH_INTERVAL_S" ]]; then'
         in script
     )
+
+
+# --- the radio recovery unit: an interface that does not exist (section 9) -------------
+
+RADIO_SCRIPT = DEPLOY / "aqua-radio-recover.sh"
+RADIO_UNIT = DEPLOY / "aqua-radio-recover.service"
+
+#: Executables the radio recovery may never reach for. Stubbed alongside `modprobe`,
+#: `reboot` and `sleep` so a run that called one shows up in the call log rather than
+#: being ruled out only by reading the source. The network ones are on the list because
+#: every state of an interface that EXISTS belongs to aqua-net-recover.sh, and
+#: `systemctl` because this unit may never stop, restart or mask the two services that
+#: cool the enclosure -- its one escalation is a plain `reboot`, nothing finer-grained.
+RADIO_FORBIDDEN = (
+    "systemctl",
+    "shutdown",
+    "poweroff",
+    "halt",
+    "nmcli",
+    "ip",
+    "ping",
+    "wpa_cli",
+    "iwconfig",
+    "ifconfig",
+    "dhclient",
+    "aqua-bridge",
+    "aqua-heartbeat",
+)
+
+#: The nine knobs the unit carries as Environment= and the installer writes from its own
+#: table: script default, unit value and installer default all have to be this.
+RADIO_INSTALLED_KNOBS = {
+    "AQUA_RADIO_IFACE": ("RADIO_IFACE", "wlan0"),
+    "AQUA_RADIO_GRACE_S": ("RADIO_GRACE", "90"),
+    "AQUA_RADIO_INTERVAL_S": ("RADIO_INTERVAL", "60"),
+    "AQUA_RADIO_ATTEMPTS": ("RADIO_ATTEMPTS", "3"),
+    "AQUA_RADIO_ATTEMPT_DELAY_S": ("RADIO_ATTEMPT_DELAY", "30"),
+    "AQUA_RADIO_SETTLE_S": ("RADIO_SETTLE", "20"),
+    "AQUA_RADIO_REBOOT": ("RADIO_REBOOT", "on"),
+    "AQUA_RADIO_REBOOT_BUDGET": ("RADIO_REBOOT_BUDGET", "2"),
+    "AQUA_RADIO_REBOOT_WINDOW_S": ("RADIO_REBOOT_WINDOW", "86400"),
+}
+
+
+def _radio_board(
+    base: Path,
+    *,
+    present: bool,
+    uptime: float = 600.0,
+    cure_at: int | None = None,
+    modules: tuple[str, ...] = ("brcmfmac", "brcmfmac_cyw"),
+) -> Path:
+    """A board whose wireless interface is present or absent, as a fake /sys + /proc.
+
+    ``present=False`` is the whole trigger: no ``/sys/class/net/wlan0`` at all, which is
+    what the 2026-10-06 boot looked like from userspace after the radio's firmware
+    download failed its read-back verification.
+
+    The step from absent to present is driven by the stub ``modprobe``, not by a clock
+    or by the stub ``sleep``: a reload either brings the netdev back or it does not, and
+    that is the only thing in this script that can change the board's state.
+    ``cure_at=N`` makes the Nth load succeed, ``cure_at=None`` never cures -- the chip
+    the kernel has given up on, which is the case the escalation exists for.
+    """
+    root = base / "root"
+    (root / "sys/class/net/lo").mkdir(parents=True, exist_ok=True)
+    (root / "sys/class/net/lo/operstate").write_text("unknown\n")
+    if present:
+        (root / "sys/class/net/wlan0").mkdir(parents=True, exist_ok=True)
+    (root / "proc").mkdir(parents=True, exist_ok=True)
+    (root / "proc/uptime").write_text(f"{uptime:.2f} {uptime / 2:.2f}\n")
+    # Both modules loaded and still no netdev: that IS the firmware-download failure,
+    # and the verdict line has to be able to say so.
+    (root / "proc/modules").write_text(
+        "".join(f"{name} 319488 0 - Live 0x0\n" for name in modules)
+        + "cfg80211 806912 1 brcmfmac, Live 0x0\nbrcmutil 16384 1 brcmfmac, Live 0x0\n"
+    )
+
+    bin_dir = base / "bin"
+    bin_dir.mkdir(parents=True)
+    if cure_at is not None:
+        (base / "cure_at").write_text(str(cure_at))
+    # A load of the FIRST module of the pair counts as one attempt (the script loads
+    # them in the reverse of the removal order, so brcmfmac comes first); the netdev
+    # appears on the attempt the test asked for, and a removal takes it away again.
+    (bin_dir / "modprobe").write_text(
+        "#!/bin/sh\n"
+        'echo "modprobe $*" >> "$CALLS"\n'
+        'if [ "$1" = "-r" ]; then\n'
+        '  rm -rf "$W_ROOT/sys/class/net/wlan0"\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "$1" = "brcmfmac" ]; then\n'
+        '  n=$(cat "$W_BASE/loads" 2>/dev/null || echo 0)\n'
+        '  n=$((n + 1)); echo "$n" > "$W_BASE/loads"\n'
+        '  if [ -f "$W_BASE/cure_at" ] && [ "$n" -ge "$(cat "$W_BASE/cure_at")" ]; then\n'
+        '    mkdir -p "$W_ROOT/sys/class/net/wlan0"\n'
+        "  fi\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    # Instant, so the tests have no wall-clock dependence; the waits are bounded by an
+    # iteration count as well as by the clock precisely so that this works.
+    (bin_dir / "sleep").write_text('#!/bin/sh\necho "sleep $*" >> "$CALLS"\n')
+    (bin_dir / "reboot").write_text('#!/bin/sh\necho "reboot $*" >> "$CALLS"\nexit 0\n')
+    for name in RADIO_FORBIDDEN:
+        (bin_dir / name).write_text(f'#!/bin/sh\necho "{name} $*" >> "$CALLS"\nexit 0\n')
+    for entry in bin_dir.iterdir():
+        entry.chmod(0o755)
+    (base / "calls.log").write_text("")
+    return bin_dir
+
+
+def _run_radio(
+    base: Path,
+    bin_dir: Path,
+    checks: int,
+    extra_env: dict[str, str] | None = None,
+    state_dir: Path | None = None,
+) -> list[str]:
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - bash is in packages-rpi.txt and in CI
+        pytest.skip("bash not available")
+    env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "AQUA_RADIO_ROOT": str(base / "root"),
+        "AQUA_RADIO_IFACE": "wlan0",
+        "AQUA_RADIO_STATE_DIR": str(state_dir or base / "state"),
+        # Six looks for the netdev instead of twenty: the bound under test is the
+        # attempt count and the escalation, not how patient one attempt is.
+        "AQUA_RADIO_SETTLE_S": "6",
+        "W_BASE": str(base),
+        "W_ROOT": str(base / "root"),
+        "CALLS": str(base / "calls.log"),
+        **(extra_env or {}),
+    }
+    done = subprocess.run(
+        [bash, str(RADIO_SCRIPT), "--checks", str(checks)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return done.stdout.splitlines()
+
+
+def test_radio_knobs_are_documented_variables_with_one_default_each():
+    """Section 9: no operator tunable is a literal in the body. The interface name, the
+    grace, the cadence, the attempt count, both delays, the escalation switch and the
+    reboot budget and its window are all knobs at the top with their reasoning."""
+    knobs = {
+        "AQUA_RADIO_IFACE": "wlan0",
+        "AQUA_RADIO_MODULES": "brcmfmac_cyw brcmfmac",
+        "AQUA_RADIO_GRACE_S": "90",
+        "AQUA_RADIO_INTERVAL_S": "60",
+        "AQUA_RADIO_ATTEMPTS": "3",
+        "AQUA_RADIO_ATTEMPT_DELAY_S": "30",
+        "AQUA_RADIO_SETTLE_S": "20",
+        "AQUA_RADIO_SETTLE_POLL_S": "1",
+        "AQUA_RADIO_REBOOT": "on",
+        "AQUA_RADIO_REBOOT_BUDGET": "2",
+        "AQUA_RADIO_REBOOT_WINDOW_S": "86400",
+        "AQUA_RADIO_LOUD_EVERY_S": "3600",
+        "AQUA_RADIO_STATE_DIR": "/var/lib/aqua-radio-recover",
+        "AQUA_RADIO_ROOT": "",
+    }
+    for name, default in knobs.items():
+        assert _shell_default(RADIO_SCRIPT, name) == default, name
+    # One interface name across all three units, each file carrying its own copy
+    # because a unit started by systemd has no environment to inherit one from.
+    assert (
+        _shell_default(RADIO_SCRIPT, "AQUA_RADIO_IFACE")
+        == _shell_default(NET_SCRIPT, "AQUA_NET_IFACE")
+        == _shell_default(WATCH_SCRIPT, "AQUA_NETWATCH_IFACE")
+    )
+    # The removal order is the module topology and not a preference: brcmfmac_cyw
+    # depends on brcmfmac, so a removal has to name both, dependents first -- and the
+    # load then goes the other way, which is the order the two-second cure was
+    # measured with. brcmutil and cfg80211 stay loaded and are not in the list.
+    modules = _shell_default(RADIO_SCRIPT, "AQUA_RADIO_MODULES").split()
+    assert modules == ["brcmfmac_cyw", "brcmfmac"]
+    assert "brcmutil" not in modules and "cfg80211" not in modules
+    # The grace has to be far above the few seconds the driver takes to register the
+    # netdev and far below the thirty hours the fault cost unattended.
+    grace = int(_shell_default(RADIO_SCRIPT, "AQUA_RADIO_GRACE_S"))
+    assert 30 <= grace <= 600
+    # One check's worst case -- every attempt failing -- stays inside a couple of
+    # minutes, so a reboot is never more than that away from the ladder starting.
+    attempts = int(_shell_default(RADIO_SCRIPT, "AQUA_RADIO_ATTEMPTS"))
+    settle = int(_shell_default(RADIO_SCRIPT, "AQUA_RADIO_SETTLE_S"))
+    delay = int(_shell_default(RADIO_SCRIPT, "AQUA_RADIO_ATTEMPT_DELAY_S"))
+    assert attempts * settle + (attempts - 1) * delay <= 180
+
+
+def test_the_radio_unit_ships_the_knobs_the_board_script_installs():
+    """Three files carry these nine numbers -- the script's default, the unit's
+    Environment=, and the installer's knob -- so all three have to agree or reading
+    deploy/ tells the truth about none of them. The same three-way agreement the
+    watcher's two cadences already have."""
+    values = _unit_values(RADIO_UNIT.read_text())
+    environment = dict(item.split("=", 1) for item in values["Environment"])
+    assert set(environment) == set(RADIO_INSTALLED_KNOBS)
+    text = BOARD_SCRIPT.read_text()
+    for directive, (variable, default) in RADIO_INSTALLED_KNOBS.items():
+        assert environment[directive] == default, directive
+        assert _shell_default(RADIO_SCRIPT, directive) == default, directive
+        assert _shell_default(BOARD_SCRIPT, variable) == default, variable
+        assert f"Environment={directive}=${variable}" in text, directive
+
+
+def test_the_radio_unit_is_wired_to_nothing_that_cools():
+    """It loads a kernel module and, bounded, reboots the board. Nothing in it may
+    order, delay, start or stop the daemon that drives the fans, and nothing may
+    sequence it against the other two network units (section 2)."""
+    values = _unit_values(RADIO_UNIT.read_text())
+    assert values["Type"] == ["simple"]
+    for key in ("Wants", "Requires", "After", "Before", "Conflicts", "PartOf", "BindsTo"):
+        for value in values.get(key, []):
+            assert "aqua-bridge" not in value and "aqua-heartbeat" not in value
+            assert "aqua-net-recover" not in value and "aqua-net-watch" not in value
+            assert "network-online" not in value  # it exists for the offline case
+    # The one escalation is the script's own, recorded in its own ledger. systemd must
+    # not be able to add a second, unrecorded board reset behind its back.
+    assert "WatchdogSec" not in values
+    assert "OnFailure" not in values
+    assert "StartLimitAction" not in values
+    assert values["StartLimitIntervalSec"] == ["0"]
+    assert values["Restart"] == ["always"]
+    for key in ("ExecStart", "ExecStop", "ExecStartPre", "ExecReload"):
+        for value in values.get(key, []):
+            assert "aqua-radio-recover.sh" in value, value
+
+
+def test_the_radio_reboot_ledger_is_on_var_and_never_a_tmpfs():
+    """The whole anti-loop mechanism. A count of reboots kept on a tmpfs is erased by
+    exactly the event it is counting, so the ledger is a StateDirectory= on /var and the
+    script's default path is inside it."""
+    values = _unit_values(RADIO_UNIT.read_text())
+    assert values["StateDirectory"] == ["aqua-radio-recover"]
+    assert "RuntimeDirectory" not in values
+    state_dir = _shell_default(RADIO_SCRIPT, "AQUA_RADIO_STATE_DIR")
+    assert state_dir == "/var/lib/aqua-radio-recover"
+    assert state_dir.startswith("/var/")
+    assert not state_dir.startswith("/run")
+    # And the append is read back before the reboot is ordered, not after: an
+    # unrecordable reboot is the one that would repeat on every boot forever.
+    script = RADIO_SCRIPT.read_text()
+    assert script.index("record_reboot()") < script.index("if ! record_reboot; then")
+    assert script.index("if ! record_reboot; then") < script.rindex("\n  reboot\n")
+
+
+def test_the_radio_unit_may_load_a_module_and_reboot_and_nothing_else():
+    """The exception to inertness, enforced by systemd and not only by the script: two
+    capabilities and two syscall sets for the two allowed actions, no address family
+    that can carry a packet, and a private /dev with no node added back -- so it cannot
+    open a hidraw device, the aquaero or the Quadro even by accident."""
+    values = _unit_values(RADIO_UNIT.read_text())
+    assert set(values["CapabilityBoundingSet"][0].split()) == {"CAP_SYS_MODULE", "CAP_SYS_BOOT"}
+    assert values["NoNewPrivileges"] == ["yes"]
+    # Said out loud rather than left to a default, because aqua-net-watch.service sets
+    # the opposite and a reader comparing the two should see the difference stated.
+    assert values["ProtectKernelModules"] == ["no"]
+    filters = values["SystemCallFilter"][0].split()
+    assert "@module" in filters and "@reboot" in filters and "@system-service" in filters
+    families = values["RestrictAddressFamilies"][0].split()
+    assert set(families) == {"AF_UNIX", "AF_NETLINK"}
+    assert "AF_INET" not in families and "AF_INET6" not in families
+    assert values["PrivateDevices"] == ["yes"]
+    # Not one physical node, unlike the watcher, which needs /dev/vcio and
+    # /dev/vchiq for the rail and had to drop PrivateDevices= to get them.
+    assert "DeviceAllow" not in values
+    assert values["ProtectSystem"] == ["strict"]
+    assert values["ProtectHome"] == ["yes"]
+    # ProcSubset=pid would hide /proc/uptime and /proc/modules, the two files it reads.
+    assert "ProcSubset" not in values
+
+
+def test_the_radio_script_runs_nothing_but_modprobe_and_reboot():
+    """Read from the source, the twin of the behavioural checks below. `reboot` is the
+    one word on no other script's allowed list and on this one's, because the owner
+    approved that escalation explicitly; everything else is still forbidden."""
+    lines = _code_lines(RADIO_SCRIPT)
+    for word in RADIO_FORBIDDEN:
+        assert not _runs_command(lines, word), f"aqua-radio-recover.sh runs {word}"
+    for line in lines:
+        assert "aqua-bridge" not in line and "aqua-heartbeat" not in line, line
+        assert "hidraw" not in line, line
+    # The two it may run, and the module order it runs them in.
+    assert _runs_command(lines, "modprobe")
+    assert _runs_command(lines, "reboot")
+    code = "\n".join(lines) + "\n"
+    assert 'modprobe -r "${MODULES[@]}"' in code
+    assert 'modprobe "${MODULES[i]}"' in code
+    # Exactly one reboot in command position in the whole script: the escalation.
+    assert len([line for line in lines if re.match(r"^reboot$", line)]) == 1
+
+
+def test_the_two_recovery_units_cannot_act_on_the_same_board_state():
+    """The division of labour, stated in both headers and true in both bodies: an
+    interface that does not exist is the radio unit's case and only its case, and every
+    state of an interface that does exist is aqua-net-recover's. Neither can reach the
+    other's."""
+    radio = RADIO_SCRIPT.read_text()
+    net = NET_SCRIPT.read_text()
+    # Both headers name the other and name the one fact that divides them.
+    assert "aqua-net-recover" in radio and "aqua-radio-recover" in net
+    assert "division of labour" in radio and "division of labour" in net
+    # The radio unit's trigger: the netdev's existence, and nothing else.
+    assert '[[ -e "$NETCLASS/$IFACE" ]]' in radio
+    # aqua-net-recover's two actions both require a device NetworkManager has a state
+    # for, and it now hands the no-device case over instead of counting it as its own.
+    assert 'if [[ -z "$state_code" ]]; then' in net
+    assert "aqua-radio-recover.service owns an absent interface" in net
+    # Neither script reaches for the other's one action.
+    net_lines = _code_lines(NET_SCRIPT)
+    assert not _runs_command(net_lines, "modprobe") and not _runs_command(net_lines, "reboot")
+    radio_lines = _code_lines(RADIO_SCRIPT)
+    assert not _runs_command(radio_lines, "nmcli") and not _runs_command(radio_lines, "ping")
+
+
+def test_an_interface_that_exists_is_never_touched(tmp_path):
+    """The narrow trigger. While the netdev is there the unit does nothing whatsoever --
+    no module, no reboot, not even a journal line -- whatever the link is doing, because
+    every state of an interface that exists belongs to aqua-net-recover.sh."""
+    bin_dir = _radio_board(tmp_path, present=True)
+    lines = _run_radio(tmp_path, bin_dir, checks=5)
+    calls = (tmp_path / "calls.log").read_text()
+    assert "modprobe" not in calls and "reboot" not in calls
+    assert not _kinds(lines, "ABSENT") and not _kinds(lines, "RELOAD")
+    assert not _kinds(lines, "HOLD") and not _kinds(lines, "GAVEUP")
+    # One "started" line per boot and nothing else: the steady-state journal cost.
+    assert [line for line in lines if not line.startswith("sleep ")] == [
+        line for line in lines if line.startswith("started:")
+    ]
+
+
+def test_an_absence_inside_the_grace_period_is_a_boot_and_not_a_fault(tmp_path):
+    """The driver registers the netdev a few seconds into boot, so an absence before
+    AQUA_RADIO_GRACE_S of uptime is a boot in progress. Reloading a driver while the
+    boot is still bringing interfaces up is how a working board gets broken."""
+    bin_dir = _radio_board(tmp_path, present=False, uptime=12.0)
+    lines = _run_radio(tmp_path, bin_dir, checks=3)
+    calls = (tmp_path / "calls.log").read_text()
+    assert "modprobe" not in calls and "reboot" not in calls
+    assert len(_kinds(lines, "HOLD")) == 1  # and rate-limited after that, not per check
+    assert "up=12s" in _kinds(lines, "HOLD")[0]
+    assert not _kinds(lines, "ABSENT")
+    # The grace is read from /proc/uptime, so it is measured from boot and a restart of
+    # the unit hours later cannot re-arm it.
+    assert "up=" in _kinds(lines, "HOLD")[0]
+
+
+def test_an_absent_interface_past_the_grace_is_reloaded_and_comes_back(tmp_path):
+    """The measured cure: remove both modules (dependents first, because brcmfmac_cyw
+    depends on brcmfmac), load them back the other way round, and the netdev returns.
+    One attempt, no reboot."""
+    bin_dir = _radio_board(tmp_path, present=False, cure_at=1)
+    lines = _run_radio(tmp_path, bin_dir, checks=2)
+    calls = [line for line in (tmp_path / "calls.log").read_text().splitlines()]
+    modprobes = [line for line in calls if line.startswith("modprobe")]
+    assert modprobes == [
+        "modprobe -r brcmfmac_cyw brcmfmac",
+        "modprobe brcmfmac",
+        "modprobe brcmfmac_cyw",
+    ]
+    assert "reboot" not in "\n".join(calls)
+    assert len(_kinds(lines, "RELOAD")) == 1
+    assert "result=present" in _kinds(lines, "RELOAD")[0]
+    (recovered,) = _kinds(lines, "RECOVERED")
+    assert "after=1 reload attempt(s)" in recovered
+    # The verdict carries what was absent and what did exist.
+    (absent,) = _kinds(lines, "ABSENT")
+    assert "iface=wlan0" in absent and "netdevs=lo" in absent
+    assert "mod=brcmfmac_cyw=loaded,brcmfmac=loaded" in absent
+    # And the second check, with the interface back, says and does nothing.
+    assert len(_kinds(lines, "ABSENT")) == 1
+
+
+def test_a_reload_that_does_not_help_is_retried_the_configured_number_of_times(tmp_path):
+    """Three attempts means three, with AQUA_RADIO_ATTEMPT_DELAY_S between them and not
+    before the first or after the last -- and then the ladder ends."""
+    bin_dir = _radio_board(tmp_path, present=False)
+    lines = _run_radio(tmp_path, bin_dir, checks=1, extra_env={"AQUA_RADIO_ATTEMPTS": "3"})
+    calls = (tmp_path / "calls.log").read_text().splitlines()
+    assert calls.count("modprobe -r brcmfmac_cyw brcmfmac") == 3
+    assert [line for line in calls if line == "sleep 30"] == ["sleep 30"] * 2
+    reloads = _kinds(lines, "RELOAD")
+    assert len(reloads) == 3
+    assert all("result=still-absent" in line for line in reloads)
+    assert "attempt=3/3" in reloads[-1]
+
+
+def test_a_reload_that_takes_two_attempts_is_not_an_escalation(tmp_path):
+    """The mmc1 "Controller never released inhibit bit(s)" line is why the attempt count
+    is above one: an SDIO host that needed another go is still a cure, not a reboot."""
+    bin_dir = _radio_board(tmp_path, present=False, cure_at=2)
+    lines = _run_radio(tmp_path, bin_dir, checks=1)
+    assert "reboot" not in (tmp_path / "calls.log").read_text()
+    assert len(_kinds(lines, "RELOAD")) == 2
+    assert "after=2 reload attempt(s)" in _kinds(lines, "RECOVERED")[0]
+
+
+def test_the_board_is_rebooted_only_after_the_attempts_are_exhausted(tmp_path):
+    """The escalation the owner approved explicitly: with no radio the board is
+    unreachable until somebody walks to it. It comes after the whole ladder and after
+    the ledger has been written, never before."""
+    bin_dir = _radio_board(tmp_path, present=False)
+    lines = _run_radio(tmp_path, bin_dir, checks=1)
+    calls = (tmp_path / "calls.log").read_text().splitlines()
+    assert calls.count("reboot ") == 1
+    # Every attempt first, and the reboot last of all.
+    assert calls.index("reboot ") == len(calls) - 1
+    assert calls.count("modprobe -r brcmfmac_cyw brcmfmac") == 3
+    (escalation,) = _kinds(lines, "REBOOT")
+    assert "tried=3 reload attempt(s)" in escalation
+    assert "reboot 1 of 2 allowed" in escalation
+    assert not _kinds(lines, "GAVEUP")
+    # Written BEFORE the reboot, on /var: one entry, so the next one knows.
+    ledger = (tmp_path / "state" / "reboots").read_text().split()
+    assert len(ledger) == 1 and ledger[0].isdigit()
+
+
+def test_the_reboot_escalation_can_be_switched_off_entirely(tmp_path):
+    """A knob, defaulting to on, with a real off switch. With it off the unit still
+    reloads the driver and still says hourly that it has given up; it simply never
+    reboots."""
+    bin_dir = _radio_board(tmp_path, present=False)
+    lines = _run_radio(tmp_path, bin_dir, checks=1, extra_env={"AQUA_RADIO_REBOOT": "off"})
+    calls = (tmp_path / "calls.log").read_text()
+    assert "reboot" not in calls
+    assert calls.count("modprobe -r brcmfmac_cyw brcmfmac") == 3  # still tried
+    (gave_up,) = _kinds(lines, "GAVEUP")
+    assert "switched off" in gave_up and "reboot=off" in gave_up
+    assert not (tmp_path / "state" / "reboots").exists()
+    # A budget of zero says the same thing from the other direction.
+    other = tmp_path / "zero"
+    other.mkdir()
+    bin_dir = _radio_board(other, present=False)
+    lines = _run_radio(other, bin_dir, checks=1, extra_env={"AQUA_RADIO_REBOOT_BUDGET": "0"})
+    assert "reboot" not in (other / "calls.log").read_text()
+    assert _kinds(lines, "GAVEUP")
+
+
+def test_a_spent_reboot_budget_refuses_to_reboot_again(tmp_path):
+    """A board stuck in a reboot loop never finishes booting, so nobody can log in to
+    fix it even standing next to it -- which is worse than a board with no network. The
+    budget is a hard stop, and the ledger it counts is on /var precisely so the reboot
+    it counts cannot erase it."""
+    bin_dir = _radio_board(tmp_path, present=False)
+    state = tmp_path / "state"
+    state.mkdir()
+    now = int(time.time())
+    (state / "reboots").write_text(f"{now - 10}\n{now - 20}\n")
+    lines = _run_radio(tmp_path, bin_dir, checks=1)
+    assert "reboot" not in (tmp_path / "calls.log").read_text()
+    (gave_up,) = _kinds(lines, "GAVEUP")
+    assert "budget for this window is spent" in gave_up and "budget=2/2" in gave_up
+    # It keeps reloading the driver, because that costs two seconds and might work.
+    assert (tmp_path / "calls.log").read_text().count("modprobe -r") == 3
+
+
+def test_a_reboot_budget_window_that_has_passed_allows_one_again(tmp_path):
+    """The window slides, so the worst case is the budget per window and not a unit that
+    has given up for good after a bad day months ago. Expired entries are pruned, so the
+    ledger cannot grow without bound either."""
+    bin_dir = _radio_board(tmp_path, present=False)
+    state = tmp_path / "state"
+    state.mkdir()
+    now = int(time.time())
+    (state / "reboots").write_text(f"{now - 90_000}\n{now - 100_000}\n")
+    lines = _run_radio(tmp_path, bin_dir, checks=1)
+    assert (tmp_path / "calls.log").read_text().count("reboot ") == 1
+    assert _kinds(lines, "REBOOT")
+    assert len((state / "reboots").read_text().split()) == 1  # the two stale ones pruned
+
+
+def test_a_reboot_that_cannot_be_recorded_is_not_ordered(tmp_path):
+    """The guard that matters most. A reboot whose record did not persist -- no state
+    directory, a read-only /var, a full card -- is exactly the reboot that would repeat
+    on every boot forever, so one that cannot be recorded is refused outright."""
+    bin_dir = _radio_board(tmp_path, present=False)
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory\n")  # mkdir -p of a path under a file cannot work
+    lines = _run_radio(tmp_path, bin_dir, checks=1, state_dir=blocker / "state")
+    assert "reboot" not in (tmp_path / "calls.log").read_text()
+    (gave_up,) = _kinds(lines, "GAVEUP")
+    assert "could NOT be recorded" in gave_up
+
+
+def test_a_board_that_has_given_up_says_so_without_filling_the_journal(tmp_path):
+    """Silence is the defect this whole family of scripts exists against -- thirty hours
+    with no interface produced three supplicant lines and nothing else -- but one line
+    per check for days is its own kind of silence. The notice is rate-limited to
+    AQUA_RADIO_LOUD_EVERY_S and the per-attempt lines are not."""
+    bin_dir = _radio_board(tmp_path, present=False)
+    lines = _run_radio(tmp_path, bin_dir, checks=3, extra_env={"AQUA_RADIO_REBOOT": "off"})
+    assert len(_kinds(lines, "GAVEUP")) == 1
+    assert len(_kinds(lines, "ABSENT")) == 3  # the verdict itself is per check
+    assert len(_kinds(lines, "RELOAD")) == 9
+
+
+@pytest.mark.parametrize(
+    ("present", "uptime", "cure_at", "extra"),
+    [
+        (True, 600.0, None, {}),  # a healthy board
+        (False, 12.0, None, {}),  # absent inside the grace
+        (False, 600.0, 1, {}),  # absent, cured by the first reload
+        (False, 600.0, None, {"AQUA_RADIO_REBOOT": "off"}),  # absent, never cured
+        (False, 600.0, 3, {"AQUA_RADIO_ATTEMPTS": "5"}),  # absent, cured late
+    ],
+)
+def test_no_state_of_the_board_makes_it_touch_a_controller_or_a_service(
+    tmp_path, present, uptime, cure_at, extra
+):
+    """The behavioural twin of the source check. systemctl, the two aqua services, every
+    network tool, shutdown, poweroff and halt are all on PATH as logging stubs, so a run
+    that reached for one shows up in the call log. The network is outside the cooling
+    path and stays there: the only two things this unit may run are modprobe and the
+    bounded reboot, which is why `reboot` is not on this list."""
+    bin_dir = _radio_board(tmp_path, present=present, uptime=uptime, cure_at=cure_at)
+    _run_radio(tmp_path, bin_dir, checks=4, extra_env=extra)
+    calls = (tmp_path / "calls.log").read_text()
+    for forbidden in RADIO_FORBIDDEN:
+        assert forbidden not in calls, forbidden
+
+
+def test_the_radio_check_flag_reports_without_loading_or_rebooting_anything(tmp_path):
+    """--check is the safe thing to run by hand on a live board, in the shape
+    install-board-watchdogs.sh --check already has: it says what it sees and what a real
+    run would do, and it changes nothing."""
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - bash is in packages-rpi.txt and in CI
+        pytest.skip("bash not available")
+    bin_dir = _radio_board(tmp_path, present=False)
+    done = subprocess.run(
+        [bash, str(RADIO_SCRIPT), "--check"],
+        env={
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "AQUA_RADIO_ROOT": str(tmp_path / "root"),
+            "AQUA_RADIO_STATE_DIR": str(tmp_path / "state"),
+            "W_BASE": str(tmp_path),
+            "W_ROOT": str(tmp_path / "root"),
+            "CALLS": str(tmp_path / "calls.log"),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert (tmp_path / "calls.log").read_text() == ""
+    assert "absent" in done.stdout and "would reload the driver" in done.stdout
+    assert not (tmp_path / "state").exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("AQUA_RADIO_REBOOT", "maybe"),
+        ("AQUA_RADIO_ATTEMPTS", "-1"),
+        ("AQUA_RADIO_GRACE_S", "0"),
+        ("AQUA_RADIO_REBOOT_WINDOW_S", "soon"),
+    ],
+)
+def test_the_radio_script_refuses_a_nonsense_knob(tmp_path, name, value):
+    """A unit that may reboot the board must not start on a typo in a budget."""
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - bash is in packages-rpi.txt and in CI
+        pytest.skip("bash not available")
+    done = subprocess.run(
+        [bash, str(RADIO_SCRIPT), "--once"],
+        env={"PATH": "/usr/bin:/bin", name: value},
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 2
+    assert name in done.stderr
+
+
+def test_the_board_script_refuses_a_nonsense_radio_knob():
+    """The same refusals on the installer's side of the three-way agreement."""
+    text = BOARD_SCRIPT.read_text()
+    assert 'echo "error: $name must be a whole number (0 = none), got' in text
+    assert "error: RADIO_REBOOT must be 'on' or 'off'" in text
+    for name in ("RADIO_GRACE", "RADIO_INTERVAL", "RADIO_ATTEMPT_DELAY", "RADIO_SETTLE"):
+        assert name in text
+
+
+def test_no_radio_recover_is_an_off_switch_and_not_a_skipped_step():
+    """Same argument as --no-net-watch: this one is a long-running service too, so an
+    earlier run's copy keeps checking with the attempt count and the reboot budget it
+    was installed with until something stops it."""
+    text = BOARD_SCRIPT.read_text()
+    assert "systemctl disable --now aqua-radio-recover.service" in text
+    for dst in ('"$RADIO_UNIT_DST"', '"$RADIO_DST"'):
+        assert f"remove_path {dst}" in text
+    assert "systemctl enable --now aqua-radio-recover.service" in text
+    assert "systemctl restart aqua-radio-recover.service" in text
+    # The ledger is evidence, not configuration: removing the unit must not hand the
+    # next install a budget that starts again from zero.
+    assert "the reboot ledger under /var/lib/aqua-radio-recover is left alone" in text
+
+
+def test_no_radio_reboot_is_the_escalations_own_off_switch():
+    """The escalation knob defaults to on and the flag writes "off" into the installed
+    unit -- so it is a change to the unit, which the installer then restarts, and not a
+    step that was skipped while the old unit kept its old escalation."""
+    text = BOARD_SCRIPT.read_text()
+    assert "--no-radio-reboot)" in text
+    assert "RADIO_REBOOT=off" in text
+    assert "[--no-radio-recover] [--no-radio-reboot]" in text
+    assert _shell_default(BOARD_SCRIPT, "RADIO_REBOOT") == "on"
+    assert "Environment=AQUA_RADIO_REBOOT=$RADIO_REBOOT" in text

@@ -1,0 +1,143 @@
+[Unit]
+Description=aqua-bridge board: bring back a wireless interface that does not exist
+Documentation=file:///opt/aqua-bridge/PROJECT.md
+# No ordering against anything, on purpose, and in particular no
+# After=NetworkManager.service and no Wants=/After=network-online.target. This
+# unit does not use NetworkManager, does not use wpa_supplicant and sends no
+# packet: its one question is whether /sys/class/net/<iface> exists, and the boot
+# in which it needs to be asked is exactly the boot in which the network never
+# comes up. Waiting for any of them would mean not running then. The script's own
+# AQUA_RADIO_GRACE_S, measured from /proc/uptime, is what keeps it from acting
+# while the boot is still bringing interfaces up -- a grace it carries itself
+# rather than borrowing from systemd's ordering, so a restart of this unit hours
+# later does not re-arm it.
+#
+# Deliberately no relation of any kind to aqua-bridge.service or to
+# aqua-heartbeat.service -- no Requires=, no Wants=, no After=, no Before=, no
+# Conflicts=, no PartOf=. The network is outside the cooling path (PROJECT.md §2):
+# nothing here may order, delay, start or stop the daemon that drives the fans.
+# And no relation to aqua-net-recover.service or aqua-net-watch.service either:
+# the three must not be able to sequence each other, and none of them needs the
+# others. The division of labour is a fact about the board and not about
+# ordering -- an interface that does not exist is this unit's case, an interface
+# that does is aqua-net-recover's -- so the two can never act at the same time
+# whatever order systemd starts them in.
+#
+# No StartLimitIntervalSec default and no StartLimitAction: this unit's one
+# escalation is the bounded reboot the script argues for and records, and systemd
+# must not be able to add a second, unrecorded one behind its back. The rate
+# limit is switched off outright, so systemd cannot park the unit as failed
+# either.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# A long-running checker, not a timer. One check on a healthy board is a single
+# [[ -e ]] and one read of /proc/uptime with no fork, so a timer would cost more
+# in systemd's own bookkeeping than the checks do; and the escalation ladder --
+# up to AQUA_RADIO_ATTEMPTS reloads, each with a bounded wait and a delay between
+# them -- is one function in one process here, instead of state that would have to
+# be persisted and reloaded between runs.
+ExecStart=/usr/local/lib/aqua-bridge/aqua-radio-recover.sh
+# /var/lib/aqua-radio-recover, which is where the reboot ledger goes -- on /var
+# and NOT under RuntimeDirectory=, because a count of reboots kept on a tmpfs
+# would be erased by exactly the event it is counting, which is the whole
+# mechanism of a reboot loop. systemd creates it and makes it the one writable
+# path under ProtectSystem=strict below. It matches the script's
+# AQUA_RADIO_STATE_DIR default, and tests/test_deploy.py checks that.
+StateDirectory=aqua-radio-recover
+# The nine knobs an owner is likely to want, so deploy/install-board-watchdogs.sh
+# can write them from its RADIO_* table; they match the script's own defaults and
+# tests/test_deploy.py checks that all three agree. Every other knob is argued at
+# the top of the script and overridden with
+# "systemctl edit aqua-radio-recover.service".
+Environment=AQUA_RADIO_IFACE=wlan0
+Environment=AQUA_RADIO_GRACE_S=90
+Environment=AQUA_RADIO_INTERVAL_S=60
+Environment=AQUA_RADIO_ATTEMPTS=3
+Environment=AQUA_RADIO_ATTEMPT_DELAY_S=30
+Environment=AQUA_RADIO_SETTLE_S=20
+Environment=AQUA_RADIO_REBOOT=on
+Environment=AQUA_RADIO_REBOOT_BUDGET=2
+Environment=AQUA_RADIO_REBOOT_WINDOW_S=86400
+SyslogIdentifier=aqua-radio-recover
+# Behind everything on a board whose CPU belongs to the control loop. CPUWeight is
+# relative and only bites when the two actually compete; a hard CPUQuota= would
+# instead stretch the driver reload across the very seconds it is being timed in.
+Nice=19
+CPUWeight=20
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+# Under memory pressure the kernel takes this before anything else on the board.
+OOMScoreAdjust=500
+MemoryHigh=32M
+MemoryMax=64M
+# It comes back if it dies, at its own pace. No OnFailure= and no WatchdogSec=: a
+# Type=simple service has nothing to notify with, and a watchdog here would be a
+# second path to a board reset that the script's ledger knows nothing about --
+# which is precisely the thing the ledger exists to make impossible.
+Restart=always
+RestartSec=60
+# The script traps SIGTERM, logs that it stopped and exits. Ten seconds is far
+# more than that needs, and a stop that arrives mid-reload still lands between two
+# modprobes at worst, which the next start's first check sorts out.
+TimeoutStopSec=10
+#
+# --- what it may do, enforced by systemd and not only by the script ------------
+#
+# Exactly two capabilities, for exactly the two actions the script is allowed:
+# CAP_SYS_MODULE for the driver reload, and CAP_SYS_BOOT so that "reboot" still
+# works by reboot(2) if PID 1's bus is unreachable. Nothing else -- no
+# CAP_NET_ADMIN (it configures no interface), no CAP_NET_RAW (it sends no
+# packet), no CAP_SYS_RAWIO.
+CapabilityBoundingSet=CAP_SYS_MODULE CAP_SYS_BOOT
+NoNewPrivileges=yes
+# The one unit in this repository that is ALLOWED to load a module, said out loud
+# rather than left to a default: ProtectKernelModules=yes would make the reload
+# fail, and a reader comparing this unit with aqua-net-watch.service (which sets
+# it to yes) should see the difference stated.
+ProtectKernelModules=no
+# No address family that can carry a packet. The script runs no nmcli, no ping,
+# no ip and no wpa_cli -- every state of an interface that EXISTS belongs to
+# aqua-net-recover.service -- and with only AF_UNIX (the bus call "reboot" makes)
+# and AF_NETLINK (what kmod and udev use) permitted here, it could not send one if
+# it tried.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# A private /dev with NO physical node added back: PrivateDevices=yes implies
+# DevicePolicy=closed, so this unit cannot open /dev/hidraw*, the aquaero, the
+# Quadro or any other device, by accident or otherwise. There is no DeviceAllow=
+# here at all, and tests/test_deploy.py checks there never is.
+# aqua-net-watch.service had to settle for DevicePolicy=closed instead, because a
+# private /dev is a fresh tmpfs that DeviceAllow= cannot bind a physical node back
+# into and its rail measurement needs /dev/vcio and /dev/vchiq. This unit reads no
+# device and writes none -- modprobe needs no node, and "reboot" talks to PID 1
+# over AF_UNIX -- so it keeps the stronger of the two settings for free.
+PrivateDevices=yes
+# The ledger under StateDirectory= above is the only thing it ever writes;
+# everything else may be read-only.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# Other processes' /proc entries are hidden. ProcSubset= is deliberately left at
+# its default: "pid" would hide /proc/uptime and /proc/modules, which are the two
+# files this unit reads to decide anything at all.
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# @module for finit_module/delete_module (the reload) and @reboot for reboot(2)
+# (the escalation); @system-service covers neither, and without them both actions
+# would fail with EPERM. They are named here so the two things this unit may do
+# are listed in the unit as well as argued in the script.
+SystemCallFilter=@system-service @module @reboot
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Idempotent board hardening for a Raspberry Pi running aqua-bridge: the SoC
 # hardware watchdog, journald limits, Wi-Fi power save off, unlimited
-# NetworkManager autoconnect retries, the Wi-Fi re-association timer, and the
-# network diagnostic watcher (PROJECT.md §2 "Watchdog layering", §9).
+# NetworkManager autoconnect retries, the Wi-Fi re-association timer, the radio
+# recovery unit for an interface that does not exist at all, and the network
+# diagnostic watcher (PROJECT.md §2 "Watchdog layering", §9).
 #
 # It does NOT touch aqua-bridge.service, the controllers, or the daemon's
 # config: the service watchdog lives in deploy/aqua-bridge.service and is
@@ -15,6 +16,8 @@
 #   deploy/install-board-watchdogs.sh --check         # report only, change nothing
 #   sudo deploy/install-board-watchdogs.sh --no-net-recover
 #   sudo deploy/install-board-watchdogs.sh --no-net-watch
+#   sudo deploy/install-board-watchdogs.sh --no-radio-recover
+#   sudo deploy/install-board-watchdogs.sh --no-radio-reboot
 #
 # --check needs no root and writes nothing; it prints what would change.
 # --no-net-recover installs no Wi-Fi script, unit or timer, and *removes* the
@@ -26,14 +29,29 @@
 # --no-net-watch does the same for the diagnostic watcher, and for the same
 # reason: a long-running service left enabled keeps running the copy of the
 # script installed back then.
+# --no-radio-recover does the same for the radio recovery unit.
+# --no-radio-reboot keeps that unit but switches off its one escalation, by
+# writing Environment=AQUA_RADIO_REBOOT=off into the installed unit instead of
+# the default "on" -- also a real off switch and not a skipped step: the unit
+# file changes, so a re-run with the flag rewrites it and restarts the service,
+# and a re-run without it puts the escalation back.
 #
-# The two network units do different jobs and neither needs the other.
-# aqua-net-recover acts: it re-associates a dead link and re-activates a profile
-# NetworkManager has given up on. aqua-net-watch only ever observes: it samples
-# the interface, the association, the address, the route, the gateway's
-# neighbour entry and the SoC's own power and temperature figures, and records
-# whether the previous boot ended cleanly. It never sends a packet, never loads
-# a module and never touches a service, so the two cannot fight.
+# The three network units do different jobs and none needs the others; their
+# triggers cannot overlap, so they cannot fight.
+# aqua-net-recover acts on an interface that EXISTS: it re-associates a dead
+# link and re-activates a profile NetworkManager has given up on. It never loads
+# a module and never reboots.
+# aqua-radio-recover acts only when the interface does NOT exist -- the
+# 2026-10-06 fault, where the brcmfmac firmware download failed its read-back
+# verification in early boot and no netdev was ever registered, so there is
+# nothing to associate, activate or probe. It reloads the Wi-Fi driver, which
+# cured it in two measured seconds, and after a bounded number of failed
+# reloads it reboots the board within a budget it records on /var. It runs no
+# nmcli, sends no packet and touches no service.
+# aqua-net-watch only ever observes: it samples the interface, the association,
+# the address, the route, the gateway's neighbour entry and the SoC's own power
+# and temperature figures, and records whether the previous boot ended cleanly.
+# It never sends a packet, never loads a module and never touches a service.
 #
 # Three settings here are verified rather than assumed, because all three have
 # already been written successfully and had no effect. Two are drop-ins that
@@ -186,6 +204,57 @@ NET_WATCH_INTERVAL="${NET_WATCH_INTERVAL:-15}"
 # already been snapshotted, and what the next hours -- or, on 2026-10-06, thirty
 # of them -- need is the evolution on record without filling a capped journal.
 NET_WATCH_OUTAGE_INTERVAL="${NET_WATCH_OUTAGE_INTERVAL:-30}"
+# --- the radio recovery unit (deploy/aqua-radio-recover.{sh,service}) ---------
+# Every one of these nine is written into aqua-radio-recover.service as an
+# Environment= line; the script carries the same default for each, and
+# tests/test_deploy.py checks that all three files agree. The script's header
+# argues each of them in full -- this table is where the board's copy comes from.
+#
+# The interface whose ABSENCE that unit acts on. Same default as NET_IFACE above
+# and as the two scripts' own, and each file carries its own copy because a unit
+# started by systemd has no environment to inherit one from.
+RADIO_IFACE="${RADIO_IFACE:-wlan0}"
+# Seconds of uptime before a missing interface counts as a fault rather than as a
+# boot in progress (Environment=AQUA_RADIO_GRACE_S). The driver registers the
+# netdev a few seconds in, so 90 s is thirty times that and the unit cannot act
+# while the boot is still bringing interfaces up.
+RADIO_GRACE="${RADIO_GRACE:-90}"
+# Seconds between two checks (Environment=AQUA_RADIO_INTERVAL_S). A check on a
+# healthy board is one [[ -e ]] and one read of /proc/uptime with no fork, so this
+# is detection latency and nothing else: one minute against the thirty hours the
+# fault cost when nothing acted.
+RADIO_INTERVAL="${RADIO_INTERVAL:-60}"
+# Driver reloads before the escalation (Environment=AQUA_RADIO_ATTEMPTS). The
+# measured cure worked on the first attempt in two seconds; 3 covers an SDIO host
+# that needed another go without turning a dead chip into an endless rmmod cycle.
+RADIO_ATTEMPTS="${RADIO_ATTEMPTS:-3}"
+# Seconds between two reload attempts (Environment=AQUA_RADIO_ATTEMPT_DELAY_S).
+RADIO_ATTEMPT_DELAY="${RADIO_ATTEMPT_DELAY:-30}"
+# Seconds a reload is given for the netdev to come back before that attempt counts
+# as failed (Environment=AQUA_RADIO_SETTLE_S). Measured: one second.
+RADIO_SETTLE="${RADIO_SETTLE:-20}"
+# Whether that unit's escalation to a reboot is enabled at all, "on" or "off"
+# (Environment=AQUA_RADIO_REBOOT). On by default, because the alternative the
+# owner lived through is a board that cools perfectly and cannot be reached for
+# thirty hours; --no-radio-reboot sets it to off. With it off the unit still
+# reloads the driver and still says hourly that it has given up -- it simply never
+# reboots.
+RADIO_REBOOT="${RADIO_REBOOT:-on}"
+# Reboots that unit may order within RADIO_REBOOT_WINDOW
+# (Environment=AQUA_RADIO_REBOOT_BUDGET). 2: the first reboot is the one with a
+# real chance (a cold start of the SDIO host is a different draw of the same dice
+# as a modprobe), the second is the benefit of the doubt, and a third in one day
+# would be a board that reboots itself all day and still has no radio -- which is
+# worse than the fault, because a board in a reboot loop never finishes booting
+# and cannot be fixed even from the console. 0 means never reboot, the same as
+# RADIO_REBOOT=off.
+RADIO_REBOOT_BUDGET="${RADIO_REBOOT_BUDGET:-2}"
+# The window that budget is counted in, in seconds
+# (Environment=AQUA_RADIO_REBOOT_WINDOW_S). 86400 -- one day -- so the worst case
+# the unit can produce is two reboots a day of an otherwise healthy board, each
+# about half a minute, with an hourly line in between saying it has given up. The
+# ledger on /var holds timestamps, so the window slides rather than resetting.
+RADIO_REBOOT_WINDOW="${RADIO_REBOOT_WINDOW:-86400}"
 
 set -euo pipefail
 
@@ -231,13 +300,19 @@ NET_WATCH_SRC="$SCRIPT_DIR/aqua-net-watch.sh"
 NET_WATCH_DST="/usr/local/lib/aqua-bridge/aqua-net-watch.sh"
 NET_WATCH_UNIT_SRC="$SCRIPT_DIR/aqua-net-watch.service"
 NET_WATCH_UNIT_DST="/etc/systemd/system/aqua-net-watch.service"
+RADIO_SRC="$SCRIPT_DIR/aqua-radio-recover.sh"
+RADIO_DST="/usr/local/lib/aqua-bridge/aqua-radio-recover.sh"
+RADIO_UNIT_SRC="$SCRIPT_DIR/aqua-radio-recover.service"
+RADIO_UNIT_DST="/etc/systemd/system/aqua-radio-recover.service"
 
 CHECK_ONLY=0
 NET_RECOVER=1
 NET_WATCH=1
+RADIO_RECOVER=1
 
 usage() {
-  echo "Usage: $0 [--check] [--no-net-recover] [--no-net-watch]" >&2
+  echo "Usage: $0 [--check] [--no-net-recover] [--no-net-watch]" \
+    "[--no-radio-recover] [--no-radio-reboot]" >&2
   exit 2
 }
 
@@ -251,6 +326,15 @@ for arg in "$@"; do
       ;;
     --no-net-watch)
       NET_WATCH=0
+      ;;
+    --no-radio-recover)
+      RADIO_RECOVER=0
+      ;;
+    --no-radio-reboot)
+      # The knob's off switch, not a skipped step: the installed unit's
+      # Environment=AQUA_RADIO_REBOOT= line changes, so this rewrites it and
+      # restarts the service, and a re-run without the flag puts it back.
+      RADIO_REBOOT=off
       ;;
     *)
       usage
@@ -287,6 +371,35 @@ for name in NET_WATCH_INTERVAL NET_WATCH_OUTAGE_INTERVAL; do
     exit 2
   fi
 done
+for name in RADIO_GRACE RADIO_INTERVAL RADIO_ATTEMPT_DELAY RADIO_SETTLE \
+  RADIO_REBOOT_WINDOW; do
+  if [[ ! "${!name}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: $name must be a whole number of seconds, got '${!name}'" >&2
+    exit 2
+  fi
+done
+# The two where 0 is meaningful and means the same thing from two directions: no
+# reload attempt at all, and no reboot ever.
+for name in RADIO_ATTEMPTS RADIO_REBOOT_BUDGET; do
+  if [[ ! "${!name}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "error: $name must be a whole number (0 = none), got '${!name}'" >&2
+    exit 2
+  fi
+done
+case "$RADIO_REBOOT" in
+  on | off) ;;
+  *)
+    echo "error: RADIO_REBOOT must be 'on' or 'off' (--no-radio-reboot sets" \
+      "'off'), got '$RADIO_REBOOT'" >&2
+    exit 2
+    ;;
+esac
+if [[ "$RADIO_SETTLE" -ge "$RADIO_REBOOT_WINDOW" ]]; then
+  echo "error: RADIO_SETTLE ($RADIO_SETTLE) is not below RADIO_REBOOT_WINDOW" \
+    "($RADIO_REBOOT_WINDOW): one wait for the netdev would outlast the window the" \
+    "reboot budget is counted in" >&2
+  exit 2
+fi
 if [[ "$NET_WATCH_OUTAGE_INTERVAL" -lt "$NET_WATCH_INTERVAL" ]]; then
   echo "error: NET_WATCH_OUTAGE_INTERVAL ($NET_WATCH_OUTAGE_INTERVAL) below" \
     "NET_WATCH_INTERVAL ($NET_WATCH_INTERVAL): an outage is the long part and" \
@@ -737,6 +850,65 @@ else
     "aqua-net-watch.service' removes it)"
 fi
 
+NEEDS_RADIO_RESTART=0
+if [[ "$RADIO_RECOVER" -eq 1 ]]; then
+  echo "== radio recovery (an interface that does not exist) =="
+  install_text "$RADIO_DST" 755 < "$RADIO_SRC"
+  NEEDS_RADIO_RESTART="$LAST_WROTE"
+  radio_tmp="$(mktemp)"
+  # Every knob the unit carries is rewritten from the table at the top of this
+  # script, including AQUA_RADIO_REBOOT, which is what makes --no-radio-reboot a
+  # change to the installed unit rather than a skipped step.
+  sed -e "s|^Environment=AQUA_RADIO_IFACE=.*|Environment=AQUA_RADIO_IFACE=$RADIO_IFACE|" \
+    -e "s|^Environment=AQUA_RADIO_GRACE_S=.*|Environment=AQUA_RADIO_GRACE_S=$RADIO_GRACE|" \
+    -e "s|^Environment=AQUA_RADIO_INTERVAL_S=.*|Environment=AQUA_RADIO_INTERVAL_S=$RADIO_INTERVAL|" \
+    -e "s|^Environment=AQUA_RADIO_ATTEMPTS=.*|Environment=AQUA_RADIO_ATTEMPTS=$RADIO_ATTEMPTS|" \
+    -e "s|^Environment=AQUA_RADIO_ATTEMPT_DELAY_S=.*|Environment=AQUA_RADIO_ATTEMPT_DELAY_S=$RADIO_ATTEMPT_DELAY|" \
+    -e "s|^Environment=AQUA_RADIO_SETTLE_S=.*|Environment=AQUA_RADIO_SETTLE_S=$RADIO_SETTLE|" \
+    -e "s|^Environment=AQUA_RADIO_REBOOT=.*|Environment=AQUA_RADIO_REBOOT=$RADIO_REBOOT|" \
+    -e "s|^Environment=AQUA_RADIO_REBOOT_BUDGET=.*|Environment=AQUA_RADIO_REBOOT_BUDGET=$RADIO_REBOOT_BUDGET|" \
+    -e "s|^Environment=AQUA_RADIO_REBOOT_WINDOW_S=.*|Environment=AQUA_RADIO_REBOOT_WINDOW_S=$RADIO_REBOOT_WINDOW|" \
+    "$RADIO_UNIT_SRC" > "$radio_tmp"
+  install_text "$RADIO_UNIT_DST" 644 < "$radio_tmp"
+  rm -f "$radio_tmp"
+  if [[ "$LAST_WROTE" -eq 1 ]]; then
+    NEEDS_RADIO_RESTART=1
+  fi
+  if [[ "$RADIO_REBOOT" == "off" ]]; then
+    echo "  escalation: AQUA_RADIO_REBOOT=off -- the driver is still reloaded," \
+      "a radio that stays missing is reported hourly, and the board is never" \
+      "rebooted from here"
+  else
+    echo "  escalation: at most $RADIO_REBOOT_BUDGET reboot(s) per" \
+      "${RADIO_REBOOT_WINDOW}s, recorded in /var/lib/aqua-radio-recover/reboots" \
+      "(never a tmpfs, so the count survives the reboot it is counting)"
+  fi
+else
+  echo "== radio recovery: off (--no-radio-recover) =="
+  # Same argument as the watcher: a long-running service left enabled keeps
+  # running the copy of the script installed back then, with the attempt count
+  # and the reboot budget it had back then. The flag has to be able to turn it
+  # off again.
+  if [[ -e "$RADIO_UNIT_DST" ]]; then
+    CHANGED=1
+    if [[ "$CHECK_ONLY" -eq 1 ]]; then
+      echo "  would stop and disable aqua-radio-recover.service"
+    else
+      as_root systemctl disable --now aqua-radio-recover.service || true
+      echo "  stopped and disabled aqua-radio-recover.service"
+    fi
+  fi
+  remove_path "$RADIO_UNIT_DST"
+  remove_path "$RADIO_DST"
+  echo "  (the reboot ledger under /var/lib/aqua-radio-recover is left alone: it" \
+    "is evidence, not configuration, and a budget deleted by hand is a budget" \
+    "that starts again from zero. 'systemctl clean --what=state" \
+    "aqua-radio-recover.service' removes it.)"
+  echo "  (an interface that does not exist is then nobody's case: nothing on" \
+    "this board will reload the driver, and the fans are unaffected either way," \
+    "PROJECT.md §2)"
+fi
+
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
   echo
   echo "== SoC watchdog (current board state, before any change) =="
@@ -803,6 +975,23 @@ if [[ "$NET_WATCH" -eq 1 ]]; then
   echo "  read an outage out of it with:"
   echo "    journalctl -t aqua-net-watch -o short-iso --since -2h"
 fi
+if [[ "$RADIO_RECOVER" -eq 1 ]]; then
+  echo "== radio recovery =="
+  as_root systemctl enable --now aqua-radio-recover.service
+  # A long-running service keeps running whatever it was started with, so a
+  # changed script or unit -- a different attempt count, a different reboot
+  # budget, --no-radio-reboot -- has to be picked up explicitly. Restarting it is
+  # harmless: it loads nothing on a board whose interface exists, and its next
+  # check is one [[ -e ]].
+  if [[ "$NEEDS_RADIO_RESTART" -eq 1 ]]; then
+    as_root systemctl restart aqua-radio-recover.service
+    echo "  restarted to pick up the new script/unit"
+  fi
+  echo "  aqua-radio-recover.service: $(systemctl is-active aqua-radio-recover.service)"
+  echo "  read its whole history -- every absence, reload and escalation, across"
+  echo "  every boot the journal holds -- with:"
+  echo "    journalctl -t aqua-radio-recover -o short-iso --since -7d"
+fi
 
 service_watchdog="?"
 if [[ -r "$UNIT_SRC" ]]; then
@@ -840,6 +1029,24 @@ reboots, never restarts aqua-bridge and never touches a controller
 (PROJECT.md §2). With the access point off, both are no-ops that cost a journal
 line -- waiting is the whole response, and there is no escalation above it.
 
+aqua-radio-recover is the one exception to that inertness, and a narrow one. It
+acts on exactly one condition -- ${RADIO_IFACE} does not EXIST -- which is the
+2026-10-06 fault: the brcmfmac firmware download to the Wi-Fi chip failed its
+read-back verification in early boot, no netdev was ever registered, and the
+board was unreachable for thirty hours while cooling perfectly. Every state of an
+interface that does exist stays aqua-net-recover's, so the two can never act at
+the same time. It waits ${RADIO_GRACE} s of uptime (the driver registers the
+netdev a few seconds in), then reloads the Wi-Fi driver -- measured on this
+board: two seconds, end to end, and NetworkManager reconnected by itself -- up to
+${RADIO_ATTEMPTS} times, ${RADIO_ATTEMPT_DELAY} s apart, each with ${RADIO_SETTLE} s
+to come back. Only then, and only with AQUA_RADIO_REBOOT=on
+(currently ${RADIO_REBOOT}), does it reboot the board, at most
+${RADIO_REBOOT_BUDGET} time(s) per ${RADIO_REBOOT_WINDOW} s, counted in a ledger on
+/var that survives the reboot it is counting and refusing the reboot outright if
+that ledger cannot be written. Past the budget it says hourly that it has given
+up. It loads a module and it reboots; it opens no controller, stops or restarts
+no service of any kind, and sends no packet.
+
 connection.autoconnect-retries=${NET_AUTOCONNECT_RETRIES} on the Wi-Fi profile
 is the other half of that: NetworkManager's default of 4 is what let the board
 stop trying altogether on 2026-09-30, and the report above reads the effective
@@ -857,4 +1064,10 @@ if [[ "$NET_WATCH" -eq 1 ]]; then
   echo "  ${NET_WATCH_DST} --boot-report"
 else
   echo "The watcher is not installed (--no-net-watch)."
+fi
+if [[ "$RADIO_RECOVER" -eq 1 ]]; then
+  echo "Ask the radio recovery what it sees, without it touching anything, with"
+  echo "  ${RADIO_DST} --check"
+else
+  echo "The radio recovery is not installed (--no-radio-recover)."
 fi
