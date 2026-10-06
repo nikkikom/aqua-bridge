@@ -530,9 +530,9 @@ capture() {
 # from the journal rather than with dmesg(1): journald holds every kernel line
 # and is persistent on this board (install-board-watchdogs.sh), so this still
 # works after the ring buffer has wrapped, and it needs no capability -- which
-# is what lets the unit run with PrivateDevices=yes and an empty
-# CapabilityBoundingSet. Oldest first is the point: the firmware verdict is
-# printed once, in early boot, and a tail would never show it.
+# is what lets the unit run with an empty CapabilityBoundingSet. Oldest first is
+# the point: the firmware verdict is printed once, in early boot, and a tail
+# would never show it.
 boot_kernel_log() {
   CAP=""
   [[ "$HAVE_JOURNALCTL" -eq 1 ]] || return 0
@@ -550,10 +550,13 @@ boot_kernel_log() {
 # flag word, the core voltage and the die temperature. They are what the owner's
 # "it was not a power sag" has never had evidence either way for, and the reason
 # is in the knobs above -- the sticky bits are cleared by the reset that ends the
-# event, so they can only be caught while the board is still up. vcgencmd needs
-# /dev/vcio, which aqua-net-watch.service allows with DeviceAllow= and nothing
-# else; if it is missing or blocked, every field here stays "?" and the sampler
-# carries on, because this must not be a hard dependency.
+# event, so they can only be caught while the board is still up. vcgencmd reaches
+# the firmware through /dev/vcio, which aqua-net-watch.service allows by name
+# under DevicePolicy=closed -- NOT under PrivateDevices=yes, which looks tighter
+# and silently made this unreadable on the real board (the whole argument is in
+# the unit file). If the tool is missing or the node unreachable, every field here
+# stays "?" and the sampler carries on, because this must not be a hard
+# dependency: the die temperature and the undervoltage bit come from /sys.
 vc_readings() {
   VC=""
   [[ "$HAVE_VCGENCMD" -eq 1 ]] || return 0
@@ -649,6 +652,29 @@ wpa_cli_args() {
 }
 wpa_cli_args
 
+# One line, the first time a sample has to fall back from wpa_cli and then no
+# more than once every AQUA_NETWATCH_LOUD_EVERY_S, carrying what wpa_cli actually
+# said. Everything about why the fallback was reached is in this line, because
+# the alternative -- bisecting the unit's sandbox from the outside -- is what it
+# cost the first time.
+wpasrc_notice() {
+  [[ "${CUR[wpasrc]}" != "wpa_cli" ]] || return 0
+  now_s
+  if [[ "$LAST_WPASRC" -ne 0 && "$((NOW - LAST_WPASRC))" -lt "$AQUA_NETWATCH_LOUD_EVERY_S" ]]; then
+    return 0
+  fi
+  LAST_WPASRC="$NOW"
+  log "WPASRC n=$SEQ src=${CUR[wpasrc]} wpa_cli gave no wpa_state${WPA_ERR:+: \"$WPA_ERR\"}." \
+    "The association rung is judged from the BSSID and the kernel's carrier" \
+    "instead, which tells associated from not associated but CANNOT see a" \
+    "4-way-handshake or group-key timeout -- the shape of the 2026-09-30 storm." \
+    "This is a degraded source, not a degraded network, and the rung is reported" \
+    "accordingly. aqua-net-watch.service grants /tmp and /run/wpa_supplicant" \
+    "read-write and sets PrivateTmp=no for exactly this (wpa_cli has to create" \
+    "its own client socket, and the supplicant replies to it from outside this" \
+    "unit's sandbox); if this line persists, that is where to look."
+}
+
 # --- the sampled state ---------------------------------------------------------
 #
 # The digest. dev is the interface's existence, then the association, then the
@@ -684,7 +710,8 @@ OUTAGE_SAMPLES=0
 OUTAGE_SNAPS=0
 SILENT_RUN=0
 SILENT_SAID=0
-WPA_WARNED=0
+LAST_WPASRC=0
+WPA_ERR=""
 SNAP_THIS_SAMPLE=0
 FW_VERDICT=""
 FW_LINE=""
@@ -881,8 +908,15 @@ sample() {
   CUR[bss]="-"
   CUR[ssid]="-"
   CUR[fq]="-"
+  # Which source answered, which decides how much the association verdict below
+  # is allowed to claim. "wpa_cli" is the only one that can see a handshake;
+  # "iw" sees an association and not how it was reached; "none" leaves only the
+  # kernel's own link state.
+  CUR[wpasrc]="-"
+  WPA_ERR=""
   if [[ "${CUR[dev]}" == "present" ]]; then
     CUR[wpa]="?"
+    CUR[wpasrc]="none"
     if [[ "$HAVE_WPA_CLI" -eq 1 ]]; then
       capture "${WPA_ARGS[@]}" status
       out="$CAP"
@@ -892,7 +926,10 @@ sample() {
           v="${line#*=}"
           [[ "$k" != "$line" ]] || continue
           case "$k" in
-            wpa_state) CUR[wpa]="$v" ;;
+            wpa_state)
+              CUR[wpa]="$v"
+              CUR[wpasrc]="wpa_cli"
+              ;;
             bssid) [[ -n "$v" ]] && CUR[bss]="$v" ;;
             # Whitespace out of the SSID: one field per token keeps the line
             # greppable, and the snapshot has it verbatim.
@@ -901,33 +938,46 @@ sample() {
           esac
         done <<< "$out"
       fi
+      if [[ "${CUR[wpasrc]}" != "wpa_cli" ]]; then
+        # Keep what it actually said. The first version of this script threw it
+        # away, which is why a unit that could not reach the supplicant for days
+        # looked like a board that was not associated: the one line that would
+        # have named the cause was captured and dropped on the floor. One line,
+        # rate-limited, is worth more than any amount of guessing afterwards.
+        WPA_ERR="${out%%$'\n'*}"
+        [[ -n "$WPA_ERR" ]] || WPA_ERR="(no output at all)"
+      fi
     fi
     # A supplicant that cannot be asked is not an excuse to stop reporting the
     # BSSID. "iw dev link" reads the association the driver already has and
     # starts nothing; "nmcli device wifi list" is NOT used as a fallback,
     # because it can trigger a scan, and making the radio act is the one thing
     # forbidden here.
-    if [[ "${CUR[bss]}" == "-" && "$HAVE_IW" -eq 1 ]]; then
+    if [[ "${CUR[wpasrc]}" != "wpa_cli" && "$HAVE_IW" -eq 1 ]]; then
       capture iw dev "$IFACE" link
       out="$CAP"
       if [[ -n "$out" ]]; then
         while read -r a b c _; do
           case "$a $b" in
-            "Connected to") CUR[bss]="$c" ;;
+            "Connected to")
+              CUR[bss]="$c"
+              CUR[wpasrc]="iw"
+              ;;
             "SSID: "*) CUR[ssid]="${b//[[:space:]]/_}" ;;
             "freq: "*) CUR[fq]="$b" ;;
           esac
         done <<< "$out"
-        [[ "${CUR[wpa]}" == "?" && "${CUR[bss]}" != "-" ]] && CUR[wpa]="ASSOCIATED(iw)"
+        if [[ "${CUR[wpasrc]}" == "iw" ]]; then
+          CUR[wpa]="ASSOCIATED(iw)"
+        elif [[ "$out" == *"Not connected"* ]]; then
+          # iw answered, and its answer is that there is no association. That is
+          # evidence, not a missing source, and the verdict below treats it so.
+          CUR[wpa]="UNASSOCIATED(iw)"
+          CUR[wpasrc]="iw"
+        fi
       fi
     fi
-    if [[ "${CUR[wpa]}" == "?" && "$WPA_WARNED" -eq 0 ]]; then
-      WPA_WARNED=1
-      log "note: the interface exists but no wpa_state is available (wpa_cli and" \
-        "iw both silent); the association layer is judged from operstate and" \
-        "carrier alone, which cannot see a 4-way-handshake failure. Everything" \
-        "else is unaffected."
-    fi
+    wpasrc_notice
   fi
 
   # --- the five verdicts, lowest rung first ---
@@ -944,12 +994,50 @@ sample() {
     OK[gw]="na"
     return 0
   fi
-  if [[ "${CUR[wpa]}" == "?" ]]; then
-    if [[ "${CUR[op]}" == "up" && "${CUR[car]}" == "1" ]]; then OK[assoc]=1; else OK[assoc]=0; fi
-  elif [[ "${CUR[op]}" == "up" && "${CUR[wpa]}" == "COMPLETED" && "${CUR[bss]}" != "-" ]]; then
-    OK[assoc]=1
-  else
+  # The association rung. The rule this got wrong once and must not get wrong
+  # again: a degraded SOURCE is never a degraded NETWORK. Reporting DOWN because
+  # wpa_cli could not be reached made the unit announce a fault continuously on a
+  # board that was associated, addressed, routed and reaching its gateway -- and
+  # an instrument that cries wolf for days cannot show the one event it exists to
+  # catch, because the DEGRADED/RECOVERED pair the owner greps for is already
+  # spent. DOWN is reserved for evidence that the board is genuinely not
+  # associated.
+  #
+  # First the kernel's own link state, which no source can override: cfg80211
+  # drops the carrier the moment an association goes, so carrier is the decisive
+  # bit, with operstate standing in when carrier cannot be read (reading it on a
+  # downed interface returns EINVAL).
+  local link_up=0
+  if [[ "${CUR[car]}" == "1" ]]; then
+    link_up=1
+  elif [[ "${CUR[car]}" == "?" && "${CUR[op]}" == "up" ]]; then
+    link_up=1
+  fi
+  if [[ "$link_up" -eq 0 ]]; then
     OK[assoc]=0
+  elif [[ "${CUR[wpasrc]}" == "wpa_cli" ]]; then
+    # The richest source, and the only one that can see a handshake in progress
+    # or a key timeout -- which is the whole shape of the 2026-09-30 storm, so
+    # anything short of COMPLETED here is a real DOWN.
+    if [[ "${CUR[wpa]}" == "COMPLETED" && "${CUR[bss]}" != "-" ]]; then
+      OK[assoc]=1
+    else
+      OK[assoc]=0
+    fi
+  elif [[ "${CUR[wpasrc]}" == "iw" ]]; then
+    # "iw" cannot report a handshake state, so it is not asked to: a BSSID under
+    # a live carrier is positive evidence of an association and is reported as
+    # the working link it is. Its "Not connected" is equally positive evidence
+    # the other way.
+    if [[ "${CUR[bss]}" != "-" ]]; then
+      OK[assoc]=1
+    else
+      OK[assoc]=0
+    fi
+  else
+    # No source at all. The kernel's link state is then the only evidence there
+    # is, and it is positive.
+    OK[assoc]=1
   fi
   if [[ "${CUR[v4]}" != "-" ]]; then OK[v4]=1; else OK[v4]=0; fi
   if [[ "${CUR[rt]}" != "-" ]]; then OK[rt]=1; else OK[rt]=0; fi

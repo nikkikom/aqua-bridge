@@ -95,27 +95,59 @@ RestrictAddressFamilies=AF_UNIX AF_NETLINK
 CapabilityBoundingSet=
 AmbientCapabilities=
 NoNewPrivileges=yes
-# A private /dev: this unit cannot open a fan controller, the aquaero or any other
-# physical device by accident, because PrivateDevices=yes implies
-# DevicePolicy=closed and the one node named below is the only physical device
-# added back.
-PrivateDevices=yes
-# /dev/vcio is the firmware mailbox, and reading it is the point: vcgencmd's
-# get_throttled, measure_volts and measure_temp are the rail measurement that
-# the 2026-10-06 episode has no evidence either way for, because the firmware's
-# latched throttle bits are cleared by the very reset that ends the event. Read
-# only, one node, nothing else. If a kernel or systemd here does not place the
-# node in the private /dev, the symptom is "thr=? volt=?" on the sample lines and
-# nothing worse -- the script treats vcgencmd as optional throughout, and the die
-# temperature and the kernel's own undervoltage alarm bit still come from /sys.
-# The fix in that case is a drop-in replacing PrivateDevices=yes with
-# DevicePolicy=closed, which keeps the same guarantee about hidraw.
+# NOT PrivateDevices=yes, and this was measured on the board rather than reasoned
+# about. Under PrivateDevices=yes the firmware tool failed with "Can't open
+# device file: /dev/vcio_gencmd": a private /dev is a fresh tmpfs with only the
+# API pseudo-devices in it, DeviceAllow= does not bind a physical node back into
+# it, and vcgencmd's fallback of creating the node itself needs CAP_MKNOD, which
+# the empty CapabilityBoundingSet= below denies. So every sample read "thr=?
+# volt=?" -- the rail measurement silently missing, which is worse than not
+# having written it, because nobody notices. With DevicePolicy=closed in its
+# place the same call returns throttled=0x0.
+#
+# The guarantee that actually mattered is unchanged: DevicePolicy=closed permits
+# only /dev/null, /dev/zero, /dev/full, /dev/random, /dev/urandom and /dev/tty
+# plus the nodes named below, so a fan controller's hidraw node is as unopenable
+# as it was. What is traded is that the real /dev is now visible rather than
+# replaced, so the denial comes from the cgroup device filter instead of from the
+# node being absent.
+DevicePolicy=closed
+# The firmware mailbox, and reading it is the point: vcgencmd's get_throttled,
+# measure_volts and measure_temp are the rail measurement the 2026-10-06 episode
+# has no evidence either way for, because the firmware's latched throttle bits
+# are cleared by the very reset that ends the event. /dev/vcio read-only is the
+# path that was verified to work; /dev/vchiq is the alternate route some builds of
+# the tool take, and it is listed so a board whose vcgencmd prefers it is not
+# silently back to "thr=?". Nothing else is added, and vcgencmd stays optional in
+# the script: if both are missing, the die temperature and the kernel's own
+# undervoltage alarm bit still come from /sys.
 DeviceAllow=/dev/vcio r
-# The only file it ever writes is the clean-stop marker in StateDirectory= above,
-# which systemd makes writable for it; everything else may be read-only.
+DeviceAllow=/dev/vchiq rw
+# The only file this unit writes of its own accord is the clean-stop marker in
+# StateDirectory= above; everything else is read-only, which keeps /var/lib and
+# /run -- including aqua-bridge's model store and aqua-net-recover's counters --
+# out of its reach.
 ProtectSystem=strict
 ProtectHome=yes
-PrivateTmp=yes
+# The two exceptions, and they exist for one reason: wpa_cli cannot ask the
+# supplicant anything until it has created a socket of its OWN for the reply to
+# come back to, and under ProtectSystem=strict there was nowhere to put it. The
+# binary's own strings give both candidate paths -- "/tmp/wpa_ctrl_%d-%d" and
+# "%s/wpa_ctrl_%d-%d" against the control directory -- so both are granted. A
+# missing path is tolerated (the "-" prefix): /run/wpa_supplicant does not exist
+# on a boot where the radio never came up, which is precisely a boot this unit
+# has to survive.
+ReadWritePaths=-/tmp -/run/wpa_supplicant
+# And NOT PrivateTmp=yes, which is the other half of the same fault. A private
+# /tmp is writable, so wpa_cli's socket is created happily -- and then the
+# supplicant, which lives outside this sandbox, cannot see that path to send the
+# reply to, so every call ends in "'STATUS' command timed out", the association
+# rung loses its only source of handshake state, and the unit was reduced to
+# guessing from the carrier. Sharing /tmp costs nothing worth having: it is
+# world-writable with the sticky bit for every user on the board already, so a
+# root-run observer gaining it adds no reach that matters, while /usr, /etc,
+# /var/lib and /run all stay read-only.
+PrivateTmp=no
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectKernelLogs=yes
