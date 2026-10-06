@@ -360,6 +360,7 @@ def test_install_script_das_flag_installs_das_config_and_dropin_never_enabling()
         "install-aquacomputer-dkms.sh",
         "install-board-watchdogs.sh",
         "aqua-net-recover.sh",
+        "aqua-net-watch.sh",
     ],
 )
 def test_shell_scripts_parse(script):
@@ -541,6 +542,8 @@ def test_board_script_takes_every_value_from_a_variable_with_a_default():
         "NET_CONNECTION": "",
         "NET_AUTOCONNECT_RETRIES": "0",
         "NET_RECOVER_INTERVAL": "5min",
+        "NET_WATCH_INTERVAL": "15",
+        "NET_WATCH_OUTAGE_INTERVAL": "30",
     }
     for name, default in knobs.items():
         assert _shell_default(BOARD_SCRIPT, name) == default
@@ -1153,3 +1156,745 @@ def test_the_link_coming_back_clears_the_outage_and_says_what_it_took(tmp_path):
     (out,) = _run_recovery(tmp_path / "down", up, runs=1)
     assert "is connected again after 1 activation attempt(s)" in out
     assert (tmp_path / "down" / "state" / "down-tries").read_text().strip() == "0"
+
+
+# --- the network diagnostic watcher (section 9, "Board hardening") ---------------------
+
+WATCH_SCRIPT = DEPLOY / "aqua-net-watch.sh"
+WATCH_UNIT = DEPLOY / "aqua-net-watch.service"
+
+#: Executables the watcher may never reach for. Stubbed alongside the read-only ones
+#: so a run that called one shows up in the call log rather than being ruled out only
+#: by reading the source. `modprobe`/`rmmod` are on the list because the 2026-10-06
+#: fault was a radio that never registered, and reloading the driver -- the one thing
+#: that might bring it back -- is deliberately not this unit's decision.
+WATCH_FORBIDDEN = (
+    "reboot",
+    "shutdown",
+    "poweroff",
+    "halt",
+    "systemctl",
+    "modprobe",
+    "rmmod",
+    "insmod",
+    "ping",
+    "arping",
+    "dhclient",
+    "ifconfig",
+    "iwconfig",
+)
+
+
+def _route_hex(addr: str) -> str:
+    """An IPv4 address as /proc/net/route spells a gateway: little-endian hex."""
+    return "".join(f"{int(octet):02X}" for octet in reversed(addr.split(".")))
+
+
+def _watch_stage(
+    path: Path,
+    *,
+    dev: bool = True,
+    operstate: str = "up",
+    carrier: str = "1",
+    wpa: str = "COMPLETED",
+    bssid: str = "aa:bb:cc:dd:ee:ff",
+    ssid: str = "a-network",
+    freq: str = "2437",
+    v4: str = "192.0.2.23/24",
+    gw: str = "192.0.2.1",
+    nud: str = "REACHABLE",
+    lladdr: bool = True,
+    rx: int = 1000,
+    tx: int = 900,
+    throttled: str = "0x0",
+    volts: str = "1.3250V",
+    temp: str = "47.1",
+    uv: str = "0",
+) -> None:
+    """One sampled state of the board, as a fake /sys + /proc + stub data under ``path``.
+
+    ``dev=False`` is the lowest rung: no ``/sys/class/net/wlan0`` at all, which is what
+    the 2026-10-06 boot looked like from userspace after the radio's firmware download
+    failed its checksum. Everything above it then has to read "na" and not "DOWN".
+    """
+    (path / "sys/class/net/lo").mkdir(parents=True, exist_ok=True)
+    (path / "sys/class/net/lo/operstate").write_text("unknown\n")
+    if dev:
+        stats = path / "sys/class/net/wlan0/statistics"
+        stats.mkdir(parents=True, exist_ok=True)
+        (path / "sys/class/net/wlan0/operstate").write_text(f"{operstate}\n")
+        (path / "sys/class/net/wlan0/carrier").write_text(f"{carrier}\n")
+        for name, value in (
+            ("rx_packets", rx),
+            ("tx_packets", tx),
+            ("rx_errors", 0),
+            ("tx_errors", 0),
+            ("rx_dropped", 0),
+            ("tx_dropped", 0),
+        ):
+            (stats / name).write_text(f"{value}\n")
+    zone = path / "sys/class/thermal/thermal_zone0"
+    zone.mkdir(parents=True, exist_ok=True)
+    (zone / "temp").write_text("47000\n")
+    hwmon = path / "sys/class/hwmon/hwmon0"
+    hwmon.mkdir(parents=True, exist_ok=True)
+    (hwmon / "in0_lcrit_alarm").write_text(f"{uv}\n")
+
+    proc = path / "proc/net"
+    proc.mkdir(parents=True, exist_ok=True)
+    wireless = "Inter-|  sta-|   Quality\n face | tus | link level noise\n"
+    if dev:
+        wireless += " wlan0: 0000   58.  -62.  -256        0      0      0      0      0        0\n"
+    (proc / "wireless").write_text(wireless)
+    route = "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+    if dev and gw:
+        route += f"wlan0\t00000000\t{_route_hex(gw)}\t0003\t0\t0\t600\t00000000\t0\t0\t0\n"
+    (proc / "route").write_text(route)
+    (path / "proc/modules").write_text(
+        "brcmfmac 319488 0 - Live 0x0\ncfg80211 806912 1 brcmfmac, Live 0x0\n"
+    )
+    (path / "proc/loadavg").write_text("0.10 0.20 0.30 1/80 999\n")
+    (path / "proc/meminfo").write_text("MemTotal:  444444 kB\nMemAvailable:  222222 kB\n")
+    (path / "proc/uptime").write_text("12345.67 11111.11\n")
+    random = path / "proc/sys/kernel/random"
+    random.mkdir(parents=True, exist_ok=True)
+    (random / "boot_id").write_text("11111111-2222-3333-4444-555555555555\n")
+
+    data = path / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    addr = ""
+    if dev:
+        if v4:
+            addr += f"3: wlan0    inet {v4} brd 192.0.2.255 scope global dynamic wlan0\n"
+        addr += "3: wlan0    inet6 fd00:2:3::17/64 scope global\n"
+        addr += "3: wlan0    inet6 fe80::1/64 scope link\n"
+    (data / "addr").write_text(addr)
+    neigh = ""
+    if dev and gw:
+        neigh = f"{gw} lladdr aa:bb:cc:dd:ee:ff {nud}\n" if lladdr else f"{gw} {nud}\n"
+    (data / "neigh4").write_text(neigh)
+    status = ""
+    if dev and bssid:
+        status += f"bssid={bssid}\nfreq={freq}\nssid={ssid}\n"
+    if dev:
+        status += f"wpa_state={wpa}\n"
+    (data / "wpa").write_text(status)
+    (data / "vc_throttled").write_text(f"throttled={throttled}\n")
+    (data / "vc_volts").write_text(f"volt={volts}\n")
+    (data / "vc_temp").write_text(f"temp={temp}'C\n")
+
+
+def _watch_board(base: Path, stages: list[dict[str, object]]) -> Path:
+    """A board whose state walks through ``stages``, one step per sample.
+
+    The step is driven by the stub `sleep` on PATH, which the script calls exactly once
+    per loop and nothing else calls: it moves a symlink that is the root of the whole
+    fake /sys and /proc, so a sample sees one stage whole, and the tests have no
+    wall-clock dependence at all (the stub returns at once, so they also run fast).
+    """
+    for index, spec in enumerate(stages):
+        _watch_stage(base / "stages" / str(index), **spec)  # type: ignore[arg-type]
+    (base / "stage").write_text("0")
+    (base / "root").symlink_to("stages/0")
+
+    bin_dir = base / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "sleep").write_text(
+        "#!/bin/sh\n"
+        'echo "sleep $*" >> "$CALLS"\n'
+        'n=$(cat "$W_BASE/stage")\n'
+        "next=$((n + 1))\n"
+        '[ -d "$W_BASE/stages/$next" ] || next="$n"\n'
+        'echo "$next" > "$W_BASE/stage"\n'
+        'ln -sfn "stages/$next" "$W_BASE/root"\n'
+    )
+    (bin_dir / "ip").write_text(
+        "#!/bin/sh\n"
+        'echo "ip $*" >> "$CALLS"\n'
+        'case "$*" in\n'
+        '  *"-o addr show dev"*) cat "$W_ROOT/data/addr" ;;\n'
+        '  *"neigh show"*) cat "$W_ROOT/data/neigh4" ;;\n'
+        "esac\n"
+    )
+    (bin_dir / "wpa_cli").write_text(
+        "#!/bin/sh\n"
+        'echo "wpa_cli $*" >> "$CALLS"\n'
+        'case "$*" in\n'
+        '  *status*) cat "$W_ROOT/data/wpa" ;;\n'
+        '  *signal_poll*) echo "RSSI=-62" ;;\n'
+        '  *scan_results*) echo "aa:bb:cc:dd:ee:ff\t2437\t-62\t[ESS]\ta-network" ;;\n'
+        "esac\n"
+    )
+    (bin_dir / "vcgencmd").write_text(
+        "#!/bin/sh\n"
+        'echo "vcgencmd $*" >> "$CALLS"\n'
+        'case "$1 $2" in\n'
+        '  "get_throttled ") cat "$W_ROOT/data/vc_throttled" ;;\n'
+        '  "measure_volts core") cat "$W_ROOT/data/vc_volts" ;;\n'
+        '  "measure_temp ") cat "$W_ROOT/data/vc_temp" ;;\n'
+        "esac\n"
+    )
+    (bin_dir / "journalctl").write_text(
+        "#!/bin/sh\n"
+        'echo "journalctl $*" >> "$CALLS"\n'
+        'case "$*" in\n'
+        "  *--list-boots*)\n"
+        '    printf "IDX BOOT ID FIRST ENTRY LAST ENTRY\\n"\n'
+        '    printf " -1 bbbb2222 Mon 2026-10-05 02:07:01 UTC Mon 2026-10-05 02:07:07 UTC\\n"\n'
+        '    printf "  0 cccc3333 Mon 2026-10-05 02:07:13 UTC Mon 2026-10-05 03:00:00 UTC\\n"\n'
+        "    ;;\n"
+        '  *"-k -b"*)\n'
+        '    printf "kernel: brcmfmac: verifymemory: Downloaded RAM image is corrupted\\n"\n'
+        '    printf "kernel: brcmfmac: dongle image file download failed\\n"\n'
+        '    printf "kernel: mmc1: Controller never released inhibit bit(s).\\n"\n'
+        "    ;;\n"
+        '  *-k*) echo "kernel: brcmfmac: nothing to report" ;;\n'
+        '  *) echo "a journal line" ;;\n'
+        "esac\n"
+    )
+    (bin_dir / "nmcli").write_text(
+        '#!/bin/sh\necho "nmcli $*" >> "$CALLS"\necho "GENERAL.STATE:100 (connected)"\n'
+    )
+    for name in WATCH_FORBIDDEN:
+        (bin_dir / name).write_text(f'#!/bin/sh\necho "{name} $*" >> "$CALLS"\nexit 0\n')
+    for entry in bin_dir.iterdir():
+        entry.chmod(0o755)
+    (base / "calls.log").write_text("")
+    return bin_dir
+
+
+def _run_watch(
+    base: Path, bin_dir: Path, samples: int, extra_env: dict[str, str] | None = None
+) -> list[str]:
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - bash is in packages-rpi.txt and in CI
+        pytest.skip("bash not available")
+    env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "AQUA_NETWATCH_ROOT": str(base / "root"),
+        "AQUA_NETWATCH_IFACE": "wlan0",
+        "AQUA_NETWATCH_STATE_DIR": str(base / "state"),
+        "AQUA_NETWATCH_SNAPSHOT_MIN_S": "0",
+        "AQUA_NETWATCH_FULL_MIN_S": "0",
+        "W_BASE": str(base),
+        "W_ROOT": str(base / "root"),
+        "CALLS": str(base / "calls.log"),
+        **(extra_env or {}),
+    }
+    done = subprocess.run(
+        [bash, str(WATCH_SCRIPT), "--samples", str(samples)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return done.stdout.splitlines()
+
+
+def _kinds(lines: list[str], kind: str) -> list[str]:
+    return [line for line in lines if line.startswith(f"{kind} ")]
+
+
+def test_watcher_knobs_are_documented_variables_with_one_default_each():
+    """Section 9: no operator tunable is a literal in the body. Every cadence,
+    threshold, interface name and path is a knob at the top with its reasoning."""
+    knobs = {
+        "AQUA_NETWATCH_IFACE": "wlan0",
+        "AQUA_NETWATCH_INTERVAL_S": "15",
+        "AQUA_NETWATCH_OUTAGE_INTERVAL_S": "30",
+        "AQUA_NETWATCH_IDLE_EVERY": "2",
+        "AQUA_NETWATCH_SNAPSHOT_MIN_S": "120",
+        "AQUA_NETWATCH_FULL_MIN_S": "900",
+        "AQUA_NETWATCH_SNAPSHOT_LINES": "25",
+        "AQUA_NETWATCH_SCAN_MAX": "20",
+        "AQUA_NETWATCH_SILENT_SAMPLES": "8",
+        "AQUA_NETWATCH_LOUD_EVERY_S": "3600",
+        "AQUA_NETWATCH_CMD_TIMEOUT_S": "5",
+        "AQUA_NETWATCH_DRIVER_MODULE": "brcmfmac",
+        "AQUA_NETWATCH_STATE_DIR": "/var/lib/aqua-net-watch",
+        "AQUA_NETWATCH_BOOT_LIST": "10",
+        "AQUA_NETWATCH_THERMAL_ZONE": "thermal_zone0",
+        "AQUA_NETWATCH_WPA_UNIT": "wpa_supplicant.service",
+        "AQUA_NETWATCH_WPA_CTRL": "",
+        "AQUA_NETWATCH_ROOT": "",
+    }
+    for name, default in knobs.items():
+        assert _shell_default(WATCH_SCRIPT, name) == default, name
+    # The two it shares with the board script and the unit, and the interface name,
+    # which each file carries its own copy of on purpose (a unit started by systemd
+    # has no environment to inherit one from).
+    assert _shell_default(WATCH_SCRIPT, "AQUA_NETWATCH_IFACE") == _shell_default(
+        NET_SCRIPT, "AQUA_NET_IFACE"
+    )
+
+
+def test_the_watcher_unit_ships_the_cadences_the_board_script_installs():
+    """Three files carry these two numbers -- the script's default, the unit's
+    Environment=, and the installer's knob -- so all three have to agree or reading
+    deploy/ tells the truth about none of them."""
+    values = _unit_values(WATCH_UNIT.read_text())
+    environment = dict(item.split("=", 1) for item in values["Environment"])
+    assert environment["AQUA_NETWATCH_INTERVAL_S"] == _shell_default(
+        BOARD_SCRIPT, "NET_WATCH_INTERVAL"
+    )
+    assert environment["AQUA_NETWATCH_OUTAGE_INTERVAL_S"] == _shell_default(
+        BOARD_SCRIPT, "NET_WATCH_OUTAGE_INTERVAL"
+    )
+    assert environment["AQUA_NETWATCH_INTERVAL_S"] == _shell_default(
+        WATCH_SCRIPT, "AQUA_NETWATCH_INTERVAL_S"
+    )
+    assert environment["AQUA_NETWATCH_OUTAGE_INTERVAL_S"] == _shell_default(
+        WATCH_SCRIPT, "AQUA_NETWATCH_OUTAGE_INTERVAL_S"
+    )
+    text = BOARD_SCRIPT.read_text()
+    for variable, directive in (
+        ("NET_WATCH_INTERVAL", "AQUA_NETWATCH_INTERVAL_S"),
+        ("NET_WATCH_OUTAGE_INTERVAL", "AQUA_NETWATCH_OUTAGE_INTERVAL_S"),
+    ):
+        assert f"Environment={directive}=${variable}" in text, directive
+
+
+def test_the_watcher_unit_is_wired_to_nothing_that_cools():
+    values = _unit_values(WATCH_UNIT.read_text())
+    assert values["Type"] == ["simple"]
+    for key in ("Wants", "Requires", "After", "Before", "Conflicts", "PartOf", "BindsTo"):
+        for value in values.get(key, []):
+            assert "aqua-bridge" not in value and "aqua-heartbeat" not in value
+            assert "aqua-net-recover" not in value  # the two must not sequence each other
+            assert "network-online" not in value  # it exists for the offline case
+    # No way for an observer to escalate: no watchdog to miss, no failure action, and
+    # the start rate limit switched off so systemd cannot park it as failed either.
+    assert "WatchdogSec" not in values
+    assert "OnFailure" not in values
+    assert "StartLimitAction" not in values
+    assert values["StartLimitIntervalSec"] == ["0"]
+    assert values["Restart"] == ["always"]
+    # The marker has to outlive a reboot, which is the whole mechanism of the boot
+    # report, so it is StateDirectory= (on /var) and never RuntimeDirectory= (tmpfs,
+    # erased by exactly the event it exists to detect).
+    assert values["StateDirectory"] == ["aqua-net-watch"]
+    assert "RuntimeDirectory" not in values
+    assert _shell_default(WATCH_SCRIPT, "AQUA_NETWATCH_STATE_DIR") == "/var/lib/aqua-net-watch"
+
+
+def test_the_watcher_unit_cannot_send_a_packet_or_open_a_controller():
+    """The inertness promise, enforced by systemd and not only by the script. No
+    address family that can carry a packet -- the watcher's whole value depends on NOT
+    keeping the gateway's ARP entry warm and NOT keeping the radio out of power save --
+    no capabilities, and a private /dev whose one physical node is the firmware mailbox
+    the rail is measured through."""
+    values = _unit_values(WATCH_UNIT.read_text())
+    families = values["RestrictAddressFamilies"][0].split()
+    assert set(families) == {"AF_UNIX", "AF_NETLINK"}
+    assert values["CapabilityBoundingSet"] == [""]
+    assert values["AmbientCapabilities"] == [""]
+    assert values["PrivateDevices"] == ["yes"]
+    assert values["DeviceAllow"] == ["/dev/vcio r"]
+    assert values["ProtectSystem"] == ["strict"]
+    assert values["NoNewPrivileges"] == ["yes"]
+    assert values["ProtectKernelModules"] == ["yes"]
+    # ProcSubset=pid would hide /proc/net/route, /proc/net/wireless and /proc/modules,
+    # which are three of the things this unit exists to read.
+    assert "ProcSubset" not in values
+    for key in ("ExecStart", "ExecStop", "ExecStartPre", "ExecReload"):
+        for value in values.get(key, []):
+            assert "aqua-net-watch.sh" in value, value
+
+
+def test_the_watcher_never_runs_anything_that_acts():
+    """Read from the source, the twin of the behavioural check below. Note modprobe:
+    the 2026-10-06 fault was a radio that never registered, and reloading the driver --
+    the one thing that might bring it back -- is the owner's decision and a separate
+    unit, deliberately not this one's."""
+    lines = _code_lines(WATCH_SCRIPT)
+    for word in WATCH_FORBIDDEN:
+        assert not _runs_command(lines, word), f"aqua-net-watch.sh runs {word}"
+    for line in lines:
+        assert "aqua-bridge" not in line or line.startswith("NET_WATCH"), line
+        assert "aqua-heartbeat" not in line and "hidraw" not in line, line
+    # Code only, never the comments: the header argues at length about the commands it
+    # does NOT run, and naming them there is the point.
+    code = "\n".join(lines) + "\n"
+    # The read-only supplicant verbs, and not the ones that make the radio act.
+    for verb in ("status", "signal_poll", "scan_results"):
+        assert f'"${{WPA_ARGS[@]}}" {verb}' in code, verb
+    for verb in ("scan", "reassociate", "reconnect", "disconnect", "set_network", "save_config"):
+        assert f'"${{WPA_ARGS[@]}}" {verb}\n' not in code, verb
+    # nmcli is read twice and written never; "device wifi list" is left out on purpose
+    # because it can trigger a scan.
+    assert "nmcli -t device show" in code and "nmcli -t connection show --active" in code
+    for forbidden in ("connection up", "connection modify", "device connect", "device wifi"):
+        assert forbidden not in code, forbidden
+
+
+def test_the_watcher_names_every_rung_of_the_ladder_lowest_first():
+    """The ladder is the diagnosis, and its order is load-bearing: absence of the
+    interface is the lowest rung, below the association, because on 2026-10-06 there was
+    no netdev at all and the four layers above it had nothing to report."""
+    text = WATCH_SCRIPT.read_text()
+    assert "LAYERS=(iface assoc v4 rt gw)" in text
+    # v6 and the rail can be transitions but are never rungs: a changed IPv6 prefix is
+    # not an outage (the owner is explicit that it is a distraction), and a latched
+    # throttle bit would otherwise keep a board that sagged once degraded all boot.
+    assert "EXTRA_LAYERS=(v6 power)" in text
+
+
+def test_a_healthy_board_samples_without_dumping_anything(tmp_path):
+    """One snapshot, at the start, and then nothing: a dump per sample is not a
+    diagnosis, it is a full journal. The idle cadence also applies, so a steady board
+    costs one line every AQUA_NETWATCH_IDLE_EVERY samples."""
+    stages = [{} for _ in range(8)]
+    bin_dir = _watch_board(tmp_path, stages)
+    lines = _run_watch(tmp_path, bin_dir, samples=8, extra_env={"AQUA_NETWATCH_IDLE_EVERY": "4"})
+    assert len(_kinds(lines, "snapshot begin")) == 1
+    assert _kinds(lines, "CHANGE") == []
+    assert _kinds(lines, "DEGRADED") == []
+    assert _kinds(lines, "POWER") == []
+    samples = _kinds(lines, "sample")
+    assert all("layers=ok" in line for line in samples), samples
+    # The first sample always prints; after that one in four.
+    assert 2 <= len(samples) <= 4, samples
+
+
+def test_an_association_that_drops_under_a_healthy_address_says_which_held(tmp_path):
+    """The question the whole file exists to answer. Four failures look identical from
+    outside the board, and the one line that tells them apart names what moved next to
+    what did not: here the association goes while the address, the route and the
+    gateway are all still fine."""
+    stages = [
+        {},
+        {"wpa": "DISCONNECTED", "bssid": "", "operstate": "down", "carrier": "0"},
+        {"wpa": "DISCONNECTED", "bssid": "", "operstate": "down", "carrier": "0"},
+    ]
+    bin_dir = _watch_board(tmp_path, stages)
+    lines = _run_watch(tmp_path, bin_dir, samples=3)
+    (change,) = _kinds(lines, "CHANGE")
+    assert "layers=assoc" in change
+    assert "wpa=COMPLETED->DISCONNECTED" in change
+    assert "bss=aa:bb:cc:dd:ee:ff->none" in change
+    # The interface held too: it existed throughout, which is the rung below.
+    assert "held=iface,v4,rt,gw" in change
+    (degraded,) = _kinds(lines, "DEGRADED")
+    assert "first=assoc" in degraded
+    assert len(_kinds(lines, "snapshot begin")) == 2  # the start one, and this
+
+
+def test_an_address_that_goes_under_a_healthy_association_says_which_held(tmp_path):
+    """The second of the four: associated throughout, and the lease is what vanished.
+    A DHCP fault, not a radio one -- and told apart from the first only by this line."""
+    stages = [{}, {"v4": ""}]
+    bin_dir = _watch_board(tmp_path, stages)
+    lines = _run_watch(tmp_path, bin_dir, samples=2)
+    (change,) = _kinds(lines, "CHANGE")
+    assert "layers=v4" in change and "v4=192.0.2.23/24->none" in change
+    assert "held=iface,assoc,rt,gw" in change
+    assert "first=v4" in _kinds(lines, "DEGRADED")[0]
+
+
+def test_a_route_that_goes_leaves_the_gateway_unknowable_rather_than_down(tmp_path):
+    """The third: address and association hold, the default route is what went. The
+    gateway then reads "na" and not "DOWN", because whether it answers is unknowable
+    with no route to it -- and four spurious DOWNs would bury the rung that moved."""
+    stages = [{}, {"gw": ""}]
+    bin_dir = _watch_board(tmp_path, stages)
+    lines = _run_watch(tmp_path, bin_dir, samples=2)
+    (change,) = _kinds(lines, "CHANGE")
+    assert "layers=rt," in change or change.rstrip().endswith("layers=rt")
+    assert "held=iface,assoc,v4" in change
+    assert "rt:DOWN" in _kinds(lines, "sample")[-1]
+    assert "gw:na" in _kinds(lines, "sample")[-1]
+    assert "first=rt" in _kinds(lines, "DEGRADED")[0]
+
+
+def test_a_gateway_that_stops_answering_is_the_only_thing_that_moved(tmp_path):
+    """The fourth: everything on this board holds and the other end of the link stops
+    answering. The kernel's own neighbour verdict is where that shows up, and the
+    watcher reads it without sending a packet of its own -- aqua-net-recover.sh's
+    five-minutely ping is what refreshes it."""
+    stages = [{}, {"nud": "FAILED", "lladdr": False}]
+    bin_dir = _watch_board(tmp_path, stages)
+    lines = _run_watch(tmp_path, bin_dir, samples=2)
+    (change,) = _kinds(lines, "CHANGE")
+    assert "layers=gw" in change and "nud=REACHABLE->FAILED" in change
+    assert "held=iface,assoc,v4,rt" in change
+    assert "first=gw" in _kinds(lines, "DEGRADED")[0]
+    assert "ping" not in (tmp_path / "calls.log").read_text()
+
+
+def test_an_absent_interface_is_the_lowest_rung_and_carries_the_kernels_verdict(tmp_path):
+    """2026-10-06: the brcmfmac firmware download over SDIO failed its checksum during
+    early boot, so the driver never registered a netdev. A watcher that only read
+    /sys/class/net/wlan0/operstate would have logged "no such file" for thirty hours.
+    The first sample has to say exactly what is wrong instead -- and the verdict was
+    printed once, in early boot, so it is read from the TOP of this boot's kernel log
+    and not from a tail of the recent ring buffer."""
+    bin_dir = _watch_board(tmp_path, [{"dev": False}, {"dev": False}])
+    lines = _run_watch(tmp_path, bin_dir, samples=2)
+    (absent,) = _kinds(lines, "ABSENT")
+    assert "does not exist" in absent
+    assert "module=brcmfmac:loaded" in absent  # loaded, and still no interface
+    assert "netdevs=lo" in absent  # and here is what does exist
+    assert "Downloaded RAM image is corrupted" in absent  # the verdict, quoted
+    assert "first=iface" in _kinds(lines, "DEGRADED")[0]
+    first_sample = _kinds(lines, "sample")[0]
+    assert "dev=absent" in first_sample
+    assert "layers=iface:DOWN,assoc:na,v4:na,rt:na,gw:na" in first_sample
+    # No counters either, rather than zeroes: a zeroed counter would read as a delta of
+    # minus the whole counter on the way out and plus the whole counter on the way back,
+    # which is two lies about traffic that never happened.
+    assert "rx=- tx=-" in first_sample and "rxe=- " in first_sample
+    # The rail is still measured, though, and that is the point: on 2026-10-06 the
+    # radio and the supply were one question, and this is the sample that has to carry
+    # the answer even with no interface to look at.
+    assert "thr=0x0" in first_sample and "volt=1.3250V" in first_sample
+    body = [line for line in lines if line.startswith("snapshot [")]
+    assert any("[absent] verdict=kernel-logged-a-failure" in line for line in body)
+    assert any("[netdevs] lo" in line for line in body)
+    assert any("[modules] brcmfmac" in line for line in body)
+    assert any("[bootradio] " in line and "download failed" in line for line in body)
+    # And it fixes nothing: reloading the driver is the owner's decision.
+    assert "reloading the driver" in absent
+    calls = (tmp_path / "calls.log").read_text()
+    for forbidden in WATCH_FORBIDDEN:
+        assert forbidden not in calls
+    # Nothing to ask about an interface that does not exist, so the per-sample forks
+    # are not made at all; the only ip/wpa_cli calls are the snapshot's.
+    assert "wpa_cli -i wlan0 status" not in calls
+
+
+def test_a_roam_between_two_access_points_is_visible_at_a_glance(tmp_path):
+    """Since 2026-10-05 two access points broadcast one SSID, so the BSSID is the only
+    field that can tell a roam from a reconnect -- which is why it is on every sample."""
+    stages = [{}, {"bssid": "11:22:33:44:55:66", "freq": "2412"}]
+    bin_dir = _watch_board(tmp_path, stages)
+    lines = _run_watch(tmp_path, bin_dir, samples=2)
+    (roam,) = _kinds(lines, "ROAM")
+    assert "bss=aa:bb:cc:dd:ee:ff->11:22:33:44:55:66" in roam
+    assert "fq=2437->2412" in roam
+    assert "association never dropped" in roam
+    assert _kinds(lines, "DEGRADED") == []  # a roam is not an outage
+
+
+def test_a_changed_ipv6_prefix_is_not_an_outage_and_costs_no_dump(tmp_path):
+    """The owner is explicit that the ISP re-dialling and changing the IPv6 global
+    prefix is a distraction and not the fault being hunted. So the digest carries
+    presence per scope, never the prefixes: a new global replacing an old one is not a
+    state change and must not spend a snapshot."""
+    stages: list[dict[str, object]] = [{}, {}]
+    bin_dir = _watch_board(tmp_path, stages)
+    # Rewrite stage 1's addresses with a different global prefix, same scopes.
+    addr = (tmp_path / "stages/1/data/addr").read_text()
+    (tmp_path / "stages/1/data/addr").write_text(addr.replace("fd00:2:3::17", "fd00:9:9::42"))
+    lines = _run_watch(tmp_path, bin_dir, samples=2)
+    assert _kinds(lines, "CHANGE") == []
+    assert len(_kinds(lines, "snapshot begin")) == 1
+
+
+def test_the_rail_is_on_every_sample_and_a_sag_is_a_transition_of_its_own(tmp_path):
+    """The 2026-10-06 forensics moved the question: the board did not fail at the
+    network, it died, twenty times, about six seconds into each boot. The firmware's
+    throttle flags only latch within the boot they happen in, so every clean reading we
+    have was taken after the reset that cleared them. This is the measurement that
+    closes that gap -- on every sample, so that the last line before a death carries
+    the rail, and as a transition with a full dump behind it."""
+    stages = [{}, {"throttled": "0x50005", "volts": "1.2000V", "uv": "1"}]
+    bin_dir = _watch_board(tmp_path, stages)
+    lines = _run_watch(tmp_path, bin_dir, samples=2)
+    first = _kinds(lines, "sample")[0]
+    assert "thr=0x0" in first and "volt=1.3250V" in first and "uv=0" in first
+    assert "temp=47.1" in first
+    (power,) = _kinds(lines, "POWER")
+    assert "thr=0x0->0x50005" in power
+    assert "now=under-voltage,throttled" in power
+    assert "since-boot=under-voltage,throttled" in power
+    assert "uv=0->1" in power
+    assert "this boot only" in power
+    begins = _kinds(lines, "snapshot begin")
+    assert len(begins) == 2 and "kind=full" in begins[1] and "POWER" in begins[1]
+    # A sag is not a rung of the ladder: the board is not "degraded" and the cadence
+    # does not slow, or a board that sagged once would stay degraded until its reset.
+    assert _kinds(lines, "DEGRADED") == []
+
+
+def test_the_boot_report_distinguishes_a_shutdown_from_a_power_loss(tmp_path):
+    """A kernel cannot log its own power loss, so it is recorded from the other side:
+    ExecStop= writes a marker, and the next start either finds it or does not. That one
+    line turns "did it reboot or did it lose power" from an inference into a fact."""
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - bash is in packages-rpi.txt and in CI
+        pytest.skip("bash not available")
+    bin_dir = _watch_board(tmp_path, [{}])
+    env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "AQUA_NETWATCH_ROOT": str(tmp_path / "root"),
+        "AQUA_NETWATCH_IFACE": "wlan0",
+        "AQUA_NETWATCH_STATE_DIR": str(tmp_path / "state"),
+        "W_BASE": str(tmp_path),
+        "W_ROOT": str(tmp_path / "root"),
+        "CALLS": str(tmp_path / "calls.log"),
+    }
+
+    def run(*args: str) -> list[str]:
+        return subprocess.run(
+            [bash, str(WATCH_SCRIPT), *args], env=env, capture_output=True, text=True, check=True
+        ).stdout.splitlines()
+
+    # No marker: the previous boot did not stop this unit, so it was not shut down.
+    (boot,) = _kinds(run("--once"), "BOOT")
+    assert "previous=previous-boot-ended-WITHOUT-a-clean-stop" in boot
+    assert "boots-in-journal=2" in boot
+    assert "prev-boot=bbbb2222" in boot  # from journalctl --list-boots
+    assert "2026-10-05 02:07:07" in boot  # ...and when that boot's journal stops
+    assert "thr=0x0" in boot and "volt=1.3250V" in boot  # this boot's rail, at boot
+
+    # The start cleared it, so a second start says the same thing: a marker is good for
+    # exactly one boot.
+    (boot,) = _kinds(run("--once"), "BOOT")
+    assert "previous=previous-boot-ended-WITHOUT-a-clean-stop" in boot
+
+    # What ExecStop= runs. The marker names this boot, so the next start inside the same
+    # boot is a restart of the unit and not a verdict on a board.
+    assert any("clean stop recorded" in line for line in run("--mark-clean-stop"))
+    assert (tmp_path / "state/last-clean-stop").is_file()
+    (boot,) = _kinds(run("--once"), "BOOT")
+    assert "previous=unit-restarted-within-this-boot" in boot
+
+    # A different boot id with the marker in place is the real clean-shutdown case.
+    run("--mark-clean-stop")
+    boot_id = tmp_path / "stages/0/proc/sys/kernel/random/boot_id"
+    boot_id.write_text("99999999-8888-7777-6666-555555555555\n")
+    (boot,) = _kinds(run("--once"), "BOOT")
+    assert "previous=previous-shutdown-was-CLEAN" in boot
+    # ...and --boot-report leaves the marker alone, so looking does not consume it.
+    run("--mark-clean-stop")
+    run("--boot-report")
+    assert (tmp_path / "state/last-clean-stop").is_file()
+
+
+def test_the_boot_report_lists_the_boots_so_a_run_of_short_ones_is_one_block(tmp_path):
+    """Twenty boots of about six seconds each, six seconds apart, is the signature the
+    owner reconstructed by hand. Printed verbatim with each boot's first and last entry
+    side by side, it is one block to look at."""
+    bin_dir = _watch_board(tmp_path, [{}])
+    lines = _run_watch(tmp_path, bin_dir, samples=1)
+    body = [line for line in lines if line.startswith("boot [")]
+    assert any("[boots] " in line and "02:07:01" in line for line in body)
+    assert any("[verdict] " in line and "power" in line for line in body)
+    assert any("[radio] " in line and "module=brcmfmac" in line for line in body)
+    assert any("[power] " in line and "latch within THIS boot only" in line for line in body)
+    assert len(_kinds(lines, "boot report begin")) == 1
+
+
+def test_a_link_that_comes_back_on_the_other_access_point_says_so(tmp_path):
+    """The payoff line: how long, what went in which order, what came back in which
+    order, and whether the board ended up on the same access point it started on."""
+    stages = [
+        {},
+        {
+            "wpa": "DISCONNECTED",
+            "bssid": "",
+            "operstate": "down",
+            "carrier": "0",
+            "v4": "",
+            "gw": "",
+        },
+        {"bssid": "11:22:33:44:55:66", "freq": "2412"},
+    ]
+    bin_dir = _watch_board(tmp_path, stages)
+    lines = _run_watch(tmp_path, bin_dir, samples=3)
+    (recovered,) = _kinds(lines, "RECOVERED")
+    assert "lost=assoc,v4,rt" in recovered
+    assert "back=assoc,v4,rt" in recovered
+    assert "bssid=changed(aa:bb:cc:dd:ee:ff->11:22:33:44:55:66)" in recovered
+    assert "fq=2437->2412" in recovered
+    assert "after=" in recovered
+
+
+def test_a_link_that_is_up_and_carrying_nothing_gets_its_own_line(tmp_path):
+    """The 2026-09-17 shape: associated, addressed, routed, gateway answering -- and
+    not one packet arriving, for hours, because the radio was in power save. All of the
+    ladder reads healthy through it, which is exactly why it needs a check of its own."""
+    stages = [{"rx": 1000} for _ in range(6)]
+    bin_dir = _watch_board(tmp_path, stages)
+    lines = _run_watch(
+        tmp_path, bin_dir, samples=6, extra_env={"AQUA_NETWATCH_SILENT_SAMPLES": "3"}
+    )
+    (silent,) = _kinds(lines, "SILENT")  # once per episode, not once per sample
+    assert "associated and carrying nothing" in silent
+    assert _kinds(lines, "DEGRADED") == []
+
+
+@pytest.mark.parametrize(
+    "stages",
+    [
+        [{}, {"wpa": "4WAY_HANDSHAKE", "v4": "", "gw": ""}, {}],
+        [{}, {"dev": False}, {}],
+        [{}, {"nud": "FAILED", "lladdr": False}, {}],
+        [{}, {"throttled": "0x50005", "uv": "1"}, {}],
+    ],
+)
+def test_no_state_of_the_board_ever_makes_the_watcher_act(tmp_path, stages):
+    """The behavioural twin of test_the_watcher_never_runs_anything_that_acts, which
+    reads the source. Every forbidden executable is on the stub PATH as a logger, so a
+    run that reached for one shows up in the call log -- checked for a handshake that
+    never completes, an interface that disappears and comes back, a gateway that stops
+    answering, and a rail that sags."""
+    bin_dir = _watch_board(tmp_path, stages)
+    _run_watch(tmp_path, bin_dir, samples=len(stages))
+    calls = (tmp_path / "calls.log").read_text()
+    for forbidden in WATCH_FORBIDDEN:
+        assert forbidden not in calls, forbidden
+    # nmcli and wpa_cli are on the list of things it may run, but only to read.
+    for line in calls.splitlines():
+        if line.startswith("nmcli "):
+            assert "device show" in line or "connection show --active" in line, line
+        if line.startswith("wpa_cli "):
+            assert line.endswith((" status", " signal_poll", " scan_results")), line
+
+
+def test_the_watcher_shares_no_state_with_the_recovery_script():
+    """The two must not be able to interfere. The recovery script keeps counters under
+    /run/aqua-net-recover; the watcher writes exactly one file, the clean-stop marker,
+    under its own StateDirectory, and reads the other's journal only to attribute a
+    change to it rather than to a fault."""
+    assert _shell_default(NET_SCRIPT, "AQUA_NET_STATE_DIR") == "/run/aqua-net-recover"
+    assert _shell_default(WATCH_SCRIPT, "AQUA_NETWATCH_STATE_DIR") == "/var/lib/aqua-net-watch"
+    watch_code = _code_lines(WATCH_SCRIPT)
+    for line in watch_code:
+        # The watcher touches the recovery script's name in exactly one way: it tails
+        # its journal, so a change the recovery script caused is attributed to it in the
+        # same snapshot rather than looking like a fault of its own.
+        if "aqua-net-recover" in line:
+            # Either the journal tail, or a continuation of a quoted journal message
+            # (the ABSENT line names the recovery script to say why it cannot help).
+            assert "journalctl -u aqua-net-recover.service" in line or line.startswith('"'), line
+    assert any("journalctl -u aqua-net-recover.service" in line for line in watch_code)
+    for line in _code_lines(NET_SCRIPT):
+        assert "aqua-net-watch" not in line, line
+    # One write, in one function, called from one place: the ExecStop= path.
+    assert "\n".join(watch_code).count('> "$BOOT_MARKER"') == 1
+
+
+def test_no_net_watch_is_an_off_switch_and_not_a_skipped_step():
+    """Same argument as --no-net-recover, and more pointed: this one is a long-running
+    service, so an earlier run's copy keeps sampling on its old cadence until something
+    stops it."""
+    text = BOARD_SCRIPT.read_text()
+    assert "systemctl disable --now aqua-net-watch.service" in text
+    for dst in ('"$NET_WATCH_UNIT_DST"', '"$NET_WATCH_DST"'):
+        assert f"remove_path {dst}" in text
+    # And a changed script or unit is picked up, which a oneshot timer never needs.
+    assert "systemctl restart aqua-net-watch.service" in text
+    assert "systemctl enable --now aqua-net-watch.service" in text
+
+
+def test_the_board_script_refuses_an_outage_cadence_faster_than_the_healthy_one():
+    """An outage is the long part, and sampling it faster than health would turn the
+    one case that lasts for days into the one that fills the journal."""
+    text = BOARD_SCRIPT.read_text()
+    assert 'if [[ "$NET_WATCH_OUTAGE_INTERVAL" -lt "$NET_WATCH_INTERVAL" ]]; then' in text
+    script = WATCH_SCRIPT.read_text()
+    assert (
+        'if [[ "$AQUA_NETWATCH_OUTAGE_INTERVAL_S" -lt "$AQUA_NETWATCH_INTERVAL_S" ]]; then'
+        in script
+    )

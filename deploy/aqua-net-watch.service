@@ -1,0 +1,138 @@
+[Unit]
+Description=aqua-bridge board: network diagnostic watcher (observes only, never acts)
+Documentation=file:///opt/aqua-bridge/PROJECT.md
+# NetworkManager only, and only for ordering: a first snapshot taken before
+# NetworkManager exists would have an empty [nmdev] section. There is no
+# Requires= and no Wants=, so a board without NetworkManager still runs this.
+# Deliberately NOT ordered against network-online.target: the states this unit
+# exists to catch are the ones where the network never comes online, and waiting
+# for that target would mean never running then -- including the 2026-10-06 boot
+# that produced no wireless interface at all.
+After=NetworkManager.service
+# Started as early as multi-user.target allows, on purpose. The verdict on a
+# radio that failed to initialise is printed once, by the kernel, during early
+# boot; this unit's first sample reads it back out of the journal and says so,
+# and the sooner that line exists the sooner the board can be diagnosed.
+#
+# Deliberately no relation of any kind to aqua-bridge.service or to
+# aqua-heartbeat.service -- no Requires=, no Wants=, no After=, no Before=, no
+# Conflicts=. The network is outside the cooling path (PROJECT.md §2): nothing
+# here may order, delay, start or stop the daemon that drives the fans. And no
+# relation to aqua-net-recover.service either: the two must not be able to
+# sequence each other, and nothing here needs them to.
+#
+# No StartLimitIntervalSec default and no StartLimitAction: a crash-looping
+# observer must never be able to escalate to anything. The rate limit is
+# switched off outright, so systemd cannot park the unit as failed either.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# A long-running sampler, not a timer. At a 15 s cadence a systemd timer would
+# cost about 5760 unit activations a day -- two journal lines of systemd's own
+# bookkeeping per activation, more journal than the samples themselves -- and
+# every sample would have to persist its predecessor's packet counters and
+# previous state to a file to say anything about a change. One process holding
+# that state in shell variables writes no files at all.
+ExecStart=/usr/local/lib/aqua-bridge/aqua-net-watch.sh
+# The whole mechanism of the boot report. A kernel cannot log its own power loss,
+# so a clean stop is recorded from the other side: this writes a three-line
+# marker, and the next start either finds it (the board was shut down) or does not
+# (the board was reset or lost power). It then clears it, so each start answers for
+# one boot. On 2026-10-06 nobody could tell those two apart afterwards; from here
+# on it is a recorded fact and not an inference.
+ExecStop=/usr/local/lib/aqua-bridge/aqua-net-watch.sh --mark-clean-stop
+# /var/lib/aqua-net-watch, which is where that marker goes -- on /var and NOT
+# under RuntimeDirectory=, because a marker on tmpfs would be erased by exactly
+# the event it exists to detect. systemd creates it and makes it the one writable
+# path under ProtectSystem=strict below. It matches the script's
+# AQUA_NETWATCH_STATE_DIR default, and tests/test_deploy.py checks that.
+StateDirectory=aqua-net-watch
+# The two cadences, so deploy/install-board-watchdogs.sh can write them from
+# NET_WATCH_INTERVAL and NET_WATCH_OUTAGE_INTERVAL; they match the script's own
+# defaults, and tests/test_deploy.py checks that the three agree. Every other
+# knob is argued at the top of the script and overridden with
+# "systemctl edit aqua-net-watch.service".
+Environment=AQUA_NETWATCH_INTERVAL_S=15
+Environment=AQUA_NETWATCH_OUTAGE_INTERVAL_S=30
+SyslogIdentifier=aqua-net-watch
+# Behind everything on a board whose CPU belongs to the control loop. CPUWeight
+# is relative and only bites when the two actually compete, which is what is
+# wanted: a hard CPUQuota= would instead stretch a snapshot across the very
+# seconds it is trying to capture. IO at idle priority because a snapshot reads
+# the journal off an SD card the recorder is also writing to.
+Nice=19
+CPUWeight=20
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+# Under memory pressure the kernel takes this before anything else on the board.
+OOMScoreAdjust=500
+MemoryHigh=48M
+MemoryMax=96M
+# It comes back if it dies, at its own pace, and that is the whole of its
+# recovery behaviour. No OnFailure=, no StartLimitAction=, no WatchdogSec= (a
+# Type=simple service has nothing to notify with, and a watchdog on an observer
+# would be a way for the observer to reboot the board, which is forbidden).
+Restart=always
+RestartSec=60
+# The script traps SIGTERM, logs that it stopped and exits; ten seconds is far
+# more than that needs.
+TimeoutStopSec=10
+#
+# --- the inertness promise, enforced by systemd and not only by the script ---
+#
+# No address family for sending packets. The script pings nothing by design
+# (PROJECT.md §9: an observer that keeps the ARP entry warm cannot see it go
+# stale, and traffic is what hides the power-save fault), and with only AF_UNIX
+# (the wpa_supplicant control socket and D-Bus) and AF_NETLINK ("ip") permitted
+# here, it could not send one if it tried. If some tool ever does need AF_INET,
+# the symptom is one snapshot section saying so -- never a missed sample.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# No capabilities at all. Everything this unit reads, it reads as uid 0 by
+# ownership: the supplicant's control socket, the journal, /proc and /sys. The
+# kernel log is read with "journalctl -k" rather than dmesg(1) precisely so that
+# CAP_SYSLOG is not needed, which is what makes this line possible.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+# A private /dev: this unit cannot open a fan controller, the aquaero or any other
+# physical device by accident, because PrivateDevices=yes implies
+# DevicePolicy=closed and the one node named below is the only physical device
+# added back.
+PrivateDevices=yes
+# /dev/vcio is the firmware mailbox, and reading it is the point: vcgencmd's
+# get_throttled, measure_volts and measure_temp are the rail measurement that
+# the 2026-10-06 episode has no evidence either way for, because the firmware's
+# latched throttle bits are cleared by the very reset that ends the event. Read
+# only, one node, nothing else. If a kernel or systemd here does not place the
+# node in the private /dev, the symptom is "thr=? volt=?" on the sample lines and
+# nothing worse -- the script treats vcgencmd as optional throughout, and the die
+# temperature and the kernel's own undervoltage alarm bit still come from /sys.
+# The fix in that case is a drop-in replacing PrivateDevices=yes with
+# DevicePolicy=closed, which keeps the same guarantee about hidraw.
+DeviceAllow=/dev/vcio r
+# The only file it ever writes is the clean-stop marker in StateDirectory= above,
+# which systemd makes writable for it; everything else may be read-only.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# Other processes' /proc entries are hidden. ProcSubset= is deliberately left at
+# its default: "pid" would hide /proc/net/route, /proc/net/wireless and
+# /proc/modules, which are three of the things this unit exists to read.
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
