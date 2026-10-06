@@ -495,6 +495,29 @@ the home router must never degrade cooling. Traced, path by path, on
   unit doing its job. A gateway watchdog that *reboots* is forbidden outright:
   with the router off it is a reboot loop, and every reboot is a heartbeat gap
   and a jolt on the fans.
+- **An interface that does not EXIST is a different fault, with a different
+  owner and the one escalation in here.** `deploy/aqua-radio-recover.sh` (§9
+  *Radio recovery*) acts on exactly one condition — `/sys/class/net/<iface>` is
+  not there — which is the 2026-10-06 fault: the `brcmfmac` firmware download to
+  the Wi-Fi chip over SDIO failed its read-back verification in early boot, no
+  netdev was ever registered, and the board was unreachable for thirty hours
+  while cooling perfectly. It reloads the driver, which cured it in two measured
+  seconds, and only after that fails `AQUA_RADIO_ATTEMPTS` times does it reboot
+  the board — which the owner approved explicitly, because with no radio the
+  board is unreachable until somebody walks to it. That is **not** the forbidden
+  gateway watchdog of the bullet above, and the difference is the trigger, not
+  the degree: switching off the router cannot make a netdev disappear, so this
+  trigger cannot be caused from outside the board and an absent access point can
+  never drive it. The reboot is bounded by a budget per window
+  (`AQUA_RADIO_REBOOT_BUDGET` in `AQUA_RADIO_REBOOT_WINDOW_S`, 2 a day) recorded
+  in a ledger on `/var` — never a tmpfs, which the reboot would erase — refused
+  outright if that ledger cannot be written, and switchable off entirely. Past
+  the budget it says hourly that it has given up rather than rebooting again: a
+  board in a reboot loop never finishes booting, so nobody can fix it even from
+  the console, which is worse than a board with no network. The two units are
+  disjoint by construction — an interface that exists is `aqua-net-recover`'s in
+  every state it can be in, an interface that does not exist is this one's — so
+  neither can act on the other's case.
 
 **The outage that shaped this (2026-09-17).** The board dropped off the
 network for hours. It kept running and kept feeding the aquaero's software
@@ -11757,6 +11780,15 @@ environment (`sudo SOC_WATCHDOG_SEC=90 deploy/install-board-watchdogs.sh`):
 | `NET_RECOVER_INTERVAL` | `5min` | `OnBootSec=`/`OnUnitActiveSec=` in `aqua-net-recover.timer` |
 | `NET_WATCH_INTERVAL` | `15` | `Environment=AQUA_NETWATCH_INTERVAL_S=` in `aqua-net-watch.service` (seconds between samples while healthy) |
 | `NET_WATCH_OUTAGE_INTERVAL` | `30` | `Environment=AQUA_NETWATCH_OUTAGE_INTERVAL_S=` in the same unit; refused below `NET_WATCH_INTERVAL` |
+| `RADIO_IFACE` | `wlan0` | `Environment=AQUA_RADIO_IFACE=` in `aqua-radio-recover.service` (the interface whose *absence* that unit acts on) |
+| `RADIO_GRACE` | `90` | `Environment=AQUA_RADIO_GRACE_S=` in the same unit (seconds of uptime before a missing interface counts as a fault) |
+| `RADIO_INTERVAL` | `60` | `Environment=AQUA_RADIO_INTERVAL_S=` in the same unit (seconds between checks) |
+| `RADIO_ATTEMPTS` | `3` | `Environment=AQUA_RADIO_ATTEMPTS=` in the same unit (driver reloads before the escalation) |
+| `RADIO_ATTEMPT_DELAY` | `30` | `Environment=AQUA_RADIO_ATTEMPT_DELAY_S=` in the same unit (seconds between two reloads) |
+| `RADIO_SETTLE` | `20` | `Environment=AQUA_RADIO_SETTLE_S=` in the same unit (seconds a reload is given for the netdev to appear; measured: 1) |
+| `RADIO_REBOOT` | `on` | `Environment=AQUA_RADIO_REBOOT=` in the same unit (`off`, or `--no-radio-reboot`, keeps the unit and switches off its escalation) |
+| `RADIO_REBOOT_BUDGET` | `2` | `Environment=AQUA_RADIO_REBOOT_BUDGET=` in the same unit (reboots allowed per window; `0` = never) |
+| `RADIO_REBOOT_WINDOW` | `86400` | `Environment=AQUA_RADIO_REBOOT_WINDOW_S=` in the same unit (the window that budget is counted in) |
 
 `--no-net-recover` is an off switch, not a skipped step: it stops and disables
 `aqua-net-recover.timer` and deletes the three installed files. Skipping alone
@@ -11768,6 +11800,18 @@ is sharper there because that one is a long-running service rather than a
 oneshot: a copy left running keeps sampling on its old cadence until something
 stops it. For the same reason a re-run that *changes* the watcher's script or
 unit also restarts it; a re-run that changes neither restarts nothing.
+`--no-radio-recover` is the same switch again for the radio recovery, with the
+same argument and one more: a copy left running keeps the attempt count and the
+reboot budget it was installed with. Its ledger under
+`/var/lib/aqua-radio-recover` is left in place either way — it is evidence, not
+configuration, and a budget deleted on every re-install is a budget that starts
+again from zero (`systemctl clean --what=state aqua-radio-recover.service`
+removes it deliberately). `--no-radio-reboot` is narrower: it keeps the unit and
+writes `Environment=AQUA_RADIO_REBOOT=off` into it, so the driver is still
+reloaded and a radio that stays missing is still reported hourly, and the board
+is simply never rebooted from there. That is also a real off switch and not a
+skipped step: the unit file changes, so the installer restarts the service, and a
+re-run without the flag puts the escalation back.
 
 Notes that only show up on a real board:
 
@@ -12188,6 +12232,208 @@ the tests have no wall-clock dependence at all. `reboot`, `shutdown`,
 loggers, so "it never acts" is checked by running it in every state — an
 interface that disappears and comes back, a handshake that never completes, a
 gateway that stops answering, a rail that sags — and not only by reading it.
+
+### Radio recovery: an interface that does not exist at all
+
+`deploy/aqua-radio-recover.{sh,service}`, installed by
+`install-board-watchdogs.sh` beside the recovery timer and the watcher
+(`--no-radio-recover` leaves it out and removes it; `--no-radio-reboot` keeps it
+and switches off its escalation). It is the **one thing in this repository that
+may reboot the board**, and everything about it is built around keeping that
+bounded.
+
+**The fault.** On 2026-10-06 the board booted, the daemon's heartbeat ran, the
+sensors and fans were fine, and there was no wireless interface at all. The
+`brcmfmac` driver's firmware download to the Wi-Fi chip over SDIO failed its
+read-back verification during early boot:
+
+```
+brcmfmac: brcmf_sdio_verifymemory: Downloaded RAM image is corrupted, block offset is 440320, len is 1891
+brcmfmac: brcmf_sdio_download_firmware: dongle image file download failed
+mmc1: Controller never released inhibit bit(s).
+```
+
+so the driver never registered a netdev. With no netdev there is nothing for
+anything above to work with: NetworkManager has no device, `wpa_supplicant` has
+nothing to associate, `aqua-net-recover.sh` finds no connection to bring up, and
+the watcher's lowest rung reads `iface DOWN` with the four above it `na`. The
+board stayed unreachable for **thirty hours** in exactly that state while running
+perfectly. It is a known, open defect for this board
+([raspberrypi/linux 5770](https://github.com/raspberrypi/linux/issues/5770))
+with no fix.
+
+**The cure, measured on the board by hand before any of this was written.**
+
+```
+START present=yes
+after-rmmod present=no           # modprobe -r brcmfmac_cyw brcmfmac
+iface-back-after=1s present=yes  # modprobe brcmfmac ; modprobe brcmfmac_cyw
+ipv4-after=1s addr=wlan0 UP <addr>/24
+DONE total=2s
+```
+
+**Two seconds, end to end.** The firmware re-downloaded and verified,
+NetworkManager reconnected by itself with nothing prompting it, and the board
+never reset. That measurement is the whole argument for this unit *and* for the
+reboot being its last resort rather than its first: the cure costs two seconds,
+and a reset costs at least the 28 s this board takes from power to its first
+controller write — longer than the aquaero's own 30 s software-sensor timeout, so
+every reset cashes out as the aquaero alarm, every fan at 100 %. Loud, never
+under-cooled, but not something to spend when `modprobe` would have done. The
+module topology is part of the measurement: `brcmfmac_cyw` depends on
+`brcmfmac`, so a removal must name both, dependents first, while `brcmutil` and
+`cfg80211` stay loaded; the load then goes the other way, `brcmfmac` first.
+`AQUA_RADIO_MODULES` is that list, in removal order, and the script loads it
+reversed.
+
+**The trigger, and why it cannot collide with `aqua-net-recover`.** One fact
+divides the two units, and it cannot be true for both at once: does
+`/sys/class/net/<iface>` exist?
+
+- It does **not** exist → this unit, and only this unit. There is nothing to
+  associate, activate or probe, and the only thing that can help is reloading the
+  driver. It runs no `nmcli`, no `ping`, no `ip` and no `wpa_cli`; systemd denies
+  it `AF_INET` outright, so it cannot send a packet even by mistake.
+- It **does** exist → `aqua-net-recover.sh`, in every state it can be in:
+  connected and carrying nothing, disconnected with nothing retrying it,
+  unmanaged, unavailable, mid-activation. Both of that script's branches need a
+  device NetworkManager has a state for, so it physically cannot act when there is
+  no interface; it now says so once, names this unit as the owner and stops,
+  instead of counting the absence as an outage it is working on. One absence, one
+  hourly voice.
+
+Nothing orders the two units against each other, neither is wired to
+`aqua-bridge.service` or `aqua-heartbeat.service` in any direction, and the
+watcher observes both and acts on neither. The division is a fact about the board,
+not about timing, so no start order can make them overlap.
+
+**The grace.** The driver registers the netdev a few seconds into boot — the
+firmware verdict, good or bad, is printed within about three seconds and
+NetworkManager's startup completes within about ten — so an absence before
+`AQUA_RADIO_GRACE_S` (90 s) of **uptime** is a boot in progress and not a missing
+radio. Reloading a driver while the boot is still bringing interfaces up is how a
+working board gets broken. It is read from `/proc/uptime` and deliberately not
+measured from the unit's own start, so a restart of the unit hours later cannot
+re-arm a grace the boot satisfied long ago.
+
+**The ladder.** Reload (`modprobe -r` both, then load them back the other way
+round) → wait up to `AQUA_RADIO_SETTLE_S` (20 s, against a measured 1 s) for the
+netdev, looking every `AQUA_RADIO_SETTLE_POLL_S` → verify by the netdev existing
+and never by an exit status, because a corrupted firmware download shows up in
+neither `modprobe`'s status nor anything else. On failure, up to
+`AQUA_RADIO_ATTEMPTS` (3) attempts, `AQUA_RADIO_ATTEMPT_DELAY_S` (30 s) apart;
+the attempt count is above one because `mmc1: Controller never released inhibit
+bit(s)` says the SDIO host can need another go. Then, and only then, the
+escalation.
+
+**Why the reboot cannot loop**, which is the part that had to be got right. A
+board stuck in a reboot loop is strictly worse than a board with no network: it
+never finishes booting, so nobody can log in to fix it *even standing next to
+it*, and the fans spend the whole time on the controller's alarm profile. Four
+bounds, and three of them hold even if the others are wrong:
+
+1. **A persistent ledger.** Every reboot this script orders is appended, as an
+   epoch timestamp, to `/var/lib/aqua-radio-recover/reboots` — a
+   `StateDirectory=` on `/var` and deliberately **not** a `RuntimeDirectory=` on
+   tmpfs. A counter on tmpfs would be erased by exactly the event it is counting,
+   which is the entire mechanism of a reboot loop.
+2. **Written before the reboot, and read back.** If the append cannot be
+   persisted and verified — no state directory, a read-only `/var`, a full card —
+   the reboot is **refused** and said so loudly. An unrecordable reboot is
+   precisely the one that would repeat on every boot forever.
+3. **A budget in a window.** At most `AQUA_RADIO_REBOOT_BUDGET` (2) reboots per
+   `AQUA_RADIO_REBOOT_WINDOW_S` (86400). Past that the script logs that it has
+   given up and keeps logging it, hourly, rather than rebooting again. The ledger
+   holds timestamps, so the window slides and a bad day months ago does not
+   disarm the unit for good.
+4. **The grace and the ladder in front of it.** No reboot can be ordered until
+   90 s of uptime has passed and three reloads have each failed with 20 s to come
+   back and 30 s between them: 210 s of a booted, running, cooling board before
+   any reboot. Even an absurd budget could not turn into a board that never
+   finishes booting.
+
+**The worst case, stated plainly.** Two reboots in any rolling 24 h, never closer
+together than about three and a half minutes of a fully booted board, each
+costing about half a minute of downtime and one aquaero alarm; then an hourly
+line saying it has given up and will not reboot again, for as long as the radio
+stays missing. The daemon cools throughout, including across both boots. With
+`AQUA_RADIO_REBOOT=off` (or `--no-radio-reboot`, or a budget of `0`) the worst
+case is no reboot at all and the hourly line from the first failed ladder on.
+
+**Every knob is at the top of the script with its reasoning**:
+`AQUA_RADIO_IFACE`, `_MODULES`, `_GRACE_S`, `_INTERVAL_S`, `_ATTEMPTS`,
+`_ATTEMPT_DELAY_S`, `_SETTLE_S`, `_SETTLE_POLL_S`, `_REBOOT`, `_REBOOT_BUDGET`,
+`_REBOOT_WINDOW_S`, `_LOUD_EVERY_S`, `_STATE_DIR` and `_ROOT` (a test seam: it
+prefixes `/sys` and `/proc` so `tests/test_deploy.py` can run the whole ladder
+against a fabricated tree without breaking a radio to do it). The unit passes the
+nine an owner is likely to want, from the installer's knob table above — script
+default, unit `Environment=` and installer knob all agree, and the tests check
+all three — and anything else is `systemctl edit aqua-radio-recover.service`.
+The script refuses to start on a knob that is not a number, or a `_REBOOT` that
+is neither `on` nor `off`: a unit that may reboot the board must not start on a
+typo in a budget.
+
+**What it costs.** While the interface exists — which is all of the time, on a
+healthy board — one check is a single `[[ -e ]]` on `/sys/class/net/<iface>` and
+one read of `/proc/uptime`, both done by the shell with no fork, every
+`AQUA_RADIO_INTERVAL_S`. No traffic, no `nmcli`, no journal line, nothing
+written. The whole steady-state cost is one `started` line per boot.
+
+**Inertness everywhere else, enforced by systemd and not only by the script.**
+`CapabilityBoundingSet=CAP_SYS_MODULE CAP_SYS_BOOT` and
+`SystemCallFilter=@system-service @module @reboot` — exactly the two actions it
+is allowed, and nothing else: no `CAP_NET_ADMIN`, no `CAP_NET_RAW`.
+`ProtectKernelModules=no` is stated out loud, because it is the one unit here
+that may load a module and `aqua-net-watch.service` sets the opposite.
+`PrivateDevices=yes` with **no** `DeviceAllow=` at all, so it cannot open
+`/dev/hidraw*`, the aquaero, the Quadro or any other device. The watcher had to
+give that up for `DevicePolicy=closed` because its rail measurement needs
+`/dev/vcio` and `/dev/vchiq` bound back in, which a private `/dev` cannot do; this
+unit measures nothing and opens nothing, so it keeps the stronger setting at no
+cost. `RestrictAddressFamilies=AF_UNIX
+AF_NETLINK`, `ProtectSystem=strict` with the ledger as the one writable path,
+`StartLimitIntervalSec=0` and no `WatchdogSec=`/`OnFailure=`/`StartLimitAction=`
+— systemd must not be able to add a second, unrecorded board reset behind the
+ledger's back. There is no relation of any kind to `aqua-bridge.service`,
+`aqua-heartbeat.service`, `aqua-net-recover.service` or `aqua-net-watch.service`,
+and no `network-online.target`: this unit exists for the boot in which the
+network never comes up.
+
+**Reading it.** One journal identifier covers the lot, so the whole history —
+every absence, every reload, every escalation, across every boot the journal
+still holds — is one command:
+
+```bash
+journalctl -t aqua-radio-recover -o short-iso --since -7d
+```
+
+Line kinds, one per outcome: `started` (the interface, the cadence, the ladder
+and the ledger as it stands), `HOLD` (absent, but inside the grace), `ABSENT`
+(the verdict: which netdevs *do* exist, whether each module is loaded, the
+uptime, the escalation state), `RELOAD` (one per attempt: both exit statuses, how
+long it took, and whether the netdev came back — this is the line the two-second
+measurement is checked against on a live board), `RECOVERED`, `REBOOT` (with the
+ledger: which reboot of the budget, in what window) and `GAVEUP` (with the
+reason: switched off, budget spent, or the ledger could not be written). `HOLD`
+and `GAVEUP` are rate-limited to `AQUA_RADIO_LOUD_EVERY_S` (1 h), because the
+defect this family of scripts exists against is silence — thirty hours with no
+interface produced three supplicant lines and nothing else — and a line per check
+for days is its own kind of silence. By hand: `--check` (what it sees and what a
+real run would do, loading and rebooting nothing), `--once` and `--checks N`.
+
+`tests/test_deploy.py` runs the whole ladder against a fabricated `/sys` and
+`/proc` and a stub `modprobe` that either brings the netdev back or does not, and
+fails if the unit touches an interface that exists, acts inside the grace,
+reloads a different number of times than `AQUA_RADIO_ATTEMPTS`, reboots before
+the attempts are exhausted, reboots with the escalation off, reboots with the
+budget spent, reboots when the ledger could not be written, or loses the module
+order. `systemctl`, `shutdown`, `poweroff`, `halt`, `nmcli`, `ip`, `ping`,
+`wpa_cli`, `ifconfig`, `iwconfig`, `dhclient`, `aqua-bridge` and `aqua-heartbeat`
+are all on the stub `PATH` as loggers, so "it never touches a controller or a
+service" is checked by running it in every state and not only by reading it. The
+step from absent to present is driven by the stub `modprobe` and not by a clock,
+and both waits are bounded by an iteration count as well as by the clock, so the
+tests have no wall-clock dependence at all.
 
 ### udev
 

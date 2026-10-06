@@ -170,6 +170,40 @@ is not yet confirmed on real hardware, on either board.
    diagnostic watcher* has the ladder, the line formats, the journal cost and
    why it cannot get in `aqua-net-recover`'s way.
 
+   And it installs the **radio recovery**,
+   `deploy/aqua-radio-recover.{sh,service}`, for the one network fault the two
+   above cannot touch: the wireless interface not existing at all. On
+   2026-10-06 the `brcmfmac` firmware download to the Wi-Fi chip over SDIO
+   failed its read-back verification in early boot, no netdev was ever
+   registered, and the board was unreachable for thirty hours while cooling
+   perfectly — NetworkManager had no device, the supplicant had nothing to
+   associate and `aqua-net-recover` had no connection to bring up. Reloading
+   the driver cured it in two measured seconds, so that is what this unit
+   does: it waits out a grace period (the driver normally registers the netdev
+   a few seconds into boot), reloads the Wi-Fi driver, waits a bounded time for
+   the interface, and retries a configured number of times. Its trigger is that
+   one condition and nothing else — while the interface exists it does nothing
+   whatsoever, because every state of an interface that *does* exist belongs to
+   `aqua-net-recover`. It is also the one thing here that may **reboot** the
+   board, as its last resort and only after every reload has failed, because
+   with no radio the board is unreachable until somebody walks to it. That
+   reboot is bounded by a budget per window, recorded in a ledger on `/var`
+   that the reboot cannot erase, refused outright if the ledger cannot be
+   written, and switchable off (`--no-radio-reboot`, or
+   `--no-radio-recover` to leave the unit out entirely): past the budget it
+   says hourly that it has given up rather than rebooting again, because a
+   board in a reboot loop never finishes booting and cannot be fixed even from
+   the console. It opens no controller, touches no service and sends no packet.
+   Read its whole history — every absence, reload and escalation, across every
+   boot the journal holds — with
+
+   ```bash
+   journalctl -t aqua-radio-recover -o short-iso --since -7d
+   ```
+
+   PROJECT.md §9 *Radio recovery* has the measurement, the ladder, the four
+   bounds on the reboot and the worst case.
+
 6. **Config.** Edit `/etc/aqua-bridge/config.yaml`: `mpc.channels` /
    `mpc.temps` / `mpc.sensors` / `mpc.topology` for the enclosure, the
    `aquacomputer:` list (one entry per controller — the supported topology

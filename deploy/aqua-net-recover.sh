@@ -42,7 +42,30 @@
 #     saying so out loud once every AQUA_NET_LOUD_EVERY_S: four days of a stuck
 #     link must never again read as four days of identical lines with nothing
 #     happening behind them.
-# It is the only thing in the repository that reacts to the network at all.
+#
+# The division of labour with aqua-radio-recover.sh -- one fact, two owners. The
+# dividing line is a single fact that cannot be true for both of them at once:
+# does /sys/class/net/<iface> exist?
+#   * It DOES exist -> this script, in every state it can be in: connected and
+#     carrying nothing, disconnected with nothing retrying it, unmanaged,
+#     unavailable, mid-activation. Both branches above require a device, and
+#     NetworkManager cannot report a state for a device that does not exist, so
+#     this script physically cannot act when there is no interface.
+#   * It does NOT exist -> aqua-radio-recover.sh, and nothing here. That is the
+#     2026-10-06 fault: the brcmfmac firmware download to the Wi-Fi chip over SDIO
+#     failed its read-back verification in early boot and no netdev was ever
+#     registered. There is then nothing to associate, activate or probe --
+#     nmcli has no device, the supplicant has nothing to re-associate, and this
+#     script has no connection to bring up -- and the only thing that helps is
+#     reloading the driver, which this script must never do. When nmcli reports no
+#     device for the interface, the branch below says so once, names that unit as
+#     the owner, and stops: one absence, one hourly voice
+#     ("journalctl -t aqua-radio-recover"), not two units narrating one fault.
+# So the two can never act on the same board state, and neither can undo the
+# other's work. This script still never loads a module and never reboots.
+#
+# It is the only thing in the repository that reacts to a network interface that
+# exists.
 #
 # Usage:
 #   deploy/aqua-net-recover.sh            # one check (the systemd timer runs this)
@@ -276,6 +299,29 @@ if [[ "$state_code" != "100" ]]; then
     set_counter down-since "$since"
   fi
   tries="$(counter down-tries)"
+
+  if [[ -z "$state_code" ]]; then
+    # NetworkManager knows no device by this name at all. On this board that means
+    # the netdev does not exist -- the 2026-10-06 firmware-download failure -- and
+    # that case belongs to aqua-radio-recover.service, which reloads the driver
+    # (see the division of labour at the top). Nothing here can act on it: there
+    # is no device to disconnect, no profile state to read and nothing to probe.
+    # Said once per outage rather than hourly, because the other unit is the one
+    # with the hourly voice for this fault and two units narrating one absence is
+    # how a journal stops being readable.
+    if [[ "$first" -eq 1 ]]; then
+      log "$AQUA_NET_IFACE: NetworkManager reports no such device, so the" \
+        "interface most likely does not exist at all (the 2026-10-06 fault: the" \
+        "radio's firmware download failed verification and no netdev was ever" \
+        "registered). Nothing here can act on that -- there is no device to" \
+        "re-associate and no profile to activate -- and it is not this script's" \
+        "case: aqua-radio-recover.service owns an absent interface and reloads" \
+        "the driver. Read it with 'journalctl -t aqua-radio-recover'. If that" \
+        "unit is not installed, nothing on this board will act. The fans are" \
+        "unaffected either way (PROJECT.md §2)."
+    fi
+    exit 0
+  fi
 
   if [[ "$state_code" != "30" ]]; then
     # 10 unmanaged, 20 unavailable (rfkill, no firmware), 40..90 an activation
