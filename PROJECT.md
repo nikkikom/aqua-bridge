@@ -99,9 +99,9 @@ measure it.
           │                          │                  one tach per output)
           ▼                          ▼                        ▲
   aquaero 6 XT: 8 thermistors,   DS18B20, 3-wire, 4.7 kΩ      │
-  4 PWM + 4 tach (xt1–xt4)       w1-gpio bus A: GPIO4         │
-  Quadro: thermistors (count     w1-gpio bus B: GPIO17        │
-  unknown), 4 PWM + 4 tach       (bus C: GPIO27 if needed)    │
+  4 PWM + 4 tach (xt1–xt4)       one w1-gpio bus: GPIO4       │
+  Quadro: thermistors (count     (a second on GPIO17 or 27    │
+  unknown), 4 PWM + 4 tach       only once wired, §9)         │
   (qd1–qd4); aquabus to the XT6        │                      │
   or its own USB port                  │                      │
           │ USB (HID)                  │ 1-Wire (sysfs)       │
@@ -185,11 +185,17 @@ measure it.
   `tools/fit_model.py` ranks by smallest margin and fastest drive
   dynamics. Plan with the XT6's 8 inputs until the Quadro's are
   confirmed.
-- **DS18B20 buses:** externally powered (3-wire) sensors only (parasite
+- **DS18B20 bus:** externally powered (3-wire) sensors only (parasite
   power disables bulk read without a strong pullup), linear topology,
-  4.7 kΩ pullup per bus. Two `w1-gpio` buses on GPIO 4 and GPIO 17 (§9),
-  a third on GPIO 27 only if a bus exceeds about 12 sensors; splitting by
-  zone pairs keeps one broken wire from blinding every zone. Each sensor
+  4.7 kΩ pullup per bus. **One** `w1-gpio` bus, on GPIO 4, carrying all
+  fourteen sensors (§9 *Overlays and modules*). It was two: the GPIO 17
+  overlay carried no sensors, manufactured family-`00` phantoms on every
+  kernel search and so took `therm_bulk_read` away from the master they
+  attached to, and it was removed. A second bus (GPIO 17 or 27) is worth
+  adding only once a bus exceeds about 12 sensors *and* the new one is
+  wired and terminated — splitting by zone pairs then keeps one broken
+  wire from blinding every zone. Multi-bus support in the reader stays
+  either way; it is simply not what this board has. Each sensor
   is bound to a logical name by its ROM id (`onewire.sensors`,
   `tools/w1_commission.py`, §10); the name carries zone, bay and role
   (`mpc.sensors`).
@@ -11452,33 +11458,50 @@ When USB host is needed (`deploy/host-usb.sh` adds it idempotently):
 dtoverlay=dwc2,dr_mode=host
 ```
 
-For the DS18B20 sensors, two buses (part of the base bring-up, §2):
+For the DS18B20 sensors, **one** bus (part of the base bring-up, §2):
 
 ```text
 dtoverlay=w1-gpio,gpiopin=4
-dtoverlay=w1-gpio,gpiopin=17
 ```
 
-A third bus on `gpiopin=27` only if one bus carries more than about 12
-sensors. The kernel creates one `w1_bus_master<N>` per overlay under
-`/sys/bus/w1/devices`, **in an order that is not the order of these lines**
-(§8 item 38: GPIO 4 came up as `w1_bus_master2`); `hw/onewire.py` discovers
-them, finds sensors by ROM id, and never needs the GPIO numbers.
+**It was two, and the second one was removed.** The board's `config.txt`
+carried a second `w1-gpio` overlay on GPIO 17; that bus had no sensors on it
+at all, so its only contribution was phantoms. Its search returned nothing
+but family-`00` devices read off a floating line, enough of them to reach
+`w1_search: max_slave_count 64 reached` and register bogus slaves — and that
+is exactly the condition that makes every `therm_bulk_read` on the master they
+attach to a no-op (next paragraph, and §8 item 38, defect (b)). The owner had
+the GPIO 17 wiring removed, the overlay line is commented out in `config.txt`,
+and that master's search was disabled at runtime for the remainder of that
+boot. All fourteen DS18B20 sensors are on GPIO 4.
 
-**Enable an overlay only for a bus that is actually wired and terminated.**
-The kernel re-searches every bus every `w1_master_timeout` seconds (10 by
-default, and `w1_master_search` = −1 means for ever — both measured on the
-board at 4 searches per bus per 36 s). On an unterminated bus each search
-reads a different family-`00` phantom off the floating line: three of them
-at a time on the board's unwired GPIO 17 bus, a completely different set
-between two searches, each one a device the kernel and udev add and remove
-again. They cost nothing in readings — `hw/onewire.py` only looks at
-declared ROM ids, and `tools/w1_commission.py --list` reports other
-families apart from the DS18B20 it offers to bind — but a phantom is a
-slave with no `family_data`, and **one of those anywhere on a master makes
-every bulk trigger on that master a no-op** (§8 item 38, defect (b)): a
-wired bus that grows one drops to serial reads, ten times slower, until it
-goes away. The fix is the wiring, not a knob.
+**Removing it shifts the master numbering**, which is why nothing in this
+repository may name a master by number. The kernel creates one
+`w1_bus_master<N>` per overlay under `/sys/bus/w1/devices`, **in an order that
+is not the order of these lines** — with both overlays, GPIO 4 came up as
+`w1_bus_master2` (§8 item 38, which records what was true when it was
+written); with GPIO 4 alone it is `w1_bus_master1`. Nothing has to change for
+that: `hw/onewire.py`'s `discover_buses()` globs `w1_bus_master*`,
+`deploy/99-w1-therm.rules` matches `w1_bus_master*` and `28-*`, and the config
+keys sensors by ROM id, so a sensor is found wherever it is. Multi-bus support
+stays in the reader and in its tests; it is simply not what this board has.
+
+**Enable an overlay only for a bus that is actually wired and terminated**
+(4.7 kΩ) — the rule the removal above is an instance of. The kernel re-searches
+every bus every `w1_master_timeout` seconds (10 by default, and
+`w1_master_search` = −1 means for ever — both measured on the board at 4
+searches per bus per 36 s). On an unterminated bus each search reads a
+different family-`00` phantom off the floating line: three of them at a time on
+the old GPIO 17 bus, a completely different set between two searches, each one
+a device the kernel and udev add and remove again, and over enough searches
+enough of them to fill the master's slave list. They cost nothing in readings —
+`hw/onewire.py` only looks at declared ROM ids, and `tools/w1_commission.py
+--list` reports other families apart from the DS18B20 it offers to bind — but a
+phantom is a slave with no `family_data`, and **one of those anywhere on a
+master makes every bulk trigger on that master a no-op** (§8 item 38, defect
+(b)): a wired bus that grows one drops to serial reads, ten times slower, until
+it goes away. The fix is the wiring, not a knob — and on this board the fix was
+to take the bus out.
 
 **The search is deliberately left alone, by the daemon and by
 `install-pi.sh` both.** `w1_master_search` and `w1_master_timeout` are
@@ -11514,7 +11537,8 @@ conversion itself is a sleep, not a spin, so what costs a core is the
 per-sensor traffic around it — the ~40 ms a serial read spends above
 `conv_time`, or the ~17 ms a bus-wide tier spends per scratchpad. At the
 default 12 bit and 12 sensors that is ~0.2 s of one core per 0.96 s netlink
-cycle, ~21 % of a core per bus, two buses ~10 % of the 4-core Zero 2 W;
+cycle, ~21 % of a core per bus — on this board's single bus ~5 % of the 4-core
+Zero 2 W, and ~10 % if a second one is ever wired;
 read one at a time the same 12 cost ~0.6 s per 9.6 s cycle, a smaller
 share of a core for a cycle that no longer fits the budget (§8 item 39).
 Measure with `tools/w1_commission.py --check`, which prints the read path,
@@ -12819,8 +12843,8 @@ on a Zero W; the hardware steps are waiting for the aquaero.
    `plugdev` with read/write, §9 *HID access*). Run
    `.venv/bin/python -m pytest -m hardware` as the service user. Warm each mapped thermistor and watch the right `obs.temps` key
    move (a swapped `temp_map` is invisible to the gate, §3).
-9. **Sensor commissioning** (DS18B20, once, before the daemon; `w1-gpio`
-   overlays of §9 active):
+9. **Sensor commissioning** (DS18B20, once, before the daemon; the
+   `w1-gpio` overlay of §9 active — one bus, on GPIO 4):
    - `.venv/bin/python tools/w1_commission.py --list` prints every ROM
      id per bus with its current reading;
    - `.venv/bin/python tools/w1_commission.py --identify` samples every

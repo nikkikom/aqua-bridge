@@ -48,13 +48,19 @@ is not yet confirmed on real hardware, on either board.
    enable_uart=1
    dtoverlay=disable-bt
    dtoverlay=w1-gpio,gpiopin=4
-   dtoverlay=w1-gpio,gpiopin=17
    ```
 
-   (a third `dtoverlay=w1-gpio,gpiopin=27` only if one bus ends up
-   carrying more than ~12 DS18B20 sensors; add an overlay only for a bus
-   you have actually wired and terminated — an unterminated one
-   manufactures phantom devices on every kernel search, PROJECT.md §9).
+   One 1-Wire bus, on GPIO 4, carrying all fourteen DS18B20 sensors. It
+   was two: a second overlay on GPIO 17 carried no sensors at all, and an
+   unterminated bus manufactures a different set of family-`00` phantoms
+   on every kernel search — enough of them to hit `w1_search:
+   max_slave_count 64 reached` and register bogus slaves, which is the
+   condition that makes every `therm_bulk_read` on that master a no-op.
+   It was removed (PROJECT.md §9 *Overlays and modules*). **Add an
+   overlay only for a bus you have actually wired and terminated**
+   (4.7 kΩ); a second one on `gpiopin=17` or a third on `gpiopin=27`
+   belongs there only once a bus carries more than about 12 sensors and
+   the new one is wired.
    Load the I2C userspace
    module: `echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf`.
    Drop `console=serial0,115200` from `/boot/firmware/cmdline.txt` if
@@ -358,7 +364,7 @@ is not yet confirmed on real hardware, on either board.
    swapped `temp_map` is invisible to the safety gate).
 
 8. **1-Wire sensor commissioning** (DS18B20, once, before the daemon
-   runs, with the `w1-gpio` overlays from step 2 active), from
+   runs, with the `w1-gpio` overlay from step 2 active), from
    `/opt/aqua-bridge`:
 
    ```bash
