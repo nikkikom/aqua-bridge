@@ -38,7 +38,12 @@
 #   rt     the address holds and the default route goes.
 #         A NetworkManager or DHCP-option problem, not a radio one.
 #   gw     all of that holds and the gateway simply stops answering.
-#         A problem on the other end of the link, not on this board.
+#         A problem on the other end of the link, not on this board. Judged by
+#         whether the kernel knows the gateway at ALL -- an entry with a
+#         hardware address that it has not given up on -- and never by which
+#         stage of the ARP ageing cycle that entry is in. See "What is a change"
+#         below: the raw state was in the digest once, and it cost 628 empty
+#         CHANGE lines a day.
 #
 # Every line is built so the layer that moved first is the one you read first. A
 # change line names the layers that moved AND the layers that held -- "held=
@@ -114,7 +119,9 @@
 #              n= sample number, dev= present or absent, op= operstate,
 #              car= carrier, wpa= wpa_state, bss= BSSID, ssid= SSID, fq= MHz,
 #              sig= dBm, v4= address/prefix, rt= default gateway, nud= that
-#              gateway's neighbour state, v6= count of global/ULA/link-local v6
+#              gateway's exact neighbour state (reported because a reader wants
+#              it, and deliberately not compared -- "What is a change" below),
+#              v6= count of global/ULA/link-local v6
 #              addresses, rx=/tx= packet delta since the previous sample,
 #              rxe/txe/rxd/txd= error and drop totals, thr= the firmware's
 #              throttle flag word, uv= the kernel's undervoltage alarm bit,
@@ -128,6 +135,9 @@
 #              of silence.
 #   CHANGE     a layer moved. Names every component that moved as old->new, the
 #              layers it belongs to, and held= the layers that did not move.
+#              The components are the digest and nothing else, so the gateway
+#              appears here as gw=yes->no (the kernel knows it, or has given up
+#              on it) and never as nud=STALE->REACHABLE.
 #   DEGRADED   the first sample in which any layer is bad. first= names which.
 #   RECOVERED  all five good again. after= how long, lost= the order they went
 #              in, back= the order they came back in, bssid= same or changed.
@@ -153,6 +163,47 @@
 # is one command:
 #
 #   journalctl -t aqua-net-watch -o short-iso --since -2h
+#
+# ---------------------------------------------------------------------------
+# What is a change
+# ---------------------------------------------------------------------------
+# A CHANGE line is a change in the DIGEST (COMP_NAMES below) and in nothing
+# else, and what is allowed into that digest is one rule: NOTHING THAT MOVES ON
+# A HEALTHY BOARD AT REST. That is not tidiness. The whole value of this unit is
+# that when the board finally fails, a person greps the journal and reads the
+# ordering off the CHANGE/DEGRADED lines; a unit that reports changes
+# continuously has spent that, and the real event arrives into a log that was
+# already crying wolf -- the same defect as the assoc rung's first version (see
+# "a degraded source is not a degraded network" in §9) and the same defect the
+# snapshot floors exist against.
+#
+# It was measured, not assumed. Twenty-two hours of a healthy board produced 628
+# CHANGE lines, every single one of them the gateway's neighbour cache ageing:
+#
+#   CHANGE n=5218 layers=gw nud=STALE->REACHABLE held=iface,assoc,v4,rt
+#   CHANGE n=5220 layers=gw nud=REACHABLE->STALE held=iface,assoc,v4,rt
+#
+# and not one change of anything else. That is the kernel's ordinary ARP ageing
+# and not a fault: an entry goes STALE when it has not been used, DELAY and then
+# PROBE when traffic resumes, REACHABLE when an answer arrives, and round again
+# every few seconds on a link something is talking over. So the gateway rung is
+# judged coarsely -- the kernel knows the gateway, or it has given up on it --
+# and the exact state stays on the sample line where a reader can have it
+# without it being able to manufacture a transition. FAILED, INCOMPLETE and a
+# missing entry are still a change, still DEGRADED first=gw and still a dump:
+# those are the kernel saying it asked and got no answer, which is exactly the
+# gw fault this rung exists for.
+#
+# The other components are in the digest because they pass the same test on this
+# board: dev, op and ssid do not move at all; wpa stays COMPLETED through a
+# background scan and leaving it is the 2026-09-30 fault; bss moves only on a
+# roam, which is a real event with a line of its own; v4 moves only when the
+# lease does; rt moves only when NetworkManager loses the default route; v6 is
+# three booleans and not the prefixes, so the ISP re-dialling cannot move it;
+# and thr/uv do not move on a healthy board at all -- the moment one of them
+# does is the moment this unit was written for. The fields that DO move at rest
+# are reported and never compared: the exact neighbour state, the signal level,
+# the core voltage, the die temperature, the frequency and the packet counters.
 #
 # ---------------------------------------------------------------------------
 # The absent-interface case
@@ -677,11 +728,15 @@ wpasrc_notice() {
 
 # --- the sampled state ---------------------------------------------------------
 #
-# The digest. dev is the interface's existence, then the association, then the
-# address, the route and the gateway's neighbour entry: that is the ladder whose
-# ORDER is the diagnosis. v6 rides along as three booleans, and thr/uv are the
-# rail; neither is a rung -- see EXTRA_LAYERS below.
-COMP_NAMES=(dev op wpa bss ssid v4 rt nud v6 thr uv)
+# The digest, and the one rule it is built on: nothing that moves on a healthy
+# board at rest -- argued in full under "What is a change" at the top, where the
+# 628 empty CHANGE lines a day that taught it are quoted. dev is the interface's
+# existence, then the association, then the address, the route and whether the
+# kernel still knows the gateway: that is the ladder whose ORDER is the
+# diagnosis. gw is coarse on purpose (yes/no/na, not the NUD state, which cycles
+# on an idle link); v6 is three booleans and not the prefixes, for the same
+# reason. v6 and thr/uv ride along without being rungs -- see EXTRA_LAYERS below.
+COMP_NAMES=(dev op wpa bss ssid v4 rt gw v6 thr uv)
 COMP_LAYER=(iface assoc assoc assoc assoc v4 rt gw v6 power power)
 #: The five layers, lowest rung first. A line that names them in this order is a
 #: line you read downwards, and the lowest bad one is the diagnosis.
@@ -873,27 +928,44 @@ sample() {
     done < "$PROC/net/route"
   fi
 
-  # That gateway's neighbour entry. nud= is the kernel's own verdict on whether
-  # the other end of the link is answering, and it is the one field here that
-  # this script gets for free off somebody else's work: aqua-net-recover.sh
-  # pings the same gateway every five minutes, and this is where the result of
-  # that ping lands. A STALE entry on an idle link is normal; an entry that is
-  # FAILED, INCOMPLETE or gone is the gateway not answering.
+  # That gateway's neighbour entry, in two fields, and the split between them is
+  # the point. This is the one rung the script gets for free off somebody else's
+  # work: aqua-net-recover.sh pings the same gateway every five minutes, and the
+  # kernel's neighbour table is where the result of that ping lands.
+  #
+  # CUR[nud] is the kernel's exact NUD state. It goes on the sample line because
+  # a reader wants it, and it is NOT in the digest: an idle link cycles through
+  # STALE, DELAY, PROBE and REACHABLE all day long, and with the raw state in the
+  # digest that cycling was 628 of 628 CHANGE lines in a healthy day (see "What
+  # is a change" at the top).
+  #
+  # CUR[gw] is what the digest and the rung verdict see, and it answers one
+  # question: does the kernel know the gateway and have no reason to think it
+  # gone. "yes" is an entry with a hardware address in any state but the two
+  # that mean the kernel has given up -- REACHABLE, STALE, DELAY, PROBE, NOARP
+  # and PERMANENT all mean the same thing here. "no" is FAILED (it asked and
+  # nobody answered), INCOMPLETE (it is asking and nobody has answered yet), an
+  # entry with no hardware address, or no entry at all. "na" is no default route
+  # to judge against, which the rung below already reports.
   CUR[nud]="-"
-  CUR[nudc]="na"
+  CUR[gw]="na"
   if [[ "${CUR[rt]}" != "-" && "$HAVE_IP" -eq 1 ]]; then
     CUR[nud]="none"
-    CUR[nudc]="no"
+    CUR[gw]="no"
     capture ip -4 neigh show dev "$IFACE"
     out="$CAP"
     if [[ -n "$out" ]]; then
       while read -r addr rest; do
         [[ "$addr" == "${CUR[rt]}" ]] || continue
         CUR[nud]="${rest##* }"
+        # The state is checked as well as the hardware address, not instead of
+        # it: a kernel that leaves the old lladdr on an entry it has just failed
+        # would otherwise read as a reachable gateway.
         if [[ "$rest" == *lladdr* ]]; then
-          CUR[nudc]="yes"
-        else
-          CUR[nudc]="no"
+          case "${CUR[nud]}" in
+            FAILED | INCOMPLETE) CUR[gw]="no" ;;
+            *) CUR[gw]="yes" ;;
+          esac
         fi
         break
       done <<< "$out"
@@ -1044,13 +1116,11 @@ sample() {
   # "na", not "DOWN", when there is no default route: whether the gateway
   # answers is then not unknown-and-bad but simply unknowable, and the rung below
   # already carries the fault. Same rule as the layers above an absent interface.
-  if [[ "${CUR[nudc]}" == "yes" ]]; then
-    OK[gw]=1
-  elif [[ "${CUR[nudc]}" == "na" ]]; then
-    OK[gw]="na"
-  else
-    OK[gw]=0
-  fi
+  case "${CUR[gw]}" in
+    yes) OK[gw]=1 ;;
+    na) OK[gw]="na" ;;
+    *) OK[gw]=0 ;;
+  esac
   return 0
 }
 
@@ -1498,14 +1568,18 @@ boot_report() {
 # --- the state machine ---------------------------------------------------------
 #
 # A change is a change in the DIGEST, which is COMP_NAMES above and nothing else.
-# Signal, core voltage, temperature, the packet counters and the exact neighbour
-# state all move on every sample of a perfectly healthy board and are
+# Signal, core voltage, temperature, the frequency, the packet counters and the
+# exact neighbour state all move on a perfectly healthy board and are
 # deliberately not in it: a snapshot per sample is not a diagnosis, it is a full
-# journal. The neighbour state enters the digest coarsely -- an entry with a MAC,
-# or not -- because REACHABLE/STALE/DELAY/PROBE cycling is what a healthy idle
-# link does. The throttle flag word and the undervoltage bit ARE in it, because
-# they do not move on a healthy board at all, and the moment one of them does is
-# the moment this whole unit was written for.
+# journal, and 628 CHANGE lines in a healthy day is a log that cannot show the
+# one that matters ("What is a change" at the top has the measurement). The
+# gateway therefore enters the digest coarsely -- the kernel knows it, or has
+# given up on it -- because REACHABLE/STALE/DELAY/PROBE cycling is what a
+# healthy idle link does, while FAILED, INCOMPLETE and a vanished entry are
+# still a change, a DEGRADED first=gw and a dump. The throttle flag word and the
+# undervoltage bit ARE in it, because they do not move on a healthy board at
+# all, and the moment one of them does is the moment this whole unit was written
+# for.
 decide() {
   local i name layer old new changed=0 silent_now=0 held="" layers_text="" first=""
   SNAP_THIS_SAMPLE=0
