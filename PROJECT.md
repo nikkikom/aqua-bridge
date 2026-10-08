@@ -11756,9 +11756,10 @@ XT6 firmware reverts (spike §2.3) or the board comes back. Accepted if
 
 `deploy/install-board-watchdogs.sh` — idempotent, run by the owner with
 `sudo`, `--check` reports without writing anything, `--no-net-recover`
-leaves the Wi-Fi timer out. It installs layer 3 of §2 and the three board
+leaves the Wi-Fi timer out. It installs layer 3 of §2, the three board
 settings the two Wi-Fi outages produced (power save off, unlimited autoconnect
-retries, the re-association timer), and it touches
+retries, the re-association timer), the diagnostic watcher, the radio recovery
+and the pstore keeper (*The pstore keeper*, below), and it touches
 `aqua-bridge.service`, the controllers and `config.yaml` **not at all**
 (`install-pi.sh` owns the unit; the script only *reads* it, to print the
 layering). Every number is a variable at the top, overridable from the
@@ -11789,6 +11790,12 @@ environment (`sudo SOC_WATCHDOG_SEC=90 deploy/install-board-watchdogs.sh`):
 | `RADIO_REBOOT` | `on` | `Environment=AQUA_RADIO_REBOOT=` in the same unit (`off`, or `--no-radio-reboot`, keeps the unit and switches off its escalation) |
 | `RADIO_REBOOT_BUDGET` | `2` | `Environment=AQUA_RADIO_REBOOT_BUDGET=` in the same unit (reboots allowed per window; `0` = never) |
 | `RADIO_REBOOT_WINDOW` | `86400` | `Environment=AQUA_RADIO_REBOOT_WINDOW_S=` in the same unit (the window that budget is counted in) |
+| `PSTORE_KEEP_DAYS` | `30` | `Environment=AQUA_PSTORE_KEEP_DAYS=` in `aqua-pstore-keep.service` (days a kept crash record survives; matches `JOURNAL_MAX_RETENTION` on purpose, `0` = no age bound) |
+| `PSTORE_KEEP_MAX` | `200` | `Environment=AQUA_PSTORE_KEEP_MAX=` in the same unit (records kept at most, newest first — the bound that holds when the clock does not; `0` = no count bound) |
+| `PSTORE_RAMOOPS_OVERLAY` | `dtoverlay=ramoops,total-size=0x80000,record-size=0x8000,console-size=0x40000` | nothing; `--check` reads `PSTORE_CONFIG_TXT` back and warns with this line when no pstore backend is registered |
+| `PSTORE_CONFIG_TXT` | `/boot/firmware/config.txt` | nothing; it is the file that overlay belongs in, read-only from here |
+| `PSTORE_SRC_DIR` | `/sys/fs/pstore` | nothing; `--check` counts the records waiting in it |
+| `PSTORE_KEEP_DIR` | `/var/lib/aqua-pstore` | nothing; `--check` counts the records held in it (the keeper's `StateDirectory=`) |
 
 `--no-net-recover` is an off switch, not a skipped step: it stops and disables
 `aqua-net-recover.timer` and deletes the three installed files. Skipping alone
@@ -11811,7 +11818,17 @@ writes `Environment=AQUA_RADIO_REBOOT=off` into it, so the driver is still
 reloaded and a radio that stays missing is still reported hourly, and the board
 is simply never rebooted from there. That is also a real off switch and not a
 skipped step: the unit file changes, so the installer restarts the service, and a
-re-run without the flag puts the escalation back.
+re-run without the flag puts the escalation back. `--no-pstore-keep` is the
+fourth of the same switch, and it applies to a oneshot too: a unit left enabled
+runs the copy of the script installed back then at every boot, with the
+retention it had back then. The records already kept under `/var/lib/aqua-pstore`
+are left in place either way, on the same argument as the reboot ledger — they
+are evidence, not configuration (`systemctl clean --what=state
+aqua-pstore-keep.service` removes them deliberately). The keeper is the one unit
+here that is `enable`d and **not** `--now`: its work is at boot, before
+`systemd-pstore.service`, and by the time the installer runs `systemd-pstore`
+has long since emptied `/sys/fs/pstore`, so starting it there would write one
+`NOTHING` line and nothing else.
 
 Notes that only show up on a real board:
 
@@ -12484,6 +12501,163 @@ service" is checked by running it in every state and not only by reading it. The
 step from absent to present is driven by the stub `modprobe` and not by a clock,
 and both waits are bounded by an iteration count as well as by the clock, so the
 tests have no wall-clock dependence at all.
+
+### The pstore keeper: a crash record the archiver would overwrite
+
+`deploy/aqua-pstore-keep.{sh,service}`, installed by
+`install-board-watchdogs.sh` (`--no-pstore-keep` leaves it out and removes it).
+It is the only unit in this repository that runs on the boot path, and the only
+one that is not about the network at all.
+
+**The question.** The board has died without logging anything: the journal stops
+mid-stream on a routine line, with no service shutdown, no shutdown target, no
+panic, no OOM and no watchdog expiry, and the deaths that followed came about
+eleven seconds into each boot (§9 *Network diagnostic watcher*, the rail
+section). A kernel cannot write its own death to a journal on an SD card, so the
+console has to survive the reset somewhere else. `ramoops` does that — it keeps
+the kernel console in a reserved region of DRAM across a warm reset — and it is
+enabled on this board with
+
+```text
+dtoverlay=ramoops,total-size=0x80000,record-size=0x8000,console-size=0x40000
+```
+
+in `/boot/firmware/config.txt`: 512 KB in all, of which 256 KB is the console
+(the part that holds the last lines before a death) and each `dmesg` record is
+bounded at 32 KB. That half works.
+
+**What destroyed the evidence is what happens next.** A reset here is normally
+followed by one or more boots that themselves die about eleven seconds in, and
+on this board `systemd-pstore` archived the console record to **one fixed
+path** — so each of those near-empty records overwrote the record from the boot
+that actually failed. Measured twice: a 25930-byte record and then a 191-byte
+record, both from eleven-second boots, each one replacing what was there. The
+single most valuable artefact this board can produce was collected correctly by
+the kernel and thrown away by the archiver, at boot, before anybody could look.
+
+**So: copy first, archive second.** The keeper is a `Type=oneshot` ordered
+`Before=systemd-pstore.service` that copies every file in `/sys/fs/pstore` to
+`/var/lib/aqua-pstore/<utc-stamp>-<short-boot-id>-<record name>` and **never
+unlinks one**. Three things about that name are load-bearing. The stamp is UTC
+and fixed width, so the names sort as the clock does and do not move twice a
+year. The short boot id is what keeps two records distinguishable when the clock
+says they happened in the same second — which is the *normal* case on a board
+that resets before `systemd-timesyncd` has run, and is exactly the case that
+overwrote the evidence twice. And nothing is ever overwritten: a destination
+that already exists is reported as `SKIPPED` and left alone. Because it copies
+rather than moves, `systemd-pstore` still finds the same records and archives
+them afterwards; this is a second copy, not a competing archiver, and its own
+archive is untouched.
+
+**Timing is the reason it is a unit and not a cron job.** `systemd-pstore` ran
+at about 10.45 s in the boots that died at 10.5 to 11.1 s — the archiver was
+inside the window the board dies in. So the keeper runs before it, at `Nice=-5`
+(the only negative nice in this repository, and the only unit here that asks for
+CPU instead of yielding it: it runs before the control loop exists, once, with
+at most 512 KB to copy), and it is bounded by `TimeoutStartSec=20` rather than
+by trust. `DefaultDependencies=no` with `After=systemd-remount-fs.service`,
+`Before=sysinit.target shutdown.target`, `Conflicts=shutdown.target` and
+`RequiresMountsFor=/var/lib` — the same shape `systemd-pstore.service` itself
+uses, because a unit pulled in *by* `sysinit.target` cannot also be ordered
+after it. Two `Condition…=` rather than two failures:
+`ConditionPathIsReadWrite=/var/lib` (a read-only `/var` early in a boot is a
+normal state of affairs) and `ConditionDirectoryNotEmpty=/sys/fs/pstore`, which
+is also what keeps a healthy boot free of this unit entirely — no records, no
+run, no line. `Restart=no` on purpose: by the time it could retry,
+`systemd-pstore` has emptied the directory, so a retry has nothing to copy and a
+restart loop on the boot path is strictly worse than one logged failure.
+
+**Nothing here is in the cooling path** (§2). It runs inside `sysinit`, once;
+the daemon starts from `multi-user.target` long afterwards. The worst case it
+can add to that is its own start timeout, and the board already takes at least
+28 s from power to its first controller write — longer than the aquaero's own
+software-sensor timeout — so the alarm profile covers that window whatever
+happens here. The unit has an empty `CapabilityBoundingSet=` (everything it
+reads it reads as uid 0 by ownership), `ProtectKernelTunables=yes`, which makes
+the whole of `/sys` read-only to it and so enforces *copies and never unlinks*
+at the kernel rather than only in the script, `PrivateDevices=yes` with no
+`DeviceAllow=` at all (it reads no device, so a controller's `hidraw` node is
+not openable), `PrivateNetwork=yes` with `RestrictAddressFamilies=AF_UNIX` (it
+has nothing to send and nothing to ask), `ProtectSystem=strict` with its
+`StateDirectory=aqua-pstore` as the one writable path, and no relation of any
+kind to `aqua-bridge.service` or `aqua-heartbeat.service`. `ProcSubset=` is left
+at its default, because `pid` would hide `/proc/sys/kernel/random/boot_id` —
+the field the whole naming scheme turns on.
+
+**Retention, and why the pruning cannot run away.** The directory has to be
+bounded: a board in a reset loop writes a record per boot, and the one thing
+worse than losing the evidence is filling the card the journal is also capped
+against (§9 *Board hardening*: a reset loop must not outbid the history it is
+evidence for). Two bounds, because one of them cannot be trusted on this board.
+`AQUA_PSTORE_KEEP_DAYS=30` matches `JOURNAL_MAX_RETENTION`, so a record and the
+journal lines around it age out together — a record whose journal has already
+been discarded is half a diagnosis — but it compares mtimes, and a board that
+resets every eleven seconds before `timesyncd` has run stamps everything with
+whatever time systemd restored. So `AQUA_PSTORE_KEEP_MAX=200`, newest first by
+mtime, is the bound that holds when the clock does not: about 100 MB worst case
+at the `total-size` above, a few MB in practice (the two measured records were
+191 and 25930 bytes), on a 15 GB card whose journal is capped at 1G.
+
+The pruning itself is written the way it is because **a deletion target built
+out of a shell variable is a deletion of the root the moment that variable is
+empty**: `rm -rf $DIR/*` with `$DIR` unset is `rm -rf /*`, and the version of
+this script written by hand on the board was caught doing exactly that by a
+safety check before it ever ran. Five things now stand between a knob and
+`rm(1)`, and each of the first four holds on its own if the rest are wrong:
+
+1. the knobs control the **age** and the **count**, not the path — neither
+   `AQUA_PSTORE_KEEP_DAYS` nor `AQUA_PSTORE_KEEP_MAX` can name a file;
+2. an **empty** knob never reaches the path at all: `: "${X:=default}"`
+   substitutes the default when the variable is empty as well as when it is
+   unset, so `AQUA_PSTORE_KEEP_DIR=` is `/var/lib/aqua-pstore` and never a bare
+   `/`. That alone is what the hand-written version was missing;
+3. what is left is **validated once**, before anything is copied or deleted, and
+   refused outright unless it is absolute and at least two components deep: `/`,
+   `/var`, a relative path and anything containing `..` each exit 2 with a
+   message and remove nothing. A path that is wrong is a refusal to run, never a
+   deletion;
+4. the path is **never expanded into a glob** and never handed to `rm -r`. Every
+   deletion is one `rm -f --` of one regular file whose full path came out of
+   `find(1)`, and a path that came out of `find` cannot be the empty string;
+5. `find` is restricted to `-maxdepth 1`, `-type f` and the keeper's **own**
+   naming pattern (`????????T??????Z-*`), so even a directory pointed somewhere
+   it should not be can only lose files this script could have written — it
+   cannot recurse, cannot follow a symlink out of the directory and cannot touch
+   a directory entry of any other shape.
+
+**It is useless without the overlay, and the installer says so.** With no
+`ramoops` the keeper installs perfectly, never runs
+(`ConditionDirectoryNotEmpty=`) and looks exactly like a board that has not
+crashed. `install-board-watchdogs.sh --check` therefore reports how many records
+are waiting in `/sys/fs/pstore`, how many are already kept, and warns — naming
+the exact `dtoverlay=` line to add — when no backend is registered or when
+`config.txt` has no `dtoverlay=ramoops` in it. Same principle as the watchdog,
+journald and `autoconnect-retries` reports: read the result back rather than
+trust the write. The installer does **not** write that line itself; it is a
+boot-configuration change that needs a reboot, and `deploy/host-usb.sh` is the
+shape of a script that edits `config.txt`.
+
+Line kinds, one `SyslogIdentifier` for the lot: `started` (the directories, the
+bounds and how many records are already held), `KEPT` (one per record, with the
+bytes and the destination — the line that says the evidence survived), `NOTHING`
+(the directory empty, or absent, with the `dtoverlay=` line quoted, because "no
+`ramoops`" and "the board did not crash" produce the same empty directory and
+want opposite responses), `SKIPPED`, `PRUNED`, `WARNING` and `done`. A failed
+copy leaves its partial file named `.partial` rather than a truncated record
+that does not say so, and the record itself is still in `/sys/fs/pstore` for
+`systemd-pstore` to archive, because nothing here has unlinked it.
+
+```bash
+journalctl -t aqua-pstore-keep -o short-iso --since -7d
+ls -l /var/lib/aqua-pstore
+/usr/local/lib/aqua-bridge/aqua-pstore-keep.sh --check   # copies and removes nothing
+```
+
+`tests/test_deploy.py` runs the script against a fabricated `/sys/fs/pstore` and
+`/proc` on the same stub-`PATH` shape as the other board scripts, and fails if a
+record is not copied, if a copy is overwritten, if the source is unlinked, if
+either bound does not bound, if a near-root or climbing keep directory is pruned
+rather than refused, or if the three files disagree about a default.
 
 ### udev
 

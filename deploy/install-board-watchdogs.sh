@@ -2,8 +2,10 @@
 # Idempotent board hardening for a Raspberry Pi running aqua-bridge: the SoC
 # hardware watchdog, journald limits, Wi-Fi power save off, unlimited
 # NetworkManager autoconnect retries, the Wi-Fi re-association timer, the radio
-# recovery unit for an interface that does not exist at all, and the network
-# diagnostic watcher (PROJECT.md §2 "Watchdog layering", §9).
+# recovery unit for an interface that does not exist at all, the network
+# diagnostic watcher, and the pstore keeper that saves a preserved crash record
+# before systemd-pstore overwrites it (PROJECT.md §2 "Watchdog layering",
+# §9).
 #
 # It does NOT touch aqua-bridge.service, the controllers, or the daemon's
 # config: the service watchdog lives in deploy/aqua-bridge.service and is
@@ -18,6 +20,7 @@
 #   sudo deploy/install-board-watchdogs.sh --no-net-watch
 #   sudo deploy/install-board-watchdogs.sh --no-radio-recover
 #   sudo deploy/install-board-watchdogs.sh --no-radio-reboot
+#   sudo deploy/install-board-watchdogs.sh --no-pstore-keep
 #
 # --check needs no root and writes nothing; it prints what would change.
 # --no-net-recover installs no Wi-Fi script, unit or timer, and *removes* the
@@ -30,6 +33,11 @@
 # reason: a long-running service left enabled keeps running the copy of the
 # script installed back then.
 # --no-radio-recover does the same for the radio recovery unit.
+# --no-pstore-keep does the same for the pstore keeper: it is a oneshot rather
+# than a long-running service, but a unit left enabled still runs the copy of the
+# script installed back then at every boot, with the retention it had back then.
+# The kept records under /var/lib/aqua-pstore are left alone either way -- they
+# are evidence, not configuration.
 # --no-radio-reboot keeps that unit but switches off its one escalation, by
 # writing Environment=AQUA_RADIO_REBOOT=off into the installed unit instead of
 # the default "on" -- also a real off switch and not a skipped step: the unit
@@ -52,6 +60,20 @@
 # the address, the route, the gateway's neighbour entry and the SoC's own power
 # and temperature figures, and records whether the previous boot ended cleanly.
 # It never sends a packet, never loads a module and never touches a service.
+#
+# aqua-pstore-keep is not a network unit at all and is the only unit here that
+# runs on the boot path. It is a oneshot, ordered BEFORE systemd-pstore.service,
+# and it copies every record the kernel preserved in /sys/fs/pstore across the
+# reset to /var/lib/aqua-pstore/<utc-stamp>-<boot>-<name>. It exists because
+# ramoops preserving the console is only half the job: a reset here is normally
+# followed by boots that die about eleven seconds in, and systemd-pstore archived
+# the console record to one fixed path, so each of those near-empty records
+# overwrote the one from the boot that actually failed -- measured twice, a
+# 25930-byte record and then a 191-byte one. It copies and never unlinks, so
+# systemd-pstore still archives the same records afterwards and its own archive
+# is unaffected. It is useless without the ramoops overlay, which this script
+# does NOT write: it reports whether it is there, the same way it reports the
+# watchdog and the journald storage rather than trusting a write.
 #
 # Three settings here are verified rather than assumed, because all three have
 # already been written successfully and had no effect. Two are drop-ins that
@@ -265,6 +287,46 @@ RADIO_REBOOT_BUDGET="${RADIO_REBOOT_BUDGET:-2}"
 # about half a minute, with an hourly line in between saying it has given up. The
 # ledger on /var holds timestamps, so the window slides rather than resetting.
 RADIO_REBOOT_WINDOW="${RADIO_REBOOT_WINDOW:-86400}"
+# --- the pstore keeper (deploy/aqua-pstore-keep.{sh,service}) ------------------
+# The first two are written into aqua-pstore-keep.service as Environment= lines;
+# the script carries the same default for each and tests/test_deploy.py checks
+# that all three files agree. The script's header argues both in full.
+#
+# Days a kept record survives before the keeper's own prune removes it
+# (Environment=AQUA_PSTORE_KEEP_DAYS). 30 deliberately equals
+# JOURNAL_MAX_RETENTION above, so a crash record and the journal lines around it
+# age out together -- a record whose journal has already been discarded is half a
+# diagnosis. 0 means never prune by age.
+PSTORE_KEEP_DAYS="${PSTORE_KEEP_DAYS:-30}"
+# Kept records retained at most, newest first, whatever their age
+# (Environment=AQUA_PSTORE_KEEP_MAX). This is the bound that holds when the clock
+# does not: a board that resets every eleven seconds before timesyncd has run
+# stamps every record with whatever time systemd restored, so an age bound alone
+# cannot be trusted on exactly the board this is for. 200 records at the ramoops
+# total-size below is a worst case of about 100 MB on a 15 GB card whose journal
+# is already capped at JOURNAL_MAX_USE, and a typical case of a few MB (the two
+# records measured on this board were 191 and 25930 bytes). 0 means never prune
+# by count -- which, with PSTORE_KEEP_DAYS=0 as well, is an unbounded directory
+# and is not a setting to leave behind.
+PSTORE_KEEP_MAX="${PSTORE_KEEP_MAX:-200}"
+# The config.txt line that makes any of this possible, and the file it belongs
+# in. This script does NOT write it -- it is a boot-configuration change that
+# needs a reboot, and deploy/host-usb.sh is the shape of a script that edits this
+# file -- but --check reads the file back and says plainly when the keeper is
+# installed and there is nothing for it to keep, because that combination looks
+# exactly like a board that has not crashed. total-size=0x80000 is 512 KB of
+# DRAM, of which console-size=0x40000 is the 256 KB kernel console (the part that
+# holds the last lines before a death) and record-size=0x8000 bounds each dmesg
+# record at 32 KB; the keeper's copy is therefore bounded at 512 KB per boot,
+# which is what makes its place on the boot path affordable.
+PSTORE_RAMOOPS_OVERLAY="${PSTORE_RAMOOPS_OVERLAY:-dtoverlay=ramoops,total-size=0x80000,record-size=0x8000,console-size=0x40000}"
+PSTORE_CONFIG_TXT="${PSTORE_CONFIG_TXT:-/boot/firmware/config.txt}"
+# Where the kernel exposes those records, read by --check to say how many are
+# waiting. The keeper carries the same default as AQUA_PSTORE_SRC_DIR.
+PSTORE_SRC_DIR="${PSTORE_SRC_DIR:-/sys/fs/pstore}"
+# Where the keeper's copies go, read by --check to say how many are held. It
+# matches the keeper's AQUA_PSTORE_KEEP_DIR and the unit's StateDirectory=.
+PSTORE_KEEP_DIR="${PSTORE_KEEP_DIR:-/var/lib/aqua-pstore}"
 
 set -euo pipefail
 
@@ -314,15 +376,20 @@ RADIO_SRC="$SCRIPT_DIR/aqua-radio-recover.sh"
 RADIO_DST="/usr/local/lib/aqua-bridge/aqua-radio-recover.sh"
 RADIO_UNIT_SRC="$SCRIPT_DIR/aqua-radio-recover.service"
 RADIO_UNIT_DST="/etc/systemd/system/aqua-radio-recover.service"
+PSTORE_SRC="$SCRIPT_DIR/aqua-pstore-keep.sh"
+PSTORE_DST="/usr/local/lib/aqua-bridge/aqua-pstore-keep.sh"
+PSTORE_UNIT_SRC="$SCRIPT_DIR/aqua-pstore-keep.service"
+PSTORE_UNIT_DST="/etc/systemd/system/aqua-pstore-keep.service"
 
 CHECK_ONLY=0
 NET_RECOVER=1
 NET_WATCH=1
 RADIO_RECOVER=1
+PSTORE_KEEP=1
 
 usage() {
   echo "Usage: $0 [--check] [--no-net-recover] [--no-net-watch]" \
-    "[--no-radio-recover] [--no-radio-reboot]" >&2
+    "[--no-radio-recover] [--no-radio-reboot] [--no-pstore-keep]" >&2
   exit 2
 }
 
@@ -339,6 +406,9 @@ for arg in "$@"; do
       ;;
     --no-radio-recover)
       RADIO_RECOVER=0
+      ;;
+    --no-pstore-keep)
+      PSTORE_KEEP=0
       ;;
     --no-radio-reboot)
       # The knob's off switch, not a skipped step: the installed unit's
@@ -393,6 +463,15 @@ done
 for name in RADIO_ATTEMPTS RADIO_REBOOT_BUDGET; do
   if [[ ! "${!name}" =~ ^(0|[1-9][0-9]*)$ ]]; then
     echo "error: $name must be a whole number (0 = none), got '${!name}'" >&2
+    exit 2
+  fi
+done
+# Both bounds accept 0, and 0 means the same thing from two directions: do not
+# prune by age, do not prune by count. Both at 0 is an unbounded directory, which
+# is legitimate for a board being watched by hand and is said so in the report.
+for name in PSTORE_KEEP_DAYS PSTORE_KEEP_MAX; do
+  if [[ ! "${!name}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "error: $name must be a whole number (0 = no bound), got '${!name}'" >&2
     exit 2
   fi
 done
@@ -667,6 +746,54 @@ journald_storage_report() {
   fi
 }
 
+# pstore_report. Prints whether there is anything for the keeper to keep, and
+# whether there ever could be -- the two questions that cannot be answered by
+# looking at this script's own writes, the same principle as watchdog_report,
+# journald_storage_report and autoconnect_retries_report above. It matters here
+# more than anywhere: with ramoops not enabled, the keeper installs perfectly,
+# runs never (ConditionDirectoryNotEmpty=) and looks exactly like a board that
+# has not crashed. Needs no root; --check calls it before anything is written, so
+# it reports the board's *current* state.
+pstore_report() {
+  local waiting=0 held=0 backend="absent" path
+  if [[ -d "$PSTORE_SRC_DIR" ]]; then
+    backend="present"
+    for path in "$PSTORE_SRC_DIR"/*; do
+      [[ -f "$path" ]] || continue
+      waiting=$((waiting + 1))
+    done
+  fi
+  for path in "$PSTORE_KEEP_DIR"/*; do
+    [[ -f "$path" ]] || continue
+    held=$((held + 1))
+  done
+  echo "  $PSTORE_SRC_DIR: $backend, $waiting record(s) waiting"
+  echo "  $PSTORE_KEEP_DIR: $held record(s) kept"
+  if [[ "$backend" == "absent" ]]; then
+    echo "  WARNING: no pstore backend is registered, so the kernel preserves" \
+      "NOTHING across a reset and the keeper has nothing to keep. Add" \
+      "'$PSTORE_RAMOOPS_OVERLAY' to $PSTORE_CONFIG_TXT (under [all]) and reboot." \
+      "This script does not write that line: it is a boot-configuration change" \
+      "that needs a reboot, and a board that dies mid-journal leaves nothing at" \
+      "all behind without it. PROJECT.md §9 'The pstore keeper'."
+  elif [[ -r "$PSTORE_CONFIG_TXT" ]] \
+    && ! grep -q '^[[:space:]]*dtoverlay=ramoops' "$PSTORE_CONFIG_TXT"; then
+    echo "  WARNING: $PSTORE_SRC_DIR exists but $PSTORE_CONFIG_TXT has no" \
+      "dtoverlay=ramoops line, so the backend holding it may not survive the" \
+      "next reboot. The line this board wants is '$PSTORE_RAMOOPS_OVERLAY'."
+  else
+    echo "  OK: a pstore backend is registered, so a death that reaches the" \
+      "kernel console survives the reset"
+  fi
+  if [[ "$PSTORE_KEEP_DAYS" -eq 0 && "$PSTORE_KEEP_MAX" -eq 0 ]]; then
+    echo "  WARNING: PSTORE_KEEP_DAYS=0 and PSTORE_KEEP_MAX=0 -- $PSTORE_KEEP_DIR" \
+      "is bounded by nothing, and a board in a reset loop writes a record per" \
+      "boot. Fine for an hour of watching by hand; not a setting to leave behind."
+  else
+    echo "  retention: ${PSTORE_KEEP_DAYS}d, at most ${PSTORE_KEEP_MAX} record(s)"
+  fi
+}
+
 echo "== hardware watchdog =="
 if [[ ! -e /dev/watchdog ]]; then
   echo "error: /dev/watchdog is absent. On Raspberry Pi OS the bcm2835_wdt" \
@@ -919,6 +1046,42 @@ else
     "PROJECT.md §2)"
 fi
 
+if [[ "$PSTORE_KEEP" -eq 1 ]]; then
+  echo "== pstore keeper (a crash record systemd-pstore would overwrite) =="
+  install_text "$PSTORE_DST" 755 < "$PSTORE_SRC"
+  pstore_tmp="$(mktemp)"
+  sed -e "s|^Environment=AQUA_PSTORE_KEEP_DAYS=.*|Environment=AQUA_PSTORE_KEEP_DAYS=$PSTORE_KEEP_DAYS|" \
+    -e "s|^Environment=AQUA_PSTORE_KEEP_MAX=.*|Environment=AQUA_PSTORE_KEEP_MAX=$PSTORE_KEEP_MAX|" \
+    "$PSTORE_UNIT_SRC" > "$pstore_tmp"
+  install_text "$PSTORE_UNIT_DST" 644 < "$pstore_tmp"
+  rm -f "$pstore_tmp"
+  echo "  it runs once per boot, before systemd-pstore.service, and copies at" \
+    "most the 512 KB ramoops holds into $PSTORE_KEEP_DIR; it never unlinks a" \
+    "record, so systemd-pstore's own archive is unaffected"
+else
+  echo "== pstore keeper: off (--no-pstore-keep) =="
+  # Same argument as the units above, and it applies to a oneshot too: a unit
+  # left enabled runs the copy of the script installed back then at every boot,
+  # with the retention it had back then.
+  if [[ -e "$PSTORE_UNIT_DST" ]]; then
+    CHANGED=1
+    if [[ "$CHECK_ONLY" -eq 1 ]]; then
+      echo "  would stop and disable aqua-pstore-keep.service"
+    else
+      as_root systemctl disable --now aqua-pstore-keep.service || true
+      echo "  stopped and disabled aqua-pstore-keep.service"
+    fi
+  fi
+  remove_path "$PSTORE_UNIT_DST"
+  remove_path "$PSTORE_DST"
+  echo "  (the records already kept under $PSTORE_KEEP_DIR are left alone: they" \
+    "are evidence, not configuration, and 'systemctl clean --what=state" \
+    "aqua-pstore-keep.service' removes them)"
+  echo "  (with nothing running before systemd-pstore, a reset followed by boots" \
+    "that die seconds in overwrites the record from the boot that failed, which" \
+    "is the fault this unit exists for, PROJECT.md §9)"
+fi
+
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
   echo
   echo "== SoC watchdog (current board state, before any change) =="
@@ -929,6 +1092,9 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
   echo
   echo "== Wi-Fi autoconnect retries (current board state, before any change) =="
   autoconnect_retries_report
+  echo
+  echo "== pstore (current board state, before any change) =="
+  pstore_report
   echo
   if [[ "$CHANGED" -eq 1 ]]; then
     echo "== check: changes pending, nothing was written =="
@@ -1003,6 +1169,23 @@ if [[ "$RADIO_RECOVER" -eq 1 ]]; then
   echo "    journalctl -t aqua-radio-recover -o short-iso --since -7d"
 fi
 
+if [[ "$PSTORE_KEEP" -eq 1 ]]; then
+  echo "== pstore keeper =="
+  # enable, and NOT --now. Its work is at boot, before systemd-pstore, and by the
+  # time this script runs systemd-pstore has long since emptied /sys/fs/pstore, so
+  # starting it here would do nothing but write a NOTHING line. Nothing is
+  # restarted either: a oneshot that has already run this boot has no state to
+  # pick up, and the next boot runs the new copy.
+  as_root systemctl enable aqua-pstore-keep.service
+  echo "  aqua-pstore-keep.service: $(systemctl is-enabled aqua-pstore-keep.service)" \
+    "(it runs at the next boot, before systemd-pstore.service)"
+  pstore_report
+  echo "  ask it what it sees, without it copying or removing anything, with:"
+  echo "    ${PSTORE_DST} --check"
+  echo "  read what it did, across every boot the journal holds, with:"
+  echo "    journalctl -t aqua-pstore-keep -o short-iso --since -7d"
+fi
+
 service_watchdog="?"
 if [[ -r "$UNIT_SRC" ]]; then
   service_watchdog="$(sed -n 's/^WatchdogSec=//p' "$UNIT_SRC" | head -n 1)"
@@ -1057,6 +1240,19 @@ that ledger cannot be written. Past the budget it says hourly that it has given
 up. It loads a module and it reboots; it opens no controller, stops or restarts
 no service of any kind, and sends no packet.
 
+aqua-pstore-keep is not a layer above either, and not a network unit at all: it
+is the one unit here that runs on the boot path. Once per boot, before
+systemd-pstore.service, it copies every record the kernel preserved in
+${PSTORE_SRC_DIR} across the reset into ${PSTORE_KEEP_DIR} under a name no later
+boot can collide with, keeps ${PSTORE_KEEP_DAYS} days and at most
+${PSTORE_KEEP_MAX} of them, and unlinks nothing -- systemd-pstore archives the
+same records afterwards and its own archive is unaffected. It exists because
+ramoops preserving the kernel console is only half the job: the reset is followed
+by boots that die about eleven seconds in, and the archiver's one fixed path
+meant each near-empty record overwrote the one from the boot that actually
+failed. It copies at most 512 KB, is bounded by its unit's TimeoutStartSec, opens
+no controller and touches no service.
+
 connection.autoconnect-retries=${NET_AUTOCONNECT_RETRIES} on the Wi-Fi profile
 is the other half of that: NetworkManager's default of 4 is what let the board
 stop trying altogether on 2026-09-30, and the report above reads the effective
@@ -1080,4 +1276,10 @@ if [[ "$RADIO_RECOVER" -eq 1 ]]; then
   echo "  ${RADIO_DST} --check"
 else
   echo "The radio recovery is not installed (--no-radio-recover)."
+fi
+if [[ "$PSTORE_KEEP" -eq 1 ]]; then
+  echo "Ask the pstore keeper what it sees, without it copying anything, with"
+  echo "  ${PSTORE_DST} --check"
+else
+  echo "The pstore keeper is not installed (--no-pstore-keep)."
 fi
