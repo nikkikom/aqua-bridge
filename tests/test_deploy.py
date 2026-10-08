@@ -1205,6 +1205,7 @@ def _watch_stage(
     gw: str = "192.0.2.1",
     nud: str = "REACHABLE",
     lladdr: bool = True,
+    neigh: bool = True,
     rx: int = 1000,
     tx: int = 900,
     throttled: str = "0x0",
@@ -1272,10 +1273,10 @@ def _watch_stage(
         addr += "3: wlan0    inet6 fd00:2:3::17/64 scope global\n"
         addr += "3: wlan0    inet6 fe80::1/64 scope link\n"
     (data / "addr").write_text(addr)
-    neigh = ""
-    if dev and gw:
-        neigh = f"{gw} lladdr aa:bb:cc:dd:ee:ff {nud}\n" if lladdr else f"{gw} {nud}\n"
-    (data / "neigh4").write_text(neigh)
+    entry = ""
+    if dev and gw and neigh:
+        entry = f"{gw} lladdr aa:bb:cc:dd:ee:ff {nud}\n" if lladdr else f"{gw} {nud}\n"
+    (data / "neigh4").write_text(entry)
     status = ""
     if dev and bssid:
         status += f"bssid={bssid}\nfreq={freq}\nssid={ssid}\n"
@@ -1580,6 +1581,34 @@ def test_the_watcher_names_every_rung_of_the_ladder_lowest_first():
     assert "EXTRA_LAYERS=(v6 power)" in text
 
 
+def test_the_digest_holds_nothing_that_moves_on_a_healthy_board():
+    """The one rule the digest is built on, checked against the digest itself. The raw
+    neighbour state was in it once, and 22 hours of a healthy board produced 628 CHANGE
+    lines -- every one of them the gateway's ARP entry ageing between STALE, DELAY and
+    REACHABLE, and not one change of anything else. A unit that reports changes
+    continuously has already spent the DEGRADED/RECOVERED pair the owner greps for, so
+    the gateway is in the digest coarsely (yes/no/na) and the exact state is reported
+    without being compared -- the same treatment the IPv6 prefixes already get."""
+    text = WATCH_SCRIPT.read_text()
+    names = re.search(r"COMP_NAMES=\(([^)]*)\)", text)
+    layers = re.search(r"COMP_LAYER=\(([^)]*)\)", text)
+    assert names is not None and layers is not None
+    components = names.group(1).split()
+    assert components == ["dev", "op", "wpa", "bss", "ssid", "v4", "rt", "gw", "v6", "thr", "uv"]
+    # One layer per component, so every transition can name the rung it belongs to.
+    assert len(layers.group(1).split()) == len(components)
+    # The fields that move on a healthy board at rest are each sampled, printed and
+    # left out of the digest: the exact NUD state, the signal, the frequency, the
+    # rail's analogue readings and the packet counters. (sig and fq are remembered
+    # across samples for the ROAM line, which reports them as old->new itself; being
+    # remembered is not being compared.)
+    for moves in ("nud", "sig", "fq", "volt", "temp", "rx", "tx", "v6count"):
+        assert moves not in components, moves
+    # And the gateway rung reads the coarse field, never the state.
+    assert '"${CUR[gw]}"' in text
+    assert '"${CUR[nudc]}"' not in text
+
+
 def test_a_healthy_board_samples_without_dumping_anything(tmp_path):
     """One snapshot, at the start, and then nothing: a dump per sample is not a
     diagnosis, it is a full journal. The idle cadence also applies, so a steady board
@@ -1651,15 +1680,97 @@ def test_a_gateway_that_stops_answering_is_the_only_thing_that_moved(tmp_path):
     """The fourth: everything on this board holds and the other end of the link stops
     answering. The kernel's own neighbour verdict is where that shows up, and the
     watcher reads it without sending a packet of its own -- aqua-net-recover.sh's
-    five-minutely ping is what refreshes it."""
+    five-minutely ping is what refreshes it.
+
+    The change is reported as the coarse verdict, gw=yes->no, because that is what is
+    in the digest; the exact state the kernel gave is still on the sample line, which
+    is where a reader wants it and where it cannot invent a transition."""
     stages = [{}, {"nud": "FAILED", "lladdr": False}]
     bin_dir = _watch_board(tmp_path, stages)
     lines = _run_watch(tmp_path, bin_dir, samples=2)
     (change,) = _kinds(lines, "CHANGE")
-    assert "layers=gw" in change and "nud=REACHABLE->FAILED" in change
+    assert "layers=gw" in change and "gw=yes->no" in change
     assert "held=iface,assoc,v4,rt" in change
     assert "first=gw" in _kinds(lines, "DEGRADED")[0]
+    assert "nud=FAILED" in _kinds(lines, "sample")[-1]
+    assert "gw:DOWN" in _kinds(lines, "sample")[-1]
     assert "ping" not in (tmp_path / "calls.log").read_text()
+
+
+def test_the_gateways_ageing_cycle_is_not_a_change_at_all(tmp_path):
+    """Measured on the board: 22 hours of a healthy board, 628 CHANGE lines, every one
+    of them this cycle and nothing else. An ARP entry goes STALE when it has not been
+    used, DELAY and then PROBE when traffic resumes, REACHABLE when an answer arrives,
+    and round again -- the kernel's ordinary ageing, not a fault. Six hundred empty
+    CHANGE lines a day means the real event arrives into a log that has been reporting
+    changes continuously, which is the one thing this unit may not do.
+
+    The whole cycle runs here under a board that is otherwise healthy and whose signal,
+    rail readings and packet counters are all moving too, as they do: not one CHANGE,
+    not one DEGRADED, and not one dump beyond the baseline the start always takes."""
+    cycle = ["REACHABLE", "STALE", "STALE", "DELAY", "PROBE", "REACHABLE", "STALE", "PROBE"]
+    stages: list[dict[str, object]] = [
+        {
+            "nud": state,
+            "rx": 1000 + 37 * index,
+            "tx": 900 + 11 * index,
+            "volts": f"1.32{50 - index}V",
+            "temp": f"4{7 + (index % 3)}.{index}",
+        }
+        for index, state in enumerate(cycle)
+    ]
+    bin_dir = _watch_board(tmp_path, stages)
+    lines = _run_watch(
+        tmp_path, bin_dir, samples=len(cycle), extra_env={"AQUA_NETWATCH_IDLE_EVERY": "1"}
+    )
+    assert _kinds(lines, "CHANGE") == []
+    assert _kinds(lines, "DEGRADED") == []
+    assert _kinds(lines, "POWER") == []
+    assert _kinds(lines, "snapshot deferred") == []
+    # The start takes its baseline dump and nothing after it wants one, which is the
+    # other half of the cost: a brief dump per ageing cycle is the journal gone.
+    assert len(_kinds(lines, "snapshot begin")) == 1
+    samples = _kinds(lines, "sample")
+    assert len(samples) == len(cycle)
+    assert all("layers=ok" in line for line in samples), samples
+    # And the state is still there to read, on every sample line, which is the point of
+    # keeping it out of the comparison rather than out of the record.
+    for state in ("REACHABLE", "STALE", "DELAY", "PROBE"):
+        assert any(f"nud={state} " in line for line in samples), state
+
+
+@pytest.mark.parametrize(
+    ("stage", "state_text"),
+    [
+        # "I asked and nobody answered", and "I am asking and nobody has answered yet".
+        ({"nud": "FAILED", "lladdr": False}, "nud=FAILED"),
+        ({"nud": "INCOMPLETE", "lladdr": False}, "nud=INCOMPLETE"),
+        # A kernel that leaves the old hardware address on an entry it has just failed
+        # must not read as a gateway it still knows: the state is checked as well as
+        # the address, not instead of it.
+        ({"nud": "FAILED", "lladdr": True}, "nud=FAILED"),
+        # The entry gone altogether. The default route is still there, so the rung is
+        # judged rather than unknowable.
+        ({"neigh": False}, "nud=none"),
+    ],
+    ids=["failed", "incomplete", "failed-keeping-the-lladdr", "entry-gone"],
+)
+def test_every_state_the_kernel_has_given_up_on_still_takes_the_gw_rung_down(
+    tmp_path, stage, state_text
+):
+    """The other side of the coarse verdict, and the thing it may never weaken: the
+    states that mean the kernel asked and got no answer are still a change, still
+    DEGRADED first=gw, and still worth a dump."""
+    bin_dir = _watch_board(tmp_path, [{}, stage])
+    lines = _run_watch(tmp_path, bin_dir, samples=2)
+    (change,) = _kinds(lines, "CHANGE")
+    assert "layers=gw" in change and "gw=yes->no" in change
+    assert "held=iface,assoc,v4,rt" in change
+    (degraded,) = _kinds(lines, "DEGRADED")
+    assert "first=gw" in degraded
+    assert state_text in _kinds(lines, "sample")[-1]
+    # The start's baseline dump, and the one behind this transition.
+    assert len(_kinds(lines, "snapshot begin")) == 2
 
 
 def test_an_absent_interface_is_the_lowest_rung_and_carries_the_kernels_verdict(tmp_path):

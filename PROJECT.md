@@ -11990,13 +11990,57 @@ lowest bad rung is the diagnosis:
 | `assoc` | the interface exists and the association drops (no BSSID, `wpa_state` leaves `COMPLETED`) | 2026-09-30, the 18-disconnect storm that ended in a temp-disabled SSID |
 | `v4` | the association holds and the IPv4 address disappears — a DHCP fault, not a radio one | the lease loss behind several of them |
 | `rt` | the address holds and the default route goes — NetworkManager, not the radio | |
-| `gw` | all of that holds and the gateway stops answering — the other end of the link | 2026-10-06, the stale neighbour entry |
+| `gw` | all of that holds and the gateway stops answering — the other end of the link | the neighbour entry going `FAILED` or vanishing; judged coarsely, see *What is a change* |
 
 The layers **above** the lowest bad one report `na`, not `DOWN`: the address
 being missing from an interface that does not exist is not evidence of
 anything, and four spurious `DOWN`s would bury the rung that matters. The same
 rule applies to `gw` with no route — whether the gateway answers is then
 unknowable, not bad.
+
+**What is a change**, and the one rule the digest is built on: *nothing that
+moves on a healthy board at rest*. A `CHANGE` line is a change in the digest
+and in nothing else, and this is the second time that rule has had to be
+enforced against a measurement rather than argued. Twenty-two hours of a
+healthy board produced **628 `CHANGE` lines, every one of them the gateway's
+neighbour cache ageing** and not one change of anything else:
+
+```text
+CHANGE n=5218 layers=gw nud=STALE->REACHABLE held=iface,assoc,v4,rt
+CHANGE n=5220 layers=gw nud=REACHABLE->STALE held=iface,assoc,v4,rt
+```
+
+That is the kernel's ordinary ARP ageing, not a fault: an entry goes `STALE`
+when it has not been used, `DELAY` and then `PROBE` when traffic resumes,
+`REACHABLE` when an answer arrives, round again every few seconds on a link
+something is talking over — and each one cost a brief dump as well, or a
+`snapshot deferred` line when the floor refused it. The defect is the same one
+as the `assoc` rung's first version below: an instrument that reports changes
+continuously has already spent the `CHANGE`/`DEGRADED` pair the owner greps
+for, so the real event arrives into a log that was crying wolf, and it spends
+the journal space the caps exist to protect. So the `gw` rung is judged by
+whether the gateway is reachable **at all** — an entry with a hardware address
+that the kernel has not given up on, reported as `gw=yes->no` — and the exact
+state stays on the `sample` line, where a reader can have it without its being
+able to manufacture a transition. `FAILED` (it asked and nobody answered),
+`INCOMPLETE` (it is asking and nobody has answered yet), an entry with no
+hardware address and no entry at all are all still `gw=no`: still a change,
+still `DEGRADED first=gw`, still a dump. The state is checked as well as the
+hardware address, not instead of it, so a kernel that leaves the old address on
+an entry it has just failed cannot read as a gateway it still knows.
+
+The other components earn their place by the same test, on this board: `dev`,
+`op` and `ssid` do not move at all; `wpa` stays `COMPLETED` through a
+background scan and leaving it is the 2026-09-30 fault; `bss` moves only on a
+roam, which is a real event with a line of its own; `v4` moves only when the
+lease does; `rt` moves only when the default route goes; `v6` is three
+booleans and not the prefixes, so the ISP re-dialling and changing the global
+prefix — which the owner is explicit is a distraction — cannot move it; and
+`thr`/`uv` do not move on a healthy board at all, which is the whole reason
+they are in there. Everything that *does* move at rest is sampled, printed and
+never compared: the exact neighbour state, the signal level, the frequency, the
+core voltage, the die temperature and the packet counters. A healthy day should
+now hold **no `CHANGE` lines at all** — the next one that appears is an event.
 
 Underneath all five rungs, the rail. The 2026-10-06 forensics moved the
 question: the last healthy boot did not fail at the network, it **died** — the
@@ -12048,8 +12092,8 @@ journalctl -t aqua-net-watch | grep 'snapshot \[scan\]'
 
 Line kinds: `sample` (one per interval while anything is moving, one per
 `AQUA_NETWATCH_IDLE_EVERY` while nothing is); `CHANGE`, which names every
-component that moved as `old->new`, the layers they belong to, **and `held=`
-the layers that did not** — `wpa=COMPLETED->DISCONNECTED … held=iface,v4,rt,gw`
+component of the digest that moved as `old->new`, the layers they belong to,
+**and `held=` the layers that did not** — `wpa=COMPLETED->DISCONNECTED … held=iface,v4,rt,gw`
 is a whole diagnosis on one line; `DEGRADED first=…` and `RECOVERED after=…
 lost=… back=… bssid=same|changed(…)`; `ABSENT`, the headline for the lowest
 rung, carrying whether the driver module is loaded, which netdevs *do* exist,
@@ -12224,7 +12268,13 @@ ladder misreports which rung moved or which held, if a dump is taken on a sample
 that changed nothing, if an absent interface is reported as "down" rather than
 with the kernel's verdict, if a changed IPv6 prefix costs a dump, if a rail
 transition does not, or if the boot report cannot tell a shutdown from a power
-loss. The step from one state to the next is driven by the stub `sleep` on
+loss. The digest rule is pinned from both sides: a full neighbour ageing cycle
+(`REACHABLE`→`STALE`→`DELAY`→`PROBE`→`REACHABLE`) on a board whose signal, rail
+readings and packet counters are all moving too must produce no `CHANGE`, no
+`DEGRADED` and no dump beyond the baseline the start always takes, while
+`FAILED`, `INCOMPLETE`, a failed entry that kept its hardware address, and the
+entry vanishing must each still give `CHANGE layers=gw gw=yes->no`,
+`DEGRADED first=gw` and their dump. The step from one state to the next is driven by the stub `sleep` on
 `PATH`, which the script calls exactly once per loop and nothing else calls, so
 the tests have no wall-clock dependence at all. `reboot`, `shutdown`,
 `poweroff`, `halt`, `systemctl`, `modprobe`, `rmmod`, `insmod`, `ping`,
