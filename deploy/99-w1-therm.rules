@@ -1,4 +1,6 @@
-# DS18B20 sensors on the w1-gpio buses (PROJECT.md §9 "udev", §8 item 38).
+# DS18B20 sensors on the w1-gpio bus (PROJECT.md §9 "udev", §8 item 38). The
+# board has one, on GPIO 4; the rules match w1_bus_master* and 28-* and so hold
+# for any number of buses and any master numbering.
 #
 # The kernel creates every w1 sysfs attribute root-owned, and the daemon does
 # not run as root (User= in aqua-bridge.service, SupplementaryGroups=plugdev).
@@ -11,8 +13,9 @@
 #                   is the next thing to try there
 # plus, on the bus master, therm_bulk_read: hw/onewire.py writes "trigger" to it
 # once per bus to find out whether this kernel honours a bulk read on that bus
-# (§8 item 38: the board's does, on the one master the kernel gives the attribute
-# to). Without this rule that write fails with EACCES, which is handled -- the
+# (§8 item 38: the board's does -- the kernel gives therm_bulk_read to one master
+# system-wide, and with one bus that master is the only one there is). Without
+# this rule that write fails with EACCES, which is handled -- the
 # bus drops a tier and the same cycle finishes there -- but then the resolution
 # write fails too and every sensor stays at its power-on 12 bit, which is where
 # the default wants it and is not where a config asking for 9, 10 or 11 does.

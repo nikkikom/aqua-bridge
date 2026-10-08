@@ -832,10 +832,15 @@ spin_up:
     qd3: {kick_duty: 0.35}
     qd4: {kick_duty: 0.35}
 
-# 1-Wire: two w1-gpio buses (dtoverlay=w1-gpio,gpiopin=4 and gpiopin=17 in
-# config.txt); bus masters are discovered under root (default /sys/bus/w1/devices).
-# The w1_bus_master<N> numbering does not follow the order of the overlay lines,
-# so nothing here names a bus -- sensors are found by ROM id wherever they are.
+# 1-Wire: one w1-gpio bus on the board this file describes
+# (dtoverlay=w1-gpio,gpiopin=4 in config.txt), carrying all fourteen DS18B20
+# sensors. It was two until the GPIO 17 overlay was removed: that bus carried no
+# sensors and its phantoms were taking therm_bulk_read away from the master they
+# attached to (PROJECT.md section 9 "Overlays and modules"). Bus masters are
+# discovered under root (default /sys/bus/w1/devices) and several are supported;
+# the w1_bus_master<N> numbering does not follow the order of the overlay lines
+# and shifts when an overlay is added or removed, so nothing here names a bus --
+# sensors are found by ROM id wherever they are.
 # Bind ROM ids with tools/w1_commission.py --list / --identify and verify the
 # bindings, read path, cycle time and CRC error rate with --check --config this file.
 onewire:
@@ -843,9 +848,10 @@ onewire:
   # ~17-20 ms per sensor, so 12 sensors on a bus take 0.96 s over netlink and
   # 1.00 s over the kernel's bulk read at 12 bit (0.40 s either way at 10 bit) --
   # about a quarter of the per-bus budget of max_age_s / 2 = 3.75 s. Netlink
-  # addresses a master by id, so EVERY bus gets a bus-wide conversion, including
-  # the second one, which the kernel never gives a therm_bulk_read to: that is
-  # what the 12-bit default rests on (PROJECT.md section 8 items 38, 39).
+  # addresses a master by id, so EVERY bus gets a bus-wide conversion -- including
+  # a second bus, if one is ever wired, which the kernel would never give a
+  # therm_bulk_read to, since only one master system-wide gets that attribute:
+  # that is what the 12-bit default rests on (PROJECT.md section 8 items 38, 39).
   #
   # Read one sensor at a time (conversion + ~40 ms each) the same 12 take 9.6 s
   # at 12 bit, 5.0 s at 11, 2.7 s at 10, 1.6 s at 9. So 12 bit does NOT fit the
