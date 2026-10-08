@@ -3,6 +3,7 @@ install scripts. No Pi needed; nothing here talks to systemd or udev."""
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -362,6 +363,7 @@ def test_install_script_das_flag_installs_das_config_and_dropin_never_enabling()
         "aqua-net-recover.sh",
         "aqua-net-watch.sh",
         "aqua-radio-recover.sh",
+        "aqua-pstore-keep.sh",
     ],
 )
 def test_shell_scripts_parse(script):
@@ -2776,3 +2778,475 @@ def test_no_radio_reboot_is_the_escalations_own_off_switch():
     assert "[--no-radio-recover] [--no-radio-reboot]" in text
     assert _shell_default(BOARD_SCRIPT, "RADIO_REBOOT") == "on"
     assert "Environment=AQUA_RADIO_REBOOT=$RADIO_REBOOT" in text
+
+
+# --- the pstore keeper: a crash record the archiver would overwrite (section 9) --------
+
+PSTORE_SCRIPT = DEPLOY / "aqua-pstore-keep.sh"
+PSTORE_UNIT = DEPLOY / "aqua-pstore-keep.service"
+
+#: Executables the keeper may never reach for, stubbed on PATH as loggers so a run that
+#: called one shows up in the call log rather than being ruled out only by reading the
+#: source. It runs on the boot path, so `systemctl` and the four ways to reset a board
+#: matter more here than anywhere: a unit ordered inside sysinit that could restart or
+#: reboot something would be the worst possible place for it.
+PSTORE_FORBIDDEN = (
+    "reboot",
+    "shutdown",
+    "poweroff",
+    "halt",
+    "systemctl",
+    "modprobe",
+    "nmcli",
+    "ip",
+    "ping",
+    "dd",
+    "mkfs",
+)
+
+#: A boot id the fabricated /proc hands out; the keeper uses its first eight hex digits.
+PSTORE_BOOT_ID = "aabbccdd-1122-3344-5566-778899aabbcc"
+
+#: What a kept name looks like: <YYYYMMDD>T<HHMMSS>Z-<8 hex>-<the record's own name>.
+PSTORE_NAME = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{8}-(.+)$")
+
+
+def _pstore_board(
+    base: Path, records: dict[str, str], *, boot_id: str = PSTORE_BOOT_ID
+) -> tuple[Path, Path, Path]:
+    """A fabricated /sys/fs/pstore, keep directory and /proc boot id under ``base``."""
+    src = base / "pstore"
+    src.mkdir(parents=True, exist_ok=True)
+    for name, text in records.items():
+        (src / name).write_text(text)
+    keep = base / "keep"
+    keep.mkdir(parents=True, exist_ok=True)
+    (base / "boot_id").write_text(f"{boot_id}\n")
+    bin_dir = base / "bin"
+    if not bin_dir.exists():
+        bin_dir.mkdir(parents=True)
+        for name in PSTORE_FORBIDDEN:
+            (bin_dir / name).write_text(f'#!/bin/sh\necho "{name} $*" >> "$CALLS"\nexit 0\n')
+        for entry in bin_dir.iterdir():
+            entry.chmod(0o755)
+    (base / "calls.log").write_text("")
+    return src, keep, bin_dir
+
+
+def _run_pstore(
+    base: Path,
+    src: Path,
+    keep: Path,
+    bin_dir: Path,
+    *,
+    args: tuple[str, ...] = (),
+    extra_env: dict[str, str] | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - bash is in packages-rpi.txt and in CI
+        pytest.skip("bash not available")
+    env = {
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "AQUA_PSTORE_SRC_DIR": str(src),
+        "AQUA_PSTORE_KEEP_DIR": str(keep),
+        "AQUA_PSTORE_BOOT_ID_PATH": str(base / "boot_id"),
+        "CALLS": str(base / "calls.log"),
+        **(extra_env or {}),
+    }
+    done = subprocess.run(
+        [bash, str(PSTORE_SCRIPT), *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check:
+        assert done.returncode == 0, done.stderr
+        assert (base / "calls.log").read_text() == "", (base / "calls.log").read_text()
+    return done
+
+
+def _aged(path: Path, days: float) -> None:
+    """Backdate a file so the keeper's age bound can see it, with no waiting."""
+    when = time.time() - days * 86400
+    os.utime(path, (when, when))
+
+
+def test_pstore_knobs_are_documented_variables_with_one_default_each():
+    """Section 9: no operator tunable is a literal in the body. The two bounds, the two
+    directories and the boot-id path are each a knob at the top with its reasoning."""
+    knobs = {
+        "AQUA_PSTORE_SRC_DIR": "/sys/fs/pstore",
+        "AQUA_PSTORE_KEEP_DIR": "/var/lib/aqua-pstore",
+        "AQUA_PSTORE_KEEP_DAYS": "30",
+        "AQUA_PSTORE_KEEP_MAX": "200",
+        "AQUA_PSTORE_BOOT_ID_PATH": "/proc/sys/kernel/random/boot_id",
+    }
+    for name, default in knobs.items():
+        assert _shell_default(PSTORE_SCRIPT, name) == default, name
+    # The retention default matches the journal's, deliberately: a record whose journal
+    # has already been discarded is half a diagnosis.
+    assert _shell_default(BOARD_SCRIPT, "JOURNAL_MAX_RETENTION").startswith(
+        _shell_default(PSTORE_SCRIPT, "AQUA_PSTORE_KEEP_DAYS")
+    )
+    # The prune's glob and the name it builds have to agree, or the bound stops
+    # bounding; both live in the script and neither is a knob.
+    text = PSTORE_SCRIPT.read_text()
+    assert "KEEP_GLOB='????????T??????Z-*'" in text
+    assert 'dest="$KEEP_DIR/${STAMP}-${BOOT_ID}-${name}"' in text
+
+
+def test_the_pstore_unit_ships_the_bounds_the_board_script_installs():
+    """Three files carry these two numbers -- the script's default, the unit's
+    Environment=, and the installer's knob -- so all three have to agree or reading
+    deploy/ tells the truth about none of them."""
+    values = _unit_values(PSTORE_UNIT.read_text())
+    environment = dict(item.split("=", 1) for item in values["Environment"])
+    for unit_key, script_knob, installer_knob in (
+        ("AQUA_PSTORE_KEEP_DAYS", "AQUA_PSTORE_KEEP_DAYS", "PSTORE_KEEP_DAYS"),
+        ("AQUA_PSTORE_KEEP_MAX", "AQUA_PSTORE_KEEP_MAX", "PSTORE_KEEP_MAX"),
+    ):
+        assert environment[unit_key] == _shell_default(PSTORE_SCRIPT, script_knob)
+        assert environment[unit_key] == _shell_default(BOARD_SCRIPT, installer_knob)
+        assert f"Environment={unit_key}=${installer_knob}" in BOARD_SCRIPT.read_text()
+    # The keep directory is the unit's StateDirectory= and the script's own default, and
+    # it is on /var: a crash record kept on a tmpfs is erased by the event it is
+    # evidence of.
+    assert values["StateDirectory"] == ["aqua-pstore"]
+    assert "RuntimeDirectory" not in values
+    assert _shell_default(PSTORE_SCRIPT, "AQUA_PSTORE_KEEP_DIR") == "/var/lib/aqua-pstore"
+    assert _shell_default(BOARD_SCRIPT, "PSTORE_KEEP_DIR") == "/var/lib/aqua-pstore"
+    assert _shell_default(BOARD_SCRIPT, "PSTORE_SRC_DIR") == _shell_default(
+        PSTORE_SCRIPT, "AQUA_PSTORE_SRC_DIR"
+    )
+
+
+def test_the_pstore_unit_runs_before_the_archiver_and_is_wired_to_nothing_that_cools():
+    """The whole fix is the ordering: systemd-pstore ran at about 10.45 s in the boots
+    that died at 10.5 to 11.1 s, and it archived the console record to one fixed path,
+    so a keeper that ran after it would be copying the record that already overwrote the
+    evidence. And it is on the boot path, which is the one place nothing may reach into
+    the cooling path from."""
+    values = _unit_values(PSTORE_UNIT.read_text())
+    assert values["Type"] == ["oneshot"]
+    assert "systemd-pstore.service" in " ".join(values["Before"])
+    # Pulled in BY sysinit.target, so it cannot also inherit After=sysinit.target --
+    # the same shape systemd-pstore.service itself uses.
+    assert values["DefaultDependencies"] == ["no"]
+    assert values["WantedBy"] == ["sysinit.target"]
+    assert "systemd-remount-fs.service" in " ".join(values["After"])
+    assert values["RequiresMountsFor"] == ["/var/lib"]
+    assert values["Conflicts"] == ["shutdown.target"]
+    # Conditions and not failures: a read-only /var early in a boot and an empty
+    # /sys/fs/pstore on every healthy boot are both normal, and a unit that logged a
+    # failure for each would make "this unit failed" mean nothing.
+    assert values["ConditionPathIsReadWrite"] == ["/var/lib"]
+    assert values["ConditionDirectoryNotEmpty"] == ["/sys/fs/pstore"]
+    for key in ("Wants", "Requires", "After", "Before", "Conflicts", "PartOf", "BindsTo"):
+        for value in values.get(key, []):
+            assert "aqua-bridge" not in value and "aqua-heartbeat" not in value, value
+            assert "aqua-net" not in value and "aqua-radio" not in value, value
+    # A oneshot on the boot path may not retry and may not escalate: by the time it
+    # could, systemd-pstore has emptied the directory.
+    assert values["Restart"] == ["no"]
+    assert "WatchdogSec" not in values
+    assert "OnFailure" not in values
+    assert "StartLimitAction" not in values
+    assert values["StartLimitIntervalSec"] == ["0"]
+    # Bounded rather than trusted, and the only unit here that asks for CPU instead of
+    # yielding it -- it runs before the control loop exists.
+    assert values["TimeoutStartSec"] == ["20"]
+    assert values["Nice"] == ["-5"]
+    for key, value in values.items():
+        if key.startswith("Exec"):
+            assert all("aqua-pstore-keep.sh" in item for item in value), value
+
+
+def test_the_pstore_unit_may_read_sysfs_and_write_one_directory_and_nothing_else():
+    """The promise that matters: it COPIES records and never unlinks one, because a
+    record it deleted is a record nothing else will ever archive. ProtectKernelTunables=
+    makes the whole of /sys read-only, so that is enforced by the kernel and not only by
+    the script."""
+    values = _unit_values(PSTORE_UNIT.read_text())
+    assert values["ProtectKernelTunables"] == ["yes"]
+    assert values["ProtectSystem"] == ["strict"]
+    assert values["CapabilityBoundingSet"] == [""]
+    assert values["AmbientCapabilities"] == [""]
+    assert values["NoNewPrivileges"] == ["yes"]
+    # It reads no device at all, so unlike the watcher it can have a private /dev with
+    # nothing added back: a controller's hidraw node is not openable.
+    assert values["PrivateDevices"] == ["yes"]
+    assert "DeviceAllow" not in values
+    # And it has nothing to send and nothing to ask.
+    assert values["PrivateNetwork"] == ["yes"]
+    assert values["RestrictAddressFamilies"] == ["AF_UNIX"]
+    # ProcSubset=pid would hide /proc/sys/kernel/random/boot_id, which is the field the
+    # whole naming scheme turns on.
+    assert "ProcSubset" not in values
+    assert "ReadWritePaths" not in values
+
+
+def test_the_keeper_never_runs_anything_that_acts():
+    """Read from the source, the twin of the behavioural checks below. It is a oneshot
+    inside sysinit, so a systemctl or a reboot from here would be in the worst possible
+    place for one."""
+    lines = _code_lines(PSTORE_SCRIPT)
+    for word in PSTORE_FORBIDDEN:
+        assert not _runs_command(lines, word), f"aqua-pstore-keep.sh runs {word}"
+    for line in lines:
+        assert "aqua-heartbeat" not in line and "hidraw" not in line, line
+    code = "\n".join(lines) + "\n"
+    # It copies; it never moves a record out of the source and never removes one.
+    assert 'cp -- "$src" "${dest}.partial"' in code
+    for forbidden in ("rm -rf", "rm -r ", 'mv -- "$src"'):
+        assert forbidden not in code, forbidden
+    # Every deletion is one regular file that came out of find, inside the keep
+    # directory and matching the keeper's own naming pattern -- never a glob built out
+    # of a variable, which is a deletion of the root the moment the variable is empty.
+    assert code.count("rm -f -- ") == code.count("rm -f")
+    assert 'rm -f -- "$path"' in code
+    for line in lines:
+        if "find " in line:
+            assert '"$KEEP_DIR"' in line and "-maxdepth 1" in line, line
+            assert "-type f" in line and '-name "$KEEP_GLOB"' in line, line
+        if "rm " in line:
+            assert "$SRC_DIR" not in line, line
+
+
+def test_every_record_is_kept_under_a_name_no_later_boot_can_collide_with(tmp_path):
+    """The fix, in one test. The archiver put the console record at one fixed path, so a
+    reset followed by boots that die eleven seconds in overwrote the record from the boot
+    that actually failed -- twice, measured. Here two boots produce the same record name
+    and both survive, because the name carries the boot id as well as the stamp."""
+    src, keep, bin_dir = _pstore_board(tmp_path, {"console-ramoops-0": "the first death\n"})
+    first = _run_pstore(tmp_path, src, keep, bin_dir)
+    assert "KEPT console-ramoops-0" in first.stdout
+    src, keep, bin_dir = _pstore_board(
+        tmp_path,
+        {"console-ramoops-0": "an eleven-second boot\n"},
+        boot_id="99887766-1122-3344-5566-778899aabbcc",
+    )
+    second = _run_pstore(tmp_path, src, keep, bin_dir)
+    assert "KEPT console-ramoops-0" in second.stdout
+    kept = sorted(path.name for path in keep.iterdir())
+    assert len(kept) == 2, kept
+    for name in kept:
+        match = PSTORE_NAME.match(name)
+        assert match is not None, name
+        assert match.group(1) == "console-ramoops-0"
+    assert any("-aabbccdd-" in name for name in kept), kept
+    assert any("-99887766-" in name for name in kept), kept
+    # Both contents are there: the second record did not replace the first.
+    bodies = sorted(path.read_text() for path in keep.iterdir())
+    assert bodies == ["an eleven-second boot\n", "the first death\n"]
+    # And the source is untouched, so systemd-pstore still has the same work to do.
+    assert (src / "console-ramoops-0").read_text() == "an eleven-second boot\n"
+
+
+def test_a_destination_that_exists_is_skipped_and_never_overwritten(tmp_path):
+    """Nothing here overwrites a kept record, whatever else happens -- that is the
+    defect it was written against, and a second run inside one second of one boot must
+    not reproduce it."""
+    src, keep, bin_dir = _pstore_board(tmp_path, {"dmesg-ramoops-0": "evidence\n"})
+    first = _run_pstore(tmp_path, src, keep, bin_dir)
+    (kept,) = list(keep.iterdir())
+    kept.write_text("do not lose me\n")
+    (src / "dmesg-ramoops-0").write_text("something else\n")
+    second = _run_pstore(tmp_path, src, keep, bin_dir)
+    assert "KEPT" in first.stdout
+    assert "SKIPPED dmesg-ramoops-0" in second.stdout
+    assert "already exists" in second.stdout
+    assert kept.read_text() == "do not lose me\n"
+    assert len(list(keep.iterdir())) == 1
+
+
+def test_the_age_bound_removes_an_old_copy_and_only_its_own_naming_pattern(tmp_path):
+    """The directory has to be bounded -- a board in a reset loop writes a record per
+    boot -- and the prune may only ever match files this script could have written."""
+    src, keep, bin_dir = _pstore_board(tmp_path, {})
+    old = keep / "20260101T000000Z-aabbccdd-console-ramoops-0"
+    old.write_text("ancient\n")
+    _aged(old, 10)
+    fresh = keep / "20261001T000000Z-aabbccdd-console-ramoops-0"
+    fresh.write_text("recent\n")
+    stranger = keep / "notes-from-the-owner.txt"
+    stranger.write_text("not mine to delete\n")
+    _aged(stranger, 400)
+    done = _run_pstore(tmp_path, src, keep, bin_dir, extra_env={"AQUA_PSTORE_KEEP_DAYS": "3"})
+    assert "PRUNED 20260101T000000Z-aabbccdd-console-ramoops-0" in done.stdout
+    assert not old.exists()
+    assert fresh.exists()
+    # Four hundred days old and far outside the bound, and still there: the prune is
+    # restricted to the keeper's own naming pattern, so a directory pointed somewhere it
+    # should not be can only lose files the keeper could have written.
+    assert stranger.exists()
+
+
+def test_the_count_bound_keeps_the_newest_and_is_what_holds_when_the_clock_does_not(
+    tmp_path,
+):
+    """The age bound compares mtimes, and a board that resets every eleven seconds
+    before timesyncd has run stamps everything with whatever time systemd restored. So
+    the count bound is the one that holds on exactly the board this is for."""
+    src, keep, bin_dir = _pstore_board(tmp_path, {})
+    names = []
+    for index in range(5):
+        path = keep / f"2026100{index + 1}T000000Z-aabbccdd-console-ramoops-0"
+        path.write_text(f"record {index}\n")
+        _aged(path, 5 - index)  # the last one written is the newest
+        names.append(path)
+    done = _run_pstore(tmp_path, src, keep, bin_dir, extra_env={"AQUA_PSTORE_KEEP_MAX": "2"})
+    assert len(list(keep.iterdir())) == 2, sorted(p.name for p in keep.iterdir())
+    assert names[3].exists() and names[4].exists()
+    for gone in names[:3]:
+        assert not gone.exists()
+        assert f"PRUNED {gone.name}" in done.stdout
+    assert "over the 2 newest" in done.stdout
+
+
+@pytest.mark.parametrize(
+    "keep_dir",
+    ["/", "/var", "keep", "/var/lib/../..", "/var/lib/aqua-pstore/.."],
+    ids=["root", "one-component", "relative", "climbing", "climbing-from-the-default"],
+)
+def test_a_near_root_or_climbing_keep_directory_is_refused_rather_than_pruned(tmp_path, keep_dir):
+    """A deletion target built out of a shell variable is a deletion of the root the
+    moment that variable is empty -- "rm -rf $DIR/*" with $DIR unset is "rm -rf /*", and
+    the version of this written by hand on the board was caught doing exactly that. A
+    path that is wrong is a refusal to run, never a deletion."""
+    src, keep, bin_dir = _pstore_board(tmp_path, {"console-ramoops-0": "evidence\n"})
+    done = _run_pstore(
+        tmp_path,
+        src,
+        keep,
+        bin_dir,
+        extra_env={"AQUA_PSTORE_KEEP_DIR": keep_dir},
+        check=False,
+    )
+    assert done.returncode == 2, done.stdout
+    assert "AQUA_PSTORE_KEEP_DIR" in done.stderr
+    # Nothing was read, copied or removed: it exits before any of that.
+    assert done.stdout == ""
+    assert (src / "console-ramoops-0").read_text() == "evidence\n"
+    assert list(keep.iterdir()) == []
+
+
+def test_an_empty_keep_directory_knob_is_the_default_and_never_a_bare_slash(tmp_path):
+    """The first line of defence, and the one the hand-written version was missing:
+    ': "${X:=default}"' substitutes the default when the variable is EMPTY as well as
+    when it is unset, so an empty knob can never become a path at all."""
+    text = PSTORE_SCRIPT.read_text()
+    assert ': "${AQUA_PSTORE_KEEP_DIR:=/var/lib/aqua-pstore}"' in text
+    src, keep, bin_dir = _pstore_board(tmp_path, {})
+    done = _run_pstore(
+        tmp_path, src, keep, bin_dir, extra_env={"AQUA_PSTORE_KEEP_DIR": ""}, check=False
+    )
+    # It falls back to /var/lib/aqua-pstore, which an unprivileged test cannot create,
+    # and says so instead of pruning anything.
+    assert done.returncode == 1, done.stdout
+    assert "/var/lib/aqua-pstore" in done.stderr
+    assert "nothing was copied" in done.stderr
+
+
+def test_an_empty_pstore_says_so_and_names_the_overlay(tmp_path):
+    """ "ramoops is not enabled" and "the board did not crash" produce the same empty
+    directory and want opposite responses, so they are told apart and the line carries
+    the dtoverlay= the board needs."""
+    src, keep, bin_dir = _pstore_board(tmp_path, {})
+    empty = _run_pstore(tmp_path, src, keep, bin_dir)
+    assert "NOTHING" in empty.stdout and "is empty" in empty.stdout
+    assert "KEPT" not in empty.stdout
+    absent = _run_pstore(tmp_path, tmp_path / "not-mounted", keep, bin_dir)
+    assert "does not exist" in absent.stdout
+    assert "dtoverlay=ramoops,total-size=0x80000" in absent.stdout
+
+
+def test_the_keeper_check_flag_copies_and_removes_nothing(tmp_path):
+    """The safe thing to run by hand on a live board: it says what a real run would copy
+    and what it would prune, and writes and removes nothing."""
+    src, keep, bin_dir = _pstore_board(tmp_path, {"console-ramoops-0": "evidence\n"})
+    old = keep / "20260101T000000Z-aabbccdd-dmesg-ramoops-0"
+    old.write_text("ancient\n")
+    _aged(old, 90)
+    done = _run_pstore(
+        tmp_path,
+        src,
+        keep,
+        bin_dir,
+        args=("--check",),
+        extra_env={"AQUA_PSTORE_KEEP_DAYS": "30"},
+    )
+    assert "would keep console-ramoops-0" in done.stdout
+    assert f"would prune {old.name}" in done.stdout
+    assert "nothing was copied, written or removed" in done.stdout
+    assert old.exists()
+    assert sorted(path.name for path in keep.iterdir()) == [old.name]
+    assert (src / "console-ramoops-0").read_text() == "evidence\n"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("AQUA_PSTORE_KEEP_DAYS", "-1"),
+        ("AQUA_PSTORE_KEEP_DAYS", "forever"),
+        ("AQUA_PSTORE_KEEP_MAX", "lots"),
+        ("AQUA_PSTORE_KEEP_MAX", "1.5"),
+    ],
+)
+def test_the_keeper_refuses_a_nonsense_bound(tmp_path, name, value):
+    src, keep, bin_dir = _pstore_board(tmp_path, {})
+    done = _run_pstore(tmp_path, src, keep, bin_dir, extra_env={name: value}, check=False)
+    assert done.returncode == 2
+    assert name in done.stderr
+
+
+def test_the_board_script_refuses_a_nonsense_pstore_knob():
+    text = BOARD_SCRIPT.read_text()
+    assert "for name in PSTORE_KEEP_DAYS PSTORE_KEEP_MAX; do" in text
+    assert _shell_default(BOARD_SCRIPT, "PSTORE_KEEP_DAYS") == "30"
+    assert _shell_default(BOARD_SCRIPT, "PSTORE_KEEP_MAX") == "200"
+
+
+def test_the_installer_verifies_the_pstore_backend_instead_of_assuming_it():
+    """With no ramoops the keeper installs perfectly, never runs
+    (ConditionDirectoryNotEmpty=) and looks exactly like a board that has not crashed --
+    so --check reads the board back and warns, naming the dtoverlay= line. Same
+    principle as the watchdog, journald and autoconnect-retries reports."""
+    text = BOARD_SCRIPT.read_text()
+    assert "pstore_report() {" in text
+    assert "== pstore (current board state, before any change) ==" in text
+    assert (
+        _shell_default(BOARD_SCRIPT, "PSTORE_RAMOOPS_OVERLAY")
+        == "dtoverlay=ramoops,total-size=0x80000,record-size=0x8000,console-size=0x40000"
+    )
+    assert _shell_default(BOARD_SCRIPT, "PSTORE_CONFIG_TXT") == "/boot/firmware/config.txt"
+    # It reports and does not write: the overlay is a boot-configuration change that
+    # needs a reboot, and deploy/host-usb.sh is the shape of a script that edits that
+    # file. config.txt is read once, with grep, and nothing else here touches it.
+    assert "grep -q '^[[:space:]]*dtoverlay=ramoops' \"$PSTORE_CONFIG_TXT\"" in text
+    for forbidden in (
+        '> "$PSTORE_CONFIG_TXT"',
+        '>> "$PSTORE_CONFIG_TXT"',
+        'tee "$PSTORE_CONFIG_TXT"',
+        "sed -i",
+    ):
+        assert forbidden not in text, forbidden
+
+
+def test_no_pstore_keep_is_an_off_switch_and_not_a_skipped_step():
+    """Same argument as the other three, and it applies to a oneshot too: a unit left
+    enabled runs the copy of the script installed back then at every boot, with the
+    retention it had back then."""
+    text = BOARD_SCRIPT.read_text()
+    assert "--no-pstore-keep)" in text
+    assert "[--no-radio-recover] [--no-radio-reboot] [--no-pstore-keep]" in text
+    assert "systemctl disable --now aqua-pstore-keep.service" in text
+    for dst in ('"$PSTORE_UNIT_DST"', '"$PSTORE_DST"'):
+        assert f"remove_path {dst}" in text
+    # enable, and NOT --now: its work is at boot, before systemd-pstore, and by the time
+    # the installer runs systemd-pstore has long since emptied /sys/fs/pstore.
+    assert "systemctl enable aqua-pstore-keep.service" in text
+    assert "systemctl enable --now aqua-pstore-keep.service" not in text
+    # The records already kept are evidence, not configuration.
+    assert "are evidence, not configuration" in text

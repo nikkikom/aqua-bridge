@@ -156,9 +156,9 @@ is not yet confirmed on real hardware, on either board.
    cleanly or the board lost power (a kernel cannot log its own power loss, so
    it is recorded from the other side, with a marker written at a clean stop).
    It sends no packet — not even a ping: a ping would refresh the gateway's
-   ARP entry and keep the radio out of power save, and a stale neighbour entry
-   and a radio asleep are two of the things being looked for, so an observer
-   that pings is an observer that hides its own evidence. It loads no module,
+   ARP entry and keep the radio out of power save, and a neighbour entry the
+   kernel has given up on and a radio asleep are two of the things being looked
+   for, so an observer that pings is an observer that hides its own evidence. It loads no module,
    touches no service, and writes nothing but that three-line marker. Read an outage out of it
    with
 
@@ -203,6 +203,41 @@ is not yet confirmed on real hardware, on either board.
 
    PROJECT.md §9 *Radio recovery* has the measurement, the ladder, the four
    bounds on the reboot and the worst case.
+
+   Finally it installs the **pstore keeper**,
+   `deploy/aqua-pstore-keep.{sh,service}`, which is the only unit here that runs
+   on the boot path and the only one that is not about the network. The board has
+   died without logging anything — the journal stops mid-stream on a routine
+   line — so the kernel console is preserved in DRAM across the reset by
+   `ramoops`, enabled with
+   `dtoverlay=ramoops,total-size=0x80000,record-size=0x8000,console-size=0x40000`
+   in `/boot/firmware/config.txt`. That half works; the half that did not is
+   what happens next. A reset here is normally followed by one or more boots
+   that die about eleven seconds in, and `systemd-pstore` archived the console
+   record to one fixed path — so each of those near-empty records overwrote the
+   record from the boot that actually failed. It destroyed the evidence twice: a
+   25930-byte record and then a 191-byte one, both from eleven-second boots,
+   each replacing what was there. So this unit is a oneshot ordered **before**
+   `systemd-pstore.service` that copies every record in `/sys/fs/pstore` to
+   `/var/lib/aqua-pstore/<utc-stamp>-<boot-id>-<name>` — a name no later boot
+   can collide with, which is the whole fix — and **never unlinks one**, so
+   `systemd-pstore` still archives the same records afterwards and its own
+   archive is unaffected. It copies at most the 512 KB `ramoops` holds, keeps 30
+   days and at most 200 records, and its pruning can only ever remove one
+   regular file at a time from a validated directory under its own naming
+   pattern. `--no-pstore-keep` leaves it out and removes it, leaving the records
+   already kept alone. The installer's `--check` says whether there is anything
+   for it to keep and whether there ever could be, because a board with no
+   `ramoops` and a board that has not crashed look identical from the outside.
+   Read what it did with
+
+   ```bash
+   journalctl -t aqua-pstore-keep -o short-iso --since -7d
+   ls -l /var/lib/aqua-pstore
+   ```
+
+   PROJECT.md §9 *The pstore keeper* has the timing, the retention argument and
+   why the pruning cannot run away.
 
 6. **Config.** Edit `/etc/aqua-bridge/config.yaml`: `mpc.channels` /
    `mpc.temps` / `mpc.sensors` / `mpc.topology` for the enclosure, the

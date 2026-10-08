@@ -1,0 +1,129 @@
+[Unit]
+Description=aqua-bridge board: keep every pstore record before systemd-pstore archives it
+Documentation=file:///opt/aqua-bridge/PROJECT.md
+# The whole point of this unit, in one line. systemd-pstore moves the records out
+# of /sys/fs/pstore and, on this board, archived the console record to one fixed
+# path -- so a reset followed by boots that die eleven seconds in overwrote the
+# record from the boot that actually failed. Measured twice: a 25930-byte record
+# and then a 191-byte one, each replacing what was there. Running first is not a
+# preference, it is the fix.
+Before=systemd-pstore.service
+# DefaultDependencies=no, exactly as systemd-pstore.service itself does, and for
+# the same reason: a unit that is pulled in BY sysinit.target cannot also be
+# ordered After= it, and the implicit dependencies would do just that. What is
+# needed instead is said here explicitly -- /var writable, and gone before a
+# shutdown.
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+# /var/lib has to be mounted before there is anywhere to copy to: on this board
+# it is on the root filesystem, but a board that puts /var on its own partition
+# must not have this unit run before it is there and silently copy into the
+# mountpoint underneath.
+RequiresMountsFor=/var/lib
+# Two conditions, not two failures. A read-only /var (the early boot of a board
+# with a dirty filesystem) and an empty /sys/fs/pstore (every healthy boot) are
+# both the normal state of affairs, and a unit that logged a failure on each of
+# them would make "this unit failed" mean nothing by the time it mattered.
+# ConditionDirectoryNotEmpty= is also what keeps a healthy boot free of this
+# unit entirely: no records, no run, no line.
+ConditionPathIsReadWrite=/var/lib
+ConditionDirectoryNotEmpty=/sys/fs/pstore
+# No relation of any kind to aqua-bridge.service or aqua-heartbeat.service -- no
+# Requires=, no Wants=, no After=, no Before=, no Conflicts=, no PartOf=. Nothing
+# about collecting a crash record may order, delay, start or stop the daemon that
+# drives the fans (PROJECT.md §2). The daemon starts from multi-user.target, long
+# after this has exited, and the only thing this unit can cost it is the start
+# timeout below -- bounded, and far inside the 28 s the board already takes from
+# power to its first controller write.
+#
+# No StartLimitIntervalSec default and no StartLimitAction: a oneshot that runs
+# once per boot cannot usefully be rate-limited, and must never be able to
+# escalate to anything.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/aqua-bridge/aqua-pstore-keep.sh
+# /var/lib/aqua-pstore, the one path this unit writes. systemd creates it and
+# makes it the only writable path under ProtectSystem=strict below; it matches
+# the script's AQUA_PSTORE_KEEP_DIR default, and tests/test_deploy.py checks
+# that. On /var and never RuntimeDirectory= on tmpfs: a crash record kept in RAM
+# is erased by exactly the event it is evidence of.
+StateDirectory=aqua-pstore
+# The two bounds, so deploy/install-board-watchdogs.sh can write them from
+# PSTORE_KEEP_DAYS and PSTORE_KEEP_MAX; they match the script's own defaults and
+# tests/test_deploy.py checks that all three agree. Every other knob is argued at
+# the top of the script and overridden with
+# "systemctl edit aqua-pstore-keep.service".
+Environment=AQUA_PSTORE_KEEP_DAYS=30
+Environment=AQUA_PSTORE_KEEP_MAX=200
+SyslogIdentifier=aqua-pstore-keep
+# Twenty seconds for a copy of at most the 512 KB ramoops holds, which takes
+# milliseconds on this card. It is a bound and not an expectation: systemd-pstore
+# ran at about 10.45 s in the boots that died at 10.5 to 11.1 s, so a keeper that
+# blocked would be holding up sysinit inside the window the board dies in. If it
+# ever hits this, the unit fails, the boot continues, and the journal says so.
+TimeoutStartSec=20
+# The only negative nice in this repository, and the only unit here that asks for
+# CPU rather than yielding it. Everything else runs behind the control loop
+# because it competes with it; this runs before the control loop exists, once,
+# with about 512 KB to copy, and the thing it is racing is the board dying again.
+Nice=-5
+# Under memory pressure this is still not worth more than the daemon -- but it is
+# not running at the same time as the daemon either, so this is about the rest of
+# the boot.
+OOMScoreAdjust=200
+MemoryHigh=32M
+MemoryMax=64M
+# It does not come back if it fails, on purpose: the records it did not copy are
+# gone by the time systemd-pstore has run, so a retry has nothing left to copy
+# and a restart loop on the boot path is strictly worse than one logged failure.
+Restart=no
+#
+# --- what it may do, enforced by systemd and not only by the script ------------
+#
+# No capabilities at all. Everything it reads it reads as uid 0 by ownership
+# (/sys/fs/pstore and its records are root-owned and owner-readable), and
+# everything it writes is its own StateDirectory=.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+# The whole of /sys read-only, which is the promise that matters here: this unit
+# COPIES records and never unlinks one. Removing them is systemd-pstore's job and
+# this unit must not be able to do it even by mistake, because a record it
+# deleted is a record nothing else will ever archive.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# Reads no device and writes none: a private /dev with no node added back, so a
+# controller's hidraw node, the aquaero and the Quadro are not openable at all.
+# There is no DeviceAllow= here and tests/test_deploy.py checks there never is.
+PrivateDevices=yes
+# It needs no network of any kind -- no name to resolve, nothing to send, nothing
+# to ask. The two together mean it could not reach the network if it tried.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# Other processes' /proc entries are hidden. ProcSubset= is deliberately left at
+# its default: "pid" would hide /proc/sys/kernel/random/boot_id, which is the
+# field that makes two records from two boots distinguishable when the clock says
+# they happened at the same second -- the normal case on a board that resets
+# before timesyncd has run, and the case that overwrote the evidence twice.
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=sysinit.target
